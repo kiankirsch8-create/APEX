@@ -1,0 +1,10 @@
+anthropic>=0.39.0
+requests>=2.32.0
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-dotenv>=1.0.1
+schedule>=1.2.2
+newsapi-python>=0.2.7
+aiohttp>=3.10.0
+pydantic>=2.9.0
+pytz>=2024.2

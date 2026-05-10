@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+.env
+.idea/
+.vscode/
+*.egg-info/
+.pytest_cache/
+
+# APEX runtime artifacts — ignore generated content but keep the dirs
+results/*
+!results/.gitkeep
+logs/*
+!logs/.gitkeep
+config/budget.json
