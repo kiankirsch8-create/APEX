@@ -11,12 +11,29 @@ the scoring downstream.
 from __future__ import annotations
 
 import asyncio
+import random
 from datetime import datetime
 from typing import Any
 
 from market_data import YFClient, build_indicator_pack
 from universe import SMALL_CAP_UNIVERSE
 from utils import log
+
+# ---------------------------------------------------------------------------
+# Randomization & scoring thresholds
+# ---------------------------------------------------------------------------
+#
+# Each scan samples a *random* subset of the curated universe so successive
+# runs find different picks instead of always converging on the same names.
+# Setting UNIVERSE_SAMPLE_SIZE >= len(SMALL_CAP_UNIVERSE) falls back to a
+# random shuffle of the full universe.
+UNIVERSE_SAMPLE_SIZE = 150
+
+# Minimum composite signal score a candidate must clear before being passed
+# to the analyzer. Filters out weak single-signal hits (e.g. SECTOR_TAILWIND
+# alone) while letting any single strong signal (>= 15pts) or any
+# multi-signal combination through.
+MIN_SCORE = 15
 
 # ---------------------------------------------------------------------------
 # Signal definitions (name, weight, direction)
@@ -59,17 +76,28 @@ async def scan(top_n: int = 3, candidate_pool_size: int = 60) -> list[dict[str, 
     """Scan the small-cap universe and return the top `top_n` picks.
 
     Strategy:
-      1. yfinance batch-download 1y of daily history for the entire universe.
-      2. Filter by price + 30-day average volume on the latest bar.
-      3. Sort by latest volume (proxy for activity), keep top `candidate_pool_size`.
-      4. Per-candidate enrich with details/snapshot/financials and score.
-      5. Return ranked top-N including triggered signals.
+      1. Randomly sample UNIVERSE_SAMPLE_SIZE tickers from the universe so
+         every scan looks at a different subset of names.
+      2. yfinance batch-download 1y of daily history for the sample.
+      3. Filter by price + 30-day average volume on the latest bar.
+      4. Sort by 30-day average volume, keep top `candidate_pool_size`.
+      5. Per-candidate enrich with details/snapshot/financials and score.
+      6. Drop candidates below MIN_SCORE.
+      7. Return ranked top-N including triggered signals.
     """
-    log(f"[SmallCapScreener] starting scan over {len(SMALL_CAP_UNIVERSE)} tickers")
+    sample_size = min(UNIVERSE_SAMPLE_SIZE, len(SMALL_CAP_UNIVERSE))
+    universe = random.sample(SMALL_CAP_UNIVERSE, sample_size)
+    log(
+        f"[SmallCapScreener] randomized sample {sample_size}/"
+        f"{len(SMALL_CAP_UNIVERSE)} tickers (min_score={MIN_SCORE})"
+    )
 
     async with YFClient() as yfc:
-        bars_by_ticker = await yfc.batch_history(SMALL_CAP_UNIVERSE, period="1y")
-        log(f"[SmallCapScreener] yfinance returned bars for {sum(1 for v in bars_by_ticker.values() if v)}/{len(SMALL_CAP_UNIVERSE)} tickers")
+        bars_by_ticker = await yfc.batch_history(universe, period="1y")
+        log(
+            f"[SmallCapScreener] yfinance returned bars for "
+            f"{sum(1 for v in bars_by_ticker.values() if v)}/{sample_size} tickers"
+        )
 
         prelim: list[dict] = []
         for ticker, rows in bars_by_ticker.items():
@@ -125,7 +153,7 @@ async def scan(top_n: int = 3, candidate_pool_size: int = 60) -> list[dict[str, 
                 if not indicators:
                     return None
                 signals, score = _score_small_cap(row, indicators, details, snap, financials)
-                if not signals:
+                if not signals or score < MIN_SCORE:
                     return None
                 return {
                     "ticker": ticker,

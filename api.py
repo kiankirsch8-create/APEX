@@ -20,7 +20,7 @@ import screener_big_players
 import screener_small_caps
 from scorer import calculate, enforce_portfolio_cap
 from scheduler import run_daily_apex
-from utils import CONFIG_DIR, RESULTS_DIR, load_json, save_json, today_str, utcnow_iso
+from utils import CONFIG_DIR, RESULTS_DIR, load_json, log, save_json, today_str, utcnow_iso
 
 app = FastAPI(
     title="APEX Stock Discovery Engine",
@@ -42,6 +42,16 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
+# In-memory cache of the most recent scan payload. Each call to
+# /api/run-scan (or /api/run) clears this first and re-populates it after
+# the scan completes — so every Run Scan produces fresh picks instead of
+# returning stale cached data. /api/latest prefers this cache over the
+# (Railway-ephemeral) JSON file on disk.
+# ---------------------------------------------------------------------------
+LATEST_RESULTS: dict = {}
+
+
+# ---------------------------------------------------------------------------
 # Startup scan — Railway resets the filesystem on every deploy. The container
 # can also boot with a stale or empty `results/latest.json` (e.g. a partial
 # write from a previous run, or a placeholder with `total_picks == 0`). We
@@ -51,21 +61,23 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup_scan() -> None:
     latest_path = RESULTS_DIR / "latest.json"
-    from utils import log
 
     try:
         with open(latest_path) as f:
             data = json.load(f)
         if data.get("total_picks", 0) > 0:
-            log("[Startup] latest.json has real data — skipping boot scan")
+            log("[Startup] latest.json has real data — hydrating LATEST_RESULTS, skipping boot scan")
+            LATEST_RESULTS.update(data)
             return  # real data exists, skip scan
     except Exception:  # noqa: BLE001 — missing file, empty file, or invalid JSON
         pass
 
     log("[Startup] No real data on disk — running first APEX scan")
     try:
-        await run_daily_apex(total_budget_usd=_stored_budget())
-        log("[Startup] First-boot APEX scan complete")
+        payload = await run_daily_apex(total_budget_usd=_stored_budget())
+        LATEST_RESULTS.clear()
+        LATEST_RESULTS.update(payload or {})
+        log(f"[Startup] First-boot APEX scan complete — {LATEST_RESULTS.get('total_picks', 0)} picks in memory")
     except Exception as e:  # noqa: BLE001 — never let a scan failure break boot
         log(f"[Startup] First-boot APEX scan failed: {e}", "error")
 
@@ -95,9 +107,14 @@ async def health() -> dict:
 # ---------------------------------------------------------------------------
 @app.get("/api/latest")
 async def get_latest() -> dict:
+    if LATEST_RESULTS:
+        return LATEST_RESULTS
     data = load_json(RESULTS_DIR / "latest.json")
     if not data:
-        raise HTTPException(status_code=404, detail="No APEX scan has run yet. Trigger one via /api/run.")
+        raise HTTPException(
+            status_code=404,
+            detail="No APEX scan has run yet. Trigger one via POST /api/run-scan.",
+        )
     return data
 
 
@@ -234,9 +251,8 @@ def _next_seven_am_iso() -> str:
 # ---------------------------------------------------------------------------
 @app.post("/api/run")
 async def trigger_run(total_budget_usd: float | None = Query(default=None)) -> dict:
-    budget = float(total_budget_usd) if total_budget_usd else _stored_budget()
-    payload = await run_daily_apex(total_budget_usd=budget)
-    return payload
+    """Backwards-compatible alias of POST /api/run-scan."""
+    return await run_scan(total_budget_usd=total_budget_usd)
 
 
 @app.api_route("/api/run-scan", methods=["GET", "POST"])
@@ -244,19 +260,23 @@ async def run_scan(total_budget_usd: float | None = Query(default=None)) -> dict
     """Trigger the full APEX scheduler pipeline on demand.
 
     Behaviour:
-    1. Runs both screeners + analyzer + scorer end-to-end via
+    1. Clears LATEST_RESULTS so any in-flight ``/api/latest`` call sees
+       'no data' until the new scan completes — guaranteeing the next
+       response is the fresh set of picks, not stale cached output.
+    2. Runs both screeners + analyzer + scorer end-to-end via
        ``run_daily_apex`` (the same code path the 07:00 daily job uses).
-    2. Persists the results to ``results/latest.json`` and
-       ``results/daily_picks_<DATE>.json`` on the local filesystem (Railway
-       container disk).
-    3. Returns the freshly-built payload as JSON so the caller can render
-       the picks immediately without a second round-trip to ``/api/latest``.
+       The screeners randomly sample their universes on every call, so
+       successive scans surface different candidates.
+    3. Updates LATEST_RESULTS with the new payload and returns it as JSON.
 
     Accepts both ``GET`` and ``POST`` so it can be triggered easily from a
     browser tab while testing on Railway.
     """
     budget = float(total_budget_usd) if total_budget_usd else _stored_budget()
+    LATEST_RESULTS.clear()
+    log("[/api/run-scan] LATEST_RESULTS cleared — forcing fresh scan")
     payload = await run_daily_apex(total_budget_usd=budget)
+    LATEST_RESULTS.update(payload)
     return payload
 
 

@@ -9,12 +9,26 @@ Returns the top 2 candidates ranked by signal score.
 from __future__ import annotations
 
 import asyncio
+import random
 from datetime import datetime
 from typing import Any
 
 from market_data import YFClient, build_indicator_pack
 from universe import LARGE_CAP_UNIVERSE
 from utils import log
+
+# ---------------------------------------------------------------------------
+# Randomization & scoring thresholds
+# ---------------------------------------------------------------------------
+#
+# Each scan samples a random subset of the curated large-cap universe so
+# successive runs find different undervalued giants rather than always
+# converging on the same handful of names.
+UNIVERSE_SAMPLE_SIZE = 60
+
+# Minimum composite signal score a candidate must clear before being passed
+# to the analyzer.
+MIN_SCORE = 15
 
 # Sector P/E priors used as a stand-in when an exact peer comparison is not
 # available from the data source. Conservative averages.
@@ -61,13 +75,18 @@ FILTERS = {
 
 
 async def scan(top_n: int = 2, candidate_pool_size: int = 80) -> list[dict[str, Any]]:
-    log(f"[BigPlayerScreener] starting scan over {len(LARGE_CAP_UNIVERSE)} tickers")
+    sample_size = min(UNIVERSE_SAMPLE_SIZE, len(LARGE_CAP_UNIVERSE))
+    universe = random.sample(LARGE_CAP_UNIVERSE, sample_size)
+    log(
+        f"[BigPlayerScreener] randomized sample {sample_size}/"
+        f"{len(LARGE_CAP_UNIVERSE)} tickers (min_score={MIN_SCORE})"
+    )
 
     async with YFClient() as yfc:
-        bars_by_ticker = await yfc.batch_history(LARGE_CAP_UNIVERSE, period="2y")
+        bars_by_ticker = await yfc.batch_history(universe, period="2y")
         log(
             f"[BigPlayerScreener] yfinance returned bars for "
-            f"{sum(1 for v in bars_by_ticker.values() if v)}/{len(LARGE_CAP_UNIVERSE)} tickers"
+            f"{sum(1 for v in bars_by_ticker.values() if v)}/{sample_size} tickers"
         )
 
         prelim: list[dict] = []
@@ -130,7 +149,7 @@ async def scan(top_n: int = 2, candidate_pool_size: int = 80) -> list[dict[str, 
                 if not indicators:
                     return None
                 signals, score = _score_big_player(row, indicators, details, snap, financials)
-                if not signals:
+                if not signals or score < MIN_SCORE:
                     return None
                 return {
                     "ticker": ticker,
