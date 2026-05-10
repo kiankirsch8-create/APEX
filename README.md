@@ -8,10 +8,10 @@ The user never picks the stock. **The machine finds it.**
 
 ## What APEX does
 
-1. **Two screeners run in parallel** every morning:
+1. **Two screeners run in parallel** every morning over a curated **400-ticker universe** (300 small/micro caps + 100 large caps in `universe.py`), all data via free **yfinance** (no API key, no rate limit):
    - `screener_small_caps.py` — explosive setups in $10M–$2B names (volume spikes, oversold bounces, short-squeeze setups, catalyst-driven plays, insider buying, etc.)
    - `screener_big_players.py` — undervalued giants ($2B+) with deep value, earnings inflection, sentiment mismatch, sector-rotation tailwinds, etc.
-2. **Top 3 small caps + top 2 big players** are passed into `analyzer.py`, which calls the **Claude `claude-opus-4-20250514`** model with a sophisticated APEX system prompt.
+2. **Top 3 small caps + top 2 big players** are passed into `analyzer.py`, which calls the **Claude `claude-opus-4-5`** model (with `claude-sonnet-4-5` as automatic fallback) using a sophisticated APEX system prompt.
 3. **`scorer.py`** validates upside, computes a probability between 25%–91%, generates a punchy reasoning sentence, and produces a strict **position-sizing recommendation** that obeys all per-position and portfolio-level caps.
 4. Results are persisted under `results/latest.json` and `results/daily_picks_YYYY-MM-DD.json` and exposed through a FastAPI server.
 
@@ -21,7 +21,8 @@ The user never picks the stock. **The machine finds it.**
 
 ```
 master_prompt.py        — the APEX analyst system prompt
-market_data.py          — async Polygon.io + technicals + news client
+market_data.py          — async yfinance client + technicals + NewsAPI
+universe.py             — curated 300 small caps + 100 large caps to scan
 screener_small_caps.py  — speculative explosive small/micro cap scanner
 screener_big_players.py — undervalued large cap scanner
 analyzer.py             — Claude-powered full report generator
@@ -43,10 +44,9 @@ config/                 — persisted budget config (auto-created)
 | Service | Env var | Get a key |
 | --- | --- | --- |
 | Anthropic (Claude Opus 4) | `ANTHROPIC_API_KEY` | <https://console.anthropic.com/settings/keys> |
-| Polygon.io (market data) | `POLYGON_API_KEY` | <https://polygon.io/dashboard/api-keys> |
 | NewsAPI.org (headlines) | `NEWSAPI_KEY` | <https://newsapi.org/account> |
 
-Polygon paid tiers are recommended — the free tier is rate-limited and won't cover the daily grouped + per-ticker fanout.
+**Market data is provided by free [yfinance](https://github.com/ranaroussi/yfinance) — no API key, no rate limits.** NewsAPI is optional; if `NEWSAPI_KEY` is missing the analyzer still runs using only yfinance news.
 
 ---
 
@@ -67,7 +67,6 @@ pip install -r requirements.txt
 
 ```env
 ANTHROPIC_API_KEY=sk-ant-...
-POLYGON_API_KEY=...
 NEWSAPI_KEY=...
 PORT=8000
 TIMEZONE=Europe/Berlin

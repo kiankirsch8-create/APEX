@@ -1,8 +1,9 @@
 """APEX analyzer — turns a screener candidate into a full APEX report.
 
-Calls Claude (claude-opus-4-20250514) with the master analyst system prompt
-and a richly-populated user message, parses the JSON response, retries once
-on parse failure, and returns the structured report dict.
+Calls Claude (claude-opus-4-5, with claude-sonnet-4-5 as automatic fallback)
+with the master analyst system prompt and a richly-populated user message,
+parses the JSON response, retries once on parse failure, and returns the
+structured report dict.
 """
 from __future__ import annotations
 
@@ -18,7 +19,8 @@ from market_data import PolygonClient, build_indicator_pack, fetch_news_headline
 from master_prompt import MASTER_ANALYST_SYSTEM_PROMPT
 from utils import env, log, utcnow_iso
 
-CLAUDE_MODEL = "claude-opus-4-20250514"
+CLAUDE_MODEL = "claude-opus-4-5"
+CLAUDE_MODEL_FALLBACK = "claude-sonnet-4-5"
 MAX_TOKENS = 4000
 
 
@@ -308,16 +310,21 @@ def _macro_snapshot() -> dict:
 
 # ---------------------------------------------------------------------------
 async def _call_claude(user_message: str) -> str:
-    """Call Anthropic Messages API in a thread (SDK is sync)."""
-    def _do_call() -> str:
+    """Call Anthropic Messages API in a thread.
+
+    Tries the primary model (claude-opus-4-5) first. If the provider call
+    raises (e.g. the model is unavailable, overloaded, or rate-limited) we
+    automatically retry once on the fallback model (claude-sonnet-4-5)
+    before giving up.
+    """
+    def _do_call(model: str) -> str:
         client = _client()
         msg = client.messages.create(
-            model=CLAUDE_MODEL,
+            model=model,
             max_tokens=MAX_TOKENS,
             system=MASTER_ANALYST_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_message}],
         )
-        # extract text block
         if not msg.content:
             return ""
         out = []
@@ -326,11 +333,14 @@ async def _call_claude(user_message: str) -> str:
                 out.append(block.text)
         return "\n".join(out).strip()
 
-    try:
-        return await asyncio.to_thread(_do_call)
-    except Exception as e:  # noqa: BLE001 — surface any provider error to retry path
-        log(f"[Analyzer] Claude call failed: {e}", "error")
-        return ""
+    for model in (CLAUDE_MODEL, CLAUDE_MODEL_FALLBACK):
+        try:
+            return await asyncio.to_thread(_do_call, model)
+        except Exception as e:  # noqa: BLE001 — try the next model
+            log(f"[Analyzer] Claude call failed on {model}: {e}", "warning")
+            continue
+    log(f"[Analyzer] Claude unreachable after fallback to {CLAUDE_MODEL_FALLBACK}", "error")
+    return ""
 
 
 def _parse_json(raw: str) -> dict | None:
