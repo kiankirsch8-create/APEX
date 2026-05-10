@@ -13,7 +13,7 @@ The user never picks the stock. **The machine finds it.**
    - `screener_big_players.py` — undervalued giants ($2B+) with deep value, earnings inflection, sentiment mismatch, sector-rotation tailwinds, etc.
 2. **Top 3 small caps + top 2 big players** are passed into `analyzer.py`, which calls the **Claude `claude-opus-4-20250514`** model with a sophisticated APEX system prompt.
 3. **`scorer.py`** validates upside, computes a probability between 25%–91%, generates a punchy reasoning sentence, and produces a strict **position-sizing recommendation** that obeys all per-position and portfolio-level caps.
-4. Results are persisted under `results/latest.json` and `results/daily_picks_YYYY-MM-DD.json` and exposed through a FastAPI server.
+4. The API server keeps the latest payload + a small bounded history **in memory** (`LATEST_RESULTS` / `RESULTS_HISTORY`) so the service is fully Railway-compatible — Railway resets the container filesystem on every deploy, so the API never relies on disk for results. The standalone scheduler CLI (`python scheduler.py --run-now`) still writes JSON to `results/` for local use.
 
 ---
 
@@ -100,6 +100,8 @@ Blocks the process and runs the pipeline every day at 07:00 local time.
 uvicorn api:app --host 0.0.0.0 --port 8000
 ```
 
+The server runs the first APEX scan in a background task on startup, so `/api/latest` returns a `503 Service Unavailable` (with a "warming up" message) for the first ~1–2 minutes after deploy. After that it returns the in-memory `LATEST_RESULTS`. To force a refresh anytime: `POST /api/run-scan`.
+
 Then point your Lovable frontend at `http://localhost:8000`.
 
 ---
@@ -112,10 +114,11 @@ Then point your Lovable frontend at `http://localhost:8000`.
 | GET | `/api/latest` | Today's picks: small caps + big players + top pick |
 | GET | `/api/pick/{ticker}` | Single pick from today's results |
 | GET | `/api/history` | List of all dates that have saved picks |
-| GET | `/api/history/{date}` | Picks for a specific `YYYY-MM-DD` |
+| GET | `/api/history/{date}` | Picks for a specific `YYYY-MM-DD` (in-memory only) |
 | POST | `/api/analyze/{ticker}?section=SMALL_CAP\|BIG_PLAYER` | On-demand full analysis |
-| POST | `/api/run` | Manually trigger today's full pipeline |
-| GET | `/api/status` | Run status, last run timestamp, next run, current budget |
+| POST | `/api/run-scan` | Trigger a real scan and update `LATEST_RESULTS` (returns the fresh payload) |
+| POST | `/api/run` | Backwards-compatible alias of `/api/run-scan` |
+| GET | `/api/status` | Run status, scan-in-progress flag, last run timestamp, next run, current budget |
 | GET | `/api/budget` | Read the saved investment budget |
 | POST | `/api/budget` | Save a new total investment budget (`{"total_budget_usd": 25000}`) |
 
