@@ -24,11 +24,25 @@ DEFAULT_BUDGET = float(env("DEFAULT_BUDGET_USD") or 10_000)
 
 
 # ---------------------------------------------------------------------------
-async def run_daily_apex(total_budget_usd: float | None = None) -> dict[str, Any]:
+async def run_daily_apex(
+    total_budget_usd: float | None = None,
+    persist: bool = True,
+) -> dict[str, Any]:
     """Execute the full APEX scan-analyze-score pipeline once.
 
-    Returns the aggregated result dict that is also persisted to disk under
-    ``results/latest.json`` and ``results/daily_picks_<DATE>.json``.
+    Returns the aggregated result dict.
+
+    Parameters
+    ----------
+    total_budget_usd : float | None
+        Override for the user's total investment budget. Falls back to the
+        config-stored value or the ``DEFAULT_BUDGET_USD`` env var.
+    persist : bool, default True
+        If True (CLI / cron), the payload is also written to
+        ``results/latest.json`` and ``results/daily_picks_<DATE>.json``.
+        Set to False when the caller manages storage itself (e.g. the API
+        server's in-memory ``LATEST_RESULTS`` global on Railway, where the
+        filesystem is reset on every deploy).
     """
     budget = float(total_budget_usd if total_budget_usd is not None else _read_budget())
     log(f"APEX scan starting — budget=${budget:,.0f}")
@@ -74,7 +88,8 @@ async def run_daily_apex(total_budget_usd: float | None = None) -> dict[str, Any
     results = enforce_portfolio_cap(results, max_total_pct=35.0)
 
     payload = _build_payload(results, budget, started)
-    _persist(payload)
+    if persist:
+        _persist(payload)
     log(f"APEX complete: {len(results)} picks in {payload['duration_seconds']:.1f}s")
     return payload
 

@@ -1,14 +1,21 @@
-"""APEX FastAPI backend.
+"""APEX FastAPI backend — in-memory results store.
+
+Results are kept in a Python global (`LATEST_RESULTS`) and a small bounded
+in-memory history dict. We do NOT read or write `results/latest.json` or
+`results/daily_picks_<DATE>.json` from this module — Railway resets the
+container filesystem on every deploy, so any persistence here would be
+lost. Instead, the server runs a fresh scan in the background on startup,
+and any client can hit POST `/api/run-scan` to refresh the in-memory data
+on demand.
 
 Run:
     uvicorn api:app --host 0.0.0.0 --port 8000
 """
 from __future__ import annotations
 
-import json
+import asyncio
 import os
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
@@ -18,17 +25,18 @@ from pydantic import BaseModel, Field
 import analyzer
 import screener_big_players
 import screener_small_caps
-from scorer import calculate, enforce_portfolio_cap
+from scorer import calculate
 from scheduler import run_daily_apex
-from utils import CONFIG_DIR, RESULTS_DIR, load_json, save_json, today_str, utcnow_iso
+from utils import CONFIG_DIR, load_json, log, save_json, today_str, utcnow_iso
 
 app = FastAPI(
     title="APEX Stock Discovery Engine",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Autonomous AI-powered stock discovery engine. The machine finds the "
         "highest-probability explosive opportunities every morning across "
-        "speculative small caps and undervalued mega caps."
+        "speculative small caps and undervalued mega caps. Results are kept "
+        "in memory so the service is fully Railway-compatible."
     ),
 )
 
@@ -42,32 +50,59 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
-# Startup scan — Railway resets the filesystem on every deploy. The container
-# can also boot with a stale or empty `results/latest.json` (e.g. a partial
-# write from a previous run, or a placeholder with `total_picks == 0`). We
-# only skip the boot-time scan when real data is on disk; otherwise we run
-# the full APEX pipeline once so the frontend always has fresh data.
+# In-memory results store — Railway-friendly. The filesystem is reset on
+# every deploy, so we never persist results to disk from the API layer.
+# ---------------------------------------------------------------------------
+LATEST_RESULTS: dict = {}
+RESULTS_HISTORY: dict[str, dict] = {}      # date_str -> payload, bounded
+_HISTORY_MAX_ENTRIES = 30
+_SCAN_LOCK = asyncio.Lock()
+_SCAN_IN_PROGRESS = False
+
+
+async def _run_and_store_scan(budget: float) -> dict:
+    """Run one full APEX scan and update the in-memory globals.
+
+    Serialised by ``_SCAN_LOCK`` — concurrent callers wait for the running
+    scan and then run their own, never trampling each other's writes.
+    """
+    global LATEST_RESULTS, _SCAN_IN_PROGRESS
+    async with _SCAN_LOCK:
+        _SCAN_IN_PROGRESS = True
+        try:
+            payload = await run_daily_apex(total_budget_usd=budget, persist=False)
+        finally:
+            _SCAN_IN_PROGRESS = False
+        LATEST_RESULTS = payload
+        date_str = payload.get("date") or today_str()
+        RESULTS_HISTORY[date_str] = payload
+        # Bound history to the most-recent N entries (FIFO by date string)
+        if len(RESULTS_HISTORY) > _HISTORY_MAX_ENTRIES:
+            for stale in sorted(RESULTS_HISTORY.keys())[: -_HISTORY_MAX_ENTRIES]:
+                RESULTS_HISTORY.pop(stale, None)
+        return payload
+
+
+# ---------------------------------------------------------------------------
+# Startup — kick off the first scan in a background task so the HTTP
+# server starts accepting requests immediately. Results are typically ready
+# within ~2 minutes; until then ``/api/latest`` returns 503.
 # ---------------------------------------------------------------------------
 @app.on_event("startup")
 async def startup_scan() -> None:
-    latest_path = RESULTS_DIR / "latest.json"
-    from utils import log
+    log("[Startup] Spawning initial APEX scan in background")
 
-    try:
-        with open(latest_path) as f:
-            data = json.load(f)
-        if data.get("total_picks", 0) > 0:
-            log("[Startup] latest.json has real data — skipping boot scan")
-            return  # real data exists, skip scan
-    except Exception:  # noqa: BLE001 — missing file, empty file, or invalid JSON
-        pass
+    async def _initial() -> None:
+        try:
+            await _run_and_store_scan(_stored_budget())
+            log(
+                f"[Startup] Initial scan complete — "
+                f"{LATEST_RESULTS.get('total_picks', 0)} picks in memory"
+            )
+        except Exception as e:  # noqa: BLE001 — never let a scan failure break boot
+            log(f"[Startup] Initial APEX scan failed: {e}", "error")
 
-    log("[Startup] No real data on disk — running first APEX scan")
-    try:
-        await run_daily_apex(total_budget_usd=_stored_budget())
-        log("[Startup] First-boot APEX scan complete")
-    except Exception as e:  # noqa: BLE001 — never let a scan failure break boot
-        log(f"[Startup] First-boot APEX scan failed: {e}", "error")
+    asyncio.create_task(_initial())
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +113,7 @@ class BudgetIn(BaseModel):
 
 
 class AnalyzeIn(BaseModel):
-    section: str | None = Field(default=None, description="SMALL_CAP or BIG_PLAYER (optional, auto-detected if omitted)")
+    section: str | None = Field(default=None, description="SMALL_CAP or BIG_PLAYER (optional)")
     total_budget_usd: float | None = Field(default=None, gt=0)
 
 
@@ -91,23 +126,28 @@ async def health() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Latest / single pick / history
+# Latest / single pick / history (all in-memory)
 # ---------------------------------------------------------------------------
 @app.get("/api/latest")
 async def get_latest() -> dict:
-    data = load_json(RESULTS_DIR / "latest.json")
-    if not data:
-        raise HTTPException(status_code=404, detail="No APEX scan has run yet. Trigger one via /api/run.")
-    return data
+    if not LATEST_RESULTS:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "APEX is still warming up — the first scan after deploy is "
+                "running in the background. Try again in ~2 minutes, or trigger "
+                "a fresh scan with POST /api/run-scan."
+            ),
+        )
+    return LATEST_RESULTS
 
 
 @app.get("/api/pick/{ticker}")
 async def get_pick(ticker: str) -> dict:
-    data = load_json(RESULTS_DIR / "latest.json")
-    if not data:
-        raise HTTPException(status_code=404, detail="No latest results available.")
+    if not LATEST_RESULTS:
+        raise HTTPException(status_code=503, detail="No results available yet — initial scan still running.")
     ticker = ticker.upper()
-    for r in data.get("all_picks", []) or []:
+    for r in LATEST_RESULTS.get("all_picks", []) or []:
         if (r.get("ticker") or "").upper() == ticker:
             return r
     raise HTTPException(status_code=404, detail=f"{ticker} not in today's picks.")
@@ -115,13 +155,8 @@ async def get_pick(ticker: str) -> dict:
 
 @app.get("/api/history")
 async def list_history() -> dict:
-    files = sorted(RESULTS_DIR.glob("daily_picks_*.json"))
-    dates = []
-    for f in files:
-        stem = f.stem.replace("daily_picks_", "")
-        if len(stem) == 10:
-            dates.append(stem)
-    return {"dates": dates, "count": len(dates)}
+    dates = sorted(RESULTS_HISTORY.keys())
+    return {"dates": dates, "count": len(dates), "in_memory_only": True}
 
 
 @app.get("/api/history/{date}")
@@ -130,14 +165,14 @@ async def get_history(date: str) -> dict:
         datetime.strptime(date, "%Y-%m-%d")
     except ValueError as e:
         raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD") from e
-    data = load_json(RESULTS_DIR / f"daily_picks_{date}.json")
+    data = RESULTS_HISTORY.get(date)
     if not data:
-        raise HTTPException(status_code=404, detail=f"No results for {date}.")
+        raise HTTPException(status_code=404, detail=f"No in-memory results for {date}.")
     return data
 
 
 # ---------------------------------------------------------------------------
-# On-demand analysis
+# On-demand single-ticker analysis (does not touch LATEST_RESULTS)
 # ---------------------------------------------------------------------------
 @app.post("/api/analyze/{ticker}")
 async def analyze_ticker(
@@ -151,8 +186,6 @@ async def analyze_ticker(
 
     budget = float(total_budget_usd) if total_budget_usd else _stored_budget()
     ticker = ticker.upper()
-
-    # Build screener-style market data so analyzer has full context
     market_data = await _build_market_data(ticker, section)
     triggered = market_data.get("triggered_signals", [])
 
@@ -167,8 +200,7 @@ async def analyze_ticker(
 
 
 async def _build_market_data(ticker: str, section: str) -> dict:
-    """Run the screener's scoring on a single ticker so the analyzer gets
-    the same triggered_signals it would in the daily pipeline."""
+    """Fetch + score a single ticker the same way the daily screeners do."""
     from market_data import PolygonClient, build_indicator_pack
 
     async with PolygonClient() as poly:
@@ -206,18 +238,20 @@ async def _build_market_data(ticker: str, section: str) -> dict:
 # ---------------------------------------------------------------------------
 @app.get("/api/status")
 async def status() -> dict:
-    data = load_json(RESULTS_DIR / "latest.json")
     today = today_str()
-    today_complete = bool(data and data.get("date") == today)
-    next_run = _next_seven_am_iso()
+    today_complete = bool(LATEST_RESULTS and LATEST_RESULTS.get("date") == today)
     return {
+        "scan_in_progress": _SCAN_IN_PROGRESS,
+        "results_loaded": bool(LATEST_RESULTS),
         "today_run_complete": today_complete,
-        "last_run_at": (data or {}).get("generated_at"),
-        "total_picks_today": (data or {}).get("total_picks", 0) if today_complete else 0,
-        "small_cap_count": (data or {}).get("small_cap_count", 0) if today_complete else 0,
-        "big_player_count": (data or {}).get("big_player_count", 0) if today_complete else 0,
-        "next_run_at": next_run,
+        "last_run_at": LATEST_RESULTS.get("generated_at"),
+        "total_picks_today": LATEST_RESULTS.get("total_picks", 0) if today_complete else 0,
+        "small_cap_count": LATEST_RESULTS.get("small_cap_count", 0) if today_complete else 0,
+        "big_player_count": LATEST_RESULTS.get("big_player_count", 0) if today_complete else 0,
+        "history_dates_in_memory": sorted(RESULTS_HISTORY.keys()),
+        "next_run_at": _next_seven_am_iso(),
         "current_budget_usd": _stored_budget(),
+        "storage": "in-memory (Railway-safe)",
     }
 
 
@@ -230,38 +264,31 @@ def _next_seven_am_iso() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Manual run triggers
+# Manual scan triggers — both update LATEST_RESULTS in memory
 # ---------------------------------------------------------------------------
-@app.post("/api/run")
-async def trigger_run(total_budget_usd: float | None = Query(default=None)) -> dict:
-    budget = float(total_budget_usd) if total_budget_usd else _stored_budget()
-    payload = await run_daily_apex(total_budget_usd=budget)
-    return payload
-
-
-@app.api_route("/api/run-scan", methods=["GET", "POST"])
+@app.post("/api/run-scan")
 async def run_scan(total_budget_usd: float | None = Query(default=None)) -> dict:
-    """Trigger the full APEX scheduler pipeline on demand.
+    """Trigger a real, blocking APEX scan and update LATEST_RESULTS in memory.
 
-    Behaviour:
-    1. Runs both screeners + analyzer + scorer end-to-end via
-       ``run_daily_apex`` (the same code path the 07:00 daily job uses).
-    2. Persists the results to ``results/latest.json`` and
-       ``results/daily_picks_<DATE>.json`` on the local filesystem (Railway
-       container disk).
-    3. Returns the freshly-built payload as JSON so the caller can render
-       the picks immediately without a second round-trip to ``/api/latest``.
-
-    Accepts both ``GET`` and ``POST`` so it can be triggered easily from a
-    browser tab while testing on Railway.
+    The full pipeline runs synchronously inside this request — both
+    screeners + analyzer + scorer end-to-end — and the freshly-built
+    payload is returned as JSON. No filesystem writes.
     """
     budget = float(total_budget_usd) if total_budget_usd else _stored_budget()
-    payload = await run_daily_apex(total_budget_usd=budget)
+    payload = await _run_and_store_scan(budget)
     return payload
 
 
+@app.post("/api/run")
+async def trigger_run(total_budget_usd: float | None = Query(default=None)) -> dict:
+    """Backwards-compatible alias for ``/api/run-scan``."""
+    return await run_scan(total_budget_usd)
+
+
 # ---------------------------------------------------------------------------
-# Budget management — persisted in config/budget.json
+# Budget management — config/budget.json. This is user configuration, not
+# results data, so it stays on disk inside the container (Railway will reset
+# it on deploy; clients can re-POST it as needed).
 # ---------------------------------------------------------------------------
 @app.get("/api/budget")
 async def get_budget() -> dict:
@@ -297,7 +324,8 @@ def _budget_updated_at() -> str | None:
 async def root() -> dict:
     return {
         "service": "APEX Stock Discovery Engine",
-        "version": "1.0.0",
+        "version": "1.1.0",
+        "storage": "in-memory (Railway-safe)",
         "endpoints": [
             "GET /health",
             "GET /api/latest",
@@ -306,8 +334,8 @@ async def root() -> dict:
             "GET /api/history/{date}",
             "POST /api/analyze/{ticker}?section=SMALL_CAP|BIG_PLAYER",
             "GET /api/status",
-            "POST /api/run",
-            "GET|POST /api/run-scan",
+            "POST /api/run-scan",
+            "POST /api/run  (alias of /api/run-scan)",
             "GET /api/budget",
             "POST /api/budget",
         ],
