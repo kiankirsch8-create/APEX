@@ -1,123 +1,386 @@
-"""Market data client — wraps Polygon.io and a few derived metrics.
+"""Market data client — yfinance backed.
 
-All functions are async and resilient: any failure returns a degraded but
-well-formed payload so the rest of the pipeline keeps running.
+yfinance is free, key-less, and rate-limit free. We expose the same shape
+the rest of the project already consumes (Polygon-style dicts) so analyzer
+and screener helpers continue to work unchanged.
+
+The blocking yfinance calls are dispatched to threads via `asyncio.to_thread`
+so we keep the async interface used elsewhere.
+
+The class `YFClient` is the new primary client. `PolygonClient` is kept as a
+backward-compatible alias so analyzer.py / api.py continue to import the same
+name without modification.
 """
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
+import math
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import aiohttp
+import pandas as pd
+import yfinance as yf
 
 from utils import env, log
 
-POLYGON_BASE = "https://api.polygon.io"
 NEWS_BASE = "https://newsapi.org/v2"
 
 
-class PolygonClient:
-    """Minimal async Polygon.io client with the few endpoints APEX needs."""
+# ---------------------------------------------------------------------------
+# yfinance-backed client
+# ---------------------------------------------------------------------------
+class YFClient:
+    """Async-friendly wrapper around yfinance.
 
-    def __init__(self, api_key: str | None = None, session: aiohttp.ClientSession | None = None):
-        self.api_key = api_key or env("POLYGON_API_KEY") or ""
-        self._session = session
-        self._owns_session = session is None
+    Each public method returns the same dict shape the legacy Polygon client
+    returned, so downstream code keeps working without changes.
+    """
 
-    async def __aenter__(self) -> "PolygonClient":
-        if self._session is None:
-            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+    def __init__(self) -> None:
+        self._session: aiohttp.ClientSession | None = None  # used for NewsAPI
+
+    async def __aenter__(self) -> "YFClient":
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
-        if self._owns_session and self._session is not None:
+        if self._session is not None:
             await self._session.close()
-
-    async def _get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        params = dict(params or {})
-        params["apiKey"] = self.api_key
-        url = f"{POLYGON_BASE}{path}"
-        if self._session is None:
-            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
-        try:
-            async with self._session.get(url, params=params) as resp:
-                if resp.status >= 400:
-                    text = await resp.text()
-                    log(f"Polygon {resp.status} on {path}: {text[:200]}", "warning")
-                    return {}
-                return await resp.json()
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            log(f"Polygon error on {path}: {e}", "warning")
-            return {}
+            self._session = None
 
     # ------------------------------------------------------------------
-    # Universe scans
-    # ------------------------------------------------------------------
-    async def list_active_tickers(self, market: str = "stocks", limit: int = 1000) -> list[dict]:
-        """List all active US-listed tickers. Paginates until cursor exhausts."""
-        results: list[dict] = []
-        params = {"market": market, "active": "true", "limit": limit}
-        path = "/v3/reference/tickers"
-        for _ in range(20):  # cap pages
-            data = await self._get(path, params=params)
-            results.extend(data.get("results", []) or [])
-            next_url = data.get("next_url")
-            if not next_url:
-                break
-            tail = next_url.split(POLYGON_BASE, 1)[-1]
-            if "?" in tail:
-                path, qs = tail.split("?", 1)
-                params = dict(p.split("=", 1) for p in qs.split("&") if "=" in p)
-            else:
-                path, params = tail, {}
-        return results
-
-    async def grouped_daily(self, date_str: str) -> list[dict]:
-        """Daily bar for *every* US ticker on `date_str` (YYYY-MM-DD)."""
-        data = await self._get(f"/v2/aggs/grouped/locale/us/market/stocks/{date_str}", params={"adjusted": "true"})
-        return data.get("results", []) or []
-
-    # ------------------------------------------------------------------
-    # Per-ticker
+    # Per-ticker reference / fundamentals
     # ------------------------------------------------------------------
     async def ticker_details(self, ticker: str) -> dict:
-        data = await self._get(f"/v3/reference/tickers/{ticker}")
-        return data.get("results", {}) or {}
+        return await asyncio.to_thread(self._sync_ticker_details, ticker)
+
+    @staticmethod
+    def _sync_ticker_details(ticker: str) -> dict:
+        try:
+            info = yf.Ticker(ticker).info or {}
+        except Exception as e:  # noqa: BLE001 — yfinance can throw a wide set of errors
+            log(f"yfinance ticker_details {ticker}: {e}", "warning")
+            return {}
+        if not info:
+            return {}
+        return {
+            "name": info.get("longName") or info.get("shortName") or ticker,
+            "ticker": ticker,
+            "market_cap": info.get("marketCap"),
+            "primary_exchange": info.get("exchange") or info.get("fullExchangeName"),
+            "description": info.get("longBusinessSummary"),
+            "homepage_url": info.get("website"),
+            "sector": info.get("sector"),
+            "industry": info.get("industry"),
+            "sic_description": info.get("industry") or info.get("sector") or "",
+            "list_date": _format_first_trade(info),
+            "currency": info.get("currency") or "USD",
+            "country": info.get("country"),
+            "_raw": info,
+        }
 
     async def aggs(self, ticker: str, days: int = 250) -> list[dict]:
-        end = datetime.utcnow().date()
-        start = end - timedelta(days=int(days * 1.6) + 10)  # buffer for non-trading days
-        data = await self._get(
-            f"/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}",
-            params={"adjusted": "true", "sort": "asc", "limit": 5000},
-        )
-        return data.get("results", []) or []
+        return await asyncio.to_thread(self._sync_aggs, ticker, days)
+
+    @staticmethod
+    def _sync_aggs(ticker: str, days: int) -> list[dict]:
+        try:
+            period = "2y" if days > 250 else "1y"
+            df = yf.Ticker(ticker).history(period=period, interval="1d", auto_adjust=False)
+        except Exception as e:  # noqa: BLE001
+            log(f"yfinance aggs {ticker}: {e}", "warning")
+            return []
+        if df is None or df.empty:
+            return []
+        return _df_to_rows(df.tail(days))
 
     async def previous_close(self, ticker: str) -> dict:
-        data = await self._get(f"/v2/aggs/ticker/{ticker}/prev", params={"adjusted": "true"})
-        rows = data.get("results", []) or []
-        return rows[0] if rows else {}
+        rows = await self.aggs(ticker, days=2)
+        return rows[-1] if rows else {}
 
     async def snapshot(self, ticker: str) -> dict:
-        data = await self._get(f"/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}")
-        return data.get("ticker", {}) or {}
+        return await asyncio.to_thread(self._sync_snapshot, ticker)
+
+    @staticmethod
+    def _sync_snapshot(ticker: str) -> dict:
+        try:
+            t = yf.Ticker(ticker)
+            info = t.info or {}
+        except Exception as e:  # noqa: BLE001
+            log(f"yfinance snapshot {ticker}: {e}", "warning")
+            return {}
+
+        last = info.get("regularMarketPrice") or info.get("currentPrice")
+        prev = info.get("regularMarketPreviousClose") or info.get("previousClose")
+        change = (last - prev) if (last is not None and prev is not None) else None
+        change_pct = info.get("regularMarketChangePercent")
+        if change_pct is None and last and prev:
+            change_pct = (last - prev) / prev * 100
+
+        short_pct_float = info.get("shortPercentOfFloat")  # 0..1 in yfinance
+        return {
+            "ticker": ticker,
+            "day": {"c": last, "v": info.get("regularMarketVolume")},
+            "prevDay": {"c": prev, "v": info.get("regularMarketPreviousClose")},
+            "todaysChange": change,
+            "todaysChangePerc": change_pct,
+            "shortInterest": {
+                "percentOfFloat": (short_pct_float * 100) if short_pct_float else None,
+                "shares": info.get("sharesShort"),
+                "shortRatio": info.get("shortRatio"),
+            },
+            "_info": info,
+        }
 
     async def financials(self, ticker: str, limit: int = 4) -> list[dict]:
-        data = await self._get(
-            "/vX/reference/financials",
-            params={"ticker": ticker, "limit": limit, "timeframe": "quarterly"},
-        )
-        return data.get("results", []) or []
+        return await asyncio.to_thread(self._sync_financials, ticker, limit)
+
+    @staticmethod
+    def _sync_financials(ticker: str, limit: int) -> list[dict]:
+        try:
+            t = yf.Ticker(ticker)
+            inc = t.quarterly_financials  # rows = line items, cols = period end dates
+            bs = t.quarterly_balance_sheet
+        except Exception as e:  # noqa: BLE001
+            log(f"yfinance financials {ticker}: {e}", "warning")
+            return []
+        if inc is None or getattr(inc, "empty", True):
+            return []
+        cols = list(inc.columns)  # newest first usually
+        results: list[dict] = []
+        for col in cols[:limit]:
+            rev = _df_at(inc, col, ["Total Revenue", "TotalRevenue", "Revenue"])
+            ni = _df_at(
+                inc, col,
+                ["Net Income", "NetIncome", "Net Income Common Stockholders", "NetIncomeCommonStockholders"],
+            )
+            eps_basic = _df_at(inc, col, ["Basic EPS", "BasicEPS"])
+            gross = _df_at(inc, col, ["Gross Profit", "GrossProfit"])
+
+            liab = _df_at(
+                bs, col,
+                [
+                    "Total Liabilities Net Minority Interest",
+                    "TotalLiabilitiesNetMinorityInterest",
+                    "Total Liab",
+                    "TotalLiabilities",
+                ],
+            )
+            eq = _df_at(
+                bs, col,
+                [
+                    "Stockholders Equity",
+                    "StockholdersEquity",
+                    "Total Stockholder Equity",
+                    "TotalStockholderEquity",
+                ],
+            )
+            cash = _df_at(
+                bs, col,
+                [
+                    "Cash And Cash Equivalents",
+                    "CashAndCashEquivalents",
+                    "Cash",
+                    "Cash Cash Equivalents And Short Term Investments",
+                ],
+            )
+            current_assets = _df_at(bs, col, ["Current Assets", "CurrentAssets", "Total Current Assets"])
+
+            end_date = col.strftime("%Y-%m-%d") if hasattr(col, "strftime") else str(col)
+            results.append(
+                {
+                    "fiscal_period": "Q",
+                    "end_date": end_date,
+                    "financials": {
+                        "income_statement": {
+                            "revenues": {"value": rev},
+                            "net_income_loss": {"value": ni},
+                            "basic_earnings_per_share": {"value": eps_basic},
+                            "gross_profit": {"value": gross},
+                        },
+                        "balance_sheet": {
+                            "liabilities": {"value": liab},
+                            "equity": {"value": eq},
+                            "cash": {"value": cash},
+                            "current_assets": {"value": current_assets},
+                        },
+                    },
+                }
+            )
+        return results
 
     async def news(self, ticker: str, limit: int = 10) -> list[dict]:
-        data = await self._get("/v2/reference/news", params={"ticker": ticker, "limit": limit})
-        return data.get("results", []) or []
+        return await asyncio.to_thread(self._sync_news, ticker, limit)
+
+    @staticmethod
+    def _sync_news(ticker: str, limit: int) -> list[dict]:
+        try:
+            items = yf.Ticker(ticker).news or []
+        except Exception as e:  # noqa: BLE001
+            log(f"yfinance news {ticker}: {e}", "warning")
+            return []
+        out: list[dict] = []
+        for n in items[:limit]:
+            if not isinstance(n, dict):
+                continue
+            content = n.get("content") if "content" in n else None
+            if isinstance(content, dict):
+                provider = (content.get("provider") or {}).get("displayName")
+                url = (content.get("canonicalUrl") or content.get("clickThroughUrl") or {}).get("url")
+                out.append(
+                    {
+                        "title": content.get("title"),
+                        "publisher": {"name": provider},
+                        "article_url": url,
+                        "published_utc": content.get("pubDate"),
+                        "description": content.get("summary"),
+                    }
+                )
+            else:
+                pub_ts = n.get("providerPublishTime")
+                pub_iso = (
+                    datetime.fromtimestamp(pub_ts, tz=timezone.utc).isoformat()
+                    if pub_ts
+                    else None
+                )
+                out.append(
+                    {
+                        "title": n.get("title"),
+                        "publisher": {"name": n.get("publisher")},
+                        "article_url": n.get("link"),
+                        "published_utc": pub_iso,
+                        "description": n.get("summary"),
+                    }
+                )
+        return out
+
+    # ------------------------------------------------------------------
+    # Universe scans — batch download
+    # ------------------------------------------------------------------
+    async def batch_history(
+        self,
+        tickers: list[str],
+        period: str = "1y",
+        chunk_size: int = 60,
+    ) -> dict[str, list[dict]]:
+        """Download daily OHLCV history for many tickers in chunks.
+
+        Yahoo limits very large multi-ticker queries, so we split into
+        ``chunk_size`` ticker chunks and run them sequentially. yfinance
+        already parallelizes inside each chunk via threads.
+        """
+        out: dict[str, list[dict]] = {}
+        chunks = [tickers[i : i + chunk_size] for i in range(0, len(tickers), chunk_size)]
+        for chunk in chunks:
+            partial = await asyncio.to_thread(self._sync_batch_history, chunk, period)
+            out.update(partial)
+        return out
+
+    @staticmethod
+    def _sync_batch_history(tickers: list[str], period: str) -> dict[str, list[dict]]:
+        try:
+            df = yf.download(
+                tickers=tickers,
+                period=period,
+                interval="1d",
+                group_by="ticker",
+                threads=True,
+                progress=False,
+                auto_adjust=False,
+            )
+        except Exception as e:  # noqa: BLE001
+            log(f"yfinance batch_history error ({len(tickers)} tickers): {e}", "warning")
+            return {}
+        if df is None or getattr(df, "empty", True):
+            return {}
+        out: dict[str, list[dict]] = {}
+        if len(tickers) == 1:
+            out[tickers[0]] = _df_to_rows(df)
+            return out
+        for t in tickers:
+            try:
+                sub = df[t]
+                out[t] = _df_to_rows(sub)
+            except (KeyError, AttributeError, ValueError):
+                out[t] = []
+        return out
 
 
-# ----------------------------------------------------------------------
-# Technical indicator helpers — pure python, no numpy dependency
-# ----------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Backwards-compat alias — analyzer.py / api.py keep importing PolygonClient
+# under this name. The implementation is now yfinance.
+# ---------------------------------------------------------------------------
+PolygonClient = YFClient
+
+
+# ---------------------------------------------------------------------------
+# DataFrame helpers
+# ---------------------------------------------------------------------------
+def _df_to_rows(df) -> list[dict]:
+    rows: list[dict] = []
+    if df is None or getattr(df, "empty", True):
+        return rows
+    for idx, row in df.iterrows():
+        try:
+            close = row.get("Close")
+            if close is None or pd.isna(close):
+                continue
+            o = row.get("Open")
+            h = row.get("High")
+            l = row.get("Low")  # noqa: E741
+            v = row.get("Volume")
+            rows.append(
+                {
+                    "t": int(idx.timestamp() * 1000) if hasattr(idx, "timestamp") else None,
+                    "o": float(o) if o is not None and not pd.isna(o) else None,
+                    "h": float(h) if h is not None and not pd.isna(h) else None,
+                    "l": float(l) if l is not None and not pd.isna(l) else None,
+                    "c": float(close),
+                    "v": int(v) if v is not None and not pd.isna(v) else 0,
+                }
+            )
+        except (TypeError, ValueError):
+            continue
+    return rows
+
+
+def _df_at(df, col, candidates: list[str]):
+    """Look up a single value in a yfinance DataFrame, returning None on miss."""
+    if df is None or getattr(df, "empty", True):
+        return None
+    if col not in df.columns:
+        return None
+    for name in candidates:
+        try:
+            if name in df.index:
+                v = df.loc[name, col]
+                if v is None or (isinstance(v, float) and math.isnan(v)) or pd.isna(v):
+                    return None
+                return float(v)
+        except (KeyError, ValueError, TypeError):
+            continue
+    return None
+
+
+def _format_first_trade(info: dict) -> str | None:
+    epoch = (
+        info.get("firstTradeDateEpochUtc")
+        or info.get("firstTradeDateMilliseconds")
+        or info.get("firstTradeDate")
+    )
+    if not epoch:
+        return None
+    try:
+        if epoch > 10**12:
+            epoch = epoch / 1000
+        return datetime.fromtimestamp(epoch, tz=timezone.utc).date().isoformat()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Technical indicator helpers (pure python, identical signatures to before)
+# ---------------------------------------------------------------------------
 def _ema(values: list[float], period: int) -> list[float]:
     if not values:
         return []
@@ -218,13 +481,16 @@ def build_indicator_pack(rows: list[dict]) -> dict:
     if not rows:
         return {}
     closes = [r.get("c") for r in rows if r.get("c") is not None]
+    if not closes:
+        return {}
     last = rows[-1]
     fwh, fwl = fifty_two_week(rows)
     av30 = avg_volume(rows, 30)
     cur_vol = last.get("v") or 0
     vol_ratio = (cur_vol / av30) if av30 else None
+    cur = last.get("c")
     return {
-        "current_price": last.get("c"),
+        "current_price": cur,
         "open": last.get("o"),
         "high": last.get("h"),
         "low": last.get("l"),
@@ -240,17 +506,17 @@ def build_indicator_pack(rows: list[dict]) -> dict:
         "sma_200": compute_sma(closes, 200),
         "bbands": compute_bbands(closes, 20, 2.0),
         "pct_from_52w_high": (
-            round(((last.get("c") - fwh) / fwh) * 100, 2) if fwh and last.get("c") else None
+            round(((cur - fwh) / fwh) * 100, 2) if fwh and cur else None
         ),
         "pct_from_52w_low": (
-            round(((last.get("c") - fwl) / fwl) * 100, 2) if fwl and last.get("c") else None
+            round(((cur - fwl) / fwl) * 100, 2) if fwl and cur else None
         ),
     }
 
 
-# ----------------------------------------------------------------------
-# News
-# ----------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# News (NewsAPI — separate from yfinance)
+# ---------------------------------------------------------------------------
 async def fetch_news_headlines(ticker: str, company_name: str | None = None, days: int = 7) -> list[dict]:
     api_key = env("NEWSAPI_KEY")
     if not api_key:
