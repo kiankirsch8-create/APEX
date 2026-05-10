@@ -41,6 +41,25 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
+# Startup scan — Railway resets the filesystem on every deploy, so when the
+# container boots and `results/latest.json` is missing we run the full APEX
+# pipeline once so the frontend always has fresh data after a deploy.
+# ---------------------------------------------------------------------------
+@app.on_event("startup")
+async def startup_scan() -> None:
+    latest_path = RESULTS_DIR / "latest.json"
+    if os.path.exists(latest_path):
+        return
+    from utils import log
+    log("[Startup] No latest.json on disk — running first APEX scan")
+    try:
+        await run_daily_apex(total_budget_usd=_stored_budget())
+        log("[Startup] First-boot APEX scan complete")
+    except Exception as e:  # noqa: BLE001 — never let a scan failure break boot
+        log(f"[Startup] First-boot APEX scan failed: {e}", "error")
+
+
+# ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
 class BudgetIn(BaseModel):
@@ -200,10 +219,31 @@ def _next_seven_am_iso() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Manual run trigger
+# Manual run triggers
 # ---------------------------------------------------------------------------
 @app.post("/api/run")
 async def trigger_run(total_budget_usd: float | None = Query(default=None)) -> dict:
+    budget = float(total_budget_usd) if total_budget_usd else _stored_budget()
+    payload = await run_daily_apex(total_budget_usd=budget)
+    return payload
+
+
+@app.api_route("/api/run-scan", methods=["GET", "POST"])
+async def run_scan(total_budget_usd: float | None = Query(default=None)) -> dict:
+    """Trigger the full APEX scheduler pipeline on demand.
+
+    Behaviour:
+    1. Runs both screeners + analyzer + scorer end-to-end via
+       ``run_daily_apex`` (the same code path the 07:00 daily job uses).
+    2. Persists the results to ``results/latest.json`` and
+       ``results/daily_picks_<DATE>.json`` on the local filesystem (Railway
+       container disk).
+    3. Returns the freshly-built payload as JSON so the caller can render
+       the picks immediately without a second round-trip to ``/api/latest``.
+
+    Accepts both ``GET`` and ``POST`` so it can be triggered easily from a
+    browser tab while testing on Railway.
+    """
     budget = float(total_budget_usd) if total_budget_usd else _stored_budget()
     payload = await run_daily_apex(total_budget_usd=budget)
     return payload
@@ -256,6 +296,7 @@ async def root() -> dict:
             "POST /api/analyze/{ticker}?section=SMALL_CAP|BIG_PLAYER",
             "GET /api/status",
             "POST /api/run",
+            "GET|POST /api/run-scan",
             "GET /api/budget",
             "POST /api/budget",
         ],
