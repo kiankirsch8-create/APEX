@@ -5,6 +5,7 @@ Run:
 """
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -41,17 +42,27 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
-# Startup scan — Railway resets the filesystem on every deploy, so when the
-# container boots and `results/latest.json` is missing we run the full APEX
-# pipeline once so the frontend always has fresh data after a deploy.
+# Startup scan — Railway resets the filesystem on every deploy. The container
+# can also boot with a stale or empty `results/latest.json` (e.g. a partial
+# write from a previous run, or a placeholder with `total_picks == 0`). We
+# only skip the boot-time scan when real data is on disk; otherwise we run
+# the full APEX pipeline once so the frontend always has fresh data.
 # ---------------------------------------------------------------------------
 @app.on_event("startup")
 async def startup_scan() -> None:
     latest_path = RESULTS_DIR / "latest.json"
-    if os.path.exists(latest_path):
-        return
     from utils import log
-    log("[Startup] No latest.json on disk — running first APEX scan")
+
+    try:
+        with open(latest_path) as f:
+            data = json.load(f)
+        if data.get("total_picks", 0) > 0:
+            log("[Startup] latest.json has real data — skipping boot scan")
+            return  # real data exists, skip scan
+    except Exception:  # noqa: BLE001 — missing file, empty file, or invalid JSON
+        pass
+
+    log("[Startup] No real data on disk — running first APEX scan")
     try:
         await run_daily_apex(total_budget_usd=_stored_budget())
         log("[Startup] First-boot APEX scan complete")
