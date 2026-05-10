@@ -1,16 +1,21 @@
 """Small-cap / speculative explosive opportunity screener.
 
-Universe: US-listed stocks with $10M <= market cap <= $2B.
-Returns the top 3 candidates ranked by composite signal score, including the
-list of triggered signals so analyzer.py & scorer.py can use them downstream.
+Universe: the curated `SMALL_CAP_UNIVERSE` from `universe.py` filtered down
+to US-listed stocks with $10M <= market cap <= $2B and matching liquidity
+filters. Uses yfinance (no API key, no rate limits).
+
+Returns the top 3 candidates ranked by composite signal score, each enriched
+with the list of triggered signals so analyzer.py and scorer.py can consume
+the scoring downstream.
 """
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any
 
-from market_data import PolygonClient, build_indicator_pack
+from market_data import YFClient, build_indicator_pack
+from universe import SMALL_CAP_UNIVERSE
 from utils import log
 
 # ---------------------------------------------------------------------------
@@ -38,7 +43,6 @@ DOWN_SIGNALS = {
 }
 
 FILTERS = {
-    "exchanges": {"XNAS", "XNYS", "XASE", "AMEX", "NASDAQ", "NYSE", "BATS"},
     "min_avg_volume": 200_000,
     "min_price": 0.50,
     "max_price": 50.0,
@@ -52,87 +56,93 @@ FILTERS = {
 # Public entry point
 # ---------------------------------------------------------------------------
 async def scan(top_n: int = 3, candidate_pool_size: int = 60) -> list[dict[str, Any]]:
-    """Scan the entire small-cap universe and return the top `top_n` picks.
+    """Scan the small-cap universe and return the top `top_n` picks.
 
     Strategy:
-      1. Pull grouped daily bars for the most recent trading day.
-      2. Resolve ticker reference data (market cap, exchange, etc.) to filter
-         the universe down to qualifying small/micro caps.
-      3. Score each candidate using technical signals from daily aggregates and
-         enrichment data (financials, snapshot, news) in parallel.
-      4. Return the ranked top-N including the list of triggered signals.
+      1. yfinance batch-download 1y of daily history for the entire universe.
+      2. Filter by price + 30-day average volume on the latest bar.
+      3. Sort by latest volume (proxy for activity), keep top `candidate_pool_size`.
+      4. Per-candidate enrich with details/snapshot/financials and score.
+      5. Return ranked top-N including triggered signals.
     """
-    log("[SmallCapScreener] starting scan")
+    log(f"[SmallCapScreener] starting scan over {len(SMALL_CAP_UNIVERSE)} tickers")
 
-    async with PolygonClient() as poly:
-        ref_date = _last_trading_day_str()
-        grouped = await poly.grouped_daily(ref_date)
-        if not grouped:
-            log("[SmallCapScreener] grouped_daily empty — using fallback universe", "warning")
-            grouped = []
+    async with YFClient() as yfc:
+        bars_by_ticker = await yfc.batch_history(SMALL_CAP_UNIVERSE, period="1y")
+        log(f"[SmallCapScreener] yfinance returned bars for {sum(1 for v in bars_by_ticker.values() if v)}/{len(SMALL_CAP_UNIVERSE)} tickers")
 
-        candidates: list[dict] = []
-        for row in grouped:
-            price = row.get("c")
-            vol = row.get("v")
-            if price is None or vol is None:
+        prelim: list[dict] = []
+        for ticker, rows in bars_by_ticker.items():
+            if not rows:
+                continue
+            last = rows[-1]
+            price = last.get("c")
+            vol = last.get("v") or 0
+            if price is None:
                 continue
             if not (FILTERS["min_price"] <= price <= FILTERS["max_price"]):
                 continue
-            if vol < FILTERS["min_avg_volume"]:
+            # 30-day average volume must clear the floor
+            recent = rows[-30:]
+            avg_v = sum(r.get("v", 0) for r in recent) / max(len(recent), 1)
+            if avg_v < FILTERS["min_avg_volume"]:
                 continue
-            candidates.append(row)
+            prelim.append(
+                {
+                    "T": ticker,
+                    "c": price,
+                    "v": vol,
+                    "_rows": rows,
+                    "_avg_vol_30d": avg_v,
+                }
+            )
 
-        candidates.sort(key=lambda r: r.get("v", 0), reverse=True)
-        candidates = candidates[: max(candidate_pool_size * 4, 200)]
-
-        log(f"[SmallCapScreener] {len(candidates)} pre-filtered candidates from grouped daily")
+        prelim.sort(key=lambda r: r["_avg_vol_30d"], reverse=True)
+        prelim = prelim[: max(candidate_pool_size, 30)]
+        log(f"[SmallCapScreener] {len(prelim)} candidates pass price/volume filter")
 
         sem = asyncio.Semaphore(8)
 
         async def enrich(row: dict) -> dict | None:
             async with sem:
-                ticker = row.get("T")
-                if not ticker:
+                ticker = row["T"]
+                try:
+                    details, snap, financials = await asyncio.gather(
+                        yfc.ticker_details(ticker),
+                        yfc.snapshot(ticker),
+                        yfc.financials(ticker, limit=8),
+                    )
+                except Exception as e:  # noqa: BLE001
+                    log(f"[SmallCapScreener] enrich {ticker} failed: {e}", "warning")
                     return None
-                details, aggs, snap = await asyncio.gather(
-                    poly.ticker_details(ticker),
-                    poly.aggs(ticker, days=250),
-                    poly.snapshot(ticker),
-                )
-                if not details:
-                    return None
-                mcap = details.get("market_cap") or 0
-                exch = (details.get("primary_exchange") or "").upper()
+
+                mcap = (details or {}).get("market_cap") or 0
                 if mcap and not (
                     FILTERS["min_market_cap"] <= mcap <= FILTERS["max_market_cap"]
                 ):
                     return None
-                if exch and exch not in FILTERS["exchanges"]:
-                    pass  # tolerant — Polygon uses MIC codes that may vary
-                indicators = build_indicator_pack(aggs)
+                indicators = build_indicator_pack(row["_rows"])
                 if not indicators:
                     return None
-                financials = await poly.financials(ticker, limit=4)
                 signals, score = _score_small_cap(row, indicators, details, snap, financials)
                 if not signals:
                     return None
                 return {
                     "ticker": ticker,
-                    "company_name": details.get("name") or ticker,
+                    "company_name": (details or {}).get("name") or ticker,
                     "section": "SMALL_CAP",
                     "score": score,
                     "triggered_signals": signals,
                     "market_cap": mcap,
-                    "exchange": exch,
+                    "exchange": (details or {}).get("primary_exchange"),
                     "indicators": indicators,
                     "details": details,
                     "snapshot": snap,
                     "financials": financials,
-                    "ref_date": ref_date,
+                    "ref_date": datetime.utcnow().date().isoformat(),
                 }
 
-        enriched = await asyncio.gather(*(enrich(r) for r in candidates[:candidate_pool_size]))
+        enriched = await asyncio.gather(*(enrich(r) for r in prelim))
         scored = [e for e in enriched if e]
         scored.sort(key=lambda x: x["score"], reverse=True)
 
@@ -142,7 +152,7 @@ async def scan(top_n: int = 3, candidate_pool_size: int = 60) -> list[dict[str, 
 
 
 # ---------------------------------------------------------------------------
-# Signal scoring
+# Signal scoring (unchanged from previous Polygon-backed version)
 # ---------------------------------------------------------------------------
 def _score_small_cap(
     row: dict,
@@ -198,7 +208,7 @@ def _score_small_cap(
             }
         )
 
-    # ---- short squeeze setup (use snapshot if exposed) ----
+    # ---- short squeeze setup ----
     short_pct = (snapshot.get("shortInterest") or {}).get("percentOfFloat") if snapshot else None
     if short_pct and short_pct > 20 and vr and vr >= 3:
         triggered.append(
@@ -224,7 +234,6 @@ def _score_small_cap(
 
     # ---- parabolic / overextended (DOWN) ----
     if pct_from_high is not None and pct_from_high > 0 and rsi and rsi > 80:
-        # if 30d return > 200% — approximate using 52w low as anchor
         pct_from_low = indicators.get("pct_from_52w_low")
         if pct_from_low and pct_from_low >= 200:
             triggered.append(
@@ -248,8 +257,8 @@ def _score_small_cap(
         )
 
     # ---- sector tailwind heuristic ----
-    sic = (details.get("sic_description") or "").lower()
-    if any(k in sic for k in ("biological", "pharmaceutical", "semiconductor", "defense", "uranium")):
+    sic = (details.get("sic_description") or "").lower() if details else ""
+    if any(k in sic for k in ("biological", "pharmaceutical", "biotech", "semiconductor", "defense", "uranium", "nuclear")):
         triggered.append(
             {
                 "name": "SECTOR_TAILWIND",
@@ -285,8 +294,6 @@ def _yoy_revenue_growth(financials: list[dict]) -> float | None:
 
 
 def _has_imminent_catalyst(details: dict, financials: list[dict]) -> bool:
-    """Approximate catalyst-imminent flag: most recent quarterly filing is 60-90
-    days old, suggesting earnings inside the next 21-day window."""
     if not financials:
         return False
     end = financials[0].get("end_date")
@@ -300,20 +307,6 @@ def _has_imminent_catalyst(details: dict, financials: list[dict]) -> bool:
     return 60 <= days_since <= 100
 
 
-def _last_trading_day_str() -> str:
-    d = datetime.utcnow().date()
-    while d.weekday() >= 5:  # Sat=5, Sun=6
-        d -= timedelta(days=1)
-    # if it's early UTC, the prior US session is the most recent confirmed bar
-    if datetime.utcnow().hour < 22:
-        d -= timedelta(days=1)
-        while d.weekday() >= 5:
-            d -= timedelta(days=1)
-    return d.isoformat()
-
-
-# ---------------------------------------------------------------------------
-# CLI
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import json

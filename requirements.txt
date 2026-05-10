@@ -8,3 +8,5 @@ newsapi-python>=0.2.7
 aiohttp>=3.10.0
 pydantic>=2.9.0
 pytz>=2024.2
+yfinance>=0.2.50
+pandas>=2.2.0

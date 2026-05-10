@@ -1,15 +1,19 @@
 """Big-player / undervalued large-cap screener.
 
-Universe: US-listed stocks with market cap > $2B that are 3+ years old.
+Universe: the curated `LARGE_CAP_UNIVERSE` from `universe.py` filtered to
+US-listed names with market cap > $2B and at least 3 years of trading
+history. Uses yfinance (no API key, no rate limits).
+
 Returns the top 2 candidates ranked by signal score.
 """
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any
 
-from market_data import PolygonClient, build_indicator_pack
+from market_data import YFClient, build_indicator_pack
+from universe import LARGE_CAP_UNIVERSE
 from utils import log
 
 # Sector P/E priors used as a stand-in when an exact peer comparison is not
@@ -53,53 +57,67 @@ FILTERS = {
     "min_market_cap": 2_000_000_000,
     "min_avg_volume": 1_000_000,
     "min_history_years": 3,
-    "max_pct_to_target": 5,  # exclude if within 5% of consensus PT
 }
 
 
 async def scan(top_n: int = 2, candidate_pool_size: int = 80) -> list[dict[str, Any]]:
-    log("[BigPlayerScreener] starting scan")
+    log(f"[BigPlayerScreener] starting scan over {len(LARGE_CAP_UNIVERSE)} tickers")
 
-    async with PolygonClient() as poly:
-        # We use a directed list of US large caps as anchor: pulling all tickers
-        # & filtering by market cap is correct but slow. We pull a wide set and
-        # filter rigorously below. Use grouped daily as an anchor to avoid the
-        # full ref-data pagination cost in the common case.
-        ref_date = _last_trading_day_str()
-        grouped = await poly.grouped_daily(ref_date)
+    async with YFClient() as yfc:
+        bars_by_ticker = await yfc.batch_history(LARGE_CAP_UNIVERSE, period="2y")
+        log(
+            f"[BigPlayerScreener] yfinance returned bars for "
+            f"{sum(1 for v in bars_by_ticker.values() if v)}/{len(LARGE_CAP_UNIVERSE)} tickers"
+        )
 
-        candidates: list[dict] = []
-        for row in grouped:
-            price = row.get("c") or 0
-            vol = row.get("v") or 0
-            if price < 5 or vol < FILTERS["min_avg_volume"]:
+        prelim: list[dict] = []
+        for ticker, rows in bars_by_ticker.items():
+            if not rows:
                 continue
-            candidates.append(row)
+            last = rows[-1]
+            price = last.get("c") or 0
+            vol = last.get("v") or 0
+            if price < 5:
+                continue
+            recent = rows[-30:]
+            avg_v = sum(r.get("v", 0) for r in recent) / max(len(recent), 1)
+            if avg_v < FILTERS["min_avg_volume"]:
+                continue
+            prelim.append(
+                {
+                    "T": ticker,
+                    "c": price,
+                    "v": vol,
+                    "_rows": rows,
+                    "_avg_vol_30d": avg_v,
+                }
+            )
 
-        candidates.sort(key=lambda r: r.get("v", 0), reverse=True)
-        candidates = candidates[: max(candidate_pool_size * 4, 250)]
-
-        log(f"[BigPlayerScreener] {len(candidates)} pre-filtered (price/volume) candidates")
+        prelim.sort(key=lambda r: r["_avg_vol_30d"], reverse=True)
+        prelim = prelim[: candidate_pool_size]
+        log(f"[BigPlayerScreener] {len(prelim)} candidates pass price/volume filter")
 
         sem = asyncio.Semaphore(8)
 
         async def enrich(row: dict) -> dict | None:
             async with sem:
-                ticker = row.get("T")
-                if not ticker:
+                ticker = row["T"]
+                try:
+                    details, snap, financials = await asyncio.gather(
+                        yfc.ticker_details(ticker),
+                        yfc.snapshot(ticker),
+                        yfc.financials(ticker, limit=8),
+                    )
+                except Exception as e:  # noqa: BLE001
+                    log(f"[BigPlayerScreener] enrich {ticker} failed: {e}", "warning")
                     return None
-                details, aggs, snap = await asyncio.gather(
-                    poly.ticker_details(ticker),
-                    poly.aggs(ticker, days=300),
-                    poly.snapshot(ticker),
-                )
-                if not details:
-                    return None
-                mcap = details.get("market_cap") or 0
+
+                mcap = (details or {}).get("market_cap") or 0
                 if mcap < FILTERS["min_market_cap"]:
                     return None
-                # history check
-                list_date = details.get("list_date")
+
+                # 3-year history check
+                list_date = (details or {}).get("list_date")
                 if list_date:
                     try:
                         ld = datetime.fromisoformat(list_date)
@@ -107,29 +125,29 @@ async def scan(top_n: int = 2, candidate_pool_size: int = 80) -> list[dict[str, 
                             return None
                     except ValueError:
                         pass
-                indicators = build_indicator_pack(aggs)
+
+                indicators = build_indicator_pack(row["_rows"])
                 if not indicators:
                     return None
-                financials = await poly.financials(ticker, limit=8)
                 signals, score = _score_big_player(row, indicators, details, snap, financials)
                 if not signals:
                     return None
                 return {
                     "ticker": ticker,
-                    "company_name": details.get("name") or ticker,
+                    "company_name": (details or {}).get("name") or ticker,
                     "section": "BIG_PLAYER",
                     "score": score,
                     "triggered_signals": signals,
                     "market_cap": mcap,
-                    "exchange": (details.get("primary_exchange") or "").upper(),
+                    "exchange": (details or {}).get("primary_exchange"),
                     "indicators": indicators,
                     "details": details,
                     "snapshot": snap,
                     "financials": financials,
-                    "ref_date": ref_date,
+                    "ref_date": datetime.utcnow().date().isoformat(),
                 }
 
-        enriched = await asyncio.gather(*(enrich(r) for r in candidates[:candidate_pool_size]))
+        enriched = await asyncio.gather(*(enrich(r) for r in prelim))
         scored = [e for e in enriched if e]
         scored.sort(key=lambda x: x["score"], reverse=True)
         top = scored[:top_n]
@@ -146,8 +164,8 @@ def _score_big_player(
     financials: list[dict],
 ) -> tuple[list[dict], float]:
     triggered: list[dict] = []
-    sector = (details.get("sic_description") or "").lower()
-    sector_pe = _sector_pe(sector)
+    sector_str = " ".join(filter(None, [(details or {}).get("sector"), (details or {}).get("industry")])).lower()
+    sector_pe = _sector_pe(sector_str)
 
     pe = _trailing_pe(details, financials, indicators.get("current_price"))
     rev_growth = _yoy_rev_growth(financials)
@@ -163,8 +181,7 @@ def _score_big_player(
                 }
             )
 
-    earnings_growth_accelerating = _earnings_inflection(financials)
-    if earnings_growth_accelerating:
+    if _earnings_inflection(financials):
         triggered.append(
             {
                 "name": "EARNINGS_INFLECTION",
@@ -227,7 +244,6 @@ def _score_big_player(
         )
 
     score = sum(s["weight"] for s in triggered)
-    # quality multiplier
     if de is not None and de < 0.5 and any(s["direction"] == "UP" for s in triggered):
         score *= 1.2
 
@@ -244,6 +260,13 @@ def _sector_pe(sector: str) -> float:
 
 
 def _trailing_pe(details: dict, financials: list[dict], price: float | None) -> float | None:
+    # Prefer yfinance's trailing PE when present (lives in details["_raw"])
+    raw = (details or {}).get("_raw") or {}
+    yf_pe = raw.get("trailingPE")
+    if isinstance(yf_pe, (int, float)) and yf_pe > 0:
+        return round(float(yf_pe), 2)
+
+    # Fallback: compute from quarterly EPS
     if price is None:
         return None
     eps_total = 0.0
@@ -284,7 +307,6 @@ def _yoy_rev_growth(financials: list[dict]) -> float | None:
 
 
 def _earnings_inflection(financials: list[dict]) -> bool:
-    """Last 2 quarters showed accelerating EPS growth after 4+ quarters of decline."""
     if len(financials) < 6:
         return False
     eps = []
@@ -301,7 +323,7 @@ def _earnings_inflection(financials: list[dict]) -> bool:
             eps.append(None)
     if any(e is None for e in eps):
         return False
-    recent_growth = eps[0] > eps[1] > 0  # most-recent quarters improving
+    recent_growth = eps[0] > eps[1] > 0
     older_decline = sum(1 for i in range(2, 5) if eps[i] < eps[i + 1]) >= 3
     return recent_growth and older_decline
 
@@ -311,8 +333,8 @@ def _debt_to_equity(financials: list[dict]) -> float | None:
         return None
     try:
         bs = financials[0].get("financials", {}).get("balance_sheet", {})
-        liab = bs.get("liabilities", {}).get("value")
-        eq = bs.get("equity", {}).get("value")
+        liab = (bs.get("liabilities") or {}).get("value")
+        eq = (bs.get("equity") or {}).get("value")
         if liab and eq and eq > 0:
             return liab / eq
     except (AttributeError, KeyError, TypeError, ZeroDivisionError):
@@ -320,17 +342,7 @@ def _debt_to_equity(financials: list[dict]) -> float | None:
     return None
 
 
-def _last_trading_day_str() -> str:
-    d = datetime.utcnow().date()
-    while d.weekday() >= 5:
-        d -= timedelta(days=1)
-    if datetime.utcnow().hour < 22:
-        d -= timedelta(days=1)
-        while d.weekday() >= 5:
-            d -= timedelta(days=1)
-    return d.isoformat()
-
-
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import json
     res = asyncio.run(scan())
