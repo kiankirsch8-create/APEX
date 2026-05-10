@@ -1,6 +1,6 @@
 """APEX analyzer — turns a screener candidate into a full APEX report.
 
-Calls Claude (claude-opus-4-20250514) with the master analyst system prompt
+Calls Claude (claude-opus-4-5) with the master analyst system prompt
 and a richly-populated user message, parses the JSON response, retries once
 on parse failure, and returns the structured report dict.
 """
@@ -18,7 +18,7 @@ from market_data import YFClient, build_indicator_pack, fetch_news_headlines
 from master_prompt import MASTER_ANALYST_SYSTEM_PROMPT
 from utils import env, log, utcnow_iso
 
-CLAUDE_MODEL = "claude-opus-4-20250514"
+CLAUDE_MODEL = "claude-opus-4-5"
 MAX_TOKENS = 4000
 
 

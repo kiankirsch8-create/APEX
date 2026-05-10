@@ -11,7 +11,7 @@ The user never picks the stock. **The machine finds it.**
 1. **Two screeners run in parallel** every morning over a curated **400-ticker universe** (300 small/micro caps + 100 large caps in `universe.py`), all data via free **yfinance** (no API key, no rate limit):
    - `screener_small_caps.py` — explosive setups in $10M–$2B names (volume spikes, oversold bounces, short-squeeze setups, catalyst-driven plays, insider buying, etc.)
    - `screener_big_players.py` — undervalued giants ($2B+) with deep value, earnings inflection, sentiment mismatch, sector-rotation tailwinds, etc.
-2. **Top 3 small caps + top 2 big players** are passed into `analyzer.py`, which calls the **Claude `claude-opus-4-20250514`** model with a sophisticated APEX system prompt.
+2. **Top 3 small caps + top 2 big players** are passed into `analyzer.py`, which calls the **Claude `claude-opus-4-5`** model with a sophisticated APEX system prompt.
 3. **`scorer.py`** validates upside, computes a probability between 25%–91%, generates a punchy reasoning sentence, and produces a strict **position-sizing recommendation** that obeys all per-position and portfolio-level caps.
 4. Results are persisted under `results/latest.json` and `results/daily_picks_YYYY-MM-DD.json` and exposed through a FastAPI server.
 
