@@ -169,13 +169,13 @@ async def analyze_ticker(
 async def _build_market_data(ticker: str, section: str) -> dict:
     """Run the screener's scoring on a single ticker so the analyzer gets
     the same triggered_signals it would in the daily pipeline."""
-    from market_data import PolygonClient, build_indicator_pack
+    from market_data import YFClient, build_indicator_pack
 
-    async with PolygonClient() as poly:
-        details = await poly.ticker_details(ticker)
-        snap = await poly.snapshot(ticker)
-        aggs = await poly.aggs(ticker, days=300)
-        financials = await poly.financials(ticker, limit=8)
+    async with YFClient() as yfc:
+        details = await yfc.ticker_details(ticker)
+        snap = await yfc.snapshot(ticker)
+        aggs = await yfc.aggs(ticker, days=300)
+        financials = await yfc.financials(ticker, limit=8)
 
     if not details:
         raise HTTPException(status_code=404, detail=f"Ticker {ticker} not found at data provider.")

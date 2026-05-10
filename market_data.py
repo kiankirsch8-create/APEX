@@ -1,15 +1,10 @@
 """Market data client — yfinance backed.
 
-yfinance is free, key-less, and rate-limit free. We expose the same shape
-the rest of the project already consumes (Polygon-style dicts) so analyzer
-and screener helpers continue to work unchanged.
+yfinance is free, key-less, and rate-limit free. The blocking yfinance
+calls are dispatched to threads via ``asyncio.to_thread`` so we keep the
+async interface used by screeners and the analyzer.
 
-The blocking yfinance calls are dispatched to threads via `asyncio.to_thread`
-so we keep the async interface used elsewhere.
-
-The class `YFClient` is the new primary client. `PolygonClient` is kept as a
-backward-compatible alias so analyzer.py / api.py continue to import the same
-name without modification.
+The single client is :class:`YFClient`.
 """
 from __future__ import annotations
 
@@ -33,8 +28,8 @@ NEWS_BASE = "https://newsapi.org/v2"
 class YFClient:
     """Async-friendly wrapper around yfinance.
 
-    Each public method returns the same dict shape the legacy Polygon client
-    returned, so downstream code keeps working without changes.
+    Returns plain dicts so downstream code (screeners, analyzer) does not
+    have to know anything about yfinance internals.
     """
 
     def __init__(self) -> None:
@@ -304,13 +299,6 @@ class YFClient:
             except (KeyError, AttributeError, ValueError):
                 out[t] = []
         return out
-
-
-# ---------------------------------------------------------------------------
-# Backwards-compat alias — analyzer.py / api.py keep importing PolygonClient
-# under this name. The implementation is now yfinance.
-# ---------------------------------------------------------------------------
-PolygonClient = YFClient
 
 
 # ---------------------------------------------------------------------------

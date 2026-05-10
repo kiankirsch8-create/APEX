@@ -14,7 +14,7 @@ from typing import Any
 
 from anthropic import Anthropic
 
-from market_data import PolygonClient, build_indicator_pack, fetch_news_headlines
+from market_data import YFClient, build_indicator_pack, fetch_news_headlines
 from master_prompt import MASTER_ANALYST_SYSTEM_PROMPT
 from utils import env, log, utcnow_iso
 
@@ -84,18 +84,18 @@ async def analyze_stock(
 async def _gather_market_data(ticker: str, market_data: dict | None) -> dict:
     """Collect everything Claude needs about a ticker."""
     md = dict(market_data or {})
-    async with PolygonClient() as poly:
-        details = md.get("details") or await poly.ticker_details(ticker)
-        snap = md.get("snapshot") or await poly.snapshot(ticker)
+    async with YFClient() as yfc:
+        details = md.get("details") or await yfc.ticker_details(ticker)
+        snap = md.get("snapshot") or await yfc.snapshot(ticker)
         aggs = md.get("aggs")
         indicators = md.get("indicators")
         if indicators is None:
-            aggs = aggs or await poly.aggs(ticker, days=250)
+            aggs = aggs or await yfc.aggs(ticker, days=250)
             indicators = build_indicator_pack(aggs)
-        financials = md.get("financials") or await poly.financials(ticker, limit=8)
+        financials = md.get("financials") or await yfc.financials(ticker, limit=8)
         company_name = details.get("name") if isinstance(details, dict) else None
         news = await fetch_news_headlines(ticker, company_name)
-        polygon_news = await poly.news(ticker, limit=8)
+        yfinance_news = await yfc.news(ticker, limit=8)
 
     return {
         "details": details,
@@ -103,7 +103,7 @@ async def _gather_market_data(ticker: str, market_data: dict | None) -> dict:
         "indicators": indicators,
         "financials": financials,
         "newsapi_headlines": news,
-        "polygon_news": [
+        "yfinance_news": [
             {
                 "title": n.get("title"),
                 "publisher": (n.get("publisher") or {}).get("name"),
@@ -111,7 +111,7 @@ async def _gather_market_data(ticker: str, market_data: dict | None) -> dict:
                 "published_utc": n.get("published_utc"),
                 "description": n.get("description"),
             }
-            for n in polygon_news
+            for n in yfinance_news
         ],
     }
 
@@ -181,7 +181,7 @@ def _build_user_message(
         },
         "screener_triggered_signals": triggered_signals,
         "recent_news_newsapi": md.get("newsapi_headlines", [])[:8],
-        "recent_news_polygon": md.get("polygon_news", [])[:8],
+        "recent_news_yfinance": md.get("yfinance_news", [])[:8],
         "macro_context": macro,
         "instructions": (
             "Return ONLY valid raw JSON matching the exact schema below. "

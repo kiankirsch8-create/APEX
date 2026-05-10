@@ -152,7 +152,7 @@ async def scan(top_n: int = 3, candidate_pool_size: int = 60) -> list[dict[str, 
 
 
 # ---------------------------------------------------------------------------
-# Signal scoring (unchanged from previous Polygon-backed version)
+# Signal scoring
 # ---------------------------------------------------------------------------
 def _score_small_cap(
     row: dict,
