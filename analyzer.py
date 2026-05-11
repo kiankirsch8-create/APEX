@@ -19,7 +19,7 @@ from master_prompt import MASTER_ANALYST_SYSTEM_PROMPT
 from utils import env, log, utcnow_iso
 
 CLAUDE_MODEL = "claude-opus-4-5"
-MAX_TOKENS = 4000
+MAX_TOKENS = 5500
 
 
 _CLIENT: Anthropic | None = None
@@ -75,6 +75,19 @@ async def analyze_stock(
     parsed.setdefault("section", section)
     parsed.setdefault("triggered_signals", [s["name"] for s in triggered_signals])
     parsed.setdefault("generated_at", utcnow_iso())
+    parsed.setdefault("conviction_tier", "TIER_3_STANDARD")
+    parsed.setdefault("pattern_matched", "PATTERN_NONE")
+    parsed.setdefault("pattern_win_rate", 0)
+    parsed.setdefault("macro_regime", "NORMAL_MODE")
+    parsed.setdefault("smart_money_score", 5.0)
+    try:
+        cs0 = float(parsed.get("composite_score")) if parsed.get("composite_score") is not None else 5.0
+    except (TypeError, ValueError):
+        cs0 = 5.0
+    parsed.setdefault("risk_adjusted_score", cs0)
+    parsed.setdefault("investment_timeframe", "4-12 WEEKS")
+    parsed.setdefault("timeframe_basis", "Default — verify against APEX timeframe rules in prompt")
+    parsed.setdefault("sector_bucket", "OTHER")
     parsed["_raw_signals"] = triggered_signals
     parsed["_total_budget_usd"] = total_budget_usd
     return parsed
@@ -183,6 +196,7 @@ def _build_user_message(
         "recent_news_newsapi": md.get("newsapi_headlines", [])[:8],
         "recent_news_yfinance": md.get("yfinance_news", [])[:8],
         "macro_context": macro,
+        "macro_market_indicators": macro,
         "instructions": (
             "Return ONLY valid raw JSON matching the exact schema below. "
             "No markdown, no commentary, no code fences. Every field is required."
@@ -192,7 +206,24 @@ def _build_user_message(
             "company_name": "string",
             "section": "SMALL_CAP | BIG_PLAYER",
             "direction": "UP | DOWN",
-            "apex_rating": "STRONG BUY | BUY | SPECULATIVE BUY | AVOID | SHORT | STRONG SHORT",
+            "apex_rating": (
+                "STRONG BUY | BUY | SPECULATIVE BUY | AVOID | SHORT | STRONG SHORT | WATCH"
+            ),
+            "conviction_tier": (
+                "TIER_1_APEX_PRIME | TIER_2_HIGH_CONVICTION | TIER_3_STANDARD | "
+                "TIER_4_WATCHLIST | TIER_5_AVOID | TIER_S1_STRONG_SHORT | TIER_S2_SHORT"
+            ),
+            "pattern_matched": (
+                "PATTERN_A_PHOENIX | PATTERN_B_SQUEEZE_CANNON | PATTERN_C_SLEEPING_GIANT | "
+                "PATTERN_D_CATALYST_SPRINT | PATTERN_E_FUNDAMENTAL_DISCONNECT | PATTERN_NONE"
+            ),
+            "pattern_win_rate": "integer 0-100 (historical pattern win %)",
+            "macro_regime": "string — FEAR_MODE | NORMAL_MODE | COMPLACENCY_MODE (+ overlays)",
+            "smart_money_score": "number 0-10",
+            "risk_adjusted_score": "number 0-10 after penalties/bonuses",
+            "investment_timeframe": "string — exact APEX timeframe rule output",
+            "timeframe_basis": "one sentence — cites market-cap / short / M&A rule",
+            "sector_bucket": "BIOTECH_PHARMA | CHINA_ADR | TECH_SOFTWARE_SEMI | ... | OTHER",
             "current_price": "number",
             "target_30d": "number",
             "target_90d": "number",
@@ -295,14 +326,57 @@ def _fundamentals_digest(financials: list[dict], price: float | None) -> dict:
     return digest
 
 
-def _macro_snapshot() -> dict:
-    """Lightweight macro context. Real-time macro data sources can replace this."""
+def _macro_snapshot() -> dict[str, Any]:
+    """Live VIX / 10Y snapshot for regime rules in the master prompt."""
+    import yfinance as yf
+
+    vix: float | None = None
+    tnx_last: float | None = None
+    tnx_week_ago: float | None = None
+    try:
+        vh = yf.Ticker("^VIX").history(period="5d", interval="1d")
+        if vh is not None and not getattr(vh, "empty", True):
+            vix = float(vh["Close"].iloc[-1])
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        th = yf.Ticker("^TNX").history(period="15d", interval="1d")
+        if th is not None and not getattr(th, "empty", True) and len(th) >= 2:
+            tnx_last = float(th["Close"].iloc[-1])
+            tnx_week_ago = float(th["Close"].iloc[max(-8, -len(th))])
+    except Exception:  # noqa: BLE001
+        pass
+
+    regime = "NORMAL_MODE"
+    if vix is not None:
+        if vix > 25:
+            regime = "FEAR_MODE"
+        elif vix < 15:
+            regime = "COMPLACENCY_MODE"
+        else:
+            regime = "NORMAL_MODE"
+    rate_overlay = ""
+    if tnx_last and tnx_week_ago and tnx_week_ago > 0 and tnx_last >= tnx_week_ago * 1.06:
+        rate_overlay = " + RATE_SHOCK (10Y yield rising fast)"
+
+    note_parts = []
+    if vix is not None:
+        note_parts.append(f"VIX≈{vix:.2f}")
+    else:
+        note_parts.append("VIX n/a")
+    if tnx_last is not None:
+        note_parts.append(f"10Y≈{tnx_last:.2f}")
+    else:
+        note_parts.append("10Y n/a")
+
     return {
-        "fed_posture": "Data-dependent; market pricing modest cuts in coming quarters.",
-        "inflation_trend": "Cooling but sticky in services; commodities mixed.",
-        "vix_estimate": None,
-        "ten_year_yield_estimate": None,
-        "regime_note": "Late-cycle rotation environment with elevated dispersion.",
+        "fed_posture": "Data-dependent; see VIX / yield snapshot below.",
+        "inflation_trend": "Track CPI/PCE from external feeds.",
+        "vix_last": vix,
+        "ten_year_yield_proxy_last": tnx_last,
+        "ten_year_yield_proxy_week_ago": tnx_week_ago,
+        "apex_macro_regime_hint": regime + rate_overlay,
+        "regime_note": " | ".join(note_parts),
     }
 
 
@@ -378,12 +452,23 @@ def _fallback_report(
         rating = "SHORT"
 
     upside = round(abs(target_12m - price) / price * 100, 1) if price else 0.0
+    macro = _macro_snapshot()
+    regime = str(macro.get("apex_macro_regime_hint") or "NORMAL_MODE")
     return {
         "ticker": ticker,
         "company_name": (md.get("details") or {}).get("name") or ticker,
         "section": section,
         "direction": direction,
         "apex_rating": rating,
+        "conviction_tier": "TIER_3_STANDARD",
+        "pattern_matched": "PATTERN_NONE",
+        "pattern_win_rate": 0,
+        "macro_regime": regime,
+        "smart_money_score": 5.0,
+        "risk_adjusted_score": 6.0,
+        "investment_timeframe": "2-6 WEEKS" if direction == "DOWN" else "4-12 WEEKS",
+        "timeframe_basis": "Fallback report — timeframe not AI-derived",
+        "sector_bucket": "OTHER",
         "current_price": price,
         "target_30d": round(price * (1.05 if direction == "UP" else 0.95), 2) if price else 0,
         "target_90d": round(price * (1.18 if direction == "UP" else 0.85), 2) if price else 0,

@@ -19,6 +19,34 @@ from universe import SMALL_CAP_UNIVERSE
 from utils import log
 
 # ---------------------------------------------------------------------------
+# Permanent / structural exclusions (symbol-level)
+# ---------------------------------------------------------------------------
+PERMANENT_EXCLUSIONS: frozenset[str] = frozenset(
+    {
+        "ESPR",  # Being acquired by ARCHIMED at $3.16
+    }
+)
+
+# Known definitive acquisition prices — exclude when spot within 3%.
+ACQUISITION_DEAL_PRICES: dict[str, float] = {
+    "ESPR": 3.16,
+}
+
+
+def _news_acquisition_language(news: list[dict]) -> bool:
+    blob = " ".join(
+        ((n.get("title") or "") + " " + (n.get("description") or "")).lower() for n in (news or [])
+    )
+    return "acquisition" in blob or "take private" in blob or "going private" in blob or "buyout" in blob
+
+
+def _price_near_known_deal(ticker: str, price: float | None) -> bool:
+    deal = ACQUISITION_DEAL_PRICES.get(ticker.upper())
+    if deal is None or deal <= 0 or price is None or price <= 0:
+        return False
+    return abs(price - deal) / deal <= 0.03
+
+# ---------------------------------------------------------------------------
 # Signal definitions (name, weight, direction)
 # ---------------------------------------------------------------------------
 UP_SIGNALS = {
@@ -106,14 +134,30 @@ async def scan(top_n: int = 3, candidate_pool_size: int = 60) -> list[dict[str, 
         async def enrich(row: dict) -> dict | None:
             async with sem:
                 ticker = row["T"]
+                if ticker.upper() in PERMANENT_EXCLUSIONS:
+                    log(f"[SmallCapScreener] EXCLUDE {ticker}: permanent exclusion list")
+                    return None
                 try:
-                    details, snap, financials = await asyncio.gather(
+                    details, snap, financials, news_items = await asyncio.gather(
                         yfc.ticker_details(ticker),
                         yfc.snapshot(ticker),
                         yfc.financials(ticker, limit=8),
+                        yfc.news(ticker, limit=12),
                     )
                 except Exception as e:  # noqa: BLE001
                     log(f"[SmallCapScreener] enrich {ticker} failed: {e}", "warning")
+                    return None
+
+                last_px = (snap.get("day") or {}).get("c") if snap else None
+                try:
+                    px_f = float(last_px) if last_px is not None else None
+                except (TypeError, ValueError):
+                    px_f = None
+                if _price_near_known_deal(ticker, px_f):
+                    log(f"[SmallCapScreener] EXCLUDE {ticker}: price within 3% of known acquisition deal")
+                    return None
+                if _news_acquisition_language(news_items):
+                    log(f"[SmallCapScreener] EXCLUDE {ticker}: acquisition language in recent headlines")
                     return None
 
                 mcap = (details or {}).get("market_cap") or 0
