@@ -5,17 +5,20 @@ Run:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Any
+
+import yfinance as yf
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 import analyzer
+import portfolio_advisor
 import screener_big_players
 import screener_small_caps
 from scorer import calculate, enforce_portfolio_cap
@@ -42,39 +45,16 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
-# Startup scan — Railway resets the filesystem on every deploy. The container
-# can also boot with a stale or empty `results/latest.json` (e.g. a partial
-# write from a previous run, or a placeholder with `total_picks == 0`). We
-# only skip the boot-time scan when real data is on disk; otherwise we run
-# the full APEX pipeline once so the frontend always has fresh data.
+# Startup — do NOT run scans here. GET /api/latest always reads results/latest.json
+# only. Use POST /api/run-scan (or /api/run) to regenerate persisted picks.
 # ---------------------------------------------------------------------------
-@app.on_event("startup")
-async def startup_scan() -> None:
-    latest_path = RESULTS_DIR / "latest.json"
-    from utils import log
-
-    try:
-        with open(latest_path) as f:
-            data = json.load(f)
-        if data.get("total_picks", 0) > 0:
-            log("[Startup] latest.json has real data — skipping boot scan")
-            return  # real data exists, skip scan
-    except Exception:  # noqa: BLE001 — missing file, empty file, or invalid JSON
-        pass
-
-    log("[Startup] No real data on disk — running first APEX scan")
-    try:
-        await run_daily_apex(total_budget_usd=_stored_budget())
-        log("[Startup] First-boot APEX scan complete")
-    except Exception as e:  # noqa: BLE001 — never let a scan failure break boot
-        log(f"[Startup] First-boot APEX scan failed: {e}", "error")
 
 
 # ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
 class BudgetIn(BaseModel):
-    total_budget_usd: float = Field(..., gt=0, description="User's total investment budget in USD")
+    budget: float = Field(..., gt=0, description="Total investment budget (USD)")
 
 
 class AnalyzeIn(BaseModel):
@@ -95,6 +75,7 @@ async def health() -> dict:
 # ---------------------------------------------------------------------------
 @app.get("/api/latest")
 async def get_latest() -> dict:
+    """Return persisted scan results from ``results/latest.json`` only (never runs a scan)."""
     data = load_json(RESULTS_DIR / "latest.json")
     if not data:
         raise HTTPException(status_code=404, detail="No APEX scan has run yet. Trigger one via /api/run.")
@@ -217,6 +198,7 @@ async def status() -> dict:
         "small_cap_count": (data or {}).get("small_cap_count", 0) if today_complete else 0,
         "big_player_count": (data or {}).get("big_player_count", 0) if today_complete else 0,
         "next_run_at": next_run,
+        "budget": _stored_budget(),
         "current_budget_usd": _stored_budget(),
     }
 
@@ -261,35 +243,139 @@ async def run_scan(total_budget_usd: float | None = Query(default=None)) -> dict
 
 
 # ---------------------------------------------------------------------------
-# Budget management — persisted in config/budget.json
+# Budget — persisted in results/budget.json (survives deploys with results volume)
 # ---------------------------------------------------------------------------
+BUDGET_PATH = RESULTS_DIR / "budget.json"
+
+
+def _migrate_legacy_budget_file() -> None:
+    if BUDGET_PATH.exists():
+        return
+    legacy = load_json(CONFIG_DIR / "budget.json", default={})
+    if isinstance(legacy, dict) and legacy.get("total_budget_usd") is not None:
+        try:
+            v = float(legacy["total_budget_usd"])
+        except (TypeError, ValueError):
+            return
+        save_json(
+            BUDGET_PATH,
+            {
+                "budget": v,
+                "updated_at": legacy.get("updated_at") or utcnow_iso(),
+                "migrated_from": "config/budget.json",
+            },
+        )
+
+
 @app.get("/api/budget")
 async def get_budget() -> dict:
-    return {"total_budget_usd": _stored_budget(), "updated_at": _budget_updated_at()}
+    return {"budget": _stored_budget()}
 
 
 @app.post("/api/budget")
 async def set_budget(payload: BudgetIn) -> dict:
-    save_json(
-        CONFIG_DIR / "budget.json",
-        {"total_budget_usd": payload.total_budget_usd, "updated_at": utcnow_iso()},
-    )
-    return {"total_budget_usd": payload.total_budget_usd, "updated_at": utcnow_iso()}
+    save_json(BUDGET_PATH, {"budget": float(payload.budget), "updated_at": utcnow_iso()})
+    return {"budget": float(payload.budget), "saved": True}
 
 
 def _stored_budget() -> float:
-    cfg = load_json(CONFIG_DIR / "budget.json")
-    if isinstance(cfg, dict) and cfg.get("total_budget_usd"):
-        try:
-            return float(cfg["total_budget_usd"])
-        except (TypeError, ValueError):
-            pass
+    _migrate_legacy_budget_file()
+    cfg = load_json(BUDGET_PATH, default={})
+    if isinstance(cfg, dict):
+        if cfg.get("budget") is not None:
+            try:
+                return float(cfg["budget"])
+            except (TypeError, ValueError):
+                pass
+        if cfg.get("total_budget_usd") is not None:
+            try:
+                return float(cfg["total_budget_usd"])
+            except (TypeError, ValueError):
+                pass
     return float(os.environ.get("DEFAULT_BUDGET_USD", 10_000))
 
 
 def _budget_updated_at() -> str | None:
-    cfg = load_json(CONFIG_DIR / "budget.json")
+    cfg = load_json(BUDGET_PATH, default={})
     return cfg.get("updated_at") if isinstance(cfg, dict) else None
+
+
+def _chart_data_sync(ticker: str) -> dict[str, Any]:
+    try:
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period="90d")
+        if hist is None or hist.empty:
+            return {
+                "ticker": ticker,
+                "historical": [],
+                "predicted_trend": [],
+                "trend_direction": "NEUTRAL",
+                "trend_strength": 0.0,
+            }
+        historical: list[dict[str, Any]] = []
+        for idx, row in hist.iterrows():
+            if hasattr(idx, "strftime"):
+                ds = idx.strftime("%Y-%m-%d")
+            else:
+                ds = str(idx)[:10]
+            historical.append({"date": ds, "close": round(float(row["Close"]), 2)})
+        closes = [h["close"] for h in historical]
+        if len(closes) >= 2:
+            slope = (closes[-1] - closes[0]) / len(closes)
+            last_date = datetime.strptime(historical[-1]["date"], "%Y-%m-%d")
+            predicted: list[dict[str, Any]] = []
+            for i in range(1, 31):
+                pred_date = last_date + timedelta(days=i)
+                pred_price = round(closes[-1] + slope * i, 2)
+                predicted.append({"date": str(pred_date.date()), "predicted_close": pred_price})
+            trend = "UP" if slope > 0 else "DOWN"
+            base = closes[0] if closes[0] else 1e-6
+            strength = min(100.0, abs(slope / base * 100 * 30))
+        else:
+            predicted = []
+            trend = "NEUTRAL"
+            strength = 0.0
+        return {
+            "ticker": ticker,
+            "historical": historical,
+            "predicted_trend": predicted,
+            "trend_direction": trend,
+            "trend_strength": round(strength, 1),
+        }
+    except Exception as e:  # noqa: BLE001
+        return {
+            "ticker": ticker,
+            "historical": [],
+            "predicted_trend": [],
+            "trend_direction": "UNKNOWN",
+            "trend_strength": 0.0,
+            "error": str(e),
+        }
+
+
+@app.get("/api/chart/{ticker}")
+async def get_chart(ticker: str) -> dict[str, Any]:
+    sym = (ticker or "").strip().upper()
+    if not sym:
+        raise HTTPException(status_code=400, detail="Invalid ticker")
+    return await asyncio.to_thread(_chart_data_sync, sym)
+
+
+@app.get("/api/portfolio-advice")
+async def portfolio_advice_get(budget: float | None = Query(default=None)) -> dict[str, Any]:
+    b = float(budget) if budget is not None else _stored_budget()
+    try:
+        return await portfolio_advisor.get_cached_or_regenerate(b)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+
+@app.post("/api/portfolio-advice/generate")
+async def portfolio_advice_generate(payload: BudgetIn) -> dict[str, Any]:
+    try:
+        return await portfolio_advisor.generate_portfolio_advice(float(payload.budget))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +396,9 @@ async def root() -> dict:
             "GET|POST /api/run-scan",
             "GET /api/budget",
             "POST /api/budget",
+            "GET /api/chart/{ticker}",
+            "GET /api/portfolio-advice",
+            "POST /api/portfolio-advice/generate",
         ],
     }
 

@@ -51,7 +51,10 @@ def _infer_diversity_bucket(report: dict) -> str:
 
 
 def _apply_correlation_caps(reports: list[dict]) -> list[dict]:
-    """Enforce daily diversification caps (Layer 7 orchestration)."""
+    """Enforce diversification caps; restore top filtered names if fewer than MIN picks."""
+    MIN_PICKS = 4
+    if not reports:
+        return reports
     if len(reports) <= 1:
         return reports
     shorts = [r for r in reports if _is_short_like(r)]
@@ -61,9 +64,10 @@ def _apply_correlation_caps(reports: list[dict]) -> list[dict]:
         key=lambda x: x.get("final_probability_percentage", 0),
         reverse=True,
     )
-    caps = {"biotech": 2, "china": 1, "tech": 2}
+    caps = {"biotech": 3, "china": 2, "tech": 3}
     counts = {k: 0 for k in caps}
     kept_longs: list[dict] = []
+    skipped_longs: list[dict] = []
     for r in longs_sorted:
         bucket = _infer_diversity_bucket(r)
         if bucket in caps and counts[bucket] >= caps[bucket]:
@@ -71,12 +75,22 @@ def _apply_correlation_caps(reports: list[dict]) -> list[dict]:
                 f"[Correlation] SKIP {r.get('ticker')}: {bucket} bucket at daily cap "
                 f"(sector_bucket={r.get('sector_bucket')})"
             )
+            skipped_longs.append(r)
             continue
         if bucket in counts:
             counts[bucket] += 1
         kept_longs.append(r)
     merged = shorts + kept_longs
     merged.sort(key=lambda x: x.get("final_probability_percentage", 0), reverse=True)
+    skipped_longs.sort(key=lambda x: x.get("final_probability_percentage", 0), reverse=True)
+    while len(merged) < MIN_PICKS and skipped_longs:
+        restore = skipped_longs.pop(0)
+        log(
+            f"[Correlation] RESTORE {restore.get('ticker')} (prob "
+            f"{restore.get('final_probability_percentage')}) to reach minimum {MIN_PICKS} picks"
+        )
+        merged.append(restore)
+        merged.sort(key=lambda x: x.get("final_probability_percentage", 0), reverse=True)
     if not any(_is_short_like(r) for r in merged):
         log("[Correlation] NOTE: no SHORT / bearish-tier name in today's basket")
     return merged
@@ -193,9 +207,24 @@ def _persist(payload: dict) -> None:
 
 
 def _read_budget() -> float:
-    cfg = load_json(RESULTS_DIR.parent / "config" / "budget.json", default={})
-    if isinstance(cfg, dict) and cfg.get("total_budget_usd"):
-        return float(cfg["total_budget_usd"])
+    cfg = load_json(RESULTS_DIR / "budget.json", default={})
+    if isinstance(cfg, dict):
+        if cfg.get("budget") is not None:
+            try:
+                return float(cfg["budget"])
+            except (TypeError, ValueError):
+                pass
+        if cfg.get("total_budget_usd") is not None:
+            try:
+                return float(cfg["total_budget_usd"])
+            except (TypeError, ValueError):
+                pass
+    leg = load_json(RESULTS_DIR.parent / "config" / "budget.json", default={})
+    if isinstance(leg, dict) and leg.get("total_budget_usd") is not None:
+        try:
+            return float(leg["total_budget_usd"])
+        except (TypeError, ValueError):
+            pass
     return DEFAULT_BUDGET
 
 

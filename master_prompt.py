@@ -277,6 +277,35 @@ POSITION SIZING caps (still mandatory):
 - SHORT / STRONG SHORT: max 3% budget.
 - Never exceed 15% single name. Respect macro_regime size cuts from SECTION 0.
 
+ADDITIONAL INTELLIGENCE SOURCES (reference as many as data allows):
+1. Federal Reserve communications: FOMC minutes, Fed speeches, dot plot
+   projections — impacts all rate-sensitive stocks.
+2. Treasury yield curve: 2yr vs 10yr spread — inverted = recession warning;
+   steepening = growth acceleration narrative.
+3. Put/Call ratio on major indexes: >1.2 extreme fear (contrarian buy skew);
+   <0.7 extreme greed (reduce risk / trim).
+4. AAII Sentiment Survey (weekly): <25% bulls historically strong buy skew;
+   >55% bulls historically strong sell / trim skew.
+5. Insider transaction database (SEC Form 4): cluster buying by multiple
+   insiders = very bullish; single insider sell often noise; multiple insiders
+   selling = very bearish.
+6. 13F filings (Berkshire Hathaway, Bridgewater, Citadel, Renaissance,
+   Two Sigma, Millennium, Point72, Druckenmiller Family Office): new
+   meaningful position = bullish context; full exit = bearish context.
+7. Analyst revision momentum vs headline rating: 5+ estimate raises in 30d
+   = bullish even if rating still HOLD.
+8. Short interest trend vs absolute level: SI falling while price flat =
+   accumulation read (can be more bullish than high SI alone).
+9. Options market: large call sweeps above ask = institutional urgency;
+   elevated stock-level put/call = hedging/bearish; low IV pre-catalyst =
+   convexity / cheap optionality.
+10. Sector ETF flows (XLK, XLF, XLV, XLE, XLI, XLB, XLU, XLRE): inflows =
+    tailwind; sustained outflows = headwind.
+
+When analyzing any stock, cite which of these sources SUPPORT vs CONTRADICT
+the thesis. A pick with 7+ sources aligned is TIER 1 quality; only 2–3
+sources aligned caps at TIER 3 maximum regardless of raw enthusiasm.
+
 CRITICAL:
 - investment_timeframe MUST be "X to Y days|weeks|months" per SECTION 1 (never
   vague labels; never cap-only); only exception is AVOID — NO TIMEFRAME.

@@ -92,9 +92,29 @@ async def analyze_stock(
         "Re-check: primary technical or fundamental trigger for move within stated window",
     )
     parsed.setdefault("sector_bucket", "OTHER")
+    _sanitize_timeframe_for_market_cap(parsed, enriched)
     parsed["_raw_signals"] = triggered_signals
     parsed["_total_budget_usd"] = total_budget_usd
     return parsed
+
+
+def _sanitize_timeframe_for_market_cap(parsed: dict[str, Any], enriched: dict[str, Any]) -> None:
+    """Clamp unrealistic day/week horizons for large / mega caps (post-parse guard)."""
+    details = enriched.get("details") or {}
+    mcap = details.get("market_cap")
+    if mcap is None:
+        return
+    try:
+        mcap_f = float(mcap)
+    except (TypeError, ValueError):
+        return
+    original_tf = (parsed.get("investment_timeframe") or "").lower()
+    if mcap_f > 2_000_000_000 and "day" in original_tf:
+        parsed["investment_timeframe"] = "3 to 6 months"
+        parsed["timeframe_basis"] = "Large cap value re-rating requires months not days"
+    if mcap_f > 50_000_000_000 and "week" in original_tf:
+        parsed["investment_timeframe"] = "6 to 18 months"
+        parsed["timeframe_basis"] = "Mega cap re-rating minimum 6 months"
 
 
 # ---------------------------------------------------------------------------
