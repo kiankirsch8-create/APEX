@@ -85,8 +85,12 @@ async def analyze_stock(
     except (TypeError, ValueError):
         cs0 = 5.0
     parsed.setdefault("risk_adjusted_score", cs0)
-    parsed.setdefault("investment_timeframe", "4-12 WEEKS")
-    parsed.setdefault("timeframe_basis", "Default — verify against APEX timeframe rules in prompt")
+    parsed.setdefault("investment_timeframe", "3 to 8 weeks")
+    parsed.setdefault("timeframe_basis", "Default — model omitted signal-derived window; verify SECTION 1 format")
+    parsed.setdefault(
+        "timeframe_catalyst",
+        "Re-check: primary technical or fundamental trigger for move within stated window",
+    )
     parsed.setdefault("sector_bucket", "OTHER")
     parsed["_raw_signals"] = triggered_signals
     parsed["_total_budget_usd"] = total_budget_usd
@@ -221,8 +225,12 @@ def _build_user_message(
             "macro_regime": "string — FEAR_MODE | NORMAL_MODE | COMPLACENCY_MODE (+ overlays)",
             "smart_money_score": "number 0-10",
             "risk_adjusted_score": "number 0-10 after penalties/bonuses",
-            "investment_timeframe": "string — exact APEX timeframe rule output",
-            "timeframe_basis": "one sentence — cites market-cap / short / M&A rule",
+            "investment_timeframe": (
+                'string — format \"X to Y days|weeks|months\" per prompt SECTION 1; '
+                'M&A no-edge only: \"AVOID — NO TIMEFRAME\"'
+            ),
+            "timeframe_basis": "1-2 sentences tying horizon to concrete momentum/fundamental signals (not cap buckets alone)",
+            "timeframe_catalyst": "specific price driver in the window (breakout level, volume, dated catalyst, etc.)",
             "sector_bucket": "BIOTECH_PHARMA | CHINA_ADR | TECH_SOFTWARE_SEMI | ... | OTHER",
             "current_price": "number",
             "target_30d": "number",
@@ -466,8 +474,9 @@ def _fallback_report(
         "macro_regime": regime,
         "smart_money_score": 5.0,
         "risk_adjusted_score": 6.0,
-        "investment_timeframe": "2-6 WEEKS" if direction == "DOWN" else "4-12 WEEKS",
-        "timeframe_basis": "Fallback report — timeframe not AI-derived",
+        "investment_timeframe": "5 to 15 days" if direction == "DOWN" else "3 to 8 weeks",
+        "timeframe_basis": "Fallback — horizon from direction and screener signals only; regenerate with AI.",
+        "timeframe_catalyst": "Fallback: confirm breakout or earnings catalyst manually; Claude unavailable.",
         "sector_bucket": "OTHER",
         "current_price": price,
         "target_30d": round(price * (1.05 if direction == "UP" else 0.95), 2) if price else 0,
