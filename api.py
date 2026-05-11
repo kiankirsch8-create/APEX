@@ -5,10 +5,10 @@ Run:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
@@ -16,11 +16,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 import analyzer
+import chart_vision
 import screener_big_players
 import screener_small_caps
+from market_data import YFClient
 from scorer import calculate, enforce_portfolio_cap
 from scheduler import run_daily_apex
-from utils import CONFIG_DIR, RESULTS_DIR, load_json, save_json, today_str, utcnow_iso
+from utils import CONFIG_DIR, RESULTS_DIR, env, load_json, save_json, today_str, utcnow_iso
 
 app = FastAPI(
     title="APEX Stock Discovery Engine",
@@ -82,6 +84,74 @@ class AnalyzeIn(BaseModel):
     total_budget_usd: float | None = Field(default=None, gt=0)
 
 
+class PortfolioAddIn(BaseModel):
+    ticker: str = Field(..., min_length=1)
+    company_name: str | None = None
+    entry_price: float = Field(..., gt=0)
+    entry_date: str = Field(..., description="YYYY-MM-DD")
+    shares: float = Field(..., gt=0)
+    invested_amount: float | None = Field(default=None, description="If omitted, shares * entry_price")
+    stop_loss: float | None = None
+    take_profit_1: float | None = None
+    take_profit_2: float | None = None
+    notes: str | None = None
+
+
+class ChartAnalyzeIn(BaseModel):
+    image_base64: str = Field(..., min_length=1)
+    ticker: str = Field(..., min_length=1)
+    timeframe: str = Field(default="1D", description="Chart interval, e.g. 1D, 1W, 4H")
+
+
+PORTFOLIO_PATH = RESULTS_DIR / "portfolio.json"
+
+
+def _float_or_none(v: Any) -> float | None:
+    try:
+        if v is None:
+            return None
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _load_portfolio() -> dict[str, Any]:
+    raw = load_json(PORTFOLIO_PATH, default=None)
+    if not isinstance(raw, dict):
+        return {"updated_at": utcnow_iso(), "positions": []}
+    poss = raw.get("positions")
+    if not isinstance(poss, list):
+        poss = []
+    return {"updated_at": raw.get("updated_at") or utcnow_iso(), "positions": poss}
+
+
+async def _enrich_portfolio_row(yfc: YFClient, p: dict[str, Any]) -> dict[str, Any]:
+    t = (p.get("ticker") or "").strip().upper()
+    cur: float | None = None
+    if t:
+        snap = await yfc.snapshot(t)
+        if snap:
+            cur = _float_or_none((snap.get("day") or {}).get("c"))
+    shares = float(p.get("shares") or 0)
+    inv = float(p.get("invested_amount") or 0)
+    current_value = round(shares * cur, 2) if cur is not None else None
+    gain_loss_dollars = round(current_value - inv, 2) if current_value is not None else None
+    gain_loss_percentage = (
+        round(gain_loss_dollars / inv * 100, 2) if gain_loss_dollars is not None and inv > 0 else None
+    )
+    base = dict(p)
+    base.update(
+        {
+            "ticker": t,
+            "current_price": cur,
+            "current_value": current_value,
+            "gain_loss_dollars": gain_loss_dollars,
+            "gain_loss_percentage": gain_loss_percentage,
+        }
+    )
+    return base
+
+
 # ---------------------------------------------------------------------------
 # Health
 # ---------------------------------------------------------------------------
@@ -122,6 +192,79 @@ async def list_history() -> dict:
         if len(stem) == 10:
             dates.append(stem)
     return {"dates": dates, "count": len(dates)}
+
+
+@app.get("/api/history/picks")
+async def history_picks() -> dict:
+    """All saved daily scans with live prices vs the price at recommendation time."""
+    files = sorted(RESULTS_DIR.glob("daily_picks_*.json"))
+    file_rows: list[tuple[str, dict[str, Any]]] = []
+    all_tickers: set[str] = set()
+    for f in files:
+        stem = f.stem.replace("daily_picks_", "")
+        if len(stem) != 10:
+            continue
+        data = load_json(f)
+        if not isinstance(data, dict):
+            continue
+        picks = data.get("all_picks") or []
+        if not picks:
+            picks = list(data.get("small_cap_picks") or []) + list(data.get("big_player_picks") or [])
+        for p in picks:
+            t = (p.get("ticker") or "").strip().upper()
+            if t:
+                all_tickers.add(t)
+        file_rows.append((stem, data))
+
+    prices: dict[str, float | None] = {}
+    if all_tickers:
+        async with YFClient() as yfc:
+
+            async def _px(sym: str) -> tuple[str, float | None]:
+                snap = await yfc.snapshot(sym)
+                if not snap:
+                    return sym, None
+                return sym, _float_or_none((snap.get("day") or {}).get("c"))
+
+            pairs = await asyncio.gather(*[_px(t) for t in sorted(all_tickers)])
+            prices = dict(pairs)
+
+    fetched_at = utcnow_iso()
+    scans: list[dict[str, Any]] = []
+    for stem, data in file_rows:
+        picks = data.get("all_picks") or []
+        if not picks:
+            picks = list(data.get("small_cap_picks") or []) + list(data.get("big_player_picks") or [])
+        entries: list[dict[str, Any]] = []
+        for p in picks:
+            t = (p.get("ticker") or "").strip().upper()
+            if not t:
+                continue
+            rec = _float_or_none(p.get("current_price"))
+            cur = prices.get(t)
+            change_pct: float | None = None
+            if rec is not None and rec > 0 and cur is not None:
+                change_pct = round((cur - rec) / rec * 100, 2)
+            entries.append(
+                {
+                    "ticker": t,
+                    "company_name": p.get("company_name"),
+                    "apex_rating": p.get("apex_rating"),
+                    "composite_score": p.get("composite_score"),
+                    "final_probability_percentage": p.get("final_probability_percentage")
+                    or p.get("probability_percentage"),
+                    "recommended_price": rec,
+                    "current_price": cur,
+                    "change_vs_recommended_pct": change_pct,
+                }
+            )
+        scans.append({"date": stem, "picks": entries, "total_picks": len(entries)})
+
+    return {
+        "scans": scans,
+        "latest_prices_fetched_at": fetched_at,
+        "scan_count": len(scans),
+    }
 
 
 @app.get("/api/history/{date}")
@@ -293,6 +436,100 @@ def _budget_updated_at() -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Portfolio — persisted in results/portfolio.json
+# ---------------------------------------------------------------------------
+@app.get("/api/portfolio")
+async def portfolio_get() -> dict:
+    data = _load_portfolio()
+    positions_in = list(data.get("positions") or [])
+    async with YFClient() as yfc:
+        enriched = await asyncio.gather(*[_enrich_portfolio_row(yfc, p) for p in positions_in])
+    return {
+        "updated_at": data.get("updated_at"),
+        "positions": list(enriched),
+        "position_count": len(enriched),
+    }
+
+
+@app.post("/api/portfolio/add")
+async def portfolio_add(body: PortfolioAddIn) -> dict:
+    try:
+        datetime.strptime(body.entry_date.strip(), "%Y-%m-%d")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="entry_date must be YYYY-MM-DD") from e
+
+    ticker = body.ticker.strip().upper()
+    invested = body.invested_amount
+    if invested is None:
+        invested = round(float(body.shares) * float(body.entry_price), 2)
+    elif invested <= 0:
+        raise HTTPException(status_code=400, detail="invested_amount must be positive when provided")
+
+    company_name = (body.company_name or "").strip()
+    if not company_name:
+        async with YFClient() as yfc:
+            det = await yfc.ticker_details(ticker)
+            company_name = ((det or {}).get("name") or ticker).strip()
+
+    entry: dict[str, Any] = {
+        "ticker": ticker,
+        "company_name": company_name,
+        "entry_price": float(body.entry_price),
+        "entry_date": body.entry_date.strip(),
+        "shares": float(body.shares),
+        "invested_amount": float(invested),
+        "stop_loss": body.stop_loss,
+        "take_profit_1": body.take_profit_1,
+        "take_profit_2": body.take_profit_2,
+        "notes": (body.notes or "").strip() or None,
+    }
+
+    data = _load_portfolio()
+    positions = [p for p in (data.get("positions") or []) if (p.get("ticker") or "").upper() != ticker]
+    positions.append(entry)
+    data["positions"] = positions
+    data["updated_at"] = utcnow_iso()
+    save_json(PORTFOLIO_PATH, data)
+
+    async with YFClient() as yfc:
+        live = await _enrich_portfolio_row(yfc, entry)
+    return {"ok": True, "position": live}
+
+
+@app.delete("/api/portfolio/remove/{ticker}")
+async def portfolio_remove(ticker: str) -> dict:
+    sym = ticker.strip().upper()
+    data = _load_portfolio()
+    before = list(data.get("positions") or [])
+    kept = [p for p in before if (p.get("ticker") or "").upper() != sym]
+    if len(kept) == len(before):
+        raise HTTPException(status_code=404, detail=f"{sym} not in portfolio.")
+    data["positions"] = kept
+    data["updated_at"] = utcnow_iso()
+    save_json(PORTFOLIO_PATH, data)
+    return {"ok": True, "removed": sym}
+
+
+# ---------------------------------------------------------------------------
+# Chart vision
+# ---------------------------------------------------------------------------
+@app.post("/api/analyze-chart")
+async def analyze_chart(payload: ChartAnalyzeIn) -> dict[str, Any]:
+    if not env("ANTHROPIC_API_KEY"):
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY is not configured.")
+    try:
+        return await chart_vision.analyze_chart_image(
+            payload.image_base64,
+            payload.ticker,
+            payload.timeframe,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+
+
+# ---------------------------------------------------------------------------
 @app.get("/")
 async def root() -> dict:
     return {
@@ -303,8 +540,13 @@ async def root() -> dict:
             "GET /api/latest",
             "GET /api/pick/{ticker}",
             "GET /api/history",
+            "GET /api/history/picks",
             "GET /api/history/{date}",
             "POST /api/analyze/{ticker}?section=SMALL_CAP|BIG_PLAYER",
+            "GET /api/portfolio",
+            "POST /api/portfolio/add",
+            "DELETE /api/portfolio/remove/{ticker}",
+            "POST /api/analyze-chart",
             "GET /api/status",
             "POST /api/run",
             "GET|POST /api/run-scan",
