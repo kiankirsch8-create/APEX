@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, model_validator
 
 import analyzer
+import chart_analyzer_v2
 import chart_vision
 import portfolio_advisor
 import screener_big_players
@@ -105,6 +106,12 @@ class ChartAnalyzeIn(BaseModel):
         if self.image_base64 and str(self.image_base64).strip():
             return self
         raise ValueError("Provide image_base64 or a non-empty images list")
+
+
+class AnalyzeDataIn(BaseModel):
+    ticker: str = Field(..., min_length=1)
+    timeframe: str = Field(default="4h", description="1h, 4h, 1d, 1w, etc.")
+    years: int = Field(default=2, ge=1, le=30, description="History span (capped per yfinance interval)")
 
 
 PORTFOLIO_PATH = RESULTS_DIR / "portfolio.json"
@@ -654,6 +661,47 @@ async def analyze_chart_endpoint(payload: ChartAnalyzeIn) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Data-driven chart / SMC analysis (yfinance + pandas-ta, no image)
+# ---------------------------------------------------------------------------
+@app.post("/api/analyze-data")
+async def analyze_data_post(body: AnalyzeDataIn) -> dict[str, Any]:
+    if not env("ANTHROPIC_API_KEY"):
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY is not configured.")
+    try:
+        return await asyncio.to_thread(
+            chart_analyzer_v2.analyze_ticker_full,
+            body.ticker.strip(),
+            body.timeframe.strip(),
+            body.years,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+
+@app.get("/api/analyze-data/{ticker}")
+async def analyze_data_get(
+    ticker: str,
+    timeframe: str = Query("4h", description="1h, 4h, 1d, 1w, etc."),
+    years: int = Query(2, ge=1, le=30),
+) -> dict[str, Any]:
+    if not env("ANTHROPIC_API_KEY"):
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY is not configured.")
+    try:
+        return await asyncio.to_thread(
+            chart_analyzer_v2.analyze_ticker_full,
+            ticker.strip(),
+            timeframe.strip(),
+            years,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+
+# ---------------------------------------------------------------------------
 @app.get("/")
 async def root() -> dict:
     return {
@@ -671,6 +719,8 @@ async def root() -> dict:
             "POST /api/portfolio/add",
             "DELETE /api/portfolio/remove/{ticker}",
             "POST /api/analyze-chart",
+            "POST /api/analyze-data",
+            "GET /api/analyze-data/{ticker}",
             "GET /api/status",
             "POST /api/run",
             "GET|POST /api/run-scan",
