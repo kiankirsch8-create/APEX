@@ -15,7 +15,7 @@ import yfinance as yf
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 import analyzer
 import chart_vision
@@ -78,9 +78,33 @@ class PortfolioAddIn(BaseModel):
 
 
 class ChartAnalyzeIn(BaseModel):
-    image_base64: str = Field(..., min_length=1)
+    """Single chart: ``image_base64``. Multi-timeframe: ``images`` (2+ items)."""
+
+    image_base64: str | None = Field(
+        default=None,
+        description="One chart as data URL or raw base64 (used when images is absent)",
+    )
+    images: list[str] | None = Field(
+        default=None,
+        description="Multiple chart images in order (weekly → daily → 4H → 1H when 4 images)",
+    )
     ticker: str = Field(..., min_length=1)
-    timeframe: str = Field(default="1D", description="Chart interval, e.g. 1D, 1W, 4H")
+    timeframe: str = Field(default="1D", description="Chart interval for single-image mode")
+    timeframes: list[str] | None = Field(
+        default=None,
+        description="Optional labels for multi mode (default 1W, 1D, 4H, 1H)",
+    )
+
+    @model_validator(mode="after")
+    def _require_image_input(self) -> ChartAnalyzeIn:
+        if self.images:
+            for i, img in enumerate(self.images):
+                if not img or not str(img).strip():
+                    raise ValueError(f"images[{i}] is empty")
+            return self
+        if self.image_base64 and str(self.image_base64).strip():
+            return self
+        raise ValueError("Provide image_base64 or a non-empty images list")
 
 
 PORTFOLIO_PATH = RESULTS_DIR / "portfolio.json"
@@ -600,12 +624,26 @@ async def portfolio_remove(ticker: str) -> dict:
 # Chart vision
 # ---------------------------------------------------------------------------
 @app.post("/api/analyze-chart")
-async def analyze_chart(payload: ChartAnalyzeIn) -> dict[str, Any]:
+async def analyze_chart_endpoint(payload: ChartAnalyzeIn) -> dict[str, Any]:
     if not env("ANTHROPIC_API_KEY"):
         raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY is not configured.")
     try:
-        return await chart_vision.analyze_chart_image(
-            payload.image_base64,
+        if payload.images is not None and len(payload.images) > 1:
+            tfs = payload.timeframes or ["1W", "1D", "4H", "1H"]
+            return await asyncio.to_thread(
+                chart_vision.analyze_multi_chart,
+                payload.images,
+                payload.ticker,
+                tfs,
+            )
+        single_img = (
+            payload.images[0]
+            if payload.images is not None and len(payload.images) == 1
+            else (payload.image_base64 or "")
+        )
+        return await asyncio.to_thread(
+            chart_vision.analyze_chart,
+            single_img,
             payload.ticker,
             payload.timeframe,
         )
