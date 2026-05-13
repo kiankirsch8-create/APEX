@@ -858,8 +858,23 @@ async def backtest_toggle(body: BacktestContinuousToggleIn) -> dict[str, Any]:
 
 @app.post("/api/backtest/improve-now")
 async def backtest_improve_now() -> dict[str, Any]:
-    """Kick off a self-improvement Claude pass over accumulated results (background thread)."""
-    return continuous_backtester.trigger_improvement_now()
+    """Run self-improvement on accumulated results in a worker thread (blocks that thread only)."""
+    try:
+        results = load_json(continuous_backtester.RESULTS_FILE, default=[]) or []
+        if not isinstance(results, list):
+            results = []
+        trades = [r for r in results if isinstance(r, dict) and not r.get("skipped")]
+        if len(trades) < 10:
+            return {"error": f"Need 10+ trades, have {len(trades)}"}
+
+        learned = await asyncio.to_thread(
+            lambda: continuous_backtester.run_improvement_cycle(list(results), min_trades=10),
+        )
+        if learned is None:
+            return {"error": "Improvement did not run (insufficient trades or early exit)"}
+        return learned
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)}
 
 
 @app.get("/api/backtest/learned/history")

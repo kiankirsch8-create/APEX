@@ -1,7 +1,7 @@
 """
 Continuous autonomous backtesting loop: random historical setups, forward outcomes,
-rolling stats, and periodic self-improvement (versioned ``learned_v*.json`` + ``learned_latest.json``;
-``learned_weights.json`` is merged, not replaced wholesale).
+rolling stats, and periodic self-improvement (timestamped backup of ``learned_weights.json``,
+``learned_v*.json`` + ``learned_latest.json`` snapshots).
 """
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import json
 import math
 import random
 import re
+import shutil
 import threading
 import time
 from datetime import datetime, timedelta
@@ -171,6 +172,16 @@ def _message_text(response: Any) -> str:
         if getattr(block, "type", None) == "text":
             parts.append(block.text)
     return "\n".join(parts).strip()
+
+
+def _improvement_response_raw_text(resp: Any) -> str:
+    """Prefer first text block (matches Anthropic SDK); fall back to full aggregation."""
+    blocks = getattr(resp, "content", None) or []
+    if blocks and getattr(blocks[0], "type", None) == "text":
+        t = getattr(blocks[0], "text", None)
+        if isinstance(t, str) and t.strip():
+            return t.strip()
+    return _message_text(resp)
 
 
 def _strip_tz(df: pd.DataFrame) -> pd.DataFrame:
@@ -743,11 +754,15 @@ def _normalize_signal_adjustments(raw: dict[str, Any]) -> dict[str, str]:
     return out
 
 
-def run_improvement_cycle(results_snapshot: list[dict[str, Any]]) -> None:
+def run_improvement_cycle(
+    results_snapshot: list[dict[str, Any]],
+    *,
+    min_trades: int = 20,
+) -> dict[str, Any] | None:
     trades = [r for r in results_snapshot if r and not r.get("skipped")]
-    if len(trades) < 20:
-        log("[Improve] Need 20+ completed trades to improve", level="info")
-        return
+    if len(trades) < min_trades:
+        log(f"[Improve] Need {min_trades}+ completed trades to improve (have {len(trades)})", level="info")
+        return None
 
     log(f"[Improve] Analyzing {len(trades)} trades...", level="info")
     save_json(IMPROVING_FILE, {"running": True, "started_at": datetime.now().isoformat(), "trades_analyzed": len(trades)})
@@ -779,6 +794,14 @@ def run_improvement_cycle(results_snapshot: list[dict[str, Any]]) -> None:
                 ),
             }
 
+    top_signals = dict(
+        sorted(
+            sig_win_rates.items(),
+            key=lambda x: int(x[1].get("total", 0)) if isinstance(x[1], dict) else 0,
+            reverse=True,
+        )[:10]
+    )
+
     loss_patterns: list[dict[str, Any]] = []
     for t in trades:
         if t.get("outcome") == "LOSS":
@@ -804,6 +827,9 @@ def run_improvement_cycle(results_snapshot: list[dict[str, Any]]) -> None:
                 }
             )
 
+    loss_sample = loss_patterns[-3:]
+    win_sample = win_patterns[-3:]
+
     ticker_perf: dict[str, dict[str, Any]] = {}
     for t in trades:
         tk = str(t.get("ticker", ""))
@@ -828,17 +854,17 @@ Wins: {n_wins}
 Losses: {len(trades) - n_wins}
 Win rate: {wr}%
 
-SIGNAL WIN RATES:
-{json.dumps(sig_win_rates, indent=2, default=str)}
+TOP SIGNAL WIN RATES (by trade count, top 10):
+{json.dumps(top_signals, indent=2, default=str)}
 
 TICKER PERFORMANCE:
 {json.dumps(ticker_perf, indent=2, default=str)}
 
-SAMPLE LOSS PATTERNS (last 5):
-{json.dumps(loss_patterns[-5:], indent=2, default=str)}
+SAMPLE LOSS PATTERNS (last 3):
+{json.dumps(loss_sample, indent=2, default=str)}
 
-SAMPLE WIN PATTERNS (last 5):
-{json.dumps(win_patterns[-5:], indent=2, default=str)}
+SAMPLE WIN PATTERNS (last 3):
+{json.dumps(win_sample, indent=2, default=str)}
 
 Analyze this data deeply and provide:
 
@@ -875,85 +901,82 @@ Return as JSON:
 
     try:
         client = _client()
-        resp = client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=4096,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = _message_text(resp)
+        try:
+            resp = client.messages.create(
+                model="claude-opus-4-5",
+                max_tokens=2000,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = _improvement_response_raw_text(resp)
+            log(f"[Improve] Claude response length: {len(raw)}", level="info")
+            log(f"[Improve] Claude response preview: {raw[:200]!r}", level="info")
+        except Exception as e:  # noqa: BLE001
+            log(f"[Improve] Claude call FAILED: {e}", level="error")
+            raise
+
         improvement = _parse_json_response(raw) or {}
+
+        if not improvement.get("analysis_summary"):
+            log("[Improve] WARNING: analysis_summary empty", level="warning")
+        if not improvement.get("new_rules"):
+            log("[Improve] WARNING: new_rules empty", level="warning")
 
         raw_adj = improvement.get("signal_adjustments", {})
         adj_norm = _normalize_signal_adjustments(raw_adj) if isinstance(raw_adj, dict) else {}
 
-        raw_summary = str(improvement.get("analysis_summary", "") or "").strip()
-        asum = raw_summary
-        if len(asum) < 200:
-            log(
-                f"[Improve] analysis_summary too short or missing ({len(asum)} chars); "
-                "improvement JSON may be truncated or the prompt failed.",
-                level="warning",
-            )
-            prev_latest = load_json(LEARNED_LATEST_FILE, default={}) or {}
-            prev_sum = str(prev_latest.get("analysis_summary", "") or "").strip()
-            if len(prev_sum) >= 200:
-                asum = (
-                    prev_sum
-                    + "\n\n[Note: The latest improvement cycle returned an analysis_summary under "
-                    + "200 characters; the narrative above is carried forward from the prior cycle.]"
-                )
-            else:
-                asum = (
-                    "The improvement cycle did not return a sufficiently detailed analysis_summary "
-                    "(minimum 200 characters). Check Claude responses, max_tokens, and the "
-                    "improvement prompt. Until a valid long narrative is produced, review backtest "
-                    "results and signal_adjustments directly."
-                )
+        exp_imp = str(
+            improvement.get("expected_improvement", "")
+            or improvement.get("expected_win_rate_improvement", "")
+            or ""
+        )
+
+        nr = improvement.get("new_rules")
+        if not isinstance(nr, list):
+            nr = []
 
         learned: dict[str, Any] = {
             "updated_at": datetime.now().isoformat(),
             "total_trades_analyzed": len(trades),
-            "signal_win_rates": sig_win_rates,
+            "analysis_summary": str(improvement.get("analysis_summary", "") or ""),
+            "new_rules": nr,
+            "reliable_signals": improvement.get("reliable_signals", [])
+            if isinstance(improvement.get("reliable_signals"), list)
+            else [],
+            "unreliable_signals": improvement.get("unreliable_signals", [])
+            if isinstance(improvement.get("unreliable_signals"), list)
+            else [],
+            "main_loss_reasons": improvement.get("main_loss_reasons", [])
+            if isinstance(improvement.get("main_loss_reasons"), list)
+            else [],
+            "recommendation": str(improvement.get("recommendation", "") or ""),
+            "expected_improvement": exp_imp,
             "signal_adjustments": adj_norm,
-            "new_rules": improvement.get("new_rules") if isinstance(improvement.get("new_rules"), list) else [],
-            "reliable_signals": improvement.get("reliable_signals") if isinstance(improvement.get("reliable_signals"), list) else [],
-            "unreliable_signals": improvement.get("unreliable_signals") if isinstance(improvement.get("unreliable_signals"), list) else [],
-            "best_tickers": improvement.get("best_tickers") if isinstance(improvement.get("best_tickers"), list) else [],
-            "worst_tickers": improvement.get("worst_tickers") if isinstance(improvement.get("worst_tickers"), list) else [],
-            "main_loss_reasons": improvement.get("main_loss_reasons") if isinstance(improvement.get("main_loss_reasons"), list) else [],
-            "recommendation": str(improvement.get("recommendation", "")),
-            "analysis_summary": asum,
-            "analysis_summary_claude_raw": raw_summary,
-            "expected_improvement": str(improvement.get("expected_win_rate_improvement", "")),
+            "signal_win_rates": sig_win_rates,
             "source": "continuous_backtester",
         }
-        ver = _next_learned_version()
-        learned["improvement_version"] = ver
-        learned["versioned_filename"] = f"learned_v{ver}.json"
 
-        versioned_path = RESULTS_DIR / f"learned_v{ver}.json"
-        save_json(versioned_path, learned)
+        if LEARNED_FILE.exists():
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_path = RESULTS_DIR / f"learned_{timestamp}.json"
+            shutil.copy(LEARNED_FILE, backup_path)
+            log(f"[Improve] Backed up prior learned_weights to {backup_path.name}", level="info")
+
+        save_json(LEARNED_FILE, learned)
         save_json(LEARNED_LATEST_FILE, learned)
 
-        prev_weights = load_json(LEARNED_FILE, default={})
-        if not isinstance(prev_weights, dict):
-            prev_weights = {}
-        merged_weights: dict[str, Any] = {**prev_weights, **learned}
-        hist = prev_weights.get("learned_version_files")
-        if not isinstance(hist, list):
-            hist = []
-        hist.append(f"learned_v{ver}.json")
-        merged_weights["learned_version_files"] = hist
-        merged_weights["learned_latest_file"] = "learned_latest.json"
-        save_json(LEARNED_FILE, merged_weights)
+        ver = _next_learned_version()
+        versioned = {**learned, "improvement_version": ver, "versioned_filename": f"learned_v{ver}.json"}
+        save_json(RESULTS_DIR / f"learned_v{ver}.json", versioned)
 
         log(
-            f"[Improve] Self-improvement complete v{ver}. New rules: {len(learned.get('new_rules', []))}. "
-            f"Saved {versioned_path.name}, learned_latest.json, merged learned_weights.json",
+            f"[Improve] Saved. Summary length: {len(learned['analysis_summary'])} "
+            f"(learned_weights.json, learned_latest.json, {versioned['versioned_filename']})",
             level="info",
         )
+        return learned
     except Exception as e:  # noqa: BLE001
-        log(f"[Improve] Improvement error: {e}", level="warning")
+        log(f"[Improve] Improvement error: {e}", level="error")
+        raise
     finally:
         save_json(
             IMPROVING_FILE,
