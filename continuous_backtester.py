@@ -36,29 +36,61 @@ FORWARD_CANDLES = 20
 IMPROVE_EVERY = 100
 
 BACKTEST_TICKERS = [
+    # Major pairs
     "EURUSD",
     "GBPUSD",
     "USDJPY",
-    "GBPAUD",
-    "EURAUD",
-    "AUDUSD",
-    "EURGBP",
-    "USDCAD",
     "USDCHF",
+    "AUDUSD",
+    "USDCAD",
     "NZDUSD",
-    "ACN",
-    "ADBE",
-    "MSFT",
-    "GOOGL",
-    "PYPL",
-    "ZTS",
-    "V",
-    "AMZN",
-    "AMD",
-    "NVDA",
+    # Euro crosses
+    "EURGBP",
+    "EURJPY",
+    "EURAUD",
+    "EURCAD",
+    "EURCHF",
+    "EURNZD",
+    # GBP crosses
+    "GBPJPY",
+    "GBPAUD",
+    "GBPCAD",
+    "GBPCHF",
+    "GBPNZD",
+    # JPY crosses
+    "AUDJPY",
+    "CADJPY",
+    "CHFJPY",
+    "NZDJPY",
+    # AUD crosses
+    "AUDCAD",
+    "AUDCHF",
+    "AUDNZD",
+    # Other crosses
+    "CADCHF",
+    "NZDCAD",
+    "NZDCHF",
+    # Exotic pairs
+    "USDMXN",
+    "USDZAR",
+    "USDNOK",
+    "USDSEK",
+    "USDDKK",
+    "USDSGD",
+    "USDHKD",
+    "USDTRY",
+    "USDPLN",
+    "USDHUF",
+    "USDCZK",
+    # Gold and Silver (trade like forex)
+    "XAUUSD",
+    "XAGUSD",
+    # Oil (commodity forex)
+    "USOIL",
+    "UKOIL",
 ]
 
-TIMEFRAMES = ["4h", "1d"]
+TIMEFRAMES = ["1h", "4h", "1d"]
 
 _TF_MAP: dict[str, str] = {
     "1h": "1h",
