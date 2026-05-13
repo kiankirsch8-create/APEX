@@ -12,9 +12,11 @@ import re
 import shutil
 import threading
 import time
+import traceback
 from datetime import datetime, timedelta
 from typing import Any
 
+import anthropic
 import pandas as pd
 import yfinance as yf
 from anthropic import Anthropic
@@ -32,6 +34,8 @@ LEARNED_LATEST_FILE = RESULTS_DIR / "learned_latest.json"
 STATE_FILE = RESULTS_DIR / "backtest_state.json"
 ENABLED_FILE = RESULTS_DIR / "backtest_enabled.json"
 IMPROVING_FILE = RESULTS_DIR / "improving.json"
+IMPROVE_DEBUG_FILE = RESULTS_DIR / "improve_debug.json"
+MIN_IMPROVE_TRADES = 10
 
 STARTING_CAPITAL = 10000.0
 POSITION_SIZE_PCT = 0.05  # 5% of capital
@@ -172,16 +176,6 @@ def _message_text(response: Any) -> str:
         if getattr(block, "type", None) == "text":
             parts.append(block.text)
     return "\n".join(parts).strip()
-
-
-def _improvement_response_raw_text(resp: Any) -> str:
-    """Prefer first text block (matches Anthropic SDK); fall back to full aggregation."""
-    blocks = getattr(resp, "content", None) or []
-    if blocks and getattr(blocks[0], "type", None) == "text":
-        t = getattr(blocks[0], "text", None)
-        if isinstance(t, str) and t.strip():
-            return t.strip()
-    return _message_text(resp)
 
 
 def _strip_tz(df: pd.DataFrame) -> pd.DataFrame:
@@ -754,14 +748,21 @@ def _normalize_signal_adjustments(raw: dict[str, Any]) -> dict[str, str]:
     return out
 
 
-def run_improvement_cycle(
-    results_snapshot: list[dict[str, Any]],
-    *,
-    min_trades: int = 20,
-) -> dict[str, Any] | None:
-    trades = [r for r in results_snapshot if r and not r.get("skipped")]
-    if len(trades) < min_trades:
-        log(f"[Improve] Need {min_trades}+ completed trades to improve (have {len(trades)})", level="info")
+def run_improvement_cycle(results_snapshot: list[dict[str, Any]]) -> dict[str, Any] | None:
+    snap = results_snapshot if isinstance(results_snapshot, list) else []
+    trades = [r for r in snap if r and not r.get("skipped")]
+    n_snap = len(snap)
+    skipped_n = len([r for r in snap if isinstance(r, dict) and r.get("skipped")])
+
+    log(f"[Improve] Starting with {len(trades)} trades", level="info")
+    log(
+        f"[Improve] Non-skipped trades: {len([t for t in trades if not t.get('skipped')])} "
+        f"(snapshot_rows={n_snap}, skipped_in_snapshot={skipped_n})",
+        level="info",
+    )
+
+    if len(trades) < MIN_IMPROVE_TRADES:
+        log("[Improve] Not enough trades", level="info")
         return None
 
     log(f"[Improve] Analyzing {len(trades)} trades...", level="info")
@@ -899,22 +900,54 @@ Return as JSON:
 }}
 """
 
+    raw = ""
     try:
         client = _client()
-        try:
-            resp = client.messages.create(
-                model="claude-opus-4-5",
-                max_tokens=2000,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            raw = _improvement_response_raw_text(resp)
-            log(f"[Improve] Claude response length: {len(raw)}", level="info")
-            log(f"[Improve] Claude response preview: {raw[:200]!r}", level="info")
-        except Exception as e:  # noqa: BLE001
-            log(f"[Improve] Claude call FAILED: {e}", level="error")
-            raise
+        log(f"[Improve] Calling Claude with {len(trades)} trades data...", level="info")
 
-        improvement = _parse_json_response(raw) or {}
+        resp = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=3000,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        if resp.content and getattr(resp.content[0], "text", None) is not None:
+            raw = str(resp.content[0].text)
+        else:
+            raw = _message_text(resp)
+
+        log(f"[Improve] Claude returned {len(raw)} chars", level="info")
+        log(f"[Improve] First 500 chars: {raw[:500]!r}", level="info")
+
+        clean = re.sub(r"```json|```", "", raw, flags=re.IGNORECASE).strip()
+
+        start = clean.find("{")
+        end = clean.rfind("}") + 1
+
+        if start == -1 or end == 0:
+            log("[Improve] No JSON found in response!", level="warning")
+            log(f"[Improve] Full response (truncated for log): {raw[:4000]!r}", level="warning")
+            save_json(IMPROVE_DEBUG_FILE, {"raw": raw, "error": "no json"})
+            return None
+
+        json_str = clean[start:end]
+        log(f"[Improve] Parsing JSON of {len(json_str)} chars", level="info")
+
+        improvement = json.loads(json_str)
+
+        if not isinstance(improvement, dict):
+            log(f"[Improve] Parsed JSON is not an object: {type(improvement).__name__}", level="warning")
+            save_json(IMPROVE_DEBUG_FILE, {"raw": raw, "error": "not a dict", "parsed": improvement})
+            return None
+
+        log("[Improve] Parsed successfully", level="info")
+        log(f"[Improve] Keys: {list(improvement.keys())}", level="info")
+        log(
+            f"[Improve] analysis_summary length: {len(str(improvement.get('analysis_summary', '') or ''))}",
+            level="info",
+        )
+        log(f"[Improve] new_rules count: {len(improvement.get('new_rules', []) or [])}", level="info")
+        log(f"[Improve] reliable_signals count: {len(improvement.get('reliable_signals', []) or [])}", level="info")
 
         if not improvement.get("analysis_summary"):
             log("[Improve] WARNING: analysis_summary empty", level="warning")
@@ -974,9 +1007,24 @@ Return as JSON:
             level="info",
         )
         return learned
+
+    except json.JSONDecodeError as e:
+        log(f"[Improve] JSON parse error: {e}", level="error")
+        log(f"[Improve] Raw text: {raw[:1000]!r}", level="error")
+        save_json(IMPROVE_DEBUG_FILE, {"raw": raw, "error": str(e)})
+        return None
+
+    except anthropic.APIError as e:
+        log(f"[Improve] Anthropic API error: {e}", level="error")
+        save_json(IMPROVE_DEBUG_FILE, {"raw": raw, "error": f"anthropic.APIError: {e}"})
+        return None
+
     except Exception as e:  # noqa: BLE001
-        log(f"[Improve] Improvement error: {e}", level="error")
-        raise
+        log(f"[Improve] Unexpected error: {e}", level="error")
+        log(f"[Improve] Traceback: {traceback.format_exc()}", level="error")
+        save_json(IMPROVE_DEBUG_FILE, {"raw": raw, "error": str(e), "traceback": traceback.format_exc()})
+        return None
+
     finally:
         save_json(
             IMPROVING_FILE,
@@ -1110,8 +1158,8 @@ def trigger_improvement_now() -> dict[str, Any]:
         return {"started": False, "error": "Improvement already running"}
     results = _load_results_list()
     trades = [r for r in results if r and not r.get("skipped")]
-    if len(trades) < 20:
-        return {"started": False, "error": "Need 20+ completed trades first"}
+    if len(trades) < MIN_IMPROVE_TRADES:
+        return {"started": False, "error": f"Need {MIN_IMPROVE_TRADES}+ completed trades first"}
     threading.Thread(target=run_improvement_cycle, args=(list(results),), daemon=True).start()
     return {"started": True}
 
@@ -1152,3 +1200,10 @@ def get_learned_history() -> list[dict[str, Any]]:
 
 def get_improving_state() -> dict[str, Any]:
     return load_json(IMPROVING_FILE, default={})
+
+
+def get_improve_debug() -> dict[str, Any]:
+    data = load_json(IMPROVE_DEBUG_FILE, default=None)
+    if isinstance(data, dict) and data:
+        return data
+    return {"message": "No debug data yet"}

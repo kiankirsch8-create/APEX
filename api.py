@@ -864,17 +864,29 @@ async def backtest_improve_now() -> dict[str, Any]:
         if not isinstance(results, list):
             results = []
         trades = [r for r in results if isinstance(r, dict) and not r.get("skipped")]
-        if len(trades) < 10:
-            return {"error": f"Need 10+ trades, have {len(trades)}"}
+        log(
+            f"[improve-now] snapshot_rows={len(results)} non_skipped_trades={len(trades)}",
+            level="info",
+        )
+        if len(trades) < continuous_backtester.MIN_IMPROVE_TRADES:
+            return {"error": f"Need {continuous_backtester.MIN_IMPROVE_TRADES}+ trades, have {len(trades)}"}
 
         learned = await asyncio.to_thread(
-            lambda: continuous_backtester.run_improvement_cycle(list(results), min_trades=10),
+            lambda: continuous_backtester.run_improvement_cycle(list(results)),
         )
         if learned is None:
-            return {"error": "Improvement did not run (insufficient trades or early exit)"}
+            return {
+                "error": "Improvement did not complete (see logs and GET /api/backtest/improve-debug)",
+            }
         return learned
     except Exception as e:  # noqa: BLE001
         return {"error": str(e)}
+
+
+@app.get("/api/backtest/improve-debug")
+async def backtest_improve_debug() -> dict[str, Any]:
+    """Last improvement parse/API failure payload from ``improve_debug.json``."""
+    return continuous_backtester.get_improve_debug()
 
 
 @app.get("/api/backtest/learned/history")
@@ -925,6 +937,7 @@ async def root() -> dict:
             "GET /api/backtest/enabled",
             "POST /api/backtest/toggle",
             "POST /api/backtest/improve-now",
+            "GET /api/backtest/improve-debug",
             "GET /api/backtest/learned",
             "GET /api/backtest/learned/history",
             "GET /api/backtest/improving",
