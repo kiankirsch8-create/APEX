@@ -32,15 +32,13 @@ from scheduler import run_daily_apex
 from utils import CONFIG_DIR, RESULTS_DIR, env, load_json, log, save_json, today_str, utcnow_iso
 
 # ---------------------------------------------------------------------------
-# Lifespan — resume continuous backtester when enabled; graceful thread stop.
+# Lifespan — graceful shutdown of continuous backtester worker thread.
+# Startup resume is handled by ``on_startup_resume_backtester`` below.
 # ---------------------------------------------------------------------------
 
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    if continuous_backtester.is_enabled():
-        continuous_backtester.start_continuous_backtest()
-        log("[Startup] Continuous backtest loop resumed (backtest_enabled.json)")
     yield
     continuous_backtester.shutdown_continuous_backtest()
 
@@ -63,6 +61,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+async def on_startup_resume_backtester() -> None:
+    try:
+        if continuous_backtester.is_enabled():
+            continuous_backtester.start_continuous_backtest()
+            log("[Startup] Backtester auto-resumed")
+        else:
+            log("[Startup] Backtester is disabled")
+    except Exception as e:  # noqa: BLE001
+        log(f"[Startup] Backtester error: {e}")
 
 
 # ---------------------------------------------------------------------------

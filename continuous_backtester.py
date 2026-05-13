@@ -31,8 +31,9 @@ ENABLED_FILE = RESULTS_DIR / "backtest_enabled.json"
 IMPROVING_FILE = RESULTS_DIR / "improving.json"
 
 STARTING_CAPITAL = 10000.0
-POSITION_SIZE_PCT = 0.02
-FORWARD_CANDLES = 20
+POSITION_SIZE_PCT = 0.05  # 5% of capital
+LEVERAGE = 50  # 50x on notional exposure
+FORWARD_CANDLES = 30
 IMPROVE_EVERY = 100
 
 BACKTEST_TICKERS = [
@@ -253,6 +254,9 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
 
         if len(past) < 50 or future.empty:
             return None
+        if len(future) < 5:
+            log(f"[Backtest] Not enough future data for {sym} {analysis_date}", level="info")
+            return None
 
         past.ta.rsi(length=14, append=True)
         past.ta.macd(append=True)
@@ -335,9 +339,15 @@ ATR: {atr} | ADX: {ind["adx"]} ({"strong" if ind["adx"] > 25 else "weak"} trend)
 BB Upper: {ind["bb_upper"]} | BB Lower: {ind["bb_lower"]}
 Asset type: {"FOREX" if is_forex else "STOCK"}
 {learned_context}
-STRICT RULES:
-- ADX below 20 = WAIT (no trade)
-- RSI 40-60 with no other confluence = WAIT
+TRADING RULES:
+- Only skip (NO TRADE) if trend is completely flat AND all indicators are neutral
+- ADX below 12 = truly no trend = WAIT
+- RSI between 48-52 with zero signals = WAIT
+- Otherwise find the best trade available
+- You should trade at least 50% of the time
+- Exotic pairs often trend strongly - trade them
+- Daily timeframe has clearer signals than 1H
+- When in doubt favor the trend direction
 - Stop loss max 1.5% for forex, 3% for stocks
 - TP1 max 2% for forex, 4% for stocks
 - TP2 max 3.5% for forex, 6% for stocks
@@ -395,8 +405,9 @@ Return ONLY valid JSON:
         if len(closes) == 0:
             return None
 
-        hit_tp1 = hit_stop = False
+        hit_tp1 = hit_tp2 = hit_stop = False
         c_tp1: int | None = None
+        c_tp2: int | None = None
         c_stop: int | None = None
 
         for i, (h, l) in enumerate(zip(highs, lows)):
@@ -404,6 +415,9 @@ Return ONLY valid JSON:
                 if not hit_tp1 and tp1 > 0 and h >= tp1:
                     hit_tp1 = True
                     c_tp1 = i + 1
+                if not hit_tp2 and tp2 > 0 and h >= tp2:
+                    hit_tp2 = True
+                    c_tp2 = i + 1
                 if not hit_stop and stop > 0 and l <= stop:
                     hit_stop = True
                     c_stop = i + 1
@@ -411,6 +425,9 @@ Return ONLY valid JSON:
                 if not hit_tp1 and tp1 > 0 and l <= tp1:
                     hit_tp1 = True
                     c_tp1 = i + 1
+                if not hit_tp2 and tp2 > 0 and l <= tp2:
+                    hit_tp2 = True
+                    c_tp2 = i + 1
                 if not hit_stop and stop > 0 and h >= stop:
                     hit_stop = True
                     c_stop = i + 1
@@ -426,40 +443,61 @@ Return ONLY valid JSON:
                     "reasoning": "Unknown direction from model",
                 }
 
-        trade_size = STARTING_CAPITAL * POSITION_SIZE_PCT
         if entry == 0:
             entry = price
+        entry = float(entry)
+        if not math.isfinite(entry) or abs(entry) < 1e-12:
+            pv = float(price)
+            entry = pv if math.isfinite(pv) and abs(pv) > 1e-12 else 1e-8
 
-        if hit_stop and (not hit_tp1 or c_stop is None or c_tp1 is None or c_stop < c_tp1):
+        if hit_stop and (not hit_tp1 or (c_stop is not None and c_tp1 is not None and c_stop < c_tp1)):
             outcome = "LOSS"
             correct = False
-            if direction == "LONG":
-                pnl_pct = (stop - entry) / entry
-            else:
-                pnl_pct = (entry - stop) / entry
-            exit_p = stop
+            exit_p = round(float(stop), 5)
             exit_r = "Stop loss hit"
+            if direction == "LONG":
+                raw_pct = (stop - entry) / entry
+            else:
+                raw_pct = (entry - stop) / entry
+
         elif hit_tp1:
             outcome = "WIN"
             correct = True
-            if direction == "LONG":
-                pnl_pct = (tp1 - entry) / entry
-            else:
-                pnl_pct = (entry - tp1) / entry
-            exit_p = tp1
+            exit_p = round(float(tp1), 5)
             exit_r = "TP1 hit"
-        else:
-            final = float(closes[-1])
             if direction == "LONG":
-                pnl_pct = (final - entry) / entry
+                raw_pct = (tp1 - entry) / entry
             else:
-                pnl_pct = (entry - final) / entry
-            correct = pnl_pct > 0
-            outcome = "WIN" if correct else "LOSS"
+                raw_pct = (entry - tp1) / entry
+
+        else:
+            final = closes[-1]
+            if pd.isna(final) or final == 0:
+                return None
+            final = round(float(final), 5)
             exit_p = final
             exit_r = "Window ended"
+            if direction == "LONG":
+                raw_pct = (final - entry) / entry
+            else:
+                raw_pct = (entry - final) / entry
+            correct = raw_pct > 0
+            outcome = "WIN" if correct else "LOSS"
 
-        pnl_d = round(trade_size * float(pnl_pct), 2)
+        base_position = STARTING_CAPITAL * POSITION_SIZE_PCT
+        leveraged_exposure = base_position * LEVERAGE
+        pnl_dollars = round(leveraged_exposure * raw_pct, 2)
+        pnl_pct_display = round(raw_pct * 100, 2)
+
+        log(
+            f"[Backtest] PnL calc: entry={entry} exit={exit_p} direction={direction} "
+            f"raw_pct={raw_pct:.4f} exposure={leveraged_exposure:.2f} pnl={pnl_dollars:.2f}",
+            level="info",
+        )
+
+        candles_to_exit = c_tp1 or c_stop
+        if candles_to_exit is None:
+            candles_to_exit = len(closes)
 
         return {
             "date": analysis_date,
@@ -468,18 +506,23 @@ Return ONLY valid JSON:
             "verdict": ai.get("verdict"),
             "direction": direction,
             "confidence": ai.get("confidence"),
-            "entry_price": entry,
-            "stop_loss": stop,
-            "tp1": tp1,
-            "tp2": tp2,
-            "exit_price": round(float(exit_p), 5),
+            "entry_price": round(entry, 5),
+            "stop_loss": round(stop, 5),
+            "tp1": round(tp1, 5),
+            "tp2": round(tp2, 5),
+            "exit_price": exit_p,
             "exit_reason": exit_r,
             "outcome": outcome,
             "correct": correct,
-            "pnl_pct": round(float(pnl_pct) * 100, 2),
-            "pnl_dollars": pnl_d,
+            "pnl_pct": pnl_pct_display,
+            "pnl_dollars": pnl_dollars,
+            "leverage": LEVERAGE,
+            "position_size": base_position,
+            "leveraged_exposure": leveraged_exposure,
             "hit_tp1": hit_tp1,
+            "hit_tp2": hit_tp2,
             "hit_stop": hit_stop,
+            "candles_to_exit": candles_to_exit,
             "signals_used": ai.get("signals_used") if isinstance(ai.get("signals_used"), list) else [],
             "confluences": ai.get("confluences") if isinstance(ai.get("confluences"), list) else [],
             "conflicts": ai.get("conflicts") if isinstance(ai.get("conflicts"), list) else [],
@@ -493,9 +536,43 @@ Return ONLY valid JSON:
         return None
 
 
+def calculate_kelly(trades: list[dict[str, Any]]) -> float:
+    completed = [t for t in trades if not t.get("skipped") and t.get("outcome") in ("WIN", "LOSS")]
+
+    if len(completed) < 20:
+        return POSITION_SIZE_PCT
+
+    wins = [t for t in completed if t.get("outcome") == "WIN"]
+    losses = [t for t in completed if t.get("outcome") == "LOSS"]
+
+    if not wins or not losses:
+        return POSITION_SIZE_PCT
+
+    win_rate = len(wins) / len(completed)
+    loss_rate = 1 - win_rate
+
+    avg_win_pct = sum(abs(float(t.get("pnl_pct", 0) or 0)) for t in wins) / len(wins)
+    avg_loss_pct = sum(abs(float(t.get("pnl_pct", 0) or 0)) for t in losses) / len(losses)
+
+    if avg_loss_pct == 0:
+        return POSITION_SIZE_PCT
+
+    win_loss_ratio = avg_win_pct / avg_loss_pct
+    kelly = win_rate - (loss_rate / win_loss_ratio)
+    kelly = max(0.01, min(0.10, kelly))
+
+    log(
+        f"[Kelly] Win rate: {win_rate:.1%} W/L ratio: {win_loss_ratio:.2f} Kelly: {kelly:.1%}",
+        level="info",
+    )
+
+    return round(kelly, 3)
+
+
 def calculate_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
     trades = [r for r in results if r and not r.get("skipped")]
     if not trades:
+        k0 = calculate_kelly([])
         return {
             "generated_at": datetime.now().isoformat(),
             "total_trades": 0,
@@ -503,6 +580,13 @@ def calculate_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
             "total_pnl_dollars": 0.0,
             "final_capital": STARTING_CAPITAL,
             "starting_capital": STARTING_CAPITAL,
+            "leverage": LEVERAGE,
+            "position_size_pct": POSITION_SIZE_PCT * 100,
+            "position_size_dollars": STARTING_CAPITAL * POSITION_SIZE_PCT,
+            "leveraged_exposure": STARTING_CAPITAL * POSITION_SIZE_PCT * LEVERAGE,
+            "max_loss_per_trade": STARTING_CAPITAL * POSITION_SIZE_PCT * LEVERAGE * 0.015,
+            "kelly_pct": round(k0 * 100, 2),
+            "kelly_dollars": round(STARTING_CAPITAL * k0, 2),
         }
 
     wins = [t for t in trades if t.get("outcome") == "WIN"]
@@ -518,8 +602,22 @@ def calculate_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
     max_dd = 0.0
 
     for t in sorted(trades, key=lambda x: str(x.get("date", ""))):
-        capital += float(t.get("pnl_dollars", 0) or 0)
-        curve.append({"date": t.get("date"), "capital": round(capital, 2)})
+        pnl = t.get("pnl_dollars", 0)
+        try:
+            pnl_f = float(pnl) if pnl is not None else 0.0
+        except (TypeError, ValueError):
+            pnl_f = 0.0
+        if pnl_f != pnl_f:  # NaN
+            pnl_f = 0.0
+        capital += pnl_f
+        curve.append(
+            {
+                "date": t.get("date"),
+                "capital": round(capital, 2),
+                "pnl": round(pnl_f, 2),
+                "outcome": t.get("outcome", "?"),
+            }
+        )
         if capital > peak:
             peak = capital
         if peak > 0:
@@ -550,6 +648,8 @@ def calculate_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
     else:
         pf = 0.0
 
+    kelly_f = calculate_kelly(trades)
+
     return {
         "generated_at": datetime.now().isoformat(),
         "starting_capital": STARTING_CAPITAL,
@@ -564,6 +664,13 @@ def calculate_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
         "avg_loss_dollars": round(sum(loss_pnls) / len(loss_pnls), 2) if loss_pnls else 0.0,
         "profit_factor": round(pf, 2),
         "max_drawdown_pct": round(max_dd, 1),
+        "leverage": LEVERAGE,
+        "position_size_pct": POSITION_SIZE_PCT * 100,
+        "position_size_dollars": STARTING_CAPITAL * POSITION_SIZE_PCT,
+        "leveraged_exposure": STARTING_CAPITAL * POSITION_SIZE_PCT * LEVERAGE,
+        "max_loss_per_trade": STARTING_CAPITAL * POSITION_SIZE_PCT * LEVERAGE * 0.015,
+        "kelly_pct": round(kelly_f * 100, 2),
+        "kelly_dollars": round(STARTING_CAPITAL * kelly_f, 2),
         "best_trade": {
             "ticker": best.get("ticker"),
             "date": best.get("date"),
