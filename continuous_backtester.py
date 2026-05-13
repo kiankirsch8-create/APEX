@@ -262,6 +262,45 @@ def _append_result(row: dict[str, Any]) -> list[dict[str, Any]]:
         return results
 
 
+def validate_rr(plan: dict[str, Any]) -> dict[str, Any]:
+    """Ensure reward at TP1 vs stop risk meets minimum R/R; downgrade to NO TRADE if not."""
+    if not isinstance(plan, dict):
+        return {}
+    direction = str(plan.get("direction", "")).strip().upper()
+    if direction not in ("LONG", "SHORT"):
+        return plan
+
+    try:
+        entry = float(plan.get("entry", 0) or 0)
+        stop = float(plan.get("stop_loss", 0) or 0)
+        tp1 = float(plan.get("tp1", 0) or 0)
+    except (TypeError, ValueError):
+        return plan
+
+    if entry == 0 or stop == 0 or tp1 == 0:
+        return plan
+
+    if direction == "LONG":
+        risk = abs(entry - stop)
+        reward = abs(tp1 - entry)
+    else:
+        risk = abs(stop - entry)
+        reward = abs(entry - tp1)
+
+    if risk == 0:
+        return plan
+
+    rr = reward / risk
+
+    if rr < 1.5:
+        log(f"[Backtest] RR {rr:.2f} too low — rejecting trade", level="info")
+        plan["direction"] = "NO TRADE"
+        plan["skip_reason"] = f"R/R {rr:.2f} below minimum 1.5"
+
+    plan["rr_ratio"] = f"1:{rr:.2f}"
+    return plan
+
+
 def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[str, Any] | None:
     try:
         sym = (ticker or "").strip().upper()
@@ -382,11 +421,26 @@ TRADING RULES:
 - Exotic pairs often trend strongly - trade them
 - Daily timeframe has clearer signals than 1H
 - When in doubt favor the trend direction
-- Stop loss max 1.5% for forex, 3% for stocks
-- TP1 max 2% for forex, 4% for stocks
-- TP2 max 3.5% for forex, 6% for stocks
-- Use ATR for precise stop/TP calculation
-- TP must be on correct side of entry
+
+STRICT RISK/REWARD RULES:
+- Minimum R/R ratio: 1:1.5
+- Preferred R/R ratio: 1:2.0 to 1:2.5
+- Stop loss: 0.5x ATR from entry (tight)
+- TP1: 1.5x ATR from entry (minimum)
+- TP2: 2.5x ATR from entry
+- TP3: 4x ATR from entry (runner)
+
+For forex 4H/Daily:
+Stop loss maximum: 0.8% from entry
+TP1 minimum: 1.2% from entry
+TP2 minimum: 2.0% from entry
+
+NEVER place a stop loss wider than TP1.
+If you cannot find a setup with 1:1.5 R/R
+return NO TRADE instead.
+A bad R/R setup is worse than no trade.
+
+Current timeframe: {timeframe}. Use ATR={atr} with entry price for distances.
 
 Return ONLY valid JSON:
 {{
@@ -397,6 +451,7 @@ Return ONLY valid JSON:
   "stop_loss": 0.0,
   "tp1": 0.0,
   "tp2": 0.0,
+  "tp3": 0.0,
   "rr_ratio": "string",
   "signals_used": ["string"],
   "confluences": ["string"],
@@ -413,9 +468,16 @@ Return ONLY valid JSON:
         )
         raw = _message_text(resp)
         ai = _parse_json_response(raw) or {}
+        if isinstance(ai, dict):
+            ai = validate_rr(ai)
+        else:
+            ai = {}
 
         direction = str(ai.get("direction", "NO TRADE")).strip().upper()
         if direction in ("NO TRADE", "WAIT", ""):
+            rs = str(ai.get("skip_reason", "") or "").strip()
+            base_reason = str(ai.get("reasoning", ""))
+            reasoning = f"{base_reason} [{rs}]" if rs else base_reason
             return {
                 "date": analysis_date,
                 "ticker": sym,
@@ -424,7 +486,9 @@ Return ONLY valid JSON:
                 "direction": "NO TRADE",
                 "skipped": True,
                 "entry_price": price,
-                "reasoning": str(ai.get("reasoning", "")),
+                "skip_reason": rs,
+                "reasoning": reasoning,
+                "rr_ratio": str(ai.get("rr_ratio", "")),
             }
 
         entry = float(ai.get("entry", price) or price)
