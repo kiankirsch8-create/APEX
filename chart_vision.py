@@ -269,12 +269,127 @@ def cap_tp_distance(result: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _safe_float_top(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or v == "":
+            return default
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _prices_from_summary(summary: str) -> list[float]:
+    """Pull plausible price literals from summary (forex 4dp first, then broader)."""
+    if not summary:
+        return []
+    seen: set[float] = set()
+    ordered: list[float] = []
+    for pat in (r"\d+\.\d{4}", r"\d+\.\d{2,6}", r"\d+\.\d+"):
+        for x in re.findall(pat, summary):
+            try:
+                f = float(x)
+            except ValueError:
+                continue
+            if f not in seen:
+                seen.add(f)
+                ordered.append(f)
+        if ordered:
+            break
+    return ordered
+
+
+def fix_entry_fields(result: dict[str, Any]) -> dict[str, Any]:
+    """Backfill entry_aggressive / entry_conservative and risk fields when the model omits them."""
+    if not isinstance(result, dict) or result.get("error"):
+        return result
+    plan_raw = result.get("trade_plan")
+    if not isinstance(plan_raw, dict):
+        result["trade_plan"] = {}
+        return result
+    plan = dict(plan_raw)
+
+    direction_raw = str(plan.get("direction", "")).strip().upper()
+    if direction_raw in ("NO TRADE", "NO_TRADE"):
+        cur = _safe_float_top(result.get("current_price"), 0.0)
+        if cur <= 0:
+            cur = _trade_plan_float(plan, "tp1") or _trade_plan_float(plan, "stop_loss") or 0.0
+        if cur > 0 and (not plan.get("entry_aggressive") or _trade_plan_float(plan, "entry_aggressive") == 0):
+            plan["entry_aggressive"] = round(cur, 6)
+        if cur > 0 and (not plan.get("entry_conservative") or _trade_plan_float(plan, "entry_conservative") == 0):
+            plan["entry_conservative"] = round(cur, 6)
+        result["trade_plan"] = plan
+        return result
+
+    summary = str(result.get("summary") or "")
+    direction = direction_raw if direction_raw in ("LONG", "SHORT") else "LONG"
+
+    current = _safe_float_top(result.get("current_price"), 0.0)
+    if current <= 0:
+        current = _trade_plan_float(plan, "tp1") or _trade_plan_float(plan, "stop_loss") or 0.0
+
+    ea = plan.get("entry_aggressive")
+    try:
+        ea_f = float(ea) if ea is not None and ea != "" else 0.0
+    except (TypeError, ValueError):
+        ea_f = 0.0
+
+    if not ea or ea_f == 0:
+        prices = _prices_from_summary(summary)
+        if prices and current > 0:
+            if direction == "SHORT":
+                above_current = [p for p in prices if p >= current * 0.999]
+                if above_current:
+                    plan["entry_aggressive"] = round(min(above_current), 6)
+                else:
+                    plan["entry_aggressive"] = round(current, 6)
+            else:
+                below_current = [p for p in prices if p <= current * 1.001]
+                if below_current:
+                    plan["entry_aggressive"] = round(max(below_current), 6)
+                else:
+                    plan["entry_aggressive"] = round(current, 6)
+        else:
+            plan["entry_aggressive"] = round(current, 6) if current > 0 else 0.0
+
+    ec = plan.get("entry_conservative")
+    try:
+        ec_f = float(ec) if ec is not None and ec != "" else 0.0
+    except (TypeError, ValueError):
+        ec_f = 0.0
+    if not ec or ec_f == 0:
+        entry = _trade_plan_float(plan, "entry_aggressive") or current
+        if direction == "SHORT":
+            plan["entry_conservative"] = round(entry * 1.005, 5)
+        else:
+            plan["entry_conservative"] = round(entry * 0.995, 5)
+
+    entry = _trade_plan_float(plan, "entry_aggressive")
+    stop = _trade_plan_float(plan, "stop_loss")
+    tp1 = _trade_plan_float(plan, "tp1")
+    direction = str(plan.get("direction", "")).strip().upper()
+
+    if entry > 0 and stop > 0 and tp1 > 0 and direction in ("LONG", "SHORT"):
+        if direction == "SHORT":
+            risk = abs(stop - entry)
+            reward = abs(entry - tp1)
+        else:
+            risk = abs(entry - stop)
+            reward = abs(tp1 - entry)
+        if risk > 0:
+            plan["rr_ratio"] = f"1:{round(reward / risk, 1)}"
+            plan["risk_pct"] = round(risk / entry * 100, 2)
+
+    result["trade_plan"] = plan
+    return result
+
+
 def _finalize_chart_analysis(result: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(result, dict) or result.get("error"):
         return result
     result = validate_trade_plan(result)
     result = enforce_verdict_format(result)
     result = cap_tp_distance(result)
+    result = fix_entry_fields(result)
     return result
 
 
