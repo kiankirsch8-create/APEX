@@ -795,6 +795,23 @@ async def backtest_history() -> dict[str, Any]:
     return backtest_analyzer.get_backtest_history()
 
 
+@app.get("/api/backtest/health")
+async def backtest_health():
+    try:
+        from continuous_backtester import is_enabled
+
+        available = True
+        enabled = is_enabled()
+    except Exception as e:
+        available = False
+        enabled = False
+    return {
+        "available": available,
+        "enabled": enabled,
+        "status": "ok",
+    }
+
+
 @app.get("/api/backtest/stats")
 async def backtest_stats() -> dict[str, Any]:
     """Rolling stats from ``results/backtest_stats.json`` (continuous backtester)."""
@@ -869,6 +886,7 @@ async def root() -> dict:
             "POST /api/backtest/single",
             "POST /api/backtest/series",
             "GET /api/backtest/history",
+            "GET /api/backtest/health",
             "GET /api/backtest/stats",
             "GET /api/backtest/results",
             "GET /api/backtest/state",
