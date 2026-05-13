@@ -1,6 +1,7 @@
 """
 Continuous autonomous backtesting loop: random historical setups, forward outcomes,
-rolling stats, and periodic Claude-driven self-improvement (writes ``learned_weights.json``).
+rolling stats, and periodic self-improvement (versioned ``learned_v*.json`` + ``learned_latest.json``;
+``learned_weights.json`` is merged, not replaced wholesale).
 """
 from __future__ import annotations
 
@@ -26,6 +27,7 @@ CLAUDE_MODEL = "claude-opus-4-5"
 RESULTS_FILE = RESULTS_DIR / "backtest_results.json"
 STATS_FILE = RESULTS_DIR / "backtest_stats.json"
 LEARNED_FILE = RESULTS_DIR / "learned_weights.json"
+LEARNED_LATEST_FILE = RESULTS_DIR / "learned_latest.json"
 STATE_FILE = RESULTS_DIR / "backtest_state.json"
 ENABLED_FILE = RESULTS_DIR / "backtest_enabled.json"
 IMPROVING_FILE = RESULTS_DIR / "improving.json"
@@ -105,6 +107,35 @@ _TF_MAP: dict[str, str] = {
 _backtest_thread: threading.Thread | None = None
 _stop_flag = threading.Event()
 _results_lock = threading.Lock()
+
+
+def _load_learned_for_context() -> dict[str, Any]:
+    """Prefer the newest improvement report; fall back to legacy ``learned_weights.json``."""
+    latest = load_json(LEARNED_LATEST_FILE, default=None)
+    if isinstance(latest, dict) and latest:
+        return latest
+    return load_json(LEARNED_FILE, default={}) or {}
+
+
+def _next_learned_version() -> int:
+    max_v = 0
+    for p in RESULTS_DIR.glob("learned_v*.json"):
+        m = re.match(r"learned_v(\d+)\.json$", p.name, re.IGNORECASE)
+        if m:
+            max_v = max(max_v, int(m.group(1)))
+    return max_v + 1
+
+
+def log_learned_startup_preview() -> None:
+    """Log first 500 chars of the current learned report for Railway / ops visibility."""
+    raw = load_json(LEARNED_LATEST_FILE, default={})
+    if not raw:
+        raw = load_json(LEARNED_FILE, default={})
+    try:
+        snippet = json.dumps(raw, indent=2, default=str)[:500]
+    except (TypeError, ValueError):
+        snippet = str(raw)[:500]
+    log(f"[Learned] Current report: {snippet}", level="info")
 
 
 def _client() -> Anthropic:
@@ -310,7 +341,7 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
         else:
             trend = "RANGING"
 
-        learned = load_json(LEARNED_FILE, default={}) or {}
+        learned = _load_learned_for_context()
         adj = learned.get("signal_adjustments") if isinstance(learned, dict) else {}
         learned_context = ""
         if isinstance(adj, dict) and adj:
@@ -822,9 +853,14 @@ Analyze this data deeply and provide:
 Be specific. Use the actual data.
 These rules will be applied to future analysis.
 
+The field "analysis_summary" is REQUIRED and must be a long narrative:
+at least 3 full paragraphs of prose (minimum 400 characters) explaining
+patterns you see, what failed, what worked, and how rules should evolve.
+Do not use bullet points inside analysis_summary; write flowing paragraphs.
+
 Return as JSON:
 {{
-  "analysis_summary": "string",
+  "analysis_summary": "string (long narrative, >=400 characters)",
   "main_loss_reasons": ["string"],
   "reliable_signals": ["string"],
   "unreliable_signals": ["string"],
@@ -841,7 +877,7 @@ Return as JSON:
         client = _client()
         resp = client.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=2000,
+            max_tokens=4096,
             messages=[{"role": "user", "content": prompt}],
         )
         raw = _message_text(resp)
@@ -849,6 +885,30 @@ Return as JSON:
 
         raw_adj = improvement.get("signal_adjustments", {})
         adj_norm = _normalize_signal_adjustments(raw_adj) if isinstance(raw_adj, dict) else {}
+
+        raw_summary = str(improvement.get("analysis_summary", "") or "").strip()
+        asum = raw_summary
+        if len(asum) < 200:
+            log(
+                f"[Improve] analysis_summary too short or missing ({len(asum)} chars); "
+                "improvement JSON may be truncated or the prompt failed.",
+                level="warning",
+            )
+            prev_latest = load_json(LEARNED_LATEST_FILE, default={}) or {}
+            prev_sum = str(prev_latest.get("analysis_summary", "") or "").strip()
+            if len(prev_sum) >= 200:
+                asum = (
+                    prev_sum
+                    + "\n\n[Note: The latest improvement cycle returned an analysis_summary under "
+                    + "200 characters; the narrative above is carried forward from the prior cycle.]"
+                )
+            else:
+                asum = (
+                    "The improvement cycle did not return a sufficiently detailed analysis_summary "
+                    "(minimum 200 characters). Check Claude responses, max_tokens, and the "
+                    "improvement prompt. Until a valid long narrative is produced, review backtest "
+                    "results and signal_adjustments directly."
+                )
 
         learned: dict[str, Any] = {
             "updated_at": datetime.now().isoformat(),
@@ -862,12 +922,36 @@ Return as JSON:
             "worst_tickers": improvement.get("worst_tickers") if isinstance(improvement.get("worst_tickers"), list) else [],
             "main_loss_reasons": improvement.get("main_loss_reasons") if isinstance(improvement.get("main_loss_reasons"), list) else [],
             "recommendation": str(improvement.get("recommendation", "")),
-            "analysis_summary": str(improvement.get("analysis_summary", "")),
+            "analysis_summary": asum,
+            "analysis_summary_claude_raw": raw_summary,
             "expected_improvement": str(improvement.get("expected_win_rate_improvement", "")),
             "source": "continuous_backtester",
         }
-        save_json(LEARNED_FILE, learned)
-        log(f"[Improve] Self-improvement complete. New rules count: {len(learned.get('new_rules', []))}", level="info")
+        ver = _next_learned_version()
+        learned["improvement_version"] = ver
+        learned["versioned_filename"] = f"learned_v{ver}.json"
+
+        versioned_path = RESULTS_DIR / f"learned_v{ver}.json"
+        save_json(versioned_path, learned)
+        save_json(LEARNED_LATEST_FILE, learned)
+
+        prev_weights = load_json(LEARNED_FILE, default={})
+        if not isinstance(prev_weights, dict):
+            prev_weights = {}
+        merged_weights: dict[str, Any] = {**prev_weights, **learned}
+        hist = prev_weights.get("learned_version_files")
+        if not isinstance(hist, list):
+            hist = []
+        hist.append(f"learned_v{ver}.json")
+        merged_weights["learned_version_files"] = hist
+        merged_weights["learned_latest_file"] = "learned_latest.json"
+        save_json(LEARNED_FILE, merged_weights)
+
+        log(
+            f"[Improve] Self-improvement complete v{ver}. New rules: {len(learned.get('new_rules', []))}. "
+            f"Saved {versioned_path.name}, learned_latest.json, merged learned_weights.json",
+            level="info",
+        )
     except Exception as e:  # noqa: BLE001
         log(f"[Improve] Improvement error: {e}", level="warning")
     finally:
@@ -1021,7 +1105,26 @@ def get_results_slice(limit: int = 50) -> list[dict[str, Any]]:
 
 
 def get_learned() -> dict[str, Any]:
+    """Latest improvement report (``learned_latest.json``), not legacy-only weights."""
+    data = load_json(LEARNED_LATEST_FILE, default=None)
+    if isinstance(data, dict) and data:
+        return data
     return load_json(LEARNED_FILE, default={})
+
+
+def get_learned_history() -> list[dict[str, Any]]:
+    """All versioned improvement cycles, oldest first (``learned_v*.json``)."""
+    rows: list[tuple[int, dict[str, Any]]] = []
+    for p in RESULTS_DIR.glob("learned_v*.json"):
+        m = re.match(r"learned_v(\d+)\.json$", p.name, re.IGNORECASE)
+        if not m:
+            continue
+        v = int(m.group(1))
+        blob = load_json(p, default=None)
+        if isinstance(blob, dict):
+            rows.append((v, blob))
+    rows.sort(key=lambda x: x[0])
+    return [d for _, d in rows]
 
 
 def get_improving_state() -> dict[str, Any]:

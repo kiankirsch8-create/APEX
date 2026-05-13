@@ -66,6 +66,7 @@ app.add_middleware(
 @app.on_event("startup")
 async def on_startup_resume_backtester() -> None:
     try:
+        continuous_backtester.log_learned_startup_preview()
         if continuous_backtester.is_enabled():
             continuous_backtester.start_continuous_backtest()
             log("[Startup] Backtester auto-resumed")
@@ -861,9 +862,15 @@ async def backtest_improve_now() -> dict[str, Any]:
     return continuous_backtester.trigger_improvement_now()
 
 
+@app.get("/api/backtest/learned/history")
+async def backtest_learned_history() -> list[dict[str, Any]]:
+    """All improvement cycles from ``learned_v*.json`` (oldest first)."""
+    return continuous_backtester.get_learned_history()
+
+
 @app.get("/api/backtest/learned")
 async def backtest_learned() -> dict[str, Any]:
-    """Learned weights / rules from the last improvement cycle (``learned_weights.json``)."""
+    """Latest improvement report from ``learned_latest.json`` (falls back to legacy weights file)."""
     return continuous_backtester.get_learned()
 
 
@@ -904,6 +911,7 @@ async def root() -> dict:
             "POST /api/backtest/toggle",
             "POST /api/backtest/improve-now",
             "GET /api/backtest/learned",
+            "GET /api/backtest/learned/history",
             "GET /api/backtest/improving",
             "GET /api/status",
             "POST /api/run",
