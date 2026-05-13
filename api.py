@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, model_validator
 
 import analyzer
+import backtest_analyzer
 import chart_vision
 import portfolio_advisor
 import screener_big_players
@@ -105,6 +106,22 @@ class ChartAnalyzeIn(BaseModel):
         if self.image_base64 and str(self.image_base64).strip():
             return self
         raise ValueError("Provide image_base64 or a non-empty images list")
+
+
+class BacktestSingleIn(BaseModel):
+    ticker: str = Field(..., min_length=1)
+    timeframe: str = Field(default="4h")
+    date: str = Field(..., description="Analysis date YYYY-MM-DD (point-in-time)")
+    forward_candles: int = Field(default=20, ge=1, le=500)
+
+
+class BacktestSeriesIn(BaseModel):
+    ticker: str = Field(..., min_length=1)
+    timeframe: str = Field(default="4h")
+    start_date: str = Field(..., description="YYYY-MM-DD")
+    end_date: str = Field(..., description="YYYY-MM-DD")
+    step_days: int = Field(default=7, ge=1, le=365)
+    forward_candles: int = Field(default=20, ge=1, le=500)
 
 
 PORTFOLIO_PATH = RESULTS_DIR / "portfolio.json"
@@ -654,6 +671,60 @@ async def analyze_chart_endpoint(payload: ChartAnalyzeIn) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Historical backtests (yfinance + pandas-ta + Claude; results persisted)
+# ---------------------------------------------------------------------------
+@app.post("/api/backtest/single")
+async def backtest_single(body: BacktestSingleIn) -> dict[str, Any]:
+    """Point-in-time analysis vs next ``forward_candles`` bars; appends to ``results/backtest_history.json``."""
+    if not env("ANTHROPIC_API_KEY"):
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY is not configured.")
+    try:
+        return await asyncio.to_thread(
+            backtest_analyzer.analyze_at_date,
+            body.ticker.strip(),
+            body.timeframe.strip(),
+            body.date.strip(),
+            body.forward_candles,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+
+@app.post("/api/backtest/series")
+async def backtest_series(body: BacktestSeriesIn) -> dict[str, Any]:
+    """
+    Grid of backtests from ``start_date`` to ``end_date`` (one Claude call per step).
+
+    **Warning:** wide date ranges can take many minutes and many API calls (e.g. tens of minutes).
+    Each successful date is appended to ``results/backtest_history.json``.
+    """
+    if not env("ANTHROPIC_API_KEY"):
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY is not configured.")
+    try:
+        return await asyncio.to_thread(
+            backtest_analyzer.run_backtest_series,
+            body.ticker.strip(),
+            body.timeframe.strip(),
+            body.start_date.strip(),
+            body.end_date.strip(),
+            body.step_days,
+            body.forward_candles,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+
+@app.get("/api/backtest/history")
+async def backtest_history() -> dict[str, Any]:
+    """All entries saved in ``results/backtest_history.json`` (singles + series runs)."""
+    return backtest_analyzer.get_backtest_history()
+
+
+# ---------------------------------------------------------------------------
 @app.get("/")
 async def root() -> dict:
     return {
@@ -671,6 +742,9 @@ async def root() -> dict:
             "POST /api/portfolio/add",
             "DELETE /api/portfolio/remove/{ticker}",
             "POST /api/analyze-chart",
+            "POST /api/backtest/single",
+            "POST /api/backtest/series",
+            "GET /api/backtest/history",
             "GET /api/status",
             "POST /api/run",
             "GET|POST /api/run-scan",

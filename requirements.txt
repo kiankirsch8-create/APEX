@@ -10,3 +10,5 @@ pydantic>=2.9.0
 pytz>=2024.2
 yfinance>=0.2.50
 pandas>=2.2.0
+numpy>=1.26.0
+pandas-ta>=0.3.14b
