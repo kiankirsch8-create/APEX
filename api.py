@@ -19,11 +19,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, model_validator
 
 import analyzer
-<<<<<<< HEAD
 import backtest_analyzer
-=======
 import chart_analyzer_v2
->>>>>>> cursor/chart-analyzer-v2-a506
 import chart_vision
 import continuous_backtester
 import portfolio_advisor
@@ -129,7 +126,6 @@ class ChartAnalyzeIn(BaseModel):
         raise ValueError("Provide image_base64 or a non-empty images list")
 
 
-<<<<<<< HEAD
 class BacktestSingleIn(BaseModel):
     ticker: str = Field(..., min_length=1)
     timeframe: str = Field(default="4h")
@@ -150,12 +146,12 @@ class BacktestContinuousToggleIn(BaseModel):
     """Enable or disable the daemon continuous backtest loop."""
 
     enabled: bool
-=======
+
+
 class AnalyzeDataIn(BaseModel):
     ticker: str = Field(..., min_length=1)
     timeframe: str = Field(default="4h", description="1h, 4h, 1d, 1w, etc.")
     years: int = Field(default=2, ge=1, le=30, description="History span (capped per yfinance interval)")
->>>>>>> cursor/chart-analyzer-v2-a506
 
 
 PORTFOLIO_PATH = RESULTS_DIR / "portfolio.json"
@@ -705,34 +701,18 @@ async def analyze_chart_endpoint(payload: ChartAnalyzeIn) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-<<<<<<< HEAD
-# Historical backtests (yfinance + pandas-ta + Claude; results persisted)
-# ---------------------------------------------------------------------------
-@app.post("/api/backtest/single")
-async def backtest_single(body: BacktestSingleIn) -> dict[str, Any]:
-    """Point-in-time analysis vs next ``forward_candles`` bars; appends to ``results/backtest_history.json``."""
-=======
 # Data-driven chart / SMC analysis (yfinance + pandas-ta, no image)
 # ---------------------------------------------------------------------------
 @app.post("/api/analyze-data")
 async def analyze_data_post(body: AnalyzeDataIn) -> dict[str, Any]:
->>>>>>> cursor/chart-analyzer-v2-a506
     if not env("ANTHROPIC_API_KEY"):
         raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY is not configured.")
     try:
         return await asyncio.to_thread(
-<<<<<<< HEAD
-            backtest_analyzer.analyze_at_date,
-            body.ticker.strip(),
-            body.timeframe.strip(),
-            body.date.strip(),
-            body.forward_candles,
-=======
             chart_analyzer_v2.analyze_ticker_full,
             body.ticker.strip(),
             body.timeframe.strip(),
             body.years,
->>>>>>> cursor/chart-analyzer-v2-a506
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -740,7 +720,49 @@ async def analyze_data_post(body: AnalyzeDataIn) -> dict[str, Any]:
         raise HTTPException(status_code=503, detail=str(e)) from e
 
 
-<<<<<<< HEAD
+@app.get("/api/analyze-data/{ticker}")
+async def analyze_data_get(
+    ticker: str,
+    timeframe: str = Query("4h", description="1h, 4h, 1d, 1w, etc."),
+    years: int = Query(2, ge=1, le=30),
+) -> dict[str, Any]:
+    if not env("ANTHROPIC_API_KEY"):
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY is not configured.")
+    try:
+        return await asyncio.to_thread(
+            chart_analyzer_v2.analyze_ticker_full,
+            ticker.strip(),
+            timeframe.strip(),
+            years,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+
+# ---------------------------------------------------------------------------
+# Historical backtests (yfinance + pandas-ta + Claude; results persisted)
+# ---------------------------------------------------------------------------
+@app.post("/api/backtest/single")
+async def backtest_single(body: BacktestSingleIn) -> dict[str, Any]:
+    """Point-in-time analysis vs next ``forward_candles`` bars; appends to ``results/backtest_history.json``."""
+    if not env("ANTHROPIC_API_KEY"):
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY is not configured.")
+    try:
+        return await asyncio.to_thread(
+            backtest_analyzer.analyze_at_date,
+            body.ticker.strip(),
+            body.timeframe.strip(),
+            body.date.strip(),
+            body.forward_candles,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+
 @app.post("/api/backtest/series")
 async def backtest_series(body: BacktestSeriesIn) -> dict[str, Any]:
     """
@@ -749,19 +771,10 @@ async def backtest_series(body: BacktestSeriesIn) -> dict[str, Any]:
     **Warning:** wide date ranges can take many minutes and many API calls (e.g. tens of minutes).
     Each successful date is appended to ``results/backtest_history.json``.
     """
-=======
-@app.get("/api/analyze-data/{ticker}")
-async def analyze_data_get(
-    ticker: str,
-    timeframe: str = Query("4h", description="1h, 4h, 1d, 1w, etc."),
-    years: int = Query(2, ge=1, le=30),
-) -> dict[str, Any]:
->>>>>>> cursor/chart-analyzer-v2-a506
     if not env("ANTHROPIC_API_KEY"):
         raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY is not configured.")
     try:
         return await asyncio.to_thread(
-<<<<<<< HEAD
             backtest_analyzer.run_backtest_series,
             body.ticker.strip(),
             body.timeframe.strip(),
@@ -769,12 +782,6 @@ async def analyze_data_get(
             body.end_date.strip(),
             body.step_days,
             body.forward_candles,
-=======
-            chart_analyzer_v2.analyze_ticker_full,
-            ticker.strip(),
-            timeframe.strip(),
-            years,
->>>>>>> cursor/chart-analyzer-v2-a506
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -782,7 +789,6 @@ async def analyze_data_get(
         raise HTTPException(status_code=503, detail=str(e)) from e
 
 
-<<<<<<< HEAD
 @app.get("/api/backtest/history")
 async def backtest_history() -> dict[str, Any]:
     """All entries saved in ``results/backtest_history.json`` (singles + series runs)."""
@@ -840,8 +846,6 @@ async def backtest_improving() -> dict[str, Any]:
     return continuous_backtester.get_improving_state()
 
 
-=======
->>>>>>> cursor/chart-analyzer-v2-a506
 # ---------------------------------------------------------------------------
 @app.get("/")
 async def root() -> dict:
@@ -860,7 +864,8 @@ async def root() -> dict:
             "POST /api/portfolio/add",
             "DELETE /api/portfolio/remove/{ticker}",
             "POST /api/analyze-chart",
-<<<<<<< HEAD
+            "POST /api/analyze-data",
+            "GET /api/analyze-data/{ticker}",
             "POST /api/backtest/single",
             "POST /api/backtest/series",
             "GET /api/backtest/history",
@@ -872,10 +877,6 @@ async def root() -> dict:
             "POST /api/backtest/improve-now",
             "GET /api/backtest/learned",
             "GET /api/backtest/improving",
-=======
-            "POST /api/analyze-data",
-            "GET /api/analyze-data/{ticker}",
->>>>>>> cursor/chart-analyzer-v2-a506
             "GET /api/status",
             "POST /api/run",
             "GET|POST /api/run-scan",
