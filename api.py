@@ -864,12 +864,18 @@ async def backtest_improve_now() -> dict[str, Any]:
         if not isinstance(results, list):
             results = []
         trades = [r for r in results if isinstance(r, dict) and not r.get("skipped")]
+        completed = [
+            r
+            for r in results
+            if isinstance(r, dict) and not r.get("skipped") and r.get("outcome") in ("WIN", "LOSS")
+        ]
         log(
-            f"[improve-now] snapshot_rows={len(results)} non_skipped_trades={len(trades)}",
+            f"[improve-now] snapshot_rows={len(results)} non_skipped={len(trades)} "
+            f"completed_win_loss={len(completed)}",
             level="info",
         )
-        if len(trades) < continuous_backtester.MIN_IMPROVE_TRADES:
-            return {"error": f"Need {continuous_backtester.MIN_IMPROVE_TRADES}+ trades, have {len(trades)}"}
+        if len(completed) < 10:
+            return {"error": f"Need 10+ completed WIN/LOSS trades, have {len(completed)}"}
 
         learned = await asyncio.to_thread(
             lambda: continuous_backtester.run_improvement_cycle(list(results)),

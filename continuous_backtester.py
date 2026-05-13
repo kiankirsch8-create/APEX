@@ -16,7 +16,6 @@ import traceback
 from datetime import datetime, timedelta
 from typing import Any
 
-import anthropic
 import pandas as pd
 import yfinance as yf
 from anthropic import Anthropic
@@ -35,7 +34,6 @@ STATE_FILE = RESULTS_DIR / "backtest_state.json"
 ENABLED_FILE = RESULTS_DIR / "backtest_enabled.json"
 IMPROVING_FILE = RESULTS_DIR / "improving.json"
 IMPROVE_DEBUG_FILE = RESULTS_DIR / "improve_debug.json"
-MIN_IMPROVE_TRADES = 10
 
 STARTING_CAPITAL = 10000.0
 POSITION_SIZE_PCT = 0.05  # 5% of capital
@@ -748,92 +746,76 @@ def _normalize_signal_adjustments(raw: dict[str, Any]) -> dict[str, str]:
     return out
 
 
-def run_improvement_cycle(results_snapshot: list[dict[str, Any]]) -> dict[str, Any] | None:
-    snap = results_snapshot if isinstance(results_snapshot, list) else []
-    trades = [r for r in snap if r and not r.get("skipped")]
-    n_snap = len(snap)
-    skipped_n = len([r for r in snap if isinstance(r, dict) and r.get("skipped")])
+def run_improvement_cycle(trades: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Self-improvement over backtest rows (full snapshot list). Filters to completed WIN/LOSS rows."""
+    snap = trades if isinstance(trades, list) else []
+    log(f"[Improve] Starting with {len(snap)} snapshot rows", level="info")
 
-    log(f"[Improve] Starting with {len(trades)} trades", level="info")
-    log(
-        f"[Improve] Non-skipped trades: {len([t for t in trades if not t.get('skipped')])} "
-        f"(snapshot_rows={n_snap}, skipped_in_snapshot={skipped_n})",
-        level="info",
-    )
+    completed = [
+        t
+        for t in snap
+        if isinstance(t, dict) and not t.get("skipped") and t.get("outcome") in ("WIN", "LOSS")
+    ]
+    log(f"[Improve] Completed trades: {len(completed)}", level="info")
 
-    if len(trades) < MIN_IMPROVE_TRADES:
-        log("[Improve] Not enough trades", level="info")
+    if len(completed) < 10:
+        log("[Improve] Not enough completed trades", level="info")
         return None
 
-    log(f"[Improve] Analyzing {len(trades)} trades...", level="info")
-    save_json(IMPROVING_FILE, {"running": True, "started_at": datetime.now().isoformat(), "trades_analyzed": len(trades)})
+    save_json(
+        IMPROVING_FILE,
+        {
+            "running": True,
+            "started_at": datetime.now().isoformat(),
+            "trades_analyzed": len(completed),
+        },
+    )
 
-    sig_stats: dict[str, dict[str, Any]] = {}
-    for t in trades:
+    sig_stats: dict[str, dict[str, float]] = {}
+    for t in completed:
         for s in t.get("signals_used") or []:
             if not isinstance(s, str):
                 continue
             if s not in sig_stats:
-                sig_stats[s] = {"wins": 0, "losses": 0, "total_pnl": 0.0}
+                sig_stats[s] = {"wins": 0.0, "losses": 0.0, "pnl": 0.0}
             if t.get("outcome") == "WIN":
                 sig_stats[s]["wins"] += 1
             else:
                 sig_stats[s]["losses"] += 1
-            sig_stats[s]["total_pnl"] += float(t.get("pnl_dollars", 0) or 0)
+            sig_stats[s]["pnl"] += float(t.get("pnl_dollars", 0) or 0)
 
     sig_win_rates: dict[str, Any] = {}
     for s, st in sig_stats.items():
-        total = int(st["wins"]) + int(st["losses"])
-        if total >= 3:
-            wr = int(st["wins"]) / total
+        total = int(st["wins"] + st["losses"])
+        if total >= 2:
+            wr = round(st["wins"] / total * 100, 1)
             sig_win_rates[s] = {
-                "win_rate": round(wr * 100, 1),
+                "win_rate": wr,
                 "total": total,
-                "pnl": round(float(st["total_pnl"]), 2),
+                "pnl": round(float(st["pnl"]), 2),
                 "adjustment": (
-                    "INCREASE_WEIGHT" if wr > 0.65 else "DECREASE_WEIGHT" if wr < 0.40 else "KEEP_WEIGHT"
+                    "INCREASE_WEIGHT" if wr > 60 else "DECREASE_WEIGHT" if wr < 40 else "KEEP_WEIGHT"
                 ),
             }
 
-    top_signals = dict(
+    top8 = dict(
         sorted(
             sig_win_rates.items(),
             key=lambda x: int(x[1].get("total", 0)) if isinstance(x[1], dict) else 0,
             reverse=True,
-        )[:10]
+        )[:8]
     )
 
-    loss_patterns: list[dict[str, Any]] = []
-    for t in trades:
-        if t.get("outcome") == "LOSS":
-            loss_patterns.append(
-                {
-                    "ticker": t.get("ticker"),
-                    "date": t.get("date"),
-                    "signals": t.get("signals_used", []),
-                    "conflicts": t.get("conflicts", []),
-                    "reasoning": str(t.get("reasoning", ""))[:200],
-                }
-            )
-
-    win_patterns: list[dict[str, Any]] = []
-    for t in trades:
-        if t.get("outcome") == "WIN":
-            win_patterns.append(
-                {
-                    "ticker": t.get("ticker"),
-                    "date": t.get("date"),
-                    "signals": t.get("signals_used", []),
-                    "pnl": t.get("pnl_dollars", 0),
-                }
-            )
-
-    loss_sample = loss_patterns[-3:]
-    win_sample = win_patterns[-3:]
+    wins = [t for t in completed if t.get("outcome") == "WIN"]
+    losses = [t for t in completed if t.get("outcome") == "LOSS"]
+    win_rate = round(len(wins) / len(completed) * 100, 1) if completed else 0.0
+    total_pnl = sum(float(t.get("pnl_dollars", 0) or 0) for t in completed)
 
     ticker_perf: dict[str, dict[str, Any]] = {}
-    for t in trades:
-        tk = str(t.get("ticker", ""))
+    for t in completed:
+        tk = str(t.get("ticker", "") or "")
+        if not tk:
+            continue
         if tk not in ticker_perf:
             ticker_perf[tk] = {"wins": 0, "losses": 0, "pnl": 0.0}
         if t.get("outcome") == "WIN":
@@ -842,189 +824,172 @@ def run_improvement_cycle(results_snapshot: list[dict[str, Any]]) -> dict[str, A
             ticker_perf[tk]["losses"] += 1
         ticker_perf[tk]["pnl"] += float(t.get("pnl_dollars", 0) or 0)
 
-    n_wins = len([t for t in trades if t.get("outcome") == "WIN"])
-    wr = round(n_wins / len(trades) * 100, 1) if trades else 0.0
+    loss_details: list[dict[str, Any]] = []
+    for t in losses[-5:]:
+        loss_details.append(
+            {
+                "ticker": t.get("ticker"),
+                "date": t.get("date"),
+                "signals": (t.get("signals_used") or [])[:5],
+                "pnl": t.get("pnl_dollars", 0),
+                "reasoning": str(t.get("reasoning", ""))[:150],
+            }
+        )
 
-    prompt = f"""
-You are the APEX trading AI analyzing your own
-backtesting results to improve your accuracy.
+    win_details: list[dict[str, Any]] = []
+    for t in wins[-5:]:
+        win_details.append(
+            {
+                "ticker": t.get("ticker"),
+                "date": t.get("date"),
+                "signals": (t.get("signals_used") or [])[:5],
+                "pnl": t.get("pnl_dollars", 0),
+            }
+        )
 
-OVERALL STATS:
-Total trades: {len(trades)}
-Wins: {n_wins}
-Losses: {len(trades) - n_wins}
-Win rate: {wr}%
+    prompt = f"""You are the APEX trading AI.
+Analyze your own backtesting results and write
+a detailed improvement report.
 
-TOP SIGNAL WIN RATES (by trade count, top 10):
-{json.dumps(top_signals, indent=2, default=str)}
+PERFORMANCE:
+Total trades: {len(completed)}
+Wins: {len(wins)} | Losses: {len(losses)}
+Win rate: {win_rate}%
+Total P&L: ${total_pnl:.2f}
+
+TOP SIGNALS BY VOLUME:
+{json.dumps(top8, indent=2, default=str)}
 
 TICKER PERFORMANCE:
 {json.dumps(ticker_perf, indent=2, default=str)}
 
-SAMPLE LOSS PATTERNS (last 3):
-{json.dumps(loss_sample, indent=2, default=str)}
+RECENT LOSSES:
+{json.dumps(loss_details, indent=2, default=str)}
 
-SAMPLE WIN PATTERNS (last 3):
-{json.dumps(win_sample, indent=2, default=str)}
+RECENT WINS:
+{json.dumps(win_details, indent=2, default=str)}
 
-Analyze this data deeply and provide:
+Write a comprehensive trading system review.
+Be specific with numbers. Reference actual signal names.
 
-1. What are the main reasons for losses?
-2. What signals are most reliable (keep/increase)?
-3. What signals cause false signals (decrease/remove)?
-4. Which tickers work best with this approach?
-5. What specific rules should be added to
-   improve win rate above 60%?
-6. Write 3-5 specific new rules for the system.
-
-Be specific. Use the actual data.
-These rules will be applied to future analysis.
-
-The field "analysis_summary" is REQUIRED and must be a long narrative:
-at least 3 full paragraphs of prose (minimum 400 characters) explaining
-patterns you see, what failed, what worked, and how rules should evolve.
-Do not use bullet points inside analysis_summary; write flowing paragraphs.
-
-Return as JSON:
+Return ONLY this exact JSON structure, nothing else:
 {{
-  "analysis_summary": "string (long narrative, >=400 characters)",
-  "main_loss_reasons": ["string"],
-  "reliable_signals": ["string"],
-  "unreliable_signals": ["string"],
-  "best_tickers": ["string"],
-  "worst_tickers": ["string"],
-  "new_rules": ["string"],
-  "expected_win_rate_improvement": "string",
-  "signal_adjustments": {{"signal_name": "INCREASE|DECREASE|REMOVE"}},
-  "recommendation": "string"
-}}
-"""
+  "analysis_summary": "Write 2-3 detailed paragraphs analyzing what patterns separate wins from losses. Reference specific signal names and percentages from the data above. Be analytical and specific.",
+  "new_rules": [
+    "RULE_1_NAME: Specific actionable rule with numbers",
+    "RULE_2_NAME: Specific actionable rule with numbers",
+    "RULE_3_NAME: Specific actionable rule with numbers",
+    "RULE_4_NAME: Specific actionable rule with numbers",
+    "RULE_5_NAME: Specific actionable rule with numbers"
+  ],
+  "reliable_signals": [
+    "Signal Name - X% win rate, $Y PnL - reason why reliable"
+  ],
+  "unreliable_signals": [
+    "Signal Name - X% win rate, $Y PnL (REMOVE/REDUCE) - reason"
+  ],
+  "main_loss_reasons": [
+    "Specific reason 1 with numbers",
+    "Specific reason 2 with numbers",
+    "Specific reason 3 with numbers"
+  ],
+  "recommendation": "The single most important change to make right now based on the data.",
+  "expected_improvement": "From {win_rate}% to approximately X% because of specific reasons",
+  "signal_adjustments": {{"SIGNAL_NAME": "INCREASE|DECREASE|REMOVE"}}
+}}"""
+
+    log("[Improve] Calling Claude claude-opus-4-5...", level="info")
+    log(f"[Improve] Prompt length: {len(prompt)} chars", level="info")
 
     raw = ""
     try:
         client = _client()
-        log(f"[Improve] Calling Claude with {len(trades)} trades data...", level="info")
-
         resp = client.messages.create(
             model="claude-opus-4-5",
             max_tokens=3000,
             messages=[{"role": "user", "content": prompt}],
         )
-
         if resp.content and getattr(resp.content[0], "text", None) is not None:
             raw = str(resp.content[0].text)
         else:
             raw = _message_text(resp)
 
-        log(f"[Improve] Claude returned {len(raw)} chars", level="info")
-        log(f"[Improve] First 500 chars: {raw[:500]!r}", level="info")
+        log(f"[Improve] Got response: {len(raw)} chars", level="info")
+        log(f"[Improve] Preview: {raw[:300]!r}", level="info")
 
         clean = re.sub(r"```json|```", "", raw, flags=re.IGNORECASE).strip()
-
         start = clean.find("{")
         end = clean.rfind("}") + 1
 
         if start == -1 or end == 0:
-            log("[Improve] No JSON found in response!", level="warning")
+            log("[Improve] No JSON in response!", level="warning")
             log(f"[Improve] Full response (truncated for log): {raw[:4000]!r}", level="warning")
-            save_json(IMPROVE_DEBUG_FILE, {"raw": raw, "error": "no json"})
+            save_json(IMPROVE_DEBUG_FILE, {"raw": raw, "error": "no json found"})
             return None
 
-        json_str = clean[start:end]
-        log(f"[Improve] Parsing JSON of {len(json_str)} chars", level="info")
-
-        improvement = json.loads(json_str)
-
-        if not isinstance(improvement, dict):
-            log(f"[Improve] Parsed JSON is not an object: {type(improvement).__name__}", level="warning")
-            save_json(IMPROVE_DEBUG_FILE, {"raw": raw, "error": "not a dict", "parsed": improvement})
+        result = json.loads(clean[start:end])
+        if not isinstance(result, dict):
+            log(f"[Improve] Parsed JSON is not an object: {type(result).__name__}", level="warning")
+            save_json(IMPROVE_DEBUG_FILE, {"raw": raw, "error": "not a dict", "parsed": result})
             return None
 
-        log("[Improve] Parsed successfully", level="info")
-        log(f"[Improve] Keys: {list(improvement.keys())}", level="info")
-        log(
-            f"[Improve] analysis_summary length: {len(str(improvement.get('analysis_summary', '') or ''))}",
-            level="info",
-        )
-        log(f"[Improve] new_rules count: {len(improvement.get('new_rules', []) or [])}", level="info")
-        log(f"[Improve] reliable_signals count: {len(improvement.get('reliable_signals', []) or [])}", level="info")
+        log("[Improve] Parsed JSON successfully", level="info")
+        log(f"[Improve] Summary: {len(str(result.get('analysis_summary', '') or ''))} chars", level="info")
+        log(f"[Improve] Rules: {len(result.get('new_rules', []) or [])}", level="info")
 
-        if not improvement.get("analysis_summary"):
-            log("[Improve] WARNING: analysis_summary empty", level="warning")
-        if not improvement.get("new_rules"):
-            log("[Improve] WARNING: new_rules empty", level="warning")
-
-        raw_adj = improvement.get("signal_adjustments", {})
+        raw_adj = result.get("signal_adjustments", {})
         adj_norm = _normalize_signal_adjustments(raw_adj) if isinstance(raw_adj, dict) else {}
 
-        exp_imp = str(
-            improvement.get("expected_improvement", "")
-            or improvement.get("expected_win_rate_improvement", "")
-            or ""
-        )
-
-        nr = improvement.get("new_rules")
+        nr = result.get("new_rules")
         if not isinstance(nr, list):
             nr = []
 
         learned: dict[str, Any] = {
             "updated_at": datetime.now().isoformat(),
-            "total_trades_analyzed": len(trades),
-            "analysis_summary": str(improvement.get("analysis_summary", "") or ""),
+            "total_trades_analyzed": len(completed),
+            "analysis_summary": str(result.get("analysis_summary", "") or ""),
             "new_rules": nr,
-            "reliable_signals": improvement.get("reliable_signals", [])
-            if isinstance(improvement.get("reliable_signals"), list)
+            "reliable_signals": result.get("reliable_signals", [])
+            if isinstance(result.get("reliable_signals"), list)
             else [],
-            "unreliable_signals": improvement.get("unreliable_signals", [])
-            if isinstance(improvement.get("unreliable_signals"), list)
+            "unreliable_signals": result.get("unreliable_signals", [])
+            if isinstance(result.get("unreliable_signals"), list)
             else [],
-            "main_loss_reasons": improvement.get("main_loss_reasons", [])
-            if isinstance(improvement.get("main_loss_reasons"), list)
+            "main_loss_reasons": result.get("main_loss_reasons", [])
+            if isinstance(result.get("main_loss_reasons"), list)
             else [],
-            "recommendation": str(improvement.get("recommendation", "") or ""),
-            "expected_improvement": exp_imp,
-            "signal_adjustments": adj_norm,
+            "recommendation": str(result.get("recommendation", "") or ""),
+            "expected_improvement": str(result.get("expected_improvement", "") or ""),
             "signal_win_rates": sig_win_rates,
+            "signal_adjustments": adj_norm,
             "source": "continuous_backtester",
         }
 
         if LEARNED_FILE.exists():
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_path = RESULTS_DIR / f"learned_{timestamp}.json"
-            shutil.copy(LEARNED_FILE, backup_path)
-            log(f"[Improve] Backed up prior learned_weights to {backup_path.name}", level="info")
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            shutil.copy(LEARNED_FILE, RESULTS_DIR / f"learned_{ts}.json")
 
         save_json(LEARNED_FILE, learned)
         save_json(LEARNED_LATEST_FILE, learned)
-
         ver = _next_learned_version()
-        versioned = {**learned, "improvement_version": ver, "versioned_filename": f"learned_v{ver}.json"}
-        save_json(RESULTS_DIR / f"learned_v{ver}.json", versioned)
-
-        log(
-            f"[Improve] Saved. Summary length: {len(learned['analysis_summary'])} "
-            f"(learned_weights.json, learned_latest.json, {versioned['versioned_filename']})",
-            level="info",
+        save_json(
+            RESULTS_DIR / f"learned_v{ver}.json",
+            {**learned, "improvement_version": ver, "versioned_filename": f"learned_v{ver}.json"},
         )
+
+        log("[Improve] Saved to learned_weights.json (and learned_latest, learned_v snapshot)", level="info")
+        log(f"[Improve] New rules count: {len(learned['new_rules'])}", level="info")
         return learned
 
     except json.JSONDecodeError as e:
-        log(f"[Improve] JSON parse error: {e}", level="error")
-        log(f"[Improve] Raw text: {raw[:1000]!r}", level="error")
+        log(f"[Improve] JSON error: {e}", level="error")
         save_json(IMPROVE_DEBUG_FILE, {"raw": raw, "error": str(e)})
         return None
-
-    except anthropic.APIError as e:
-        log(f"[Improve] Anthropic API error: {e}", level="error")
-        save_json(IMPROVE_DEBUG_FILE, {"raw": raw, "error": f"anthropic.APIError: {e}"})
-        return None
-
     except Exception as e:  # noqa: BLE001
-        log(f"[Improve] Unexpected error: {e}", level="error")
-        log(f"[Improve] Traceback: {traceback.format_exc()}", level="error")
+        log(f"[Improve] Error: {e}", level="error")
+        log(f"[Improve] {traceback.format_exc()}", level="error")
         save_json(IMPROVE_DEBUG_FILE, {"raw": raw, "error": str(e), "traceback": traceback.format_exc()})
         return None
-
     finally:
         save_json(
             IMPROVING_FILE,
@@ -1157,9 +1122,13 @@ def trigger_improvement_now() -> dict[str, Any]:
     if is_improving():
         return {"started": False, "error": "Improvement already running"}
     results = _load_results_list()
-    trades = [r for r in results if r and not r.get("skipped")]
-    if len(trades) < MIN_IMPROVE_TRADES:
-        return {"started": False, "error": f"Need {MIN_IMPROVE_TRADES}+ completed trades first"}
+    completed = [
+        r
+        for r in results
+        if r and not r.get("skipped") and r.get("outcome") in ("WIN", "LOSS")
+    ]
+    if len(completed) < 10:
+        return {"started": False, "error": "Need 10+ completed WIN/LOSS trades first"}
     threading.Thread(target=run_improvement_cycle, args=(list(results),), daemon=True).start()
     return {"started": True}
 
