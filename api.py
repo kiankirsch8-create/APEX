@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -20,13 +21,28 @@ from pydantic import BaseModel, Field, model_validator
 import analyzer
 import backtest_analyzer
 import chart_vision
+import continuous_backtester
 import portfolio_advisor
 import screener_big_players
 import screener_small_caps
 from market_data import YFClient
 from scorer import calculate, enforce_portfolio_cap
 from scheduler import run_daily_apex
-from utils import CONFIG_DIR, RESULTS_DIR, env, load_json, save_json, today_str, utcnow_iso
+from utils import CONFIG_DIR, RESULTS_DIR, env, load_json, log, save_json, today_str, utcnow_iso
+
+# ---------------------------------------------------------------------------
+# Lifespan — resume continuous backtester when enabled; graceful thread stop.
+# ---------------------------------------------------------------------------
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    if continuous_backtester.is_enabled():
+        continuous_backtester.start_continuous_backtest()
+        log("[Startup] Continuous backtest loop resumed (backtest_enabled.json)")
+    yield
+    continuous_backtester.shutdown_continuous_backtest()
+
 
 app = FastAPI(
     title="APEX Stock Discovery Engine",
@@ -36,6 +52,7 @@ app = FastAPI(
         "highest-probability explosive opportunities every morning across "
         "speculative small caps and undervalued mega caps."
     ),
+    lifespan=_lifespan,
 )
 
 app.add_middleware(
@@ -122,6 +139,12 @@ class BacktestSeriesIn(BaseModel):
     end_date: str = Field(..., description="YYYY-MM-DD")
     step_days: int = Field(default=7, ge=1, le=365)
     forward_candles: int = Field(default=20, ge=1, le=500)
+
+
+class BacktestContinuousToggleIn(BaseModel):
+    """Enable or disable the daemon continuous backtest loop."""
+
+    enabled: bool
 
 
 PORTFOLIO_PATH = RESULTS_DIR / "portfolio.json"
@@ -724,6 +747,57 @@ async def backtest_history() -> dict[str, Any]:
     return backtest_analyzer.get_backtest_history()
 
 
+@app.get("/api/backtest/stats")
+async def backtest_stats() -> dict[str, Any]:
+    """Rolling stats from ``results/backtest_stats.json`` (continuous backtester)."""
+    return continuous_backtester.get_stats()
+
+
+@app.get("/api/backtest/results")
+async def backtest_results(limit: int = Query(50, ge=1, le=5000)) -> dict[str, Any]:
+    """Last ``limit`` rows from ``results/backtest_results.json``."""
+    return {"limit": limit, "results": continuous_backtester.get_results_slice(limit)}
+
+
+@app.get("/api/backtest/state")
+async def backtest_state() -> dict[str, Any]:
+    """Daemon state: current ticker/date, status, counters (``backtest_state.json``)."""
+    return continuous_backtester.get_state()
+
+
+@app.get("/api/backtest/enabled")
+async def backtest_enabled() -> dict[str, Any]:
+    return {"enabled": continuous_backtester.is_enabled()}
+
+
+@app.post("/api/backtest/toggle")
+async def backtest_toggle(body: BacktestContinuousToggleIn) -> dict[str, Any]:
+    """Turn the autonomous continuous backtest loop on or off."""
+    if body.enabled:
+        started = continuous_backtester.start_continuous_backtest()
+        return {"enabled": True, "started": started}
+    continuous_backtester.stop_continuous_backtest()
+    return {"enabled": False, "stopped": True}
+
+
+@app.post("/api/backtest/improve-now")
+async def backtest_improve_now() -> dict[str, Any]:
+    """Kick off a self-improvement Claude pass over accumulated results (background thread)."""
+    return continuous_backtester.trigger_improvement_now()
+
+
+@app.get("/api/backtest/learned")
+async def backtest_learned() -> dict[str, Any]:
+    """Learned weights / rules from the last improvement cycle (``learned_weights.json``)."""
+    return continuous_backtester.get_learned()
+
+
+@app.get("/api/backtest/improving")
+async def backtest_improving() -> dict[str, Any]:
+    """Whether an improvement job is currently running (``improving.json``)."""
+    return continuous_backtester.get_improving_state()
+
+
 # ---------------------------------------------------------------------------
 @app.get("/")
 async def root() -> dict:
@@ -745,6 +819,14 @@ async def root() -> dict:
             "POST /api/backtest/single",
             "POST /api/backtest/series",
             "GET /api/backtest/history",
+            "GET /api/backtest/stats",
+            "GET /api/backtest/results",
+            "GET /api/backtest/state",
+            "GET /api/backtest/enabled",
+            "POST /api/backtest/toggle",
+            "POST /api/backtest/improve-now",
+            "GET /api/backtest/learned",
+            "GET /api/backtest/improving",
             "GET /api/status",
             "POST /api/run",
             "GET|POST /api/run-scan",
