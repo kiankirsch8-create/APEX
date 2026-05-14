@@ -39,7 +39,7 @@ POSITION_SIZE_PCT = 0.05  # 5% of capital
 LEVERAGE = 50  # 50x on notional exposure
 IMPROVE_EVERY = 100
 
-# --- Hard filters: CHF + pegged (see ``apply_hard_filters``) ---
+# --- Hard filters: CHF crosses only (see ``run_one_backtest`` early return) ---
 CHF_PAIRS = [
     "GBPCHF",
     "AUDCHF",
@@ -49,9 +49,7 @@ CHF_PAIRS = [
     "CADCHF",
 ]
 
-PEGGED_PAIRS = ["USDHKD", "EURDKK", "CHFDKK"]
-
-HARD_EXCLUDED_TICKERS = list(CHF_PAIRS) + list(PEGGED_PAIRS)
+HARD_EXCLUDED_TICKERS = list(CHF_PAIRS)
 
 BANNED_SIGNALS: list[str] = []
 
@@ -183,6 +181,27 @@ def reset_learned_rules() -> None:
     }
     save_json(LEARNED_FILE, default_learned)
     log("[Reset] Learned rules reset to defaults", level="info")
+
+
+def reset_backtest_stats_files() -> None:
+    """Clear continuous backtest results, rolling stats JSON, and learned weights (atomic writes)."""
+    save_json(RESULTS_FILE, [])
+    empty_stats: dict[str, Any] = {
+        "generated_at": datetime.now().isoformat(),
+        "total_trades": 0,
+        "win_rate_pct": 0,
+        "total_pnl_dollars": 0,
+        "final_capital": STARTING_CAPITAL,
+        "starting_capital": STARTING_CAPITAL,
+        "winning_trades": 0,
+        "losing_trades": 0,
+        "capital_curve": [],
+        "signal_performance": {},
+        "timeframe_performance": {},
+    }
+    save_json(STATS_FILE, empty_stats)
+    reset_learned_rules()
+    log("[Reset] Backtest results, stats, and learned rules cleared", level="info")
 
 
 def _client() -> Anthropic:
@@ -390,57 +409,8 @@ def get_ohlcv(
     return past, future
 
 
-def apply_hard_filters(
-    ticker: str,
-    indicators: dict[str, Any],  # noqa: ARG001
-    timeframe: str,  # noqa: ARG001
-) -> dict[str, Any]:
-    """CHF and pegged pairs only — everything else is Claude's call."""
-    sym = (ticker or "").strip().upper()
-    if sym in CHF_PAIRS:
-        return {"pass": False, "reason": "CHF excluded - 0% historical"}
-    if sym in PEGGED_PAIRS:
-        return {"pass": False, "reason": "Pegged currency - no movement"}
-    return {"pass": True, "reason": None}
-
-
 def validate_rr(plan: dict[str, Any]) -> dict[str, Any]:
-    """Compute R/R; only reject extreme cases (reward/risk < 0.8)."""
-    if not isinstance(plan, dict):
-        return {}
-    direction = str(plan.get("direction", "")).strip().upper()
-    if direction not in ("LONG", "SHORT"):
-        return plan
-
-    try:
-        entry_raw = plan.get("entry_aggressive", plan.get("entry", 0))
-        entry = float(entry_raw or 0)
-        stop = float(plan.get("stop_loss", 0) or 0)
-        tp1 = float(plan.get("tp1", 0) or 0)
-    except (TypeError, ValueError):
-        return plan
-
-    if entry == 0 or stop == 0 or tp1 == 0:
-        return plan
-
-    if direction == "LONG":
-        risk = abs(entry - stop)
-        reward = abs(tp1 - entry)
-    else:
-        risk = abs(stop - entry)
-        reward = abs(entry - tp1)
-
-    if risk == 0:
-        return plan
-
-    rr = reward / risk
-    plan["rr_ratio"] = f"1:{rr:.2f}"
-
-    if rr < 0.8:
-        log(f"[RR] {rr:.2f} extremely poor - skipping", level="warning")
-        plan["direction"] = "NO TRADE"
-        plan["skip_reason"] = f"R/R {rr:.2f} below 0.8"
-
+    """R/R validation disabled — every non-CHF analysis must produce a trade."""
     return plan
 
 
@@ -543,9 +513,8 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
         ind["swing_highs"] = swing_highs[-5:]
         ind["swing_lows"] = swing_lows[-5:]
 
-        filters = apply_hard_filters(sym, {}, tf_key)
-        if not filters.get("pass", True):
-            log(f"[Backtest] FILTERED: {sym} — {filters.get('reason')}", level="info")
+        if sym in CHF_PAIRS:
+            log(f"[Backtest] FILTERED: {sym} — CHF excluded", level="info")
             return {
                 "date": analysis_date,
                 "ticker": sym,
@@ -553,8 +522,8 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
                 "verdict": "FILTERED",
                 "direction": "NO TRADE",
                 "skipped": True,
-                "skip_reason": str(filters.get("reason") or ""),
-                "reasoning": str(filters.get("reason") or ""),
+                "skip_reason": "CHF excluded",
+                "reasoning": "CHF excluded",
                 "entry_price": price,
             }
 
@@ -565,8 +534,9 @@ You are APEX — an autonomous trading system
 learning through experience.
 
 Your PRIMARY PURPOSE right now is to ALWAYS
-make a trading decision. Never return NO TRADE
-unless the asset has zero price movement (pegged).
+make a trading decision. The system only skips
+CHF crosses; for every other asset you must output
+LONG or SHORT.
 
 You MUST take a position on every single asset
 you analyze. This is how you learn.
@@ -677,8 +647,7 @@ Every trade — win or loss — is data.
 Losses teach you just as much as wins.
 
 ABSOLUTE RULES:
-1. ALWAYS take LONG or SHORT. Never NO TRADE.
-   Exception: HKD pegged pairs (USDHKD) = NO TRADE
+1. ALWAYS output LONG or SHORT in JSON. Never NO TRADE.
 2. Stop loss MUST be placed at a logical level
 3. Minimum R/R of 1.2 — adjust levels to achieve
 4. State your reasoning clearly
@@ -695,7 +664,7 @@ SIGNAL PRIORITY (use in order):
 Return ONLY valid JSON:
 {{
   "verdict": "STRONG BUY|BUY|SELL|STRONG SELL",
-  "direction": "LONG|SHORT",
+  "direction": "LONG or SHORT only - never NO TRADE",
   "confidence": "HIGH|MEDIUM|LOW",
   "htf_bias": "BULLISH|BEARISH|NEUTRAL",
   "market_structure": "UPTREND|DOWNTREND|RANGING",
@@ -713,8 +682,11 @@ Return ONLY valid JSON:
   "reasoning": "string"
 }}
 
-REMINDER: direction must be LONG or SHORT.
-Never NO TRADE. Make the call.
+MANDATORY: direction field must be LONG or SHORT.
+If you return anything else the system will
+override you with a forced decision.
+Make the best decision you can with available data.
+There is no wrong answer - just make a call.
 """
 
         client = _client()
@@ -724,44 +696,69 @@ Never NO TRADE. Make the call.
             messages=[{"role": "user", "content": prompt}],
         )
         raw = _message_text(resp)
-        ai = _parse_json_response(raw) or {}
-        if isinstance(ai, dict):
-            ai = validate_rr(ai)
-        else:
-            ai = {}
+        parsed = _parse_json_response(raw)
+        ai: dict[str, Any] = parsed if isinstance(parsed, dict) else {}
 
-        direction = str(ai.get("direction", "NO TRADE")).strip().upper()
-        if direction in ("NO TRADE", "WAIT", ""):
-            log(
-                f"[Backtest] WARNING: NO_TRADE/WAIT/empty direction for {sym} {timeframe} "
-                f"{analysis_date} — saving as skipped (excluded from executed-trade stats)",
-                level="warning",
-            )
-            rs = str(ai.get("skip_reason", "") or "").strip()
-            ntr = ai.get("no_trade_reason")
-            if not rs and ntr is not None and str(ntr).strip():
-                rs = str(ntr).strip()
-            base_reason = str(ai.get("reasoning", ""))
-            reasoning = f"{base_reason} [{rs}]" if rs else base_reason
-            return {
-                "date": analysis_date,
-                "ticker": sym,
-                "timeframe": timeframe,
-                "verdict": ai.get("verdict", "WAIT"),
-                "direction": "NO TRADE",
-                "skipped": True,
-                "entry_price": price,
-                "skip_reason": rs,
-                "reasoning": reasoning,
-                "rr_ratio": str(ai.get("rr_ratio", "")),
-                "htf_bias": str(ai.get("htf_bias") or ""),
-                "market_structure": str(ai.get("market_structure") or ""),
-                "price_zone": str(ai.get("price_zone") or ""),
-                "smc_concept": str(ai.get("smc_concept") or ""),
-                "no_trade_reason": ntr if ntr is not None else None,
-            }
+        direction_raw = str(ai.get("direction", "")).strip().upper()
+        if direction_raw not in ("LONG", "SHORT"):
+            ema200 = float(ind.get("ema200", price) or price)
+            if float(price) > ema200:
+                direction_raw = "LONG"
+                ai["direction"] = "LONG"
+                ai["verdict"] = "BUY"
+            else:
+                direction_raw = "SHORT"
+                ai["direction"] = "SHORT"
+                ai["verdict"] = "SELL"
+            ai["confidence"] = "LOW"
+            prev_r = str(ai.get("reasoning", "") or "")
+            forced_note = " [FORCED: system requires trade on every analysis]"
+            ai["reasoning"] = prev_r + forced_note if forced_note not in prev_r else prev_r
+            log(f"[Loop] FORCED trade direction: {direction_raw}", level="info")
+
+        direction = str(ai.get("direction", direction_raw)).strip().upper()
+        if direction not in ("LONG", "SHORT"):
+            direction = direction_raw
+        ai["direction"] = direction
 
         entry = float(ai.get("entry", price) or price)
+        atr = float(ind.get("atr") or 0) or (abs(float(price)) * 0.01)
+
+        def _nz(x: Any) -> float:
+            try:
+                v = float(x or 0)
+                return v if math.isfinite(v) else 0.0
+            except (TypeError, ValueError):
+                return 0.0
+
+        if _nz(ai.get("stop_loss")) == 0:
+            if direction == "LONG":
+                ai["stop_loss"] = round(entry - (atr * 1.0), 5)
+            else:
+                ai["stop_loss"] = round(entry + (atr * 1.0), 5)
+
+        if _nz(ai.get("tp1")) == 0:
+            if direction == "LONG":
+                ai["tp1"] = round(entry + (atr * 1.5), 5)
+                ai["tp2"] = round(entry + (atr * 2.5), 5)
+            else:
+                ai["tp1"] = round(entry - (atr * 1.5), 5)
+                ai["tp2"] = round(entry - (atr * 2.5), 5)
+        elif _nz(ai.get("tp2")) == 0:
+            if direction == "LONG":
+                ai["tp2"] = round(entry + (atr * 2.5), 5)
+            else:
+                ai["tp2"] = round(entry - (atr * 2.5), 5)
+
+        if _nz(ai.get("tp3")) == 0:
+            if direction == "LONG":
+                ai["tp3"] = round(entry + (atr * 4.0), 5)
+            else:
+                ai["tp3"] = round(entry - (atr * 4.0), 5)
+
+        if not str(ai.get("rr_ratio", "")).strip():
+            ai["rr_ratio"] = "1:1.50"
+
         stop = float(ai.get("stop_loss", 0) or 0)
         tp1 = float(ai.get("tp1", 0) or 0)
         tp2 = float(ai.get("tp2", 0) or 0)
@@ -779,8 +776,9 @@ Never NO TRADE. Make the call.
         c_tp2: int | None = None
         c_stop: int | None = None
 
+        is_short = direction == "SHORT"
         for i, (h, l) in enumerate(zip(highs, lows)):
-            if direction == "LONG":
+            if not is_short:
                 if not hit_tp1 and tp1 > 0 and h >= tp1:
                     hit_tp1 = True
                     c_tp1 = i + 1
@@ -790,7 +788,7 @@ Never NO TRADE. Make the call.
                 if not hit_stop and stop > 0 and l <= stop:
                     hit_stop = True
                     c_stop = i + 1
-            elif direction == "SHORT":
+            else:
                 if not hit_tp1 and tp1 > 0 and l <= tp1:
                     hit_tp1 = True
                     c_tp1 = i + 1
@@ -800,21 +798,6 @@ Never NO TRADE. Make the call.
                 if not hit_stop and stop > 0 and h >= stop:
                     hit_stop = True
                     c_stop = i + 1
-            else:
-                return {
-                    "date": analysis_date,
-                    "ticker": sym,
-                    "timeframe": timeframe,
-                    "verdict": ai.get("verdict", "WAIT"),
-                    "direction": direction,
-                    "skipped": True,
-                    "entry_price": price,
-                    "reasoning": "Unknown direction from model",
-                    "htf_bias": str(ai.get("htf_bias") or ""),
-                    "market_structure": str(ai.get("market_structure") or ""),
-                    "price_zone": str(ai.get("price_zone") or ""),
-                    "smc_concept": str(ai.get("smc_concept") or ""),
-                }
 
         if entry == 0:
             entry = price

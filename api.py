@@ -930,6 +930,17 @@ async def backtest_reset_learned() -> dict[str, Any]:
     return {"reset": True, "message": "Learned rules cleared"}
 
 
+@app.post("/api/backtest/reset-stats")
+async def backtest_reset_stats() -> dict[str, Any]:
+    """Clear continuous backtest results, stats JSON, and learned weights on ``DATA_DIR``."""
+    try:
+        continuous_backtester.reset_backtest_stats_files()
+        return {"reset": True, "message": "All stats cleared"}
+    except Exception as e:  # noqa: BLE001
+        log(f"[API] reset-stats error: {e}", level="warning")
+        return {"reset": False, "error": str(e)}
+
+
 @app.get("/api/backtest/improve-debug")
 async def backtest_improve_debug() -> dict[str, Any]:
     """Last improvement parse/API failure payload from ``improve_debug.json``."""
@@ -1000,6 +1011,7 @@ async def root() -> dict:
             "POST /api/backtest/toggle",
             "POST /api/backtest/improve-now",
             "POST /api/backtest/reset-learned",
+            "POST /api/backtest/reset-stats",
             "GET /api/backtest/improve-debug",
             "GET /api/backtest/learned",
             "GET /api/backtest/learned/history",
