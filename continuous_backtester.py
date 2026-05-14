@@ -414,6 +414,45 @@ def validate_rr(plan: dict[str, Any]) -> dict[str, Any]:
     return plan
 
 
+def calculate_position_size(confidence: str, zone_pct: float, account_balance: float) -> dict[str, Any]:
+    """Dollar risk budget from declared confidence and zone (equilibrium halves risk)."""
+    c = (confidence or "MEDIUM").strip().upper()
+    risk_pct = {"HIGH": 0.02, "MEDIUM": 0.01, "LOW": 0.005}.get(c, 0.01)
+    if 40 <= zone_pct <= 60:
+        risk_pct *= 0.5
+    max_risk_dollars = float(account_balance) * risk_pct
+    return {"max_risk_dollars": round(max_risk_dollars, 2), "risk_pct": risk_pct}
+
+
+def validate_stop_loss(entry: float, stop: float, direction: str, timeframe: str) -> float:
+    """Cap stop distance from entry by timeframe (max % move against position)."""
+    MAX_STOP_PCT = {"1h": 0.008, "4h": 0.015, "1d": 0.025, "1w": 0.040}
+    tf = timeframe.lower().strip()
+    max_pct = MAX_STOP_PCT.get(tf, 0.015)
+    try:
+        e = float(entry)
+        s = float(stop)
+    except (TypeError, ValueError):
+        return round(float(stop or 0), 5)
+    if not math.isfinite(e) or e <= 0 or not math.isfinite(s):
+        return round(s, 5) if math.isfinite(s) else round(e * 0.99, 5)
+    max_distance = abs(e) * max_pct
+    d = str(direction or "").strip().upper()
+    if d == "LONG":
+        if s >= e:
+            return round(e - max_distance, 5)
+        min_stop = e - max_distance
+        if s < min_stop:
+            return round(min_stop, 5)
+    else:
+        if s <= e:
+            return round(e + max_distance, 5)
+        max_stop = e + max_distance
+        if s > max_stop:
+            return round(max_stop, 5)
+    return round(s, 5)
+
+
 def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[str, Any] | None:
     try:
         sym = (ticker or "").strip().upper()
@@ -529,40 +568,51 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
 
         tf_desc = TF_DESCRIPTIONS.get(tf_key, tf_key)
 
-        hi52 = float(ind.get("high_52w") or price * 1.1)
-        lo52 = float(ind.get("low_52w") or price * 0.9)
-        if not math.isfinite(hi52):
-            hi52 = float(price) * 1.1
-        if not math.isfinite(lo52):
-            lo52 = float(price) * 0.9
-        if hi52 > lo52:
-            zone_pct = round((float(price) - lo52) / (hi52 - lo52) * 100, 1)
-        else:
-            zone_pct = 50.0
-        zone_label = "PREMIUM" if zone_pct > 60 else ("DISCOUNT" if zone_pct < 40 else "EQUILIBRIUM")
+        high_52w = float(ind.get("high_52w") or price * 1.1)
+        low_52w = float(ind.get("low_52w") or price * 0.9)
+        if not math.isfinite(high_52w):
+            high_52w = float(price) * 1.1
+        if not math.isfinite(low_52w):
+            low_52w = float(price) * 0.9
+        zone_pct = (
+            round((float(price) - low_52w) / (high_52w - low_52w) * 100, 1)
+            if high_52w > low_52w
+            else 50.0
+        )
+        zone_label = (
+            "EXTREME DISCOUNT" if zone_pct < 20 else
+            "DISCOUNT" if zone_pct < 40 else
+            "EQUILIBRIUM" if zone_pct < 60 else
+            "PREMIUM" if zone_pct < 80 else
+            "EXTREME PREMIUM"
+        )
 
         sh = json.dumps(ind.get("swing_highs") or [])
         sl = json.dumps(ind.get("swing_lows") or [])
 
         prompt = f"""
-You are APEX — an autonomous trading system
-learning through backtested experience.
+You are APEX — an autonomous trading AI that
+learns through experience across thousands of trades.
 
-You MUST take either LONG or SHORT on every
-analysis. Never return NO TRADE.
+You analyze markets using institutional concepts,
+smart money principles, and price action.
+You ALWAYS take a position — LONG or SHORT.
+Every trade teaches you something valuable.
 
-ASSET: {sym}
-TIMEFRAME: {tf_desc}
-DATE: {analysis_date}
-PRICE: {price}
+═══════════════════════════════════════
+ASSET INFORMATION
+═══════════════════════════════════════
+Asset: {sym}
+Timeframe: {tf_desc}
+Date: {analysis_date}
+Current Price: {price}
 
-Price Zone: {zone_label} ({zone_pct}% of 52w range)
-52w Range: {lo52:.5f} to {hi52:.5f}
-
-INDICATORS:
+═══════════════════════════════════════
+MARKET DATA
+═══════════════════════════════════════
 RSI(14): {ind["rsi"]:.2f}
-MACD Histogram: {ind["macd_hist"]:.5f}
-MACD Line: {ind.get("macd_line", 0):.5f}
+MACD Histogram: {ind["macd_hist"]:.6f}
+MACD Line: {ind.get("macd_line", 0):.6f}
 EMA20: {ind["ema20"]:.5f}
 EMA50: {ind["ema50"]:.5f}
 EMA200: {ind["ema200"]:.5f}
@@ -571,174 +621,264 @@ ADX(14): {ind["adx"]:.2f}
 BB Upper: {ind["bb_upper"]:.5f}
 BB Middle: {ind.get("bb_mid", 0):.5f}
 BB Lower: {ind["bb_lower"]:.5f}
-52w High: {ind.get("high_52w", 0):.5f}
-52w Low: {ind.get("low_52w", 0):.5f}
-Swing Highs (recent): {sh}
-Swing Lows (recent): {sl}
+52w High: {high_52w:.5f}
+52w Low: {low_52w:.5f}
 
-STEP 1 — DETERMINE PREMIUM OR DISCOUNT:
-This is the MOST IMPORTANT step.
-Calculate the current range position:
+═══════════════════════════════════════
+ZONE ANALYSIS (pre-calculated)
+═══════════════════════════════════════
+Zone Position: {zone_pct}% of 52-week range
+Zone Label: {zone_label}
+Zone Interpretation:
+- EXTREME DISCOUNT (0-20%): Strong institutional buying zone
+- DISCOUNT (20-40%): Prefer longs
+- EQUILIBRIUM (40-60%): Reduced edge, use other signals
+- PREMIUM (60-80%): Prefer shorts
+- EXTREME PREMIUM (80-100%): Strong institutional selling zone
 
-Range = 52w High - 52w Low
-Current position = (Price - 52w Low) / Range
+Recent Swing Highs: {sh}
+Recent Swing Lows: {sl}
 
-Above 50% = PREMIUM zone (prefer shorts)
-Below 50% = DISCOUNT zone (prefer longs)
+═══════════════════════════════════════
+YOUR ANALYSIS FRAMEWORK
+═══════════════════════════════════════
 
-RULE: Only short in PREMIUM zone
-      Only long in DISCOUNT zone
-      This single rule prevents most losses
+STEP 1 — ZONE DETERMINES DIRECTION BIAS:
 
-EXCEPTION: If ADX is above 35 AND trend is
-extremely strong, you may trade with trend
-even against the zone. But note this clearly.
+EXTREME DISCOUNT (0-20%):
+→ Strong LONG bias
+→ Institutions accumulate here
+→ Mean reversion longs are high probability
+→ Only short if ALL other signals strongly disagree
 
-STEP 2 — DETERMINE HTF BIAS:
-Price vs EMA200:
-Above EMA200 = BULLISH bias
-Below EMA200 = BEARISH bias
+DISCOUNT (20-40%):
+→ Prefer LONG
+→ Go short only if trend is strongly down AND
+  zone_pct is approaching 40 not 20
 
-This sets your preferred direction.
-Trade WITH this bias whenever possible.
+EQUILIBRIUM (40-60%):
+→ Reduced edge from zone alone
+→ Must rely on trend, momentum, SMC concepts
+→ Follow the majority of other signals
+→ Smaller position size appropriate
 
-STEP 3 — SMART MONEY ANALYSIS:
-Look for these in order of importance:
+PREMIUM (60-80%):
+→ Prefer SHORT
+→ Go long only if trend is strongly up AND
+  zone_pct is approaching 60 not 80
 
-LIQUIDITY SWEEP (highest priority):
-Did price just spike above recent swing highs
-then reverse? = bearish liquidity sweep = SHORT
-Did price just spike below recent swing lows
-then reverse? = bullish liquidity sweep = LONG
-Use swing_highs and swing_lows to identify
+EXTREME PREMIUM (80-100%):
+→ Strong SHORT bias
+→ Institutions distribute here
+→ Mean reversion shorts are high probability
+→ Only long if ALL other signals strongly disagree
 
-ORDER BLOCK (high priority):
-Last bearish candle before a strong bullish move
-= bullish order block, enter LONG when price returns
-Last bullish candle before a strong bearish move
-= bearish order block, enter SHORT when returns
-Identify using swing_highs and swing_lows patterns
+STEP 2 — SMART MONEY CONCEPTS:
+Look for these and note if found:
 
-PREMIUM/DISCOUNT + OB COMBINATION:
-Bullish OB in discount zone = HIGHEST quality long
-Bearish OB in premium zone = HIGHEST quality short
-This combination wins most consistently
+LIQUIDITY SWEEP (highest value signal):
+Check swing_highs and swing_lows.
+If price recently spiked ABOVE a swing high
+then pulled back below it = BEARISH sweep
+Institutions grabbed buy-stops then reversed.
+This is a SHORT signal.
 
-STEP 4 — SIGNAL CONFLUENCE:
-Count your confirming signals:
+If price recently spiked BELOW a swing low
+then recovered above it = BULLISH sweep
+Institutions grabbed sell-stops then reversed.
+This is a LONG signal.
 
-FOR LONGS (in discount zone):
-+2: Liquidity sweep below recent lows then reversal
-+2: Bullish order block present
-+1: Price above EMA200 (bullish HTF bias)
-+1: EMA20 above EMA50 (short term bullish)
-+1: RSI between 30-50 bouncing up (not overbought)
-+1: MACD histogram turning positive
-+1: ADX above 25 (trend has strength)
-+1: Price near BB lower (statistical support)
+A liquidity sweep in the correct zone
+(premium sweep = short, discount sweep = long)
+is the HIGHEST quality setup available.
 
-FOR SHORTS (in premium zone):
-+2: Liquidity sweep above recent highs then reversal
-+2: Bearish order block present
-+1: Price below EMA200 (bearish HTF bias)
-+1: EMA20 below EMA50 (short term bearish)
-+1: RSI between 50-70 turning down (not oversold)
-+1: MACD histogram turning negative
-+1: ADX above 25 (trend has strength)
-+1: Price near BB upper (statistical resistance)
+ORDER BLOCKS:
+The last bearish candle before a strong
+bullish impulse move = bullish order block
+Price returning to this zone = LONG entry
 
-MINIMUM 3 points to trade with HIGH confidence
-MINIMUM 2 points to trade with MEDIUM confidence
-1 point = LOW confidence but still trade
+The last bullish candle before a strong
+bearish impulse move = bearish order block
+Price returning to this zone = SHORT entry
 
-STEP 5 — CRITICAL AVOIDANCE RULES:
-These cause most losses - avoid them:
+FAIR VALUE GAP:
+Three-candle pattern where middle candle
+creates a gap that price returns to fill.
+Use swing_highs/lows to identify imbalances.
+Entry at the FVG in direction of trend.
 
-NEVER short when RSI is below 35
-(oversold = likely bounce not continuation)
+INSTITUTIONAL POSITIONING CLUES:
+- Strong moves away from round numbers = institutional
+- Price respecting EMA200 exactly = algo-driven
+- Multiple equal highs/lows = liquidity pool
+- V-shaped recoveries = institutional accumulation
 
-NEVER long when RSI is above 65
-(overbought = likely pullback not continuation)
+STEP 3 — ADDITIONAL CONFLUENCE:
+After zone and SMC, add these confirmations:
 
-NEVER short in discount zone without
-a liquidity sweep confirmation
-(discount zone = institutional buying area)
+HTF TREND (EMA200):
+Above EMA200 = bullish institutional positioning
+Below EMA200 = bearish institutional positioning
+Aligns with zone = stronger signal
+Conflicts with zone = weaker signal but zone wins
 
-NEVER long in premium zone without
-a liquidity sweep confirmation
-(premium zone = institutional selling area)
+MOMENTUM (RSI + MACD):
+RSI 30-50 in DISCOUNT = bounce long setup
+RSI 50-70 in PREMIUM = pullback short setup
+RSI below 30 anywhere = oversold, consider long
+RSI above 70 anywhere = overbought, consider short
+MACD histogram direction = short term momentum
 
-NEVER trade with ADX below 15
-(no trend = random movement)
+TREND STRENGTH (ADX):
+ADX above 30 = strong trend, follow it
+ADX 20-30 = moderate trend, use zone for direction
+ADX below 20 = weak/no trend, zone is primary guide
+ADX below 15 = ranging market, be cautious
 
-If RSI is below 35 and price is in discount:
-ALWAYS go LONG (bounce trade)
+EMA STACK:
+EMA20 > EMA50 > EMA200 = strong uptrend
+EMA20 < EMA50 < EMA200 = strong downtrend
+Mixed = transitioning, use zone + RSI
 
-If RSI is above 65 and price is in premium:
-ALWAYS go SHORT (pullback trade)
+STEP 4 — MAKE YOUR DECISION:
 
-STEP 6 — STOP LOSS PLACEMENT:
+Combine everything using this priority:
+1. Zone (highest weight)
+2. SMC concept present (very high weight)
+3. HTF bias EMA200 (medium weight)
+4. RSI extreme reading (medium weight)
+5. ADX + MACD momentum (lower weight)
+
+TIEBREAKER when signals split 50/50:
+→ Use zone label as final decision
+→ If equilibrium zone: use EMA200 direction
+
+CONFIDENCE ASSESSMENT:
+HIGH: Zone + SMC concept + HTF bias all agree
+MEDIUM: Zone + at least 2 other signals agree
+LOW: Only zone or only momentum, mixed signals
+
+STEP 5 — STOP LOSS PLACEMENT:
+This is where the trade succeeds or fails.
+Place stop at a LOGICAL market level:
+
 FOR LONGS:
-Place stop below the most recent swing low
-Minimum 1x ATR below entry
-Never place stop below 52w low
+Place stop BELOW the nearest swing low
+from swing_lows list that is below entry
+Add 0.5x ATR buffer below that level
+This is where you are proven wrong
 
 FOR SHORTS:
-Place stop above the most recent swing high
-Minimum 1x ATR above entry
-Never place stop above 52w high
+Place stop ABOVE the nearest swing high
+from swing_highs list that is above entry
+Add 0.5x ATR buffer above that level
+This is where you are proven wrong
 
-STEP 7 — TAKE PROFIT TARGETS:
-TP1 = 1.5x your risk (distance from entry to stop)
-TP2 = 2.5x your risk
-TP3 = 4x your risk (let this run)
+IMPORTANT STOP RULES:
+Maximum stop distance by timeframe:
+1H: 0.8% from entry
+4H: 1.5% from entry
+1D: 2.5% from entry
+1W: 4.0% from entry
 
-For longs: TPs go UP from entry
-For shorts: TPs go DOWN from entry
-Double-check direction is correct.
+If logical stop is beyond maximum:
+Use maximum stop distance instead.
+Lower your confidence level.
 
-STEP 8 — MAKE YOUR DECISION:
-Even with mixed signals you MUST choose.
-Use this decision tree:
+STEP 6 — TAKE PROFIT LEVELS:
+Always set three targets:
+TP1 = 1.5x your stop distance (from entry)
+TP2 = 2.5x your stop distance
+TP3 = 4.0x your stop distance (runner)
 
-1. What zone is price in? (Premium/Discount)
-2. Was there a recent liquidity sweep?
-3. What does EMA200 say?
-4. Count your confluence points
-5. Place stop at nearest swing point
-6. Set targets at 1.5R, 2.5R, 4R
-7. State your confidence level
+Check TP1 doesn't land inside a major
+support/resistance level.
+If it does, adjust to just before that level.
 
-ALWAYS TRADE. If genuinely no direction:
-Use EMA200 as tiebreaker (above = LONG, below = SHORT)
+STEP 7 — CONFIDENCE-BASED SIZING GUIDANCE:
+This guides the system's position sizing.
+Be honest about confidence level:
 
-MANDATORY: direction must be LONG or SHORT.
-If you return NO TRADE system overrides you.
+HIGH confidence setups:
+- Extreme zone (below 20% or above 80%)
+- Plus SMC concept (sweep or OB)
+- Plus HTF bias aligned
+→ Full risk allocation
 
-Python reference (from OHLC window — align your JSON):
-zone_position_pct ≈ {zone_pct}, price_zone ≈ {zone_label}
+MEDIUM confidence setups:
+- Clear zone (below 40% or above 60%)
+- Plus 2 other signals aligned
+→ Standard risk allocation
 
-Return ONLY valid JSON:
+LOW confidence setups:
+- Equilibrium zone
+- Or conflicting signals
+- Or no SMC concept
+→ Reduced risk allocation
+
+═══════════════════════════════════════
+ABSOLUTE RULES — NON NEGOTIABLE
+═══════════════════════════════════════
+1. direction MUST be LONG or SHORT
+   Never return NO TRADE
+
+2. Stop loss MUST be at logical swing level
+   Not just ATR from entry
+
+3. TP1 must give minimum 1.2R
+   If impossible with logical stop:
+   tighten stop not TP
+
+4. Never short when RSI below 30
+   (too oversold, bounce risk)
+   EXCEPTION: RSI below 30 + extreme premium
+   = still short but note the risk
+
+5. Never long when RSI above 70
+   (too overbought, pullback risk)
+   EXCEPTION: RSI above 70 + extreme discount
+   = still long but note the risk
+
+6. Always state your zone_position_pct number
+   This helps the system track zone accuracy
+
+═══════════════════════════════════════
+LEARNING CONTEXT
+═══════════════════════════════════════
+You are building experience through repetition.
+Each trade — win or loss — teaches the system:
+- Which zones produce the best results
+- Which SMC concepts improve win rate
+- Which pairs trend most reliably
+- Which timeframes give cleanest setups
+
+Do not fear losses. They are data points.
+Make your best decision with available information.
+Be decisive and clear in your reasoning.
+
+═══════════════════════════════════════
+RETURN VALID JSON ONLY
+═══════════════════════════════════════
 {{
   "verdict": "STRONG BUY|BUY|SELL|STRONG SELL",
   "direction": "LONG|SHORT",
   "confidence": "HIGH|MEDIUM|LOW",
-  "price_zone": "PREMIUM|DISCOUNT|EQUILIBRIUM",
   "zone_position_pct": {zone_pct},
-  "htf_bias": "BULLISH|BEARISH",
-  "smc_concept": "LIQUIDITY_SWEEP|ORDER_BLOCK|PREMIUM_DISCOUNT|NONE",
-  "confluence_points": 0,
+  "zone_label": "{zone_label}",
+  "htf_bias": "BULLISH|BEARISH|NEUTRAL",
+  "smc_concept": "LIQUIDITY_SWEEP|ORDER_BLOCK|FVG|INSTITUTIONAL|NONE",
   "entry": {price},
   "stop_loss": 0.0,
   "tp1": 0.0,
   "tp2": 0.0,
   "tp3": 0.0,
-  "rr_ratio": "1:1.50",
-  "signals_used": ["string"],
-  "confluences": ["string"],
-  "conflicts": ["string"],
-  "reasoning": "string",
-  "zone_reasoning": "string"
+  "rr_ratio": "1:X.XX",
+  "signals_used": ["list of signals found"],
+  "confluences": ["list of confirming factors"],
+  "conflicts": ["list of opposing signals"],
+  "reasoning": "detailed explanation of decision",
+  "zone_reasoning": "why zone supports this direction",
+  "smc_reasoning": "what SMC concept found or why none"
 }}
 """
 
@@ -774,8 +914,17 @@ Return ONLY valid JSON:
             direction = direction_raw
         ai["direction"] = direction
 
+        confidence = str(ai.get("confidence", "MEDIUM")).strip().upper()
+        if confidence not in ("HIGH", "MEDIUM", "LOW"):
+            confidence = "MEDIUM"
+        ai["confidence"] = confidence
+
+        current_capital = STARTING_CAPITAL
+
         entry = float(ai.get("entry", price) or price)
-        atr = float(ind.get("atr") or 0) or (abs(float(price)) * 0.01)
+        if not math.isfinite(entry) or entry <= 0:
+            entry = float(price)
+        atr = float(ind.get("atr") or 0) or (abs(float(entry)) * 0.01)
 
         def _nz(x: Any) -> float:
             try:
@@ -790,32 +939,72 @@ Return ONLY valid JSON:
             else:
                 ai["stop_loss"] = round(entry + (atr * 1.0), 5)
 
-        if _nz(ai.get("tp1")) == 0:
-            if direction == "LONG":
-                ai["tp1"] = round(entry + (atr * 1.5), 5)
-                ai["tp2"] = round(entry + (atr * 2.5), 5)
-            else:
-                ai["tp1"] = round(entry - (atr * 1.5), 5)
-                ai["tp2"] = round(entry - (atr * 2.5), 5)
-        elif _nz(ai.get("tp2")) == 0:
-            if direction == "LONG":
-                ai["tp2"] = round(entry + (atr * 2.5), 5)
-            else:
-                ai["tp2"] = round(entry - (atr * 2.5), 5)
+        stop = validate_stop_loss(entry, _nz(ai.get("stop_loss")), direction, tf_key)
+        ai["stop_loss"] = stop
 
-        if _nz(ai.get("tp3")) == 0:
-            if direction == "LONG":
-                ai["tp3"] = round(entry + (atr * 4.0), 5)
-            else:
-                ai["tp3"] = round(entry - (atr * 4.0), 5)
+        if direction == "LONG":
+            risk = entry - stop
+            if risk <= 0:
+                stop = validate_stop_loss(
+                    entry, round(entry - max(atr * 1.0, entry * 0.001), 5), direction, tf_key
+                )
+                ai["stop_loss"] = stop
+                risk = entry - stop
+        else:
+            risk = stop - entry
+            if risk <= 0:
+                stop = validate_stop_loss(
+                    entry, round(entry + max(atr * 1.0, entry * 0.001), 5), direction, tf_key
+                )
+                ai["stop_loss"] = stop
+                risk = stop - entry
 
-        if not str(ai.get("rr_ratio", "")).strip():
+        if risk <= 0:
+            risk = max(atr * 1.0, entry * 0.001)
+            if direction == "LONG":
+                stop = round(entry - risk, 5)
+            else:
+                stop = round(entry + risk, 5)
+            stop = validate_stop_loss(entry, stop, direction, tf_key)
+            ai["stop_loss"] = stop
+            if direction == "LONG":
+                risk = entry - stop
+            else:
+                risk = stop - entry
+
+        if direction == "LONG":
+            ai["tp1"] = round(entry + risk * 1.5, 5)
+            ai["tp2"] = round(entry + risk * 2.5, 5)
+            ai["tp3"] = round(entry + risk * 4.0, 5)
+            rew = abs(float(ai["tp1"]) - entry)
+        else:
+            ai["tp1"] = round(entry - risk * 1.5, 5)
+            ai["tp2"] = round(entry - risk * 2.5, 5)
+            ai["tp3"] = round(entry - risk * 4.0, 5)
+            rew = abs(entry - float(ai["tp1"]))
+
+        if risk > 0:
+            ai["rr_ratio"] = f"1:{(rew / risk):.2f}"
+        elif not str(ai.get("rr_ratio", "")).strip():
             ai["rr_ratio"] = "1:1.50"
 
-        stop = float(ai.get("stop_loss", 0) or 0)
-        tp1 = float(ai.get("tp1", 0) or 0)
-        tp2 = float(ai.get("tp2", 0) or 0)
-        tp3 = float(ai.get("tp3", 0) or 0)
+        stop = float(ai["stop_loss"])
+        tp1 = float(ai["tp1"])
+        tp2 = float(ai["tp2"])
+        tp3 = float(ai["tp3"])
+
+        risk_pct_of_price = risk / entry if entry > 0 else 0.0
+        sizing = calculate_position_size(confidence, zone_pct, current_capital)
+        max_risk_dollars = sizing["max_risk_dollars"]
+        sizing_risk_pct = sizing["risk_pct"]
+
+        denom = risk_pct_of_price * LEVERAGE
+        if denom > 1e-12:
+            position_size = min(max_risk_dollars / denom, 500.0)
+        else:
+            position_size = min(500.0, max_risk_dollars * 10.0)
+        leveraged_exposure = position_size * LEVERAGE
+        risk_pct_display = round(risk_pct_of_price * 100, 3)
 
         fut = future.head(fwd_n)
         highs = fut["High"].astype(float).values
@@ -852,13 +1041,6 @@ Return ONLY valid JSON:
                     hit_stop = True
                     c_stop = i + 1
 
-        if entry == 0:
-            entry = price
-        entry = float(entry)
-        if not math.isfinite(entry) or abs(entry) < 1e-12:
-            pv = float(price)
-            entry = pv if math.isfinite(pv) and abs(pv) > 1e-12 else 1e-8
-
         if hit_stop and (not hit_tp1 or (c_stop is not None and c_tp1 is not None and c_stop < c_tp1)):
             outcome = "LOSS"
             correct = False
@@ -893,14 +1075,13 @@ Return ONLY valid JSON:
             correct = raw_pct > 0
             outcome = "WIN" if correct else "LOSS"
 
-        base_position = STARTING_CAPITAL * POSITION_SIZE_PCT
-        leveraged_exposure = base_position * LEVERAGE
         pnl_dollars = round(leveraged_exposure * raw_pct, 2)
         pnl_pct_display = round(raw_pct * 100, 2)
 
         log(
             f"[Backtest] PnL calc: entry={entry} exit={exit_p} direction={direction} "
-            f"raw_pct={raw_pct:.4f} exposure={leveraged_exposure:.2f} pnl={pnl_dollars:.2f}",
+            f"raw_pct={raw_pct:.4f} exposure={leveraged_exposure:.2f} pnl={pnl_dollars:.2f} "
+            f"pos_size={position_size:.2f} max_risk={max_risk_dollars:.2f}",
             level="info",
         )
 
@@ -917,7 +1098,17 @@ Return ONLY valid JSON:
             zone_pos_stored = zone_pct
 
         pz_ai = str(ai.get("price_zone") or "").strip().upper()
-        price_zone_stored = pz_ai if pz_ai in ("PREMIUM", "DISCOUNT", "EQUILIBRIUM") else zone_label
+        ai_zone_lbl = str(ai.get("zone_label") or "").strip()
+        coarse_src = ai_zone_lbl or zone_label
+        ul = coarse_src.upper()
+        if pz_ai in ("PREMIUM", "DISCOUNT", "EQUILIBRIUM"):
+            price_zone_stored = pz_ai
+        elif "DISCOUNT" in ul:
+            price_zone_stored = "DISCOUNT"
+        elif "PREMIUM" in ul:
+            price_zone_stored = "PREMIUM"
+        else:
+            price_zone_stored = "EQUILIBRIUM"
 
         try:
             conf_pts = int(round(float(ai.get("confluence_points", 0) or 0)))
@@ -930,14 +1121,18 @@ Return ONLY valid JSON:
             "timeframe": timeframe,
             "verdict": ai.get("verdict"),
             "direction": direction,
-            "confidence": ai.get("confidence"),
+            "confidence": confidence,
             "htf_bias": str(ai.get("htf_bias") or ""),
             "market_structure": str(ai.get("market_structure") or ""),
+            "zone_pct": zone_pct,
+            "zone_label": zone_label,
+            "zone_label_model": ai_zone_lbl or None,
             "price_zone": price_zone_stored,
             "zone_position_pct": zone_pos_stored,
             "smc_concept": str(ai.get("smc_concept") or "NONE"),
             "confluence_points": conf_pts,
             "zone_reasoning": str(ai.get("zone_reasoning") or ""),
+            "smc_reasoning": str(ai.get("smc_reasoning") or ""),
             "entry_price": round(entry, 5),
             "stop_loss": round(stop, 5),
             "tp1": round(tp1, 5),
@@ -950,8 +1145,11 @@ Return ONLY valid JSON:
             "pnl_pct": pnl_pct_display,
             "pnl_dollars": pnl_dollars,
             "leverage": LEVERAGE,
-            "position_size": base_position,
-            "leveraged_exposure": leveraged_exposure,
+            "position_size": round(position_size, 2),
+            "leveraged_exposure": round(leveraged_exposure, 2),
+            "max_risk_dollars": max_risk_dollars,
+            "account_risk_pct": sizing_risk_pct,
+            "risk_pct_of_price": risk_pct_display,
             "hit_tp1": hit_tp1,
             "hit_tp2": hit_tp2,
             "hit_stop": hit_stop,
