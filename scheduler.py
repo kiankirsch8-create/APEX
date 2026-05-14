@@ -108,7 +108,7 @@ async def run_daily_apex(total_budget_usd: float | None = None) -> dict[str, Any
     """Execute the full APEX scan-analyze-score pipeline once.
 
     Returns the aggregated result dict that is also persisted to disk under
-    ``results/latest.json`` and ``results/daily_picks_<DATE>.json``.
+    ``latest.json`` and ``daily_picks_<DATE>.json`` under RESULTS_DIR (e.g. ``/data`` on Railway).
     """
     budget = float(total_budget_usd if total_budget_usd is not None else _read_budget())
     log(f"APEX scan starting — budget=${budget:,.0f}")

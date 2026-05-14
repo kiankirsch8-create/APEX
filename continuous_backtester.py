@@ -26,6 +26,7 @@ from utils import RESULTS_DIR, env, load_json, log, save_json, utcnow_iso
 
 CLAUDE_MODEL = "claude-opus-4-5"
 
+# Backtest / continuous loop JSON lives under RESULTS_DIR (./results locally, /data on Railway).
 RESULTS_FILE = RESULTS_DIR / "backtest_results.json"
 STATS_FILE = RESULTS_DIR / "backtest_stats.json"
 LEARNED_FILE = RESULTS_DIR / "learned_weights.json"

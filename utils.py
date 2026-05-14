@@ -14,11 +14,28 @@ from dotenv import load_dotenv
 load_dotenv()
 
 ROOT_DIR = Path(__file__).resolve().parent
-RESULTS_DIR = ROOT_DIR / "results"
+
+# Persisted JSON: local dev uses ./results. On Railway, mount a volume at /data and
+# either rely on auto-detection (RAILWAY_* env) or set APEX_RESULTS_DIR=/data explicitly.
+if os.environ.get("APEX_RESULTS_DIR"):
+    _RESULTS_CANDIDATE = Path(os.environ["APEX_RESULTS_DIR"]).expanduser()
+elif os.environ.get("RAILWAY_ENVIRONMENT") is not None or os.environ.get("RAILWAY_PROJECT_ID") is not None:
+    _RESULTS_CANDIDATE = Path("/data")
+else:
+    _RESULTS_CANDIDATE = ROOT_DIR / "results"
+
+RESULTS_DIR = _RESULTS_CANDIDATE.resolve()
+try:
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    (RESULTS_DIR / "daily_picks").mkdir(parents=True, exist_ok=True)
+except (PermissionError, OSError):
+    RESULTS_DIR = (ROOT_DIR / "results").resolve()
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    (RESULTS_DIR / "daily_picks").mkdir(parents=True, exist_ok=True)
+
 LOGS_DIR = ROOT_DIR / "logs"
 CONFIG_DIR = ROOT_DIR / "config"
-
-for _d in (RESULTS_DIR, LOGS_DIR, CONFIG_DIR):
+for _d in (LOGS_DIR, CONFIG_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 

@@ -1,6 +1,6 @@
 """APEX WEALTH — long-term diversified portfolio advice (Claude).
 
-Separate from the daily scanner. Caches to ``results/portfolio_advice.json``.
+Separate from the daily scanner. Caches to ``portfolio_advice.json`` under RESULTS_DIR.
 """
 from __future__ import annotations
 
