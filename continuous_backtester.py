@@ -529,24 +529,37 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
 
         tf_desc = TF_DESCRIPTIONS.get(tf_key, tf_key)
 
+        hi52 = float(ind.get("high_52w") or price * 1.1)
+        lo52 = float(ind.get("low_52w") or price * 0.9)
+        if not math.isfinite(hi52):
+            hi52 = float(price) * 1.1
+        if not math.isfinite(lo52):
+            lo52 = float(price) * 0.9
+        if hi52 > lo52:
+            zone_pct = round((float(price) - lo52) / (hi52 - lo52) * 100, 1)
+        else:
+            zone_pct = 50.0
+        zone_label = "PREMIUM" if zone_pct > 60 else ("DISCOUNT" if zone_pct < 40 else "EQUILIBRIUM")
+
+        sh = json.dumps(ind.get("swing_highs") or [])
+        sl = json.dumps(ind.get("swing_lows") or [])
+
         prompt = f"""
 You are APEX — an autonomous trading system
-learning through experience.
+learning through backtested experience.
 
-Your PRIMARY PURPOSE right now is to ALWAYS
-make a trading decision. The system only skips
-CHF crosses; for every other asset you must output
-LONG or SHORT.
-
-You MUST take a position on every single asset
-you analyze. This is how you learn.
+You MUST take either LONG or SHORT on every
+analysis. Never return NO TRADE.
 
 ASSET: {sym}
 TIMEFRAME: {tf_desc}
 DATE: {analysis_date}
 PRICE: {price}
 
-MARKET DATA:
+Price Zone: {zone_label} ({zone_pct}% of 52w range)
+52w Range: {lo52:.5f} to {hi52:.5f}
+
+INDICATORS:
 RSI(14): {ind["rsi"]:.2f}
 MACD Histogram: {ind["macd_hist"]:.5f}
 MACD Line: {ind.get("macd_line", 0):.5f}
@@ -560,133 +573,173 @@ BB Middle: {ind.get("bb_mid", 0):.5f}
 BB Lower: {ind["bb_lower"]:.5f}
 52w High: {ind.get("high_52w", 0):.5f}
 52w Low: {ind.get("low_52w", 0):.5f}
-Swing Highs: {json.dumps(ind.get("swing_highs") or [])}
-Swing Lows: {json.dumps(ind.get("swing_lows") or [])}
+Swing Highs (recent): {sh}
+Swing Lows (recent): {sl}
 
-YOUR ANALYSIS PROCESS:
+STEP 1 — DETERMINE PREMIUM OR DISCOUNT:
+This is the MOST IMPORTANT step.
+Calculate the current range position:
 
-STEP 1 — DETERMINE DIRECTION:
-Look at the available data and decide:
-LONG or SHORT. You must pick one.
+Range = 52w High - 52w Low
+Current position = (Price - 52w Low) / Range
 
-Use whatever evidence is strongest:
-- Price vs EMA200: above = bullish, below = bearish
-- EMA20 vs EMA50: 20 above 50 = bullish
-- RSI: above 50 = bullish momentum, below 50 = bearish
-- MACD histogram: positive = bullish, negative = bearish
-- ADX direction: which way is the trend moving
-- Price position in BB: upper half = bullish, lower = bearish
-- Recent swing highs/lows: higher highs = up, lower lows = down
+Above 50% = PREMIUM zone (prefer shorts)
+Below 50% = DISCOUNT zone (prefer longs)
 
-When signals conflict go with the MAJORITY.
-If 4 say up and 2 say down = LONG.
-If perfectly split = go with 200 EMA direction.
-There is ALWAYS a majority. Find it.
+RULE: Only short in PREMIUM zone
+      Only long in DISCOUNT zone
+      This single rule prevents most losses
 
-STEP 2 — FIND SMART MONEY CONCEPTS (if visible):
-These IMPROVE your entry but are NOT required.
-Check if any are present and mention them:
+EXCEPTION: If ADX is above 35 AND trend is
+extremely strong, you may trade with trend
+even against the zone. But note this clearly.
 
-LIQUIDITY SWEEP: Did price just fake above a
-high or below a low then reverse?
-This is the highest quality entry signal.
+STEP 2 — DETERMINE HTF BIAS:
+Price vs EMA200:
+Above EMA200 = BULLISH bias
+Below EMA200 = BEARISH bias
 
-ORDER BLOCK: Is price returning to the last
-opposing candle before a strong move?
-Enter at the order block for precision.
+This sets your preferred direction.
+Trade WITH this bias whenever possible.
 
-PREMIUM/DISCOUNT:
-Range = distance between last major high and low
-Above 50% of range = PREMIUM (prefer shorts)
-Below 50% of range = DISCOUNT (prefer longs)
+STEP 3 — SMART MONEY ANALYSIS:
+Look for these in order of importance:
 
-FAIR VALUE GAP: Three candle imbalance zone.
-Price often returns here before continuing.
+LIQUIDITY SWEEP (highest priority):
+Did price just spike above recent swing highs
+then reverse? = bearish liquidity sweep = SHORT
+Did price just spike below recent swing lows
+then reverse? = bullish liquidity sweep = LONG
+Use swing_highs and swing_lows to identify
 
-If you find any of these = higher confidence.
-If none visible = still take the trade using
-standard trend following. That is fine.
+ORDER BLOCK (high priority):
+Last bearish candle before a strong bullish move
+= bullish order block, enter LONG when price returns
+Last bullish candle before a strong bearish move
+= bearish order block, enter SHORT when returns
+Identify using swing_highs and swing_lows patterns
 
-STEP 3 — SET YOUR LEVELS:
+PREMIUM/DISCOUNT + OB COMBINATION:
+Bullish OB in discount zone = HIGHEST quality long
+Bearish OB in premium zone = HIGHEST quality short
+This combination wins most consistently
 
-STOP LOSS:
-Place below the most recent swing low for LONG
-Place above the most recent swing high for SHORT
-Use 1x ATR as minimum distance
-Never place stop within 0.5x ATR of entry
+STEP 4 — SIGNAL CONFLUENCE:
+Count your confirming signals:
 
-TAKE PROFIT:
-TP1 = 1.5x your risk distance
-TP2 = 2.5x your risk distance
-TP3 = 4x your risk distance (runner)
+FOR LONGS (in discount zone):
++2: Liquidity sweep below recent lows then reversal
++2: Bullish order block present
++1: Price above EMA200 (bullish HTF bias)
++1: EMA20 above EMA50 (short term bullish)
++1: RSI between 30-50 bouncing up (not overbought)
++1: MACD histogram turning positive
++1: ADX above 25 (trend has strength)
++1: Price near BB lower (statistical support)
 
-MINIMUM R/R = 1.2
-If your natural stop gives less than 1.2 R/R
-widen TP or tighten stop until you get 1.2+
-Do NOT return NO TRADE because of R/R.
-Adjust the levels until R/R works.
+FOR SHORTS (in premium zone):
++2: Liquidity sweep above recent highs then reversal
++2: Bearish order block present
++1: Price below EMA200 (bearish HTF bias)
++1: EMA20 below EMA50 (short term bearish)
++1: RSI between 50-70 turning down (not oversold)
++1: MACD histogram turning negative
++1: ADX above 25 (trend has strength)
++1: Price near BB upper (statistical resistance)
 
-STEP 4 — CONFIDENCE LEVEL:
-HIGH: ADX above 30 + clear trend + SMC concept present
-MEDIUM: ADX above 20 + trend direction clear
-LOW: Mixed signals but majority points one way
+MINIMUM 3 points to trade with HIGH confidence
+MINIMUM 2 points to trade with MEDIUM confidence
+1 point = LOW confidence but still trade
 
-Even LOW confidence = take the trade.
-You are learning. Every trade teaches something.
+STEP 5 — CRITICAL AVOIDANCE RULES:
+These cause most losses - avoid them:
 
-STEP 5 — WHAT YOU ARE LEARNING:
-Over thousands of trades you will discover:
-- Which pairs trend most reliably
-- Which timeframes give cleanest signals
-- Which signal combinations have highest win rate
-- Which market conditions to avoid
-- How to use SMC concepts for better entries
+NEVER short when RSI is below 35
+(oversold = likely bounce not continuation)
 
-You cannot learn any of this by saying NO TRADE.
-Every trade — win or loss — is data.
-Losses teach you just as much as wins.
+NEVER long when RSI is above 65
+(overbought = likely pullback not continuation)
 
-ABSOLUTE RULES:
-1. ALWAYS output LONG or SHORT in JSON. Never NO TRADE.
-2. Stop loss MUST be placed at a logical level
-3. Minimum R/R of 1.2 — adjust levels to achieve
-4. State your reasoning clearly
-5. Use whatever data is available to make best decision
-6. Label the SMC concept if found, say NONE if not
+NEVER short in discount zone without
+a liquidity sweep confirmation
+(discount zone = institutional buying area)
 
-SIGNAL PRIORITY (use in order):
-1. Liquidity sweep + reversal = highest priority
-2. Order block return = very high priority
-3. FVG fill = high priority
-4. HTF trend alignment = standard priority
-5. EMA stack + ADX = baseline confirmation
+NEVER long in premium zone without
+a liquidity sweep confirmation
+(premium zone = institutional selling area)
+
+NEVER trade with ADX below 15
+(no trend = random movement)
+
+If RSI is below 35 and price is in discount:
+ALWAYS go LONG (bounce trade)
+
+If RSI is above 65 and price is in premium:
+ALWAYS go SHORT (pullback trade)
+
+STEP 6 — STOP LOSS PLACEMENT:
+FOR LONGS:
+Place stop below the most recent swing low
+Minimum 1x ATR below entry
+Never place stop below 52w low
+
+FOR SHORTS:
+Place stop above the most recent swing high
+Minimum 1x ATR above entry
+Never place stop above 52w high
+
+STEP 7 — TAKE PROFIT TARGETS:
+TP1 = 1.5x your risk (distance from entry to stop)
+TP2 = 2.5x your risk
+TP3 = 4x your risk (let this run)
+
+For longs: TPs go UP from entry
+For shorts: TPs go DOWN from entry
+Double-check direction is correct.
+
+STEP 8 — MAKE YOUR DECISION:
+Even with mixed signals you MUST choose.
+Use this decision tree:
+
+1. What zone is price in? (Premium/Discount)
+2. Was there a recent liquidity sweep?
+3. What does EMA200 say?
+4. Count your confluence points
+5. Place stop at nearest swing point
+6. Set targets at 1.5R, 2.5R, 4R
+7. State your confidence level
+
+ALWAYS TRADE. If genuinely no direction:
+Use EMA200 as tiebreaker (above = LONG, below = SHORT)
+
+MANDATORY: direction must be LONG or SHORT.
+If you return NO TRADE system overrides you.
+
+Python reference (from OHLC window — align your JSON):
+zone_position_pct ≈ {zone_pct}, price_zone ≈ {zone_label}
 
 Return ONLY valid JSON:
 {{
   "verdict": "STRONG BUY|BUY|SELL|STRONG SELL",
-  "direction": "LONG or SHORT only - never NO TRADE",
+  "direction": "LONG|SHORT",
   "confidence": "HIGH|MEDIUM|LOW",
-  "htf_bias": "BULLISH|BEARISH|NEUTRAL",
-  "market_structure": "UPTREND|DOWNTREND|RANGING",
   "price_zone": "PREMIUM|DISCOUNT|EQUILIBRIUM",
-  "smc_concept": "LIQUIDITY_SWEEP|ORDER_BLOCK|FVG|PREMIUM_DISCOUNT|NONE",
+  "zone_position_pct": {zone_pct},
+  "htf_bias": "BULLISH|BEARISH",
+  "smc_concept": "LIQUIDITY_SWEEP|ORDER_BLOCK|PREMIUM_DISCOUNT|NONE",
+  "confluence_points": 0,
   "entry": {price},
   "stop_loss": 0.0,
   "tp1": 0.0,
   "tp2": 0.0,
   "tp3": 0.0,
-  "rr_ratio": "string",
+  "rr_ratio": "1:1.50",
   "signals_used": ["string"],
   "confluences": ["string"],
   "conflicts": ["string"],
-  "reasoning": "string"
+  "reasoning": "string",
+  "zone_reasoning": "string"
 }}
-
-MANDATORY: direction field must be LONG or SHORT.
-If you return anything else the system will
-override you with a forced decision.
-Make the best decision you can with available data.
-There is no wrong answer - just make a call.
 """
 
         client = _client()
@@ -855,6 +908,22 @@ There is no wrong answer - just make a call.
         if candles_to_exit is None:
             candles_to_exit = len(closes)
 
+        try:
+            z_ai = float(ai.get("zone_position_pct", zone_pct))
+            if not math.isfinite(z_ai):
+                z_ai = zone_pct
+            zone_pos_stored = max(0.0, min(100.0, round(z_ai, 1)))
+        except (TypeError, ValueError):
+            zone_pos_stored = zone_pct
+
+        pz_ai = str(ai.get("price_zone") or "").strip().upper()
+        price_zone_stored = pz_ai if pz_ai in ("PREMIUM", "DISCOUNT", "EQUILIBRIUM") else zone_label
+
+        try:
+            conf_pts = int(round(float(ai.get("confluence_points", 0) or 0)))
+        except (TypeError, ValueError):
+            conf_pts = 0
+
         return {
             "date": analysis_date,
             "ticker": sym,
@@ -864,8 +933,11 @@ There is no wrong answer - just make a call.
             "confidence": ai.get("confidence"),
             "htf_bias": str(ai.get("htf_bias") or ""),
             "market_structure": str(ai.get("market_structure") or ""),
-            "price_zone": str(ai.get("price_zone") or ""),
-            "smc_concept": str(ai.get("smc_concept") or ""),
+            "price_zone": price_zone_stored,
+            "zone_position_pct": zone_pos_stored,
+            "smc_concept": str(ai.get("smc_concept") or "NONE"),
+            "confluence_points": conf_pts,
+            "zone_reasoning": str(ai.get("zone_reasoning") or ""),
             "entry_price": round(entry, 5),
             "stop_loss": round(stop, 5),
             "tp1": round(tp1, 5),
