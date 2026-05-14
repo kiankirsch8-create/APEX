@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import random
 import re
 import threading
@@ -280,46 +281,62 @@ def get_random_date(days_back_max: int = 365, days_back_min: int = 10, *, skip_w
 def _result_dedup_key(row: Any) -> str:
     if not isinstance(row, dict):
         return ""
-    t = str(row.get("ticker") or "").strip().upper()
-    d = str(row.get("date") or "").strip()
-    tf = str(row.get("timeframe") or "").strip().lower()
-    return f"{t}_{d}_{tf}"
+    return f"{row.get('ticker')}_{row.get('date')}_{row.get('timeframe')}"
+
+
+def _read_backtest_results_file() -> list[dict[str, Any]]:
+    """Read ``RESULTS_FILE`` into a list of dicts. Callers must hold ``_results_lock`` when used with writes."""
+    if not RESULTS_FILE.exists():
+        return []
+    try:
+        with open(RESULTS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return [r for r in data if isinstance(r, dict)]
+    except Exception as e:  # noqa: BLE001
+        log(f"[IO] read backtest_results.json: {e}", level="warning")
+    return []
 
 
 def _load_results_list() -> list[dict[str, Any]]:
     with _results_lock:
-        raw = load_json(RESULTS_FILE, default=[])
-        if isinstance(raw, list):
-            return [r for r in raw if isinstance(r, dict)]
-        return []
+        return _read_backtest_results_file()
 
 
-def append_result(result: dict[str, Any]) -> tuple[bool, int]:
-    """Append one backtest row if the (ticker, date, timeframe) key is new. Returns (added, total_count)."""
+def append_result(result: dict[str, Any]) -> int:
+    """Append one backtest row if (ticker, date, timeframe) is new. Sole writer to ``RESULTS_FILE``. Returns new length or prior length if duplicate; 0 on hard failure."""
     try:
         with _results_lock:
-            existing = load_json(RESULTS_FILE, default=[])
-            if not isinstance(existing, list):
-                existing = []
+            existing = _read_backtest_results_file()
 
-            key = _result_dedup_key(result)
-            existing_keys = {_result_dedup_key(r) for r in existing}
+            key = f"{result.get('ticker')}_{result.get('date')}_{result.get('timeframe')}"
+            existing_keys: set[str] = set()
+            for r in existing:
+                k = f"{r.get('ticker')}_{r.get('date')}_{r.get('timeframe')}"
+                existing_keys.add(k)
 
-            if key and key not in existing_keys:
-                existing.append(result)
-                save_json(RESULTS_FILE, existing)
-                n = len(existing)
-                log(
-                    f"[IO] Saved result #{n}: {result.get('ticker')} "
-                    f"{result.get('outcome', '?')}",
-                    level="info",
-                )
-                return True, n
-            log(f"[IO] Skipping duplicate: {key}", level="info")
-            return False, len(existing)
+            if key in existing_keys:
+                return len(existing)
+
+            existing.append(result)
+
+            tmp = str(RESULTS_FILE) + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(existing, f, indent=2, default=str)
+            os.replace(tmp, str(RESULTS_FILE))
+
+            n = len(existing)
+            log(
+                f"[IO] Appended result #{n}: {result.get('ticker')} "
+                f"{result.get('outcome', 'SKIP')}",
+                level="info",
+            )
+            return n
+
     except Exception as e:  # noqa: BLE001
-        log(f"[IO] append error: {e}", level="error")
-        return False, 0
+        log(f"[IO] append_result error: {e}", level="error")
+        log(traceback.format_exc(), level="error")
+        return 0
 
 
 def get_ohlcv(
@@ -1283,7 +1300,9 @@ def continuous_backtest_loop() -> None:
             result = run_one_backtest(ticker, timeframe, date)
 
             if result is not None:
-                added, count = append_result(result)
+                prev_len = len(_load_results_list())
+                count = append_result(result)
+                added = count > prev_len
 
                 if added and not result.get("skipped"):
                     outcome = result.get("outcome", "?")
