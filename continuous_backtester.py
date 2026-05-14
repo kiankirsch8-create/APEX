@@ -39,7 +39,7 @@ POSITION_SIZE_PCT = 0.05  # 5% of capital
 LEVERAGE = 50  # 50x on notional exposure
 IMPROVE_EVERY = 100
 
-# --- Hard filters: CHF crosses only (see ``apply_hard_filters``) ---
+# --- Hard filters: CHF + pegged (see ``apply_hard_filters``) ---
 CHF_PAIRS = [
     "GBPCHF",
     "AUDCHF",
@@ -48,6 +48,10 @@ CHF_PAIRS = [
     "NZDCHF",
     "CADCHF",
 ]
+
+PEGGED_PAIRS = ["USDHKD", "EURDKK", "CHFDKK"]
+
+HARD_EXCLUDED_TICKERS = list(CHF_PAIRS) + list(PEGGED_PAIRS)
 
 BANNED_SIGNALS: list[str] = []
 
@@ -391,16 +395,17 @@ def apply_hard_filters(
     indicators: dict[str, Any],  # noqa: ARG001
     timeframe: str,  # noqa: ARG001
 ) -> dict[str, Any]:
-    """CHF crosses only — ADX and SMC are decided in the Claude prompt."""
-    chf_only = ["GBPCHF", "AUDCHF", "EURCHF", "USDCHF", "NZDCHF", "CADCHF"]
+    """CHF and pegged pairs only — everything else is Claude's call."""
     sym = (ticker or "").strip().upper()
-    if sym in chf_only:
-        return {"pass": False, "reason": "CHF excluded"}
+    if sym in CHF_PAIRS:
+        return {"pass": False, "reason": "CHF excluded - 0% historical"}
+    if sym in PEGGED_PAIRS:
+        return {"pass": False, "reason": "Pegged currency - no movement"}
     return {"pass": True, "reason": None}
 
 
 def validate_rr(plan: dict[str, Any]) -> dict[str, Any]:
-    """Ensure reward at TP1 vs stop risk meets minimum R/R (1.3); downgrade to NO TRADE if not."""
+    """Compute R/R; only reject extreme cases (reward/risk < 0.8)."""
     if not isinstance(plan, dict):
         return {}
     direction = str(plan.get("direction", "")).strip().upper()
@@ -408,7 +413,8 @@ def validate_rr(plan: dict[str, Any]) -> dict[str, Any]:
         return plan
 
     try:
-        entry = float(plan.get("entry", 0) or 0)
+        entry_raw = plan.get("entry_aggressive", plan.get("entry", 0))
+        entry = float(entry_raw or 0)
         stop = float(plan.get("stop_loss", 0) or 0)
         tp1 = float(plan.get("tp1", 0) or 0)
     except (TypeError, ValueError):
@@ -428,13 +434,13 @@ def validate_rr(plan: dict[str, Any]) -> dict[str, Any]:
         return plan
 
     rr = reward / risk
-
-    if rr < 1.3:
-        log(f"[Backtest] RR {rr:.2f} below 1.3 minimum", level="info")
-        plan["direction"] = "NO TRADE"
-        plan["skip_reason"] = f"R/R {rr:.2f} below 1.3 minimum"
-
     plan["rr_ratio"] = f"1:{rr:.2f}"
+
+    if rr < 0.8:
+        log(f"[RR] {rr:.2f} extremely poor - skipping", level="warning")
+        plan["direction"] = "NO TRADE"
+        plan["skip_reason"] = f"R/R {rr:.2f} below 0.8"
+
     return plan
 
 
@@ -553,187 +559,148 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
             }
 
         tf_desc = TF_DESCRIPTIONS.get(tf_key, tf_key)
-        sh = json.dumps(ind.get("swing_highs") or [])
-        sl = json.dumps(ind.get("swing_lows") or [])
 
         prompt = f"""
-You are APEX — an elite autonomous trading system
-trained on institutional order flow, smart money
-concepts, and price action methodology.
+You are APEX — an autonomous trading system
+learning through experience.
+
+Your PRIMARY PURPOSE right now is to ALWAYS
+make a trading decision. Never return NO TRADE
+unless the asset has zero price movement (pegged).
+
+You MUST take a position on every single asset
+you analyze. This is how you learn.
 
 ASSET: {sym}
 TIMEFRAME: {tf_desc}
 DATE: {analysis_date}
-CURRENT PRICE: {price}
+PRICE: {price}
 
 MARKET DATA:
 RSI(14): {ind["rsi"]:.2f}
-MACD Line: {ind.get("macd_line", 0):.5f}
-MACD Signal: {ind.get("macd_signal", 0):.5f}
 MACD Histogram: {ind["macd_hist"]:.5f}
+MACD Line: {ind.get("macd_line", 0):.5f}
 EMA20: {ind["ema20"]:.5f}
 EMA50: {ind["ema50"]:.5f}
 EMA200: {ind["ema200"]:.5f}
 ATR(14): {ind["atr"]:.5f}
 ADX(14): {ind["adx"]:.2f}
 BB Upper: {ind["bb_upper"]:.5f}
-BB Middle: {ind["bb_mid"]:.5f}
+BB Middle: {ind.get("bb_mid", 0):.5f}
 BB Lower: {ind["bb_lower"]:.5f}
 52w High: {ind.get("high_52w", 0):.5f}
 52w Low: {ind.get("low_52w", 0):.5f}
-Recent Swing Highs: {sh}
-Recent Swing Lows: {sl}
+Swing Highs: {json.dumps(ind.get("swing_highs") or [])}
+Swing Lows: {json.dumps(ind.get("swing_lows") or [])}
 
-ANALYSIS FRAMEWORK — USE ALL OF THESE:
+YOUR ANALYSIS PROCESS:
 
-STEP 1 — HIGHER TIMEFRAME BIAS:
-Before anything else determine the HTF bias.
-Is price above or below the 200 EMA?
-Is the 50 EMA above or below the 200 EMA?
-This determines the ONLY direction you trade.
-ONLY trade in the direction of HTF bias.
-Never trade counter-trend.
+STEP 1 — DETERMINE DIRECTION:
+Look at the available data and decide:
+LONG or SHORT. You must pick one.
 
-STEP 2 — SMART MONEY CONCEPTS:
-Look for these institutional footprints:
+Use whatever evidence is strongest:
+- Price vs EMA200: above = bullish, below = bearish
+- EMA20 vs EMA50: 20 above 50 = bullish
+- RSI: above 50 = bullish momentum, below 50 = bearish
+- MACD histogram: positive = bullish, negative = bearish
+- ADX direction: which way is the trend moving
+- Price position in BB: upper half = bullish, lower = bearish
+- Recent swing highs/lows: higher highs = up, lower lows = down
 
-LIQUIDITY POOLS:
-Equal highs above price = buy-side liquidity (BSL)
-Smart money will hunt this before reversing down
-Equal lows below price = sell-side liquidity (SSL)
-Smart money will hunt this before reversing up
-Previous day/week high or low = liquidity targets
+When signals conflict go with the MAJORITY.
+If 4 say up and 2 say down = LONG.
+If perfectly split = go with 200 EMA direction.
+There is ALWAYS a majority. Find it.
 
-ORDER BLOCKS:
-Last bearish candle before strong bullish move = bullish OB
-Last bullish candle before strong bearish move = bearish OB
-Price returning to OB = high probability entry zone
-Use swing_highs and swing_lows to identify these zones
+STEP 2 — FIND SMART MONEY CONCEPTS (if visible):
+These IMPROVE your entry but are NOT required.
+Check if any are present and mention them:
 
-FAIR VALUE GAPS (FVG/Imbalance):
-Three candle pattern where middle candle leaves gap
-Price often returns to fill imbalance before continuing
-Use as entry confirmation
+LIQUIDITY SWEEP: Did price just fake above a
+high or below a low then reverse?
+This is the highest quality entry signal.
 
-MARKET STRUCTURE:
-Higher Highs + Higher Lows = uptrend (only take longs)
-Lower Highs + Lower Lows = downtrend (only take shorts)
-Break of Structure (BOS) = trend confirmed
-Change of Character (CHOCH) = potential reversal
+ORDER BLOCK: Is price returning to the last
+opposing candle before a strong move?
+Enter at the order block for precision.
 
 PREMIUM/DISCOUNT:
-Identify the range between last major high and low
-Above 50% of range = PREMIUM (favorable context for shorts — use in Tier scoring)
-Below 50% of range = DISCOUNT (favorable context for longs — use in Tier scoring)
-These are guides, not absolute bans: if your Step 3 score clears 3+ points you may still trade with clear risk/reward.
+Range = distance between last major high and low
+Above 50% of range = PREMIUM (prefer shorts)
+Below 50% of range = DISCOUNT (prefer longs)
 
-STEP 3 — ENTRY CONFIRMATION:
-You need MINIMUM 3 of these to align.
-You do NOT need all of them.
-Find whatever combination is strongest:
+FAIR VALUE GAP: Three candle imbalance zone.
+Price often returns here before continuing.
 
-TIER 1 SIGNALS (each counts as 2):
-- Price in DISCOUNT for longs / PREMIUM for shorts
-- Liquidity sweep just occurred (faked a level then reversed)
-- Clear order block with price returning to it
-- ADX above 30 with strong trend direction
+If you find any of these = higher confidence.
+If none visible = still take the trade using
+standard trend following. That is fine.
 
-TIER 2 SIGNALS (each counts as 1):
-- HTF bias confirmed (price vs 200 EMA direction)
-- Market structure break in trade direction
-- Fair Value Gap present near entry
-- RSI between 40-60 with momentum in direction
-- MACD aligned with trade direction
-- EMA stack perfectly aligned (20/50/200)
-- Price at key level (previous high/low/EMA200)
+STEP 3 — SET YOUR LEVELS:
 
-MINIMUM TO TRADE: 3 points total
-(e.g. 1 Tier1 + 1 Tier2 = 3 points = trade)
-(e.g. 3 Tier2 signals = 3 points = trade)
+STOP LOSS:
+Place below the most recent swing low for LONG
+Place above the most recent swing high for SHORT
+Use 1x ATR as minimum distance
+Never place stop within 0.5x ATR of entry
 
-CRITICAL: If you have ADX above 25 AND
-clear trend direction AND price not at extreme:
-That alone is enough for MEDIUM confidence trade.
+TAKE PROFIT:
+TP1 = 1.5x your risk distance
+TP2 = 2.5x your risk distance
+TP3 = 4x your risk distance (runner)
 
-Do NOT require perfect SMC setup for every trade.
-SMC concepts IMPROVE the setup when present.
-Standard trend following works when SMC absent.
+MINIMUM R/R = 1.2
+If your natural stop gives less than 1.2 R/R
+widen TP or tighten stop until you get 1.2+
+Do NOT return NO TRADE because of R/R.
+Adjust the levels until R/R works.
 
-TARGET: Take a trade on 35-40% of setups.
-If you find yourself saying NO TRADE more than
-60% of the time you are being too selective.
+STEP 4 — CONFIDENCE LEVEL:
+HIGH: ADX above 30 + clear trend + SMC concept present
+MEDIUM: ADX above 20 + trend direction clear
+LOW: Mixed signals but majority points one way
 
-R/R RULES — RELAXED:
-Minimum R/R: 1.5
-Preferred: 2.0 to 3.0
-If setup is excellent (Tier1 + Tier1) accept 1.3+
-Never accept below 1.3 regardless
+Even LOW confidence = take the trade.
+You are learning. Every trade teaches something.
 
-STEP 4 — QUICK CHECKLIST before entry:
-1. Which direction does 200 EMA favor?
-2. Is ADX above 20? (below 15 = NO TRADE)
-3. Is RSI neutral or confirming direction?
-4. What is my specific stop level?
-5. What is my R/R? Above 1.3?
-If all 5 answered positively = TAKE THE TRADE
+STEP 5 — WHAT YOU ARE LEARNING:
+Over thousands of trades you will discover:
+- Which pairs trend most reliably
+- Which timeframes give cleanest signals
+- Which signal combinations have highest win rate
+- Which market conditions to avoid
+- How to use SMC concepts for better entries
 
-REMEMBER: You are backtesting to LEARN.
-Taking imperfect trades and seeing results
-teaches us more than taking zero trades.
-A MEDIUM confidence trade with 1.5 R/R
-is better than NO TRADE.
-Be decisive. Make a call.
+You cannot learn any of this by saying NO TRADE.
+Every trade — win or loss — is data.
+Losses teach you just as much as wins.
 
-STEP 5 — WHAT BOOSTS EDGE (optional):
-These often improve win rate when several align; they are not all mandatory if Step 3 scoring and R/R already justify the trade:
-- HTF bias is clear (strong trend on 200 EMA)
-- Price has swept liquidity (faked below/above a level)
-- Price is now in discount/premium zone
-- Order block or FVG nearby as entry
-- ADX above 25 with momentum
-- RSI has room to run (roughly 40-60)
+ABSOLUTE RULES:
+1. ALWAYS take LONG or SHORT. Never NO TRADE.
+   Exception: HKD pegged pairs (USDHKD) = NO TRADE
+2. Stop loss MUST be placed at a logical level
+3. Minimum R/R of 1.2 — adjust levels to achieve
+4. State your reasoning clearly
+5. Use whatever data is available to make best decision
+6. Label the SMC concept if found, say NONE if not
 
-STEP 6 — WHAT TO AVOID:
-Never trade:
-- Into obvious support/resistance without a sweep first
-- When price is at BB extreme (wait for bounce confirmation)
-- When RSI is above 70 (long) or below 30 (short)
-- When MACD and price disagree (divergence)
-- When ADX is below 15 (no trend)
-- Hard counter to 200 EMA unless your Step 3 tier score clearly supports a tactical mean-reversion plan
-- When the move has already happened (chasing)
-- At random entry points — always need a specific reason
-
-STEP 7 — PAIR SPECIFIC RULES:
-Based on backtested performance apply these:
-Avoid GBPAUD, EURCAD — historically unreliable
-Avoid CHF pairs completely
-USDJPY, EURUSD, GBPUSD — most reliable pairs
-AUD pairs — good for trend following
-JPY crosses — strong trends but volatile stops
-
-STEP 8 — RETURN YOUR ANALYSIS:
-State clearly:
-1. HTF bias: BULLISH/BEARISH and why
-2. Market structure: last BOS/CHOCH observed
-3. Zone: is price in PREMIUM or DISCOUNT
-4. SMC concept present: OB/FVG/Liquidity/None
-5. Entry logic: specific reason to enter NOW (include tier points used)
-6. Stop placement: specific level with reason
-7. TP levels: with specific target reason
-8. R/R ratio: default target ≥1.5; may use 1.3+ only when exceptional Tier1 overlap per rules above
-
-Use NO TRADE when the Step 4 checklist fails or achievable R/R would be below 1.3.
+SIGNAL PRIORITY (use in order):
+1. Liquidity sweep + reversal = highest priority
+2. Order block return = very high priority
+3. FVG fill = high priority
+4. HTF trend alignment = standard priority
+5. EMA stack + ADX = baseline confirmation
 
 Return ONLY valid JSON:
 {{
-  "verdict": "STRONG BUY|BUY|WAIT|SELL|STRONG SELL",
-  "direction": "LONG|SHORT|NO TRADE",
+  "verdict": "STRONG BUY|BUY|SELL|STRONG SELL",
+  "direction": "LONG|SHORT",
   "confidence": "HIGH|MEDIUM|LOW",
   "htf_bias": "BULLISH|BEARISH|NEUTRAL",
   "market_structure": "UPTREND|DOWNTREND|RANGING",
   "price_zone": "PREMIUM|DISCOUNT|EQUILIBRIUM",
-  "smc_concept": "ORDER_BLOCK|FVG|LIQUIDITY_SWEEP|NONE",
+  "smc_concept": "LIQUIDITY_SWEEP|ORDER_BLOCK|FVG|PREMIUM_DISCOUNT|NONE",
   "entry": {price},
   "stop_loss": 0.0,
   "tp1": 0.0,
@@ -743,9 +710,11 @@ Return ONLY valid JSON:
   "signals_used": ["string"],
   "confluences": ["string"],
   "conflicts": ["string"],
-  "reasoning": "string",
-  "no_trade_reason": null
+  "reasoning": "string"
 }}
+
+REMINDER: direction must be LONG or SHORT.
+Never NO TRADE. Make the call.
 """
 
         client = _client()
@@ -763,6 +732,11 @@ Return ONLY valid JSON:
 
         direction = str(ai.get("direction", "NO TRADE")).strip().upper()
         if direction in ("NO TRADE", "WAIT", ""):
+            log(
+                f"[Backtest] WARNING: NO_TRADE/WAIT/empty direction for {sym} {timeframe} "
+                f"{analysis_date} — saving as skipped (excluded from executed-trade stats)",
+                level="warning",
+            )
             rs = str(ai.get("skip_reason", "") or "").strip()
             ntr = ai.get("no_trade_reason")
             if not rs and ntr is not None and str(ntr).strip():
@@ -1008,7 +982,7 @@ def _smc_stats_from_trades(trades: list[dict[str, Any]]) -> dict[str, Any]:
             zone_buckets[key]["losses"] += 1
         zone_buckets[key]["pnl"] += float(t.get("pnl_dollars", 0) or 0)
 
-    rr_bins = {"lt_1_3": 0, "1_3_to_2": 0, "gt_2": 0, "unknown": 0}
+    rr_bins = {"lt_0_8": 0, "0_8_to_1_2": 0, "gt_1_2": 0, "unknown": 0}
     rr_vals: list[float] = []
     for t in trades:
         v = _parse_rr_ratio_numeric(t.get("rr_ratio"))
@@ -1016,12 +990,12 @@ def _smc_stats_from_trades(trades: list[dict[str, Any]]) -> dict[str, Any]:
             rr_bins["unknown"] += 1
             continue
         rr_vals.append(v)
-        if v < 1.3:
-            rr_bins["lt_1_3"] += 1
-        elif v <= 2.0:
-            rr_bins["1_3_to_2"] += 1
+        if v < 0.8:
+            rr_bins["lt_0_8"] += 1
+        elif v <= 1.2:
+            rr_bins["0_8_to_1_2"] += 1
         else:
-            rr_bins["gt_2"] += 1
+            rr_bins["gt_1_2"] += 1
 
     rr_ratio_distribution = {
         "buckets": rr_bins,
@@ -1070,7 +1044,23 @@ def calculate_kelly(trades: list[dict[str, Any]]) -> float:
 
 
 def calculate_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
-    trades = [r for r in results if r and not r.get("skipped")]
+    row_list = [r for r in (results or []) if isinstance(r, dict)]
+    n_all = len(row_list)
+    hard_filtered_n = sum(1 for r in row_list if str(r.get("verdict", "")).upper() == "FILTERED")
+    eligible_after_hard = max(0, n_all - hard_filtered_n)
+
+    trades = [r for r in row_list if not r.get("skipped")]
+    executed_trade_rate_pct = (
+        round(100 * len(trades) / max(1, eligible_after_hard), 1) if eligible_after_hard else 0.0
+    )
+    execution_meta: dict[str, Any] = {
+        "total_saved_backtests": n_all,
+        "hard_filtered_backtests": hard_filtered_n,
+        "eligible_after_hard_filter": eligible_after_hard,
+        "executed_trade_rows": len(trades),
+        "executed_trade_rate_pct_of_eligible": executed_trade_rate_pct,
+    }
+
     if not trades:
         k0 = calculate_kelly([])
         smc_empty = _smc_stats_from_trades([])
@@ -1089,8 +1079,9 @@ def calculate_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
             "kelly_pct": round(k0 * 100, 2),
             "kelly_dollars": round(STARTING_CAPITAL * k0, 2),
             "timeframe_performance": {},
-            "excluded_tickers": list(CHF_PAIRS),
+            "excluded_tickers": HARD_EXCLUDED_TICKERS,
             "banned_signals": list(BANNED_SIGNALS),
+            **execution_meta,
             **smc_empty,
         }
 
@@ -1219,8 +1210,9 @@ def calculate_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
         "signal_performance": sig_perf,
         "recent_trades": sorted(trades, key=lambda x: str(x.get("date", "")), reverse=True)[:50],
         "timeframe_performance": tf_perf,
-        "excluded_tickers": list(CHF_PAIRS),
+        "excluded_tickers": HARD_EXCLUDED_TICKERS,
         "banned_signals": list(BANNED_SIGNALS),
+        **execution_meta,
         **smc_agg,
     }
 
