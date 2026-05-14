@@ -388,23 +388,19 @@ def get_ohlcv(
 
 def apply_hard_filters(
     ticker: str,
-    indicators: dict[str, Any],
+    indicators: dict[str, Any],  # noqa: ARG001
     timeframe: str,  # noqa: ARG001
 ) -> dict[str, Any]:
-    """CHF pairs excluded + ADX floor (15). All SMC/ICT logic is in the Claude prompt."""
+    """CHF crosses only — ADX and SMC are decided in the Claude prompt."""
+    chf_only = ["GBPCHF", "AUDCHF", "EURCHF", "USDCHF", "NZDCHF", "CADCHF"]
     sym = (ticker or "").strip().upper()
-    if sym in CHF_PAIRS:
-        return {"pass": False, "reason": "CHF pair excluded"}
-
-    adx = float(indicators.get("adx", 0) or 0)
-    if adx < 15:
-        return {"pass": False, "reason": f"ADX {adx:.1f} below 15"}
-
+    if sym in chf_only:
+        return {"pass": False, "reason": "CHF excluded"}
     return {"pass": True, "reason": None}
 
 
 def validate_rr(plan: dict[str, Any]) -> dict[str, Any]:
-    """Ensure reward at TP1 vs stop risk meets minimum R/R (1.8); downgrade to NO TRADE if not."""
+    """Ensure reward at TP1 vs stop risk meets minimum R/R (1.3); downgrade to NO TRADE if not."""
     if not isinstance(plan, dict):
         return {}
     direction = str(plan.get("direction", "")).strip().upper()
@@ -433,10 +429,10 @@ def validate_rr(plan: dict[str, Any]) -> dict[str, Any]:
 
     rr = reward / risk
 
-    if rr < 1.8:
-        log(f"[Backtest] RR {rr:.2f} below 1.8 minimum", level="info")
+    if rr < 1.3:
+        log(f"[Backtest] RR {rr:.2f} below 1.3 minimum", level="info")
         plan["direction"] = "NO TRADE"
-        plan["skip_reason"] = f"R/R {rr:.2f} below 1.8 minimum"
+        plan["skip_reason"] = f"R/R {rr:.2f} below 1.3 minimum"
 
     plan["rr_ratio"] = f"1:{rr:.2f}"
     return plan
@@ -541,7 +537,7 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
         ind["swing_highs"] = swing_highs[-5:]
         ind["swing_lows"] = swing_lows[-5:]
 
-        filters = apply_hard_filters(sym, {"adx": ind["adx"]}, tf_key)
+        filters = apply_hard_filters(sym, {}, tf_key)
         if not filters.get("pass", True):
             log(f"[Backtest] FILTERED: {sym} — {filters.get('reason')}", level="info")
             return {
@@ -627,50 +623,75 @@ Change of Character (CHOCH) = potential reversal
 
 PREMIUM/DISCOUNT:
 Identify the range between last major high and low
-Above 50% of range = PREMIUM (only sell here)
-Below 50% of range = DISCOUNT (only buy here)
-Never buy in premium, never sell in discount
-This single rule eliminates most bad trades
+Above 50% of range = PREMIUM (favorable context for shorts — use in Tier scoring)
+Below 50% of range = DISCOUNT (favorable context for longs — use in Tier scoring)
+These are guides, not absolute bans: if your Step 3 score clears 3+ points you may still trade with clear risk/reward.
 
 STEP 3 — ENTRY CONFIRMATION:
-Only enter when ALL of these align:
-1. HTF bias confirmed (price vs 200 EMA)
-2. Market structure supports direction (BOS/CHOCH)
-3. Price in correct zone (discount for longs/premium for shorts)
-4. At least one SMC concept present (OB, FVG, liquidity)
-5. ADX above 20 confirming trend has momentum
-6. RSI not extreme against trade direction
-   (not above 70 for longs, not below 30 for shorts)
+You need MINIMUM 3 of these to align.
+You do NOT need all of them.
+Find whatever combination is strongest:
 
-STEP 4 — CRITICAL R/R RULES:
-MINIMUM Risk/Reward: 1:2.0 (not 1:1.5)
-PREFERRED Risk/Reward: 1:2.5 to 1:3.0
-IDEAL Risk/Reward: 1:3.0 or better
+TIER 1 SIGNALS (each counts as 2):
+- Price in DISCOUNT for longs / PREMIUM for shorts
+- Liquidity sweep just occurred (faked a level then reversed)
+- Clear order block with price returning to it
+- ADX above 30 with strong trend direction
 
-Stop loss: place BELOW structure for longs
-           place ABOVE structure for shorts
-           Never use simple ATR stop without structure logic
-           Stop goes below/above the order block or swing low/high
+TIER 2 SIGNALS (each counts as 1):
+- HTF bias confirmed (price vs 200 EMA direction)
+- Market structure break in trade direction
+- Fair Value Gap present near entry
+- RSI between 40-60 with momentum in direction
+- MACD aligned with trade direction
+- EMA stack perfectly aligned (20/50/200)
+- Price at key level (previous high/low/EMA200)
 
-TP1: at nearest liquidity pool or structure level
-TP2: at 2x the risk distance minimum
-TP3: runner to major HTF level
+MINIMUM TO TRADE: 3 points total
+(e.g. 1 Tier1 + 1 Tier2 = 3 points = trade)
+(e.g. 3 Tier2 signals = 3 points = trade)
 
-If you cannot find a setup with minimum 1:2 R/R
-return NO TRADE — a bad R/R kills profitability
+CRITICAL: If you have ADX above 25 AND
+clear trend direction AND price not at extreme:
+That alone is enough for MEDIUM confidence trade.
 
-STEP 5 — WHAT MAKES A HIGH PROBABILITY SETUP:
-The winning template looks like this:
+Do NOT require perfect SMC setup for every trade.
+SMC concepts IMPROVE the setup when present.
+Standard trend following works when SMC absent.
+
+TARGET: Take a trade on 35-40% of setups.
+If you find yourself saying NO TRADE more than
+60% of the time you are being too selective.
+
+R/R RULES — RELAXED:
+Minimum R/R: 1.5
+Preferred: 2.0 to 3.0
+If setup is excellent (Tier1 + Tier1) accept 1.3+
+Never accept below 1.3 regardless
+
+STEP 4 — QUICK CHECKLIST before entry:
+1. Which direction does 200 EMA favor?
+2. Is ADX above 20? (below 15 = NO TRADE)
+3. Is RSI neutral or confirming direction?
+4. What is my specific stop level?
+5. What is my R/R? Above 1.3?
+If all 5 answered positively = TAKE THE TRADE
+
+REMEMBER: You are backtesting to LEARN.
+Taking imperfect trades and seeing results
+teaches us more than taking zero trades.
+A MEDIUM confidence trade with 1.5 R/R
+is better than NO TRADE.
+Be decisive. Make a call.
+
+STEP 5 — WHAT BOOSTS EDGE (optional):
+These often improve win rate when several align; they are not all mandatory if Step 3 scoring and R/R already justify the trade:
 - HTF bias is clear (strong trend on 200 EMA)
 - Price has swept liquidity (faked below/above a level)
 - Price is now in discount/premium zone
-- There is an order block or FVG nearby as entry
-- ADX is above 25 confirming trend
-- RSI has room to run (40-60 range, not extreme)
-- R/R is at least 1:2
-
-This setup wins 50-60% of the time.
-Without these criteria do NOT enter.
+- Order block or FVG nearby as entry
+- ADX above 25 with momentum
+- RSI has room to run (roughly 40-60)
 
 STEP 6 — WHAT TO AVOID:
 Never trade:
@@ -678,8 +699,8 @@ Never trade:
 - When price is at BB extreme (wait for bounce confirmation)
 - When RSI is above 70 (long) or below 30 (short)
 - When MACD and price disagree (divergence)
-- When ADX is below 18 (no trend)
-- Counter to 200 EMA direction
+- When ADX is below 15 (no trend)
+- Hard counter to 200 EMA unless your Step 3 tier score clearly supports a tactical mean-reversion plan
 - When the move has already happened (chasing)
 - At random entry points — always need a specific reason
 
@@ -697,13 +718,12 @@ State clearly:
 2. Market structure: last BOS/CHOCH observed
 3. Zone: is price in PREMIUM or DISCOUNT
 4. SMC concept present: OB/FVG/Liquidity/None
-5. Entry logic: specific reason to enter NOW
+5. Entry logic: specific reason to enter NOW (include tier points used)
 6. Stop placement: specific level with reason
 7. TP levels: with specific target reason
-8. R/R ratio: must be 1:2 minimum
+8. R/R ratio: default target ≥1.5; may use 1.3+ only when exceptional Tier1 overlap per rules above
 
-If ANY of steps 1-6 don't align: return NO TRADE
-with specific reason why setup is incomplete.
+Use NO TRADE when the Step 4 checklist fails or achievable R/R would be below 1.3.
 
 Return ONLY valid JSON:
 {{
@@ -988,7 +1008,7 @@ def _smc_stats_from_trades(trades: list[dict[str, Any]]) -> dict[str, Any]:
             zone_buckets[key]["losses"] += 1
         zone_buckets[key]["pnl"] += float(t.get("pnl_dollars", 0) or 0)
 
-    rr_bins = {"lt_1_8": 0, "1_8_to_2_5": 0, "gt_2_5": 0, "unknown": 0}
+    rr_bins = {"lt_1_3": 0, "1_3_to_2": 0, "gt_2": 0, "unknown": 0}
     rr_vals: list[float] = []
     for t in trades:
         v = _parse_rr_ratio_numeric(t.get("rr_ratio"))
@@ -996,12 +1016,12 @@ def _smc_stats_from_trades(trades: list[dict[str, Any]]) -> dict[str, Any]:
             rr_bins["unknown"] += 1
             continue
         rr_vals.append(v)
-        if v < 1.8:
-            rr_bins["lt_1_8"] += 1
-        elif v <= 2.5:
-            rr_bins["1_8_to_2_5"] += 1
+        if v < 1.3:
+            rr_bins["lt_1_3"] += 1
+        elif v <= 2.0:
+            rr_bins["1_3_to_2"] += 1
         else:
-            rr_bins["gt_2_5"] += 1
+            rr_bins["gt_2"] += 1
 
     rr_ratio_distribution = {
         "buckets": rr_bins,
