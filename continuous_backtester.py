@@ -367,7 +367,7 @@ def apply_hard_filters(
     indicators: dict[str, Any],
     timeframe: str,  # noqa: ARG001 — reserved for timeframe-specific rules
 ) -> dict[str, Any]:
-    """Pre-Claude gates only: excluded CHF symbols + ADX floor (20). All other context is prompt guidance."""
+    """Pre-Claude gates only: excluded CHF symbols + ADX floor (15). All other context is prompt guidance."""
     result: dict[str, Any] = {"pass": True, "reason": None, "warnings": []}
     sym = (ticker or "").strip().upper()
 
@@ -377,9 +377,9 @@ def apply_hard_filters(
         return result
 
     adx = float(indicators.get("adx", 0) or 0)
-    if adx < 20:
+    if adx < 15:
         result["pass"] = False
-        result["reason"] = f"ADX {adx:.1f} below 20 minimum — very weak / noisy regime"
+        result["reason"] = f"ADX {adx:.1f} below 15"
         return result
 
     return result
@@ -524,22 +524,24 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
         learned = _load_learned_for_context() or {}
         if not isinstance(learned, dict):
             learned = {}
-        new_rules = learned.get("new_rules", [])
-        reliable = learned.get("reliable_signals", [])
-        unreliable = learned.get("unreliable_signals", [])
+        new_rules_raw = learned.get("new_rules", [])
+        new_rules = (
+            [r for r in new_rules_raw if str(r).strip()]
+            if isinstance(new_rules_raw, list)
+            else []
+        )
         learned_section = ""
-        if (isinstance(new_rules, list) and new_rules) or (isinstance(reliable, list) and reliable) or (
-            isinstance(unreliable, list) and unreliable
-        ):
-            chunks: list[str] = []
-            if isinstance(new_rules, list) and new_rules:
-                rules_text = "\n".join(f"- {r}" for r in new_rules if str(r).strip())
-                chunks.append(f"LEARNED RULES (apply strictly, discovered from backtesting):\n{rules_text}")
-            if isinstance(reliable, list) and reliable:
-                chunks.append("RELIABLE SIGNALS (prioritize these):\n" + "\n".join(f"+ {s}" for s in reliable[:5]))
-            if isinstance(unreliable, list) and unreliable:
-                chunks.append("UNRELIABLE SIGNALS (avoid or ignore these):\n" + "\n".join(f"- {s}" for s in unreliable[:5]))
-            learned_section = "\n\n".join(chunks)
+        if new_rules:
+            rules_text = "\n".join(f"- {r}" for r in new_rules[:3])
+            learned_section = f"""
+GUIDELINES FROM PAST BACKTESTS
+(use as hints not strict rules):
+{rules_text}
+
+These are tendencies not absolute blocks.
+A strong setup overrides any guideline.
+ADX above 40 with clear trend = always trade.
+"""
 
         total_trades_so_far = len(_load_results_list())
         tf_desc = TF_DESCRIPTIONS.get(tf_key, TF_DESCRIPTIONS["4h"])
@@ -552,6 +554,10 @@ You are APEX — an elite autonomous trading system.
 You execute with perfect discipline, no emotions.
 You have analyzed {total_trades_so_far} past trades
 and learned from every result.
+
+IMPORTANT: You should be finding trades regularly. If you keep saying NO TRADE you are being too conservative.
+Take calculated risks - that is the purpose of this backtesting system.
+Aim to trade at least 4 out of 10 setups (about 40% of charts that pass hard filters should be LONG or SHORT, not NO TRADE).
 
 ASSET: {sym} | TYPE: {"FOREX" if is_forex else "STOCK"}
 TIMEFRAME: {tf_desc}
@@ -572,19 +578,20 @@ BB Lower: {ind["bb_lower"]:.5f}
 
 {learned_section}
 
-TRADE FREQUENCY: Over many runs we need roughly 30–40% of setups to be LONG or SHORT (not NO TRADE).
-When structure and R/R are acceptable, take the trade. Reserve NO TRADE for genuinely weak or conflicting charts.
+TRADE FREQUENCY: After hard filters, bias toward ~40% LONG/SHORT over many runs when R/R and levels work.
+Reserve NO TRADE only when there are zero clear directional signals or the chart is genuinely unusable.
 
 HARD RULES — follow strictly:
 1. CHF pairs never appear here (already removed upstream).
 2. Stop loss ≈ 1x ATR (max {max_stop_pct:.1f}% of entry); TP1 ≈ 1.5x ATR (max {max_tp_pct:.1f}% of entry); TP2 may extend to ≈2.5x ATR if justified.
 3. Minimum R/R at TP1 vs stop: 1.5:1 or better.
-4. If fewer than 2 confluences = NO TRADE.
+4. If zero clear signals exist = NO TRADE. Otherwise find the best trade available (LONG or SHORT) that respects the ATR/R/R rules above.
 
 SOFT PREFERENCES — judgment only; NOT automatic rejections:
+- Prefer strong trends but trade moderate trends too when other signals align (EMA stack, levels, momentum).
 - Prefer NOT to take longs when RSI > 65 (overbought context).
 - Prefer NOT to take shorts when RSI < 35 (oversold context).
-- Prefer higher-quality trend when ADX >= 25; ADX between 20 and 24 is acceptable but treat as lower conviction.
+- Prefer higher-quality trend when ADX >= 25; ADX between 15 and 24 is acceptable (you already passed the data floor) but add confluence when ADX is modest.
 - Prefer trend / structure over pure mean reversion; do not use BB extremes or MACD histogram alone as the only thesis.
 
 DISCOURAGED AS SOLE ENTRY DRIVER (add other confluence instead):
