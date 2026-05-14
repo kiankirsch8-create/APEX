@@ -1195,10 +1195,6 @@ RETURN JSON ONLY — NO OTHER TEXT
             level="info",
         )
 
-        candles_to_exit = c_tp1 or c_stop
-        if candles_to_exit is None:
-            candles_to_exit = len(closes)
-
         try:
             z_ai = float(ai.get("zone_position_pct", ai.get("zone_pct", zone_pct)))
             if not math.isfinite(z_ai):
@@ -1864,12 +1860,12 @@ def continuous_backtest_loop() -> None:
 
             if is_improving():
                 log("[Loop] Improvement running, waiting...", level="info")
-                time.sleep(30)
+                time.sleep(15)
                 continue
 
             if not env("ANTHROPIC_API_KEY"):
                 log("[Loop] ANTHROPIC_API_KEY missing — sleeping", level="warning")
-                time.sleep(60)
+                time.sleep(10)
                 continue
 
             ticker = random.choice(BACKTEST_TICKERS)
@@ -1956,7 +1952,7 @@ def continuous_backtest_loop() -> None:
         except Exception as e:  # noqa: BLE001
             log(f"[Loop] Error: {e}", level="error")
             log(f"[Loop] {traceback.format_exc()}", level="error")
-            time.sleep(10)
+            time.sleep(5)
             continue
 
     log("[Loop] Stopped", level="info")
