@@ -47,7 +47,7 @@ STRATEGIES: dict[str, dict[str, Any]] = {
             "then retests it as support/resistance"
         ),
         "timeframes": ["4h", "1d"],
-        "min_adx": 20,
+        "min_adx": 18,
         "category": "TREND_FOLLOWING",
     },
     "S02_LIQUIDITY_SWEEP": {
@@ -67,7 +67,7 @@ STRATEGIES: dict[str, dict[str, Any]] = {
             "to EMA20 or EMA50"
         ),
         "timeframes": ["4h", "1d"],
-        "min_adx": 25,
+        "min_adx": 18,
         "category": "TREND_FOLLOWING",
     },
     "S04_EXTREME_REVERSION": {
@@ -190,6 +190,7 @@ EXCLUDED_PAIRS = frozenset(
         "USDHUF",
         "USDDKK",
         "USDSGD",
+        "USDTRY",  # structural carry trade, fights shorts
     }
 )
 
@@ -767,7 +768,13 @@ def evaluate_forward_candles(
                 trailing_activated = True
 
             if hit_tp1 and trailing_activated:
-                new_trail = close - risk * 1.5
+                if hit_tp3:
+                    trail_mult = 0.5
+                elif hit_tp2:
+                    trail_mult = 1.0
+                else:
+                    trail_mult = 1.5
+                new_trail = close - risk * trail_mult
                 if new_trail > current_stop:
                     current_stop = new_trail
 
@@ -796,7 +803,13 @@ def evaluate_forward_candles(
                 trailing_activated = True
 
             if hit_tp1 and trailing_activated:
-                new_trail = close + risk * 1.5
+                if hit_tp3:
+                    trail_mult = 0.5
+                elif hit_tp2:
+                    trail_mult = 1.0
+                else:
+                    trail_mult = 1.5
+                new_trail = close + risk * trail_mult
                 if new_trail < current_stop:
                     current_stop = new_trail
 
@@ -1097,7 +1110,9 @@ Non-negotiables:
 ✓ Clear breakout candle closed beyond level
 ✓ Price has pulled back to test that level
 ✓ Retest candle shows rejection (closing away)
-✓ ADX above 20 (trend exists)
+✓ ADX above 18 (trend exists)
+✓ Price within 1.0x ATR of a swing_high or
+  swing_low counts as "at the level"
 
 LONG trigger: Price breaks above resistance,
 retests it, holds above → BUY the retest
@@ -1106,7 +1121,7 @@ retests it, holds below → SELL the retest
 
 Stop: Beyond the retest candle
 Identify: Look at swing_highs/swing_lows for
-the broken level. Is price near one now?
+the broken level. Is price within 1.0x ATR of one now?
 
 ────────────────────────────────────────
 S02: LIQUIDITY SWEEP REVERSAL
@@ -1115,18 +1130,21 @@ What it is: Institutions run stops beyond
 swing clusters then reverse direction.
 
 Non-negotiables:
-✓ Equal highs or lows visible in swing data
+✓ Equal highs or lows: levels within 0.3%
+  of each other count as equal
 ✓ Price spiked beyond those equal levels
-✓ Price closed BACK inside the range
-✓ RSI was at extreme during spike (>65 or <35)
+✓ Close is at least 0.2x ATR back inside
+  the pre-sweep range (wick sweep OK)
+✓ RSI during sweep can be anywhere 25-75
+  (sweep + close-back is primary)
 
 LONG trigger: Spike below equal lows, close back above
 SHORT trigger: Spike above equal highs, close back below
 
 Stop: Beyond the sweep wick extreme
-Identify: Check swing_lows for equal values.
+Identify: Check swing_lows for near-equal values.
 Did price go below them and recover?
-Check swing_highs for equal values.
+Check swing_highs for near-equal values.
 Did price go above them and pull back?
 
 ────────────────────────────────────────
@@ -1138,9 +1156,9 @@ pulls back to moving average support.
 Non-negotiables:
 ✓ EMA20 > EMA50 > EMA200 (uptrend) OR
   EMA20 < EMA50 < EMA200 (downtrend)
-✓ Price has pulled back to EMA20 or EMA50
-✓ RSI between 35-60 at the pullback
-✓ ADX above 25
+✓ Price within 1.5x ATR of EMA20 or EMA50
+✓ RSI between 30-65 at the pullback
+✓ ADX above 18
 
 LONG trigger: In uptrend, price touches EMA20
 or EMA50, RSI was falling but now turning up
@@ -1148,7 +1166,7 @@ SHORT trigger: In downtrend, price bounces to
 EMA20 or EMA50, RSI was rising but now turning down
 
 Stop: Below EMA50 (long) or above EMA50 (short)
-Identify: Is price currently near EMA20 or EMA50?
+Identify: Is price within 1.5x ATR of EMA20 or EMA50?
 Is there a clear EMA stack?
 
 ────────────────────────────────────────
@@ -1158,14 +1176,14 @@ What it is: Price at statistical extreme,
 mean reversion highly probable.
 
 Non-negotiables:
-✓ Zone below 8% (EXTREME_DISCOUNT) for longs
-  OR zone above 92% (EXTREME_PREMIUM) for shorts
-✓ RSI below 25 (long) or above 75 (short)
-✓ ADX below 30 (not in strong trend)
+✓ Zone below 12% (EXTREME_DISCOUNT) for longs
+  OR zone above 88% (EXTREME_PREMIUM) for shorts
+✓ RSI below 30 (long) or above 70 (short)
+✓ ADX below 40 (not in strong trend)
 ✓ Previous visit to this zone reversed
 
-LONG trigger: EXTREME_DISCOUNT + RSI below 25
-SHORT trigger: EXTREME_PREMIUM + RSI above 75
+LONG trigger: EXTREME_DISCOUNT + RSI below 30
+SHORT trigger: EXTREME_PREMIUM + RSI above 70
 
 Stop: 0.5x ATR beyond the extreme
 Identify: Zone is {zone_pct:.1f}%. RSI is {ind["rsi"]:.1f}.
@@ -1182,7 +1200,9 @@ Non-negotiables:
   MACD histogram makes lower high
 ✓ BULLISH: Price makes lower low but
   MACD histogram makes higher low
-✓ Divergence spans at least 3 candles
+✓ MACD line and histogram both confirm
+  the divergence direction
+✓ Divergence spans at least 2 candles
 ✓ RSI also showing divergence
 
 LONG trigger: Bullish divergence + MACD
@@ -1253,9 +1273,9 @@ What it is: Price compresses then
 explodes out with institutional backing.
 
 Non-negotiables:
-✓ BB Width below 1.5% (compression)
+✓ BB Width below 2.5% (compression)
   Current BB Width: {bb_width:.3f}%
-✓ ADX below 20 during compression
+✓ ADX below 25 during compression
 ✓ At least 5 candles inside the range
 ✓ Breakout candle closes clearly outside BB
 ✓ Volume spike on breakout (if available)
@@ -1320,7 +1340,8 @@ role - resistance becomes support etc.
 Non-negotiables:
 ✓ Price clearly broke through a level
   (full candle body, not just wick)
-✓ Price has returned to test the level
+✓ Price within 1.0x ATR of any swing_high or
+  swing_low that was tested at least once before
 ✓ Level is holding in its new role
 ✓ Rejection candle visible at the level
 
@@ -1331,7 +1352,7 @@ as resistance on retest
 
 Stop: Beyond the flipped level
 Identify: Look at swing_highs/swing_lows.
-Is price near a previously significant level?
+Is price within 1.0x ATR of a prior-tested swing level?
 Has that level role-reversed?
 
 ────────────────────────────────────────
@@ -1341,9 +1362,9 @@ What it is: After consolidation energy
 releases explosively.
 
 Non-negotiables:
-✓ BB Width below 1.0% (tight compression)
+✓ BB Width below 2.0% (tight compression)
   Current: {bb_width:.3f}%
-✓ ADX below 18 (no trend during compression)
+✓ ADX below 22 (no trend during compression)
 ✓ Candle closes outside BB after compression
 ✓ This candle has above-average range
 
@@ -1353,6 +1374,24 @@ SHORT trigger: Close below lower BB after squeeze
 Stop: Midpoint of the compression range
 Identify: Is current BB Width compressed?
 Did price just break out?
+
+STRATEGY SELECTION GUIDANCE:
+You must identify a named strategy for at least
+60% of trades. Do not be overly strict with
+non-negotiables — use judgment within 15% of
+each threshold.
+
+For example:
+- ADX 22 when threshold is 25 = VALID if trend clear
+- Zone 14% when extreme threshold is 12% = VALID
+- RSI 68 when threshold is 70 = VALID
+
+The non-negotiables are guidelines not hard walls.
+A trade that meets 3 of 4 non-negotiables with
+the 4th close to threshold = USE THE STRATEGY.
+
+Only use S00_BEST_AVAILABLE when NO strategy
+comes within 20% of its thresholds.
 
 ════════════════════════════════════════
 DECISION FRAMEWORK
@@ -1397,8 +1436,10 @@ TP2 = 3.0x risk distance
 TP3 = 5.0x risk distance
 
 After TP1: stop moves to breakeven
-After TP2: stop moves to +1R
-After TP3: trail at 1.5R below/above price
+After TP2: stop moves to +1R; then trail at 1.0R
+below/above each close (tighter than before)
+After TP3: trail at 0.5R below/above close
+(very tight — ride the trend)
 
 STEP 7: CONFIDENCE AND SIZING
 HIGH (2% risk): Strategy perfectly met +
@@ -1558,7 +1599,7 @@ CRITICAL RULES:
             risk = entry - stop
             if risk <= 0:
                 stop = validate_stop_loss(
-                    entry, round(entry - max(atr * 1.0, entry * 0.001), 5), direction, tf_key
+                    entry, round(entry - max(atr * 1.5, entry * 0.001), 5), direction, tf_key
                 )
                 ai["stop_loss"] = stop
                 risk = entry - stop
@@ -1566,13 +1607,13 @@ CRITICAL RULES:
             risk = stop - entry
             if risk <= 0:
                 stop = validate_stop_loss(
-                    entry, round(entry + max(atr * 1.0, entry * 0.001), 5), direction, tf_key
+                    entry, round(entry + max(atr * 1.5, entry * 0.001), 5), direction, tf_key
                 )
                 ai["stop_loss"] = stop
                 risk = stop - entry
 
         if risk <= 0:
-            risk = max(atr * 1.0, entry * 0.001)
+            risk = max(atr * 1.5, entry * 0.001)
             if direction == "LONG":
                 stop = round(entry - risk, 5)
             else:
@@ -1583,6 +1624,25 @@ CRITICAL RULES:
                 risk = entry - stop
             else:
                 risk = stop - entry
+
+        # Minimum stop distance = 1.5x ATR (Claude often places stops too tight)
+        stop = float(ai["stop_loss"])
+        if direction == "LONG":
+            min_stop = entry - (atr * 1.5)
+            if stop > min_stop:
+                stop = min_stop
+                log(f"[SL] Widened stop to 1.5x ATR: {stop:.5f}")
+        else:
+            max_stop = entry + (atr * 1.5)
+            if stop < max_stop:
+                stop = max_stop
+                log(f"[SL] Widened stop to 1.5x ATR: {stop:.5f}")
+        stop = validate_stop_loss(entry, round(stop, 5), direction, tf_key)
+        ai["stop_loss"] = stop
+        if direction == "LONG":
+            risk = entry - stop
+        else:
+            risk = stop - entry
 
         if direction == "LONG":
             ai["tp1"] = round(entry + risk * 2.0, 5)
