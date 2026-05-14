@@ -923,6 +923,13 @@ async def backtest_improve_now() -> dict[str, Any]:
         return {"error": str(e)}
 
 
+@app.post("/api/backtest/reset-learned")
+async def backtest_reset_learned() -> dict[str, Any]:
+    """Clear ``learned_weights.json`` to default empty rules (removes overly strict improvement output)."""
+    continuous_backtester.reset_learned_rules()
+    return {"reset": True, "message": "Learned rules cleared"}
+
+
 @app.get("/api/backtest/improve-debug")
 async def backtest_improve_debug() -> dict[str, Any]:
     """Last improvement parse/API failure payload from ``improve_debug.json``."""
@@ -992,6 +999,7 @@ async def root() -> dict:
             "GET /api/backtest/enabled",
             "POST /api/backtest/toggle",
             "POST /api/backtest/improve-now",
+            "POST /api/backtest/reset-learned",
             "GET /api/backtest/improve-debug",
             "GET /api/backtest/learned",
             "GET /api/backtest/learned/history",

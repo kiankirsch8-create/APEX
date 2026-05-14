@@ -39,7 +39,7 @@ POSITION_SIZE_PCT = 0.05  # 5% of capital
 LEVERAGE = 50  # 50x on notional exposure
 IMPROVE_EVERY = 100
 
-# --- Hard filters (learned-style exclusions applied before Claude) ---
+# --- Hard filters: CHF crosses only (see ``apply_hard_filters``) ---
 CHF_PAIRS = [
     "GBPCHF",
     "AUDCHF",
@@ -47,7 +47,6 @@ CHF_PAIRS = [
     "USDCHF",
     "NZDCHF",
     "CADCHF",
-    "CHFJPY",
 ]
 
 BANNED_SIGNALS = [
@@ -158,12 +157,6 @@ _stop_flag = threading.Event()
 _results_lock = threading.Lock()
 
 
-def _load_learned_for_context() -> dict[str, Any]:
-    """Latest improvement weights from ``learned_weights.json``."""
-    raw = load_json(LEARNED_FILE, default=None)
-    return raw if isinstance(raw, dict) else {}
-
-
 def log_learned_startup_preview() -> None:
     """Log first 500 chars of the current learned report for Railway / ops visibility."""
     raw = load_json(LEARNED_FILE, default={}) or {}
@@ -172,6 +165,25 @@ def log_learned_startup_preview() -> None:
     except (TypeError, ValueError):
         snippet = str(raw)[:500]
     log(f"[Learned] Current report: {snippet}", level="info")
+
+
+def reset_learned_rules() -> None:
+    """Overwrite ``learned_weights.json`` with empty defaults (clears overly strict improvement rules)."""
+    default_learned: dict[str, Any] = {
+        "updated_at": datetime.now().isoformat(),
+        "total_trades_analyzed": 0,
+        "analysis_summary": "",
+        "new_rules": [],
+        "reliable_signals": [],
+        "unreliable_signals": [],
+        "main_loss_reasons": [],
+        "recommendation": "",
+        "expected_improvement": "",
+        "signal_win_rates": {},
+        "signal_adjustments": {},
+    }
+    save_json(LEARNED_FILE, default_learned)
+    log("[Reset] Learned rules reset to defaults", level="info")
 
 
 def _client() -> Anthropic:
@@ -381,25 +393,22 @@ def get_ohlcv(
 
 def apply_hard_filters(
     ticker: str,
-    indicators: dict[str, Any],
-    timeframe: str,  # noqa: ARG001 — reserved for timeframe-specific rules
+    indicators: dict[str, Any],  # noqa: ARG001
+    timeframe: str,  # noqa: ARG001
 ) -> dict[str, Any]:
-    """Pre-Claude gates only: excluded CHF symbols + ADX floor (15). All other context is prompt guidance."""
-    result: dict[str, Any] = {"pass": True, "reason": None, "warnings": []}
+    """CHF cross exclusion only. All other decisions go to Claude."""
+    chf_only = [
+        "GBPCHF",
+        "AUDCHF",
+        "EURCHF",
+        "USDCHF",
+        "NZDCHF",
+        "CADCHF",
+    ]
     sym = (ticker or "").strip().upper()
-
-    if sym in CHF_PAIRS:
-        result["pass"] = False
-        result["reason"] = "CHF pair excluded — 0% win rate across 10 trades (-$877)"
-        return result
-
-    adx = float(indicators.get("adx", 0) or 0)
-    if adx < 15:
-        result["pass"] = False
-        result["reason"] = f"ADX {adx:.1f} below 15"
-        return result
-
-    return result
+    if sym in chf_only:
+        return {"pass": False, "reason": "CHF pair excluded"}
+    return {"pass": True, "reason": None}
 
 
 def validate_rr(plan: dict[str, Any]) -> dict[str, Any]:
@@ -511,19 +520,7 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
         else:
             trend = "RANGING"
 
-        filters = apply_hard_filters(
-            sym,
-            {
-                "adx": ind["adx"],
-                "rsi": ind["rsi"],
-                "macd_hist": ind["macd_hist"],
-                "bb_upper": ind["bb_upper"],
-                "bb_lower": ind["bb_lower"],
-                "ema20": ind["ema20"],
-                "current_price": price,
-            },
-            tf_key,
-        )
+        filters = apply_hard_filters(sym, {}, tf_key)
         if not filters.get("pass", True):
             log(f"[Backtest] FILTERED: {sym} — {filters.get('reason')}", level="info")
             return {
@@ -538,48 +535,16 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
                 "entry_price": price,
             }
 
-        learned = _load_learned_for_context() or {}
-        if not isinstance(learned, dict):
-            learned = {}
-        new_rules_raw = learned.get("new_rules", [])
-        new_rules = (
-            [r for r in new_rules_raw if str(r).strip()]
-            if isinstance(new_rules_raw, list)
-            else []
-        )
-        learned_section = ""
-        if new_rules:
-            rules_text = "\n".join(f"- {r}" for r in new_rules[:3])
-            learned_section = f"""
-GUIDELINES FROM PAST BACKTESTS
-(use as hints not strict rules):
-{rules_text}
-
-These are tendencies not absolute blocks.
-A strong setup overrides any guideline.
-ADX above 40 with clear trend = always trade.
-"""
-
-        total_trades_so_far = len(_load_results_list())
         tf_desc = TF_DESCRIPTIONS.get(tf_key, TF_DESCRIPTIONS["4h"])
-        max_stop_pct = TF_MAX_STOP_PCT.get(tf_key, 0.012) * 100
-        max_tp_pct = TF_MAX_TP_PCT.get(tf_key, 0.020) * 100
-        atr = ind["atr"]
 
         prompt = f"""
-You are APEX — an elite autonomous trading system.
-You execute with perfect discipline, no emotions.
-You have analyzed {total_trades_so_far} past trades
-and learned from every result.
-
-IMPORTANT: You should be finding trades regularly. If you keep saying NO TRADE you are being too conservative.
-Take calculated risks - that is the purpose of this backtesting system.
-Aim to trade at least 4 out of 10 setups (about 40% of charts that pass hard filters should be LONG or SHORT, not NO TRADE).
+You are APEX — a disciplined trading analyst evaluating a historical snapshot for backtesting.
 
 ASSET: {sym} | TYPE: {"FOREX" if is_forex else "STOCK"}
 TIMEFRAME: {tf_desc}
 DATE: {analysis_date}
 PRICE: {price}
+(Backtests completed so far in this system: {total_trades_so_far}.)
 
 MARKET DATA:
 Trend: {trend}
@@ -593,27 +558,14 @@ ADX: {ind["adx"]:.2f}
 BB Upper: {ind["bb_upper"]:.5f}
 BB Lower: {ind["bb_lower"]:.5f}
 
-{learned_section}
-
-TRADE FREQUENCY: After hard filters, bias toward ~40% LONG/SHORT over many runs when R/R and levels work.
-Reserve NO TRADE only when there are zero clear directional signals or the chart is genuinely unusable.
-
-HARD RULES — follow strictly:
-1. CHF pairs never appear here (already removed upstream).
-2. Stop loss ≈ 1x ATR (max {max_stop_pct:.1f}% of entry); TP1 ≈ 1.5x ATR (max {max_tp_pct:.1f}% of entry); TP2 may extend to ≈2.5x ATR if justified.
-3. Minimum R/R at TP1 vs stop: 1.5:1 or better.
-4. If zero clear signals exist = NO TRADE. Otherwise find the best trade available (LONG or SHORT) that respects the ATR/R/R rules above.
-
-SOFT PREFERENCES — judgment only; NOT automatic rejections:
-- Prefer strong trends but trade moderate trends too when other signals align (EMA stack, levels, momentum).
-- Prefer NOT to take longs when RSI > 65 (overbought context).
-- Prefer NOT to take shorts when RSI < 35 (oversold context).
-- Prefer higher-quality trend when ADX >= 25; ADX between 15 and 24 is acceptable (you already passed the data floor) but add confluence when ADX is modest.
-- Prefer trend / structure over pure mean reversion; do not use BB extremes or MACD histogram alone as the only thesis.
-
-DISCOURAGED AS SOLE ENTRY DRIVER (add other confluence instead):
-- Price near BB Lower / BB Upper without additional structure
-- MACD histogram bullish or bearish in isolation
+TRADING GUIDELINES:
+- Look for clear trend direction
+- ADX above 20 preferred
+- At least 2-3 signals aligning
+- Stop loss 1x ATR, TP1 1.5x ATR
+- Take trades when you see a clear setup
+- Aim to trade 30-40% of setups
+- NO TRADE only when truly no direction
 
 Return ONLY valid JSON:
 {{
