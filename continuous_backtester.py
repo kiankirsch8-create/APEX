@@ -90,7 +90,7 @@ TF_MAX_TP_PCT: dict[str, float] = {
 TF_DESCRIPTIONS: dict[str, str] = {
     "1h": "1H intraday — hold 2-48 hours, tight stops",
     "4h": "4H day trade — hold 4-48 hours, best confluence",
-    "1d": "Daily swing — hold 3-20 days, ADX 30+ required",
+    "1d": "Daily swing — hold 3-20 days; prefer ADX 25+ for conviction",
     "1w": "Weekly position — highest conviction only",
 }
 
@@ -367,7 +367,7 @@ def apply_hard_filters(
     indicators: dict[str, Any],
     timeframe: str,  # noqa: ARG001 — reserved for timeframe-specific rules
 ) -> dict[str, Any]:
-    """Pre-Claude gates: CHF pairs, ADX, RSI extremes, BB upper long risk."""
+    """Pre-Claude gates only: excluded CHF symbols + ADX floor (20). All other context is prompt guidance."""
     result: dict[str, Any] = {"pass": True, "reason": None, "warnings": []}
     sym = (ticker or "").strip().upper()
 
@@ -377,30 +377,9 @@ def apply_hard_filters(
         return result
 
     adx = float(indicators.get("adx", 0) or 0)
-    rsi = float(indicators.get("rsi", 50) or 50)
-    bb_upper = float(indicators.get("bb_upper", 0) or 0)
-    bb_lower = float(indicators.get("bb_lower", 0) or 0)
-    price = float(indicators.get("current_price", 0) or 0)
-    ema20 = float(indicators.get("ema20", price) or price)
-
-    if adx < 25:
+    if adx < 20:
         result["pass"] = False
-        result["reason"] = f"ADX {adx:.1f} below 25 minimum — weak trend"
-        return result
-
-    if price > ema20 and rsi > 65:
-        result["pass"] = False
-        result["reason"] = f"RSI {rsi:.1f} overbought on long — high failure rate"
-        return result
-
-    if price < ema20 and rsi < 35:
-        result["pass"] = False
-        result["reason"] = f"RSI {rsi:.1f} oversold on short — high failure rate"
-        return result
-
-    if bb_upper > 0 and price > 0 and price > bb_upper * 0.998:
-        result["pass"] = False
-        result["reason"] = "Price at BB Upper — no long entries"
+        result["reason"] = f"ADX {adx:.1f} below 20 minimum — very weak / noisy regime"
         return result
 
     return result
@@ -593,23 +572,24 @@ BB Lower: {ind["bb_lower"]:.5f}
 
 {learned_section}
 
-HARD RULES — non-negotiable:
-1. ADX must be above 25 for any trade
-2. No CHF pairs (already filtered before this prompt)
-3. No mean-reversion entries (no BB extremes as sole thesis)
-4. Only trade with STRONG trend confirmation
-5. Stop loss = 1x ATR (max {max_stop_pct:.1f}% of entry)
-6. TP1 = 1.5x ATR (max {max_tp_pct:.1f}% of entry)
-7. TP2 = 2.5x ATR
-8. Minimum R/R ratio: 1.5
-9. If fewer than 3 confluences = NO TRADE
+TRADE FREQUENCY: Over many runs we need roughly 30–40% of setups to be LONG or SHORT (not NO TRADE).
+When structure and R/R are acceptable, take the trade. Reserve NO TRADE for genuinely weak or conflicting charts.
 
-BANNED SIGNALS — never use these as entry reasons:
-- Price near BB Lower
-- Price near BB Upper
-- MACD Histogram bullish
-- MACD Histogram bearish (alone)
-- Mean reversion signals
+HARD RULES — follow strictly:
+1. CHF pairs never appear here (already removed upstream).
+2. Stop loss ≈ 1x ATR (max {max_stop_pct:.1f}% of entry); TP1 ≈ 1.5x ATR (max {max_tp_pct:.1f}% of entry); TP2 may extend to ≈2.5x ATR if justified.
+3. Minimum R/R at TP1 vs stop: 1.5:1 or better.
+4. If fewer than 2 confluences = NO TRADE.
+
+SOFT PREFERENCES — judgment only; NOT automatic rejections:
+- Prefer NOT to take longs when RSI > 65 (overbought context).
+- Prefer NOT to take shorts when RSI < 35 (oversold context).
+- Prefer higher-quality trend when ADX >= 25; ADX between 20 and 24 is acceptable but treat as lower conviction.
+- Prefer trend / structure over pure mean reversion; do not use BB extremes or MACD histogram alone as the only thesis.
+
+DISCOURAGED AS SOLE ENTRY DRIVER (add other confluence instead):
+- Price near BB Lower / BB Upper without additional structure
+- MACD histogram bullish or bearish in isolation
 
 Return ONLY valid JSON:
 {{
