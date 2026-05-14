@@ -1,10 +1,7 @@
 """
 Continuous autonomous backtesting loop: random historical setups, forward outcomes,
-rolling stats, and periodic self-improvement (timestamped backup of ``learned_weights.json``,
-``learned_v*.json`` + ``learned_latest.json`` snapshots).
-
-Persisted state uses ``RESULTS_DIR`` (file-backed). If PostgreSQL mirroring is enabled
-elsewhere in the app, keep writing through the same paths so DB sync layers stay consistent.
+rolling stats, and periodic self-improvement. All state is simple JSON on ``DATA_DIR``
+(default ``/data`` on Railway with a volume; falls back to ``./results`` locally).
 """
 from __future__ import annotations
 
@@ -12,7 +9,6 @@ import json
 import math
 import random
 import re
-import shutil
 import threading
 import time
 import traceback
@@ -25,19 +21,17 @@ from anthropic import Anthropic
 
 import pandas_ta  # noqa: F401
 
-from utils import RESULTS_DIR, env, load_json, log, save_json, utcnow_iso
+from utils import DATA_DIR, env, load_json, log, save_json, utcnow_iso
 
 CLAUDE_MODEL = "claude-opus-4-5"
 
-# Backtest / continuous loop JSON lives under RESULTS_DIR (./results locally, /data on Railway).
-RESULTS_FILE = RESULTS_DIR / "backtest_results.json"
-STATS_FILE = RESULTS_DIR / "backtest_stats.json"
-LEARNED_FILE = RESULTS_DIR / "learned_weights.json"
-LEARNED_LATEST_FILE = RESULTS_DIR / "learned_latest.json"
-STATE_FILE = RESULTS_DIR / "backtest_state.json"
-ENABLED_FILE = RESULTS_DIR / "backtest_enabled.json"
-IMPROVING_FILE = RESULTS_DIR / "improving.json"
-IMPROVE_DEBUG_FILE = RESULTS_DIR / "improve_debug.json"
+RESULTS_FILE = DATA_DIR / "backtest_results.json"
+STATS_FILE = DATA_DIR / "backtest_stats.json"
+LEARNED_FILE = DATA_DIR / "learned_weights.json"
+STATE_FILE = DATA_DIR / "backtest_state.json"
+ENABLED_FILE = DATA_DIR / "backtest_enabled.json"
+IMPROVING_FILE = DATA_DIR / "improving.json"
+IMPROVE_DEBUG_FILE = DATA_DIR / "improve_debug.json"
 
 STARTING_CAPITAL = 10000.0
 POSITION_SIZE_PCT = 0.05  # 5% of capital
@@ -164,27 +158,14 @@ _results_lock = threading.Lock()
 
 
 def _load_learned_for_context() -> dict[str, Any]:
-    """Prefer the newest improvement report; fall back to legacy ``learned_weights.json``."""
-    latest = load_json(LEARNED_LATEST_FILE, default=None)
-    if isinstance(latest, dict) and latest:
-        return latest
-    return load_json(LEARNED_FILE, default={}) or {}
-
-
-def _next_learned_version() -> int:
-    max_v = 0
-    for p in RESULTS_DIR.glob("learned_v*.json"):
-        m = re.match(r"learned_v(\d+)\.json$", p.name, re.IGNORECASE)
-        if m:
-            max_v = max(max_v, int(m.group(1)))
-    return max_v + 1
+    """Latest improvement weights from ``learned_weights.json``."""
+    raw = load_json(LEARNED_FILE, default=None)
+    return raw if isinstance(raw, dict) else {}
 
 
 def log_learned_startup_preview() -> None:
     """Log first 500 chars of the current learned report for Railway / ops visibility."""
-    raw = load_json(LEARNED_LATEST_FILE, default={})
-    if not raw:
-        raw = load_json(LEARNED_FILE, default={})
+    raw = load_json(LEARNED_FILE, default={}) or {}
     try:
         snippet = json.dumps(raw, indent=2, default=str)[:500]
     except (TypeError, ValueError):
@@ -296,21 +277,49 @@ def get_random_date(days_back_max: int = 365, days_back_min: int = 10, *, skip_w
     return date.strftime("%Y-%m-%d")
 
 
+def _result_dedup_key(row: Any) -> str:
+    if not isinstance(row, dict):
+        return ""
+    t = str(row.get("ticker") or "").strip().upper()
+    d = str(row.get("date") or "").strip()
+    tf = str(row.get("timeframe") or "").strip().lower()
+    return f"{t}_{d}_{tf}"
+
+
 def _load_results_list() -> list[dict[str, Any]]:
     with _results_lock:
         raw = load_json(RESULTS_FILE, default=[])
         if isinstance(raw, list):
-            return raw
+            return [r for r in raw if isinstance(r, dict)]
         return []
 
 
-def _append_result(row: dict[str, Any]) -> list[dict[str, Any]]:
-    with _results_lock:
-        raw = load_json(RESULTS_FILE, default=[])
-        results = raw if isinstance(raw, list) else []
-        results.append(row)
-        save_json(RESULTS_FILE, results)
-        return results
+def append_result(result: dict[str, Any]) -> tuple[bool, int]:
+    """Append one backtest row if the (ticker, date, timeframe) key is new. Returns (added, total_count)."""
+    try:
+        with _results_lock:
+            existing = load_json(RESULTS_FILE, default=[])
+            if not isinstance(existing, list):
+                existing = []
+
+            key = _result_dedup_key(result)
+            existing_keys = {_result_dedup_key(r) for r in existing}
+
+            if key and key not in existing_keys:
+                existing.append(result)
+                save_json(RESULTS_FILE, existing)
+                n = len(existing)
+                log(
+                    f"[IO] Saved result #{n}: {result.get('ticker')} "
+                    f"{result.get('outcome', '?')}",
+                    level="info",
+                )
+                return True, n
+            log(f"[IO] Skipping duplicate: {key}", level="info")
+            return False, len(existing)
+    except Exception as e:  # noqa: BLE001
+        log(f"[IO] append error: {e}", level="error")
+        return False, 0
 
 
 def get_ohlcv(
@@ -1213,19 +1222,9 @@ Return ONLY this exact JSON structure, nothing else:
             "source": "continuous_backtester",
         }
 
-        if LEARNED_FILE.exists():
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            shutil.copy(LEARNED_FILE, RESULTS_DIR / f"learned_{ts}.json")
-
         save_json(LEARNED_FILE, learned)
-        save_json(LEARNED_LATEST_FILE, learned)
-        ver = _next_learned_version()
-        save_json(
-            RESULTS_DIR / f"learned_v{ver}.json",
-            {**learned, "improvement_version": ver, "versioned_filename": f"learned_v{ver}.json"},
-        )
 
-        log("[Improve] Saved to learned_weights.json (and learned_latest, learned_v snapshot)", level="info")
+        log("[Improve] Saved to learned_weights.json", level="info")
         log(f"[Improve] New rules count: {len(learned['new_rules'])}", level="info")
         return learned
 
@@ -1246,87 +1245,104 @@ Return ONLY this exact JSON structure, nothing else:
 
 
 def continuous_backtest_loop() -> None:
-    log("[Backtest Loop] Starting continuous loop", level="info")
+    log("[Loop] Starting continuous backtest loop", level="info")
     tests_since_improve = 0
 
     while not _stop_flag.is_set():
-        if not is_enabled():
-            log("[Backtest Loop] Disabled, waiting...", level="info")
-            time.sleep(30)
+        try:
+            if not is_enabled():
+                time.sleep(10)
+                continue
+
+            if is_improving():
+                log("[Loop] Improvement running, waiting...", level="info")
+                time.sleep(30)
+                continue
+
+            if not env("ANTHROPIC_API_KEY"):
+                log("[Loop] ANTHROPIC_API_KEY missing — sleeping", level="warning")
+                time.sleep(60)
+                continue
+
+            ticker = random.choice(BACKTEST_TICKERS)
+            timeframe = random.choices(
+                list(TF_WEIGHTS.keys()),
+                weights=list(TF_WEIGHTS.values()),
+                k=1,
+            )[0]
+            is_fx = len(ticker) == 6 and ticker.isalpha()
+            date = get_random_date(days_back_max=365, days_back_min=10, skip_weekends=not is_fx)
+
+            existing = _load_results_list()
+            key = _result_dedup_key({"ticker": ticker, "date": date, "timeframe": timeframe})
+            existing_keys = {_result_dedup_key(r) for r in existing}
+
+            if key in existing_keys:
+                continue
+
+            update_state(
+                {
+                    "status": "testing",
+                    "current_ticker": ticker,
+                    "current_date": date,
+                    "current_timeframe": timeframe,
+                    "total_tests_run": len(existing),
+                    "last_heartbeat": datetime.now().isoformat(),
+                }
+            )
+
+            log(f"[Loop] Testing {ticker} {timeframe} {date}", level="info")
+
+            result = run_one_backtest(ticker, timeframe, date)
+
+            if result is not None:
+                added, count = append_result(result)
+
+                if added and not result.get("skipped"):
+                    outcome = result.get("outcome", "?")
+                    pnl = float(result.get("pnl_dollars", 0) or 0)
+                    log(
+                        f"[Loop] #{count} {ticker} {timeframe} {date}: {outcome} ${pnl:.2f}",
+                        level="info",
+                    )
+                    if result.get("outcome") in ("WIN", "LOSS"):
+                        tests_since_improve += 1
+
+                if added and count > 0 and count % 5 == 0:
+                    all_results = _load_results_list()
+                    stats = calculate_stats(all_results)
+                    save_json(STATS_FILE, stats)
+                    log(
+                        f"[Loop] Stats updated: WR={stats.get('win_rate_pct', 0)}% "
+                        f"Trades={stats.get('total_trades', 0)}",
+                        level="info",
+                    )
+
+                if tests_since_improve >= IMPROVE_EVERY:
+                    log("[Loop] Running improvement cycle...", level="info")
+                    tests_since_improve = 0
+                    snap = _load_results_list()
+                    threading.Thread(target=run_improvement_cycle, args=(snap,), daemon=True).start()
+
+            update_state(
+                {
+                    "status": "idle",
+                    "last_heartbeat": datetime.now().isoformat(),
+                    "total_tests_run": len(_load_results_list()),
+                    "tests_since_improve": tests_since_improve,
+                    "last_session_at": datetime.now().isoformat(),
+                }
+            )
+
+            time.sleep(5)
+
+        except Exception as e:  # noqa: BLE001
+            log(f"[Loop] Error: {e}", level="error")
+            log(f"[Loop] {traceback.format_exc()}", level="error")
+            time.sleep(10)
             continue
 
-        if is_improving():
-            log("[Backtest Loop] Improvement running, waiting...", level="info")
-            time.sleep(60)
-            continue
-
-        if not env("ANTHROPIC_API_KEY"):
-            log("[Backtest Loop] ANTHROPIC_API_KEY missing — sleeping", level="warning")
-            time.sleep(60)
-            continue
-
-        results = _load_results_list()
-        existing_keys = {f"{r.get('ticker')}|{r.get('date')}|{r.get('timeframe')}" for r in results if isinstance(r, dict)}
-
-        ticker = random.choice(BACKTEST_TICKERS)
-        timeframe = random.choices(
-            list(TF_WEIGHTS.keys()),
-            weights=list(TF_WEIGHTS.values()),
-            k=1,
-        )[0]
-        is_fx = len(ticker) == 6 and ticker.isalpha()
-        date = get_random_date(skip_weekends=not is_fx)
-        key = f"{ticker}|{date}|{timeframe}"
-
-        if key in existing_keys:
-            time.sleep(0.2)
-            continue
-
-        update_state(
-            {
-                "status": "testing",
-                "current_ticker": ticker,
-                "current_date": date,
-                "current_timeframe": timeframe,
-                "total_tests_run": len(results),
-            }
-        )
-
-        log(f"[Backtest Loop] Testing {ticker} {timeframe} on {date}", level="info")
-
-        result = run_one_backtest(ticker, timeframe, date)
-        if result:
-            results_after = _append_result(result)
-            tests_since_improve += 1
-
-            if not result.get("skipped"):
-                stats = calculate_stats(results_after)
-                save_json(STATS_FILE, stats)
-                log(
-                    f"[Backtest Loop] {ticker} {date}: {result.get('outcome', '?')} "
-                    f"${float(result.get('pnl_dollars', 0) or 0):.2f} | Total: {len(results_after)} | "
-                    f"WR: {stats.get('win_rate_pct', 0)}%",
-                    level="info",
-                )
-
-            if tests_since_improve >= IMPROVE_EVERY:
-                log("[Backtest Loop] Running improvement cycle...", level="info")
-                tests_since_improve = 0
-                snap = _load_results_list()
-                threading.Thread(target=run_improvement_cycle, args=(snap,), daemon=True).start()
-
-        update_state(
-            {
-                "status": "idle",
-                "tests_since_improve": tests_since_improve,
-                "last_session_at": datetime.now().isoformat(),
-                "total_tests_run": len(_load_results_list()),
-            }
-        )
-
-        time.sleep(3)
-
-    log("[Backtest Loop] Stopped", level="info")
+    log("[Loop] Stopped", level="info")
     update_state({"status": "stopped"})
 
 
@@ -1386,37 +1402,29 @@ def trigger_improvement_now() -> dict[str, Any]:
 
 
 def get_stats() -> dict[str, Any]:
-    return load_json(STATS_FILE, default={})
-
-
-def get_results_slice(limit: int = 50) -> list[dict[str, Any]]:
-    results = _load_results_list()
-    if limit <= 0:
-        return []
-    return results[-limit:]
+    return load_json(STATS_FILE, default={}) or {}
 
 
 def get_learned() -> dict[str, Any]:
-    """Latest improvement report (``learned_latest.json``), not legacy-only weights."""
-    data = load_json(LEARNED_LATEST_FILE, default=None)
+    """Latest improvement report from ``learned_weights.json`` on the data volume."""
+    data = load_json(LEARNED_FILE, default=None)
     if isinstance(data, dict) and data:
         return data
-    return load_json(LEARNED_FILE, default={})
+    return {
+        "analysis_summary": "",
+        "new_rules": [],
+        "reliable_signals": [],
+        "unreliable_signals": [],
+        "main_loss_reasons": [],
+        "recommendation": "",
+        "expected_improvement": "",
+        "total_trades_analyzed": 0,
+    }
 
 
 def get_learned_history() -> list[dict[str, Any]]:
-    """All versioned improvement cycles, oldest first (``learned_v*.json``)."""
-    rows: list[tuple[int, dict[str, Any]]] = []
-    for p in RESULTS_DIR.glob("learned_v*.json"):
-        m = re.match(r"learned_v(\d+)\.json$", p.name, re.IGNORECASE)
-        if not m:
-            continue
-        v = int(m.group(1))
-        blob = load_json(p, default=None)
-        if isinstance(blob, dict):
-            rows.append((v, blob))
-    rows.sort(key=lambda x: x[0])
-    return [d for _, d in rows]
+    """Learned-rule history archives are not written separately; use ``learned_weights.json``."""
+    return []
 
 
 def get_improving_state() -> dict[str, Any]:

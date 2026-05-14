@@ -29,7 +29,7 @@ import screener_small_caps
 from market_data import YFClient
 from scorer import calculate, enforce_portfolio_cap
 from scheduler import run_daily_apex
-from utils import CONFIG_DIR, RESULTS_DIR, env, load_json, log, save_json, today_str, utcnow_iso
+from utils import CONFIG_DIR, DATA_DIR, RESULTS_DIR, env, load_json, log, save_json, today_str, utcnow_iso
 
 # ---------------------------------------------------------------------------
 # Lifespan — graceful shutdown of continuous backtester worker thread.
@@ -66,9 +66,9 @@ app.add_middleware(
 @app.on_event("startup")
 async def on_startup_resume_backtester() -> None:
     try:
-        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        (RESULTS_DIR / "daily_picks").mkdir(parents=True, exist_ok=True)
-        log(f"[Startup] Persist directory: {RESULTS_DIR}")
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        (DATA_DIR / "daily_picks").mkdir(parents=True, exist_ok=True)
+        log(f"[Startup] Persist directory: {DATA_DIR}")
         continuous_backtester.log_learned_startup_preview()
         if continuous_backtester.is_enabled():
             continuous_backtester.start_continuous_backtest()
@@ -828,14 +828,45 @@ async def backtest_health():
 
 @app.get("/api/backtest/stats")
 async def backtest_stats() -> dict[str, Any]:
-    """Rolling stats from ``backtest_stats.json`` (continuous backtester) under RESULTS_DIR."""
-    return continuous_backtester.get_stats()
+    """Rolling stats from ``backtest_stats.json`` on the data volume."""
+    try:
+        data = load_json(continuous_backtester.STATS_FILE, default=None)
+        if not data:
+            return {
+                "total_trades": 0,
+                "win_rate_pct": 0,
+                "total_pnl_dollars": 0,
+                "final_capital": 10000,
+                "starting_capital": 10000,
+                "winning_trades": 0,
+                "losing_trades": 0,
+                "capital_curve": [],
+                "recent_trades": [],
+                "signal_performance": {},
+                "timeframe_performance": {},
+            }
+        return data
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)}
 
 
 @app.get("/api/backtest/results")
 async def backtest_results(limit: int = Query(50, ge=1, le=5000)) -> dict[str, Any]:
-    """Last ``limit`` rows from ``backtest_results.json`` under RESULTS_DIR."""
-    return {"limit": limit, "results": continuous_backtester.get_results_slice(limit)}
+    """Backtest rows from ``backtest_results.json``, newest by date first."""
+    try:
+        data = load_json(continuous_backtester.RESULTS_FILE, default=None)
+        if not data:
+            return {"limit": limit, "total": 0, "results": []}
+        if not isinstance(data, list):
+            return {"limit": limit, "total": 0, "results": []}
+        sorted_data = sorted(data, key=lambda x: str(x.get("date", "")), reverse=True)
+        return {
+            "limit": limit,
+            "total": len(sorted_data),
+            "results": sorted_data[:limit],
+        }
+    except Exception as e:  # noqa: BLE001
+        return {"limit": limit, "total": 0, "results": [], "error": str(e)}
 
 
 @app.get("/api/backtest/state")
@@ -900,14 +931,29 @@ async def backtest_improve_debug() -> dict[str, Any]:
 
 @app.get("/api/backtest/learned/history")
 async def backtest_learned_history() -> list[dict[str, Any]]:
-    """All improvement cycles from ``learned_v*.json`` (oldest first)."""
+    """Reserved for future multi-cycle archives; currently empty (see ``learned_weights.json``)."""
     return continuous_backtester.get_learned_history()
 
 
 @app.get("/api/backtest/learned")
 async def backtest_learned() -> dict[str, Any]:
-    """Latest improvement report from ``learned_latest.json`` (falls back to legacy weights file)."""
-    return continuous_backtester.get_learned()
+    """Improvement weights from ``learned_weights.json`` on the data volume."""
+    try:
+        data = load_json(continuous_backtester.LEARNED_FILE, default=None)
+        if data and isinstance(data, dict):
+            return data
+        return {
+            "analysis_summary": "",
+            "new_rules": [],
+            "reliable_signals": [],
+            "unreliable_signals": [],
+            "main_loss_reasons": [],
+            "recommendation": "",
+            "expected_improvement": "",
+            "total_trades_analyzed": 0,
+        }
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)}
 
 
 @app.get("/api/backtest/improving")

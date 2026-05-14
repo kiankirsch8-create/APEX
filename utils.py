@@ -15,23 +15,20 @@ load_dotenv()
 
 ROOT_DIR = Path(__file__).resolve().parent
 
-# Persisted JSON: local dev uses ./results. On Railway, mount a volume at /data and
-# either rely on auto-detection (RAILWAY_* env) or set APEX_RESULTS_DIR=/data explicitly.
-if os.environ.get("APEX_RESULTS_DIR"):
-    _RESULTS_CANDIDATE = Path(os.environ["APEX_RESULTS_DIR"]).expanduser()
-elif os.environ.get("RAILWAY_ENVIRONMENT") is not None or os.environ.get("RAILWAY_PROJECT_ID") is not None:
-    _RESULTS_CANDIDATE = Path("/data")
-else:
-    _RESULTS_CANDIDATE = ROOT_DIR / "results"
-
-RESULTS_DIR = _RESULTS_CANDIDATE.resolve()
+# All persisted JSON: Railway volume at /data (override with APEX_RESULTS_DIR). Local
+# fallback to ./results if /data is not writable.
+_DATA_PRIMARY = Path(os.environ.get("APEX_RESULTS_DIR", "/data")).expanduser()
+DATA_DIR = _DATA_PRIMARY.resolve()
 try:
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    (RESULTS_DIR / "daily_picks").mkdir(parents=True, exist_ok=True)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    (DATA_DIR / "daily_picks").mkdir(parents=True, exist_ok=True)
 except (PermissionError, OSError):
-    RESULTS_DIR = (ROOT_DIR / "results").resolve()
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    (RESULTS_DIR / "daily_picks").mkdir(parents=True, exist_ok=True)
+    DATA_DIR = (ROOT_DIR / "results").resolve()
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    (DATA_DIR / "daily_picks").mkdir(parents=True, exist_ok=True)
+
+# Alias kept for modules that still import RESULTS_DIR.
+RESULTS_DIR = DATA_DIR
 
 LOGS_DIR = ROOT_DIR / "logs"
 CONFIG_DIR = ROOT_DIR / "config"
@@ -77,28 +74,35 @@ def log(message: str, level: str = "info") -> None:
     getattr(logger, level.lower(), logger.info)(message)
 
 
-def save_json(path: str | Path, data: Any) -> Path:
-    """Write `data` as JSON to `path`. Creates parent dirs as needed."""
-    p = Path(path)
-    if not p.is_absolute():
-        p = ROOT_DIR / p
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, default=str)
-    return p
+def save_json(path: str | Path, data: Any) -> Path | None:
+    """Write `data` as JSON atomically (temp file + rename). Logs and returns None on failure."""
+    try:
+        p = Path(path)
+        if not p.is_absolute():
+            p = ROOT_DIR / p
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = str(p) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, default=str)
+        os.replace(tmp, str(p))
+        return p
+    except Exception as e:  # noqa: BLE001
+        log(f"[IO] save error {path}: {e}")
+        return None
 
 
 def load_json(path: str | Path, default: Any = None) -> Any:
-    """Read JSON from `path` returning `default` on missing / invalid file."""
-    p = Path(path)
-    if not p.is_absolute():
-        p = ROOT_DIR / p
-    if not p.exists():
-        return default
+    """Read JSON from `path`. On missing file or any error, log and return `default`."""
     try:
-        with p.open("r", encoding="utf-8") as f:
+        p = Path(path)
+        if not p.is_absolute():
+            p = ROOT_DIR / p
+        if not p.exists():
+            return default
+        with open(p, encoding="utf-8") as f:
             return json.load(f)
-    except (json.JSONDecodeError, OSError):
+    except Exception as e:  # noqa: BLE001
+        log(f"[IO] load error {path}: {e}")
         return default
 
 
