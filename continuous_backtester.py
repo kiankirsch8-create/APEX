@@ -393,10 +393,10 @@ def get_ohlcv(
 
 def apply_hard_filters(
     ticker: str,
-    indicators: dict[str, Any],  # noqa: ARG001
+    indicators: dict[str, Any],
     timeframe: str,  # noqa: ARG001
 ) -> dict[str, Any]:
-    """CHF cross exclusion only. All other decisions go to Claude."""
+    """CHF cross exclusion + ADX floor (18). No RSI/BB or other hard gates."""
     chf_only = [
         "GBPCHF",
         "AUDCHF",
@@ -408,11 +408,16 @@ def apply_hard_filters(
     sym = (ticker or "").strip().upper()
     if sym in chf_only:
         return {"pass": False, "reason": "CHF pair excluded"}
+
+    adx = float(indicators.get("adx", 0) or 0)
+    if adx < 18:
+        return {"pass": False, "reason": f"ADX {adx:.1f} below 18"}
+
     return {"pass": True, "reason": None}
 
 
 def validate_rr(plan: dict[str, Any]) -> dict[str, Any]:
-    """Ensure reward at TP1 vs stop risk meets minimum R/R; downgrade to NO TRADE if not."""
+    """Ensure reward at TP1 vs stop risk meets minimum R/R (1.0); downgrade to NO TRADE if not."""
     if not isinstance(plan, dict):
         return {}
     direction = str(plan.get("direction", "")).strip().upper()
@@ -441,10 +446,10 @@ def validate_rr(plan: dict[str, Any]) -> dict[str, Any]:
 
     rr = reward / risk
 
-    if rr < 1.5:
+    if rr < 1.0:
         log(f"[Backtest] RR {rr:.2f} too low — rejecting trade", level="info")
         plan["direction"] = "NO TRADE"
-        plan["skip_reason"] = f"R/R {rr:.2f} below minimum 1.5"
+        plan["skip_reason"] = f"R/R {rr:.2f} below minimum 1.0"
 
     plan["rr_ratio"] = f"1:{rr:.2f}"
     return plan
@@ -520,7 +525,7 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
         else:
             trend = "RANGING"
 
-        filters = apply_hard_filters(sym, {}, tf_key)
+        filters = apply_hard_filters(sym, {"adx": ind["adx"]}, tf_key)
         if not filters.get("pass", True):
             log(f"[Backtest] FILTERED: {sym} — {filters.get('reason')}", level="info")
             return {
@@ -536,6 +541,10 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
             }
 
         tf_desc = TF_DESCRIPTIONS.get(tf_key, TF_DESCRIPTIONS["4h"])
+        total_trades_so_far = len(_load_results_list())
+
+        # Learned rules disabled — letting Claude decide freely until 200+ real trades.
+        learned_section = ""
 
         prompt = f"""
 You are APEX — a disciplined trading analyst evaluating a historical snapshot for backtesting.
@@ -557,7 +566,7 @@ ATR: {ind["atr"]:.5f}
 ADX: {ind["adx"]:.2f}
 BB Upper: {ind["bb_upper"]:.5f}
 BB Lower: {ind["bb_lower"]:.5f}
-
+{learned_section}
 TRADING GUIDELINES:
 - Look for clear trend direction
 - ADX above 20 preferred
@@ -1203,6 +1212,7 @@ Return ONLY this exact JSON structure, nothing else:
 def continuous_backtest_loop() -> None:
     log("[Loop] Starting continuous backtest loop", level="info")
     tests_since_improve = 0
+    loop_completed_tests = 0
 
     while not _stop_flag.is_set():
         try:
@@ -1252,6 +1262,13 @@ def continuous_backtest_loop() -> None:
             result = run_one_backtest(ticker, timeframe, date)
 
             if result is not None:
+                loop_completed_tests += 1
+                if loop_completed_tests % 10 == 0:
+                    log(
+                        f"[Loop] Running - tests: {len(_load_results_list())}",
+                        level="info",
+                    )
+
                 prev_len = len(_load_results_list())
                 count = append_result(result)
                 added = count > prev_len
@@ -1292,7 +1309,7 @@ def continuous_backtest_loop() -> None:
                 }
             )
 
-            time.sleep(5)
+            time.sleep(3)
 
         except Exception as e:  # noqa: BLE001
             log(f"[Loop] Error: {e}", level="error")
