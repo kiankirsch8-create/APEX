@@ -70,6 +70,25 @@ DOWN_SIGNALS = {
     "SHORT_INTEREST_SPIKE": 12,           # SI +50% in last 2 weeks
 }
 
+# Exclusion signals — when any of these are triggered, the candidate is
+# DROPPED from the screener output entirely. These mark situations where the
+# upside is already capped (announced M&A, tender offers, going-private deals)
+# and where any further analysis would just be merger-arbitrage noise.
+EXCLUSION_SIGNALS = {"MERGER_ANNOUNCED", "TRADING_AT_DEAL_PRICE", "MERGER_ARBITRAGE_ONLY"}
+
+# Known acquisition / tender-offer prices. Anything trading within
+# ``MERGER_PRICE_TOLERANCE_PCT`` of these levels is treated as deal-bound
+# and excluded from the screener. Add new deals here as they're announced;
+# remove them when the deal closes or breaks.
+KNOWN_ACQUISITIONS: dict[str, dict] = {
+    "ESPR":  {"deal_price": 3.16,  "acquirer": "Otsuka",          "type": "TENDER"},
+    "HZNP":  {"deal_price": 116.5, "acquirer": "Amgen",            "type": "MERGER"},
+    "SGEN":  {"deal_price": 229.0, "acquirer": "Pfizer",           "type": "MERGER"},
+    "CERT":  {"deal_price": 12.5,  "acquirer": "Sumeru Equity",    "type": "TENDER"},
+    "PRGO":  {"deal_price": None,  "acquirer": "—",                "type": "RUMOR"},
+}
+MERGER_PRICE_TOLERANCE_PCT = 2.0  # within 2% of deal price = treat as deal-bound
+
 FILTERS = {
     "min_avg_volume": 200_000,
     "min_price": 0.50,
@@ -78,6 +97,42 @@ FILTERS = {
     "max_market_cap": 2_000_000_000,
     "min_history_quarters": 2,
 }
+
+
+def _merger_signals_for(ticker: str, price: float | None) -> list[dict]:
+    """Return ``MERGER_ANNOUNCED`` / ``TRADING_AT_DEAL_PRICE`` signals
+    when this ticker is on the known-acquisitions list and is trading
+    close to the announced deal price.
+    """
+    if not ticker:
+        return []
+    deal = KNOWN_ACQUISITIONS.get(ticker.upper())
+    if not deal:
+        return []
+    deal_price = deal.get("deal_price")
+    acquirer = deal.get("acquirer", "n/a")
+    triggered: list[dict] = [
+        {
+            "name": "MERGER_ANNOUNCED",
+            "weight": 0,
+            "direction": "EXCLUDE",
+            "detail": f"Announced {deal.get('type','M&A')} by {acquirer}"
+                      + (f" at ${deal_price:.2f}" if deal_price else ""),
+        }
+    ]
+    if deal_price and price is not None:
+        diff_pct = abs(price - deal_price) / deal_price * 100
+        if diff_pct <= MERGER_PRICE_TOLERANCE_PCT:
+            triggered.append(
+                {
+                    "name": "TRADING_AT_DEAL_PRICE",
+                    "weight": 0,
+                    "direction": "EXCLUDE",
+                    "detail": f"Price ${price:.2f} within {diff_pct:.2f}% of "
+                              f"deal price ${deal_price:.2f}",
+                }
+            )
+    return triggered
 
 
 # ---------------------------------------------------------------------------
@@ -168,8 +223,31 @@ async def scan(top_n: int = 3, candidate_pool_size: int = 60) -> list[dict[str, 
                 indicators = build_indicator_pack(row["_rows"])
                 if not indicators:
                     return None
+
+                # ---- merger / acquisition exclusion gate ----------------
+                # ESPR @ $3.16 is the canonical example: tender offer is
+                # announced, the stock is glued to the deal price, there is
+                # no upside left for outside investors. Drop it before the
+                # scorer wastes time on it.
+                merger_sigs = _merger_signals_for(ticker, indicators.get("current_price"))
+                if merger_sigs:
+                    log(
+                        f"[SmallCapScreener] EXCLUDING {ticker} — "
+                        + "; ".join(s["detail"] for s in merger_sigs),
+                        "warning",
+                    )
+                    return None
+
                 signals, score = _score_small_cap(row, indicators, details, snap, financials)
                 if not signals:
+                    return None
+                # Belt-and-braces: even if a future scoring rule synthesises
+                # a merger marker, drop the candidate.
+                if any(s.get("name") in EXCLUSION_SIGNALS for s in signals):
+                    log(
+                        f"[SmallCapScreener] EXCLUDING {ticker} — signal-level merger flag",
+                        "warning",
+                    )
                     return None
                 return {
                     "ticker": ticker,
