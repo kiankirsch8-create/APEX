@@ -49,12 +49,7 @@ CHF_PAIRS = [
     "CADCHF",
 ]
 
-BANNED_SIGNALS = [
-    "Price near BB Lower",
-    "MACD Histogram bullish",
-    "MACD Histogram bearish",
-    "Price near BB Upper",
-]
+BANNED_SIGNALS: list[str] = []
 
 # --- Multi-timeframe backtest universe ---
 TF_WEIGHTS = {
@@ -396,28 +391,20 @@ def apply_hard_filters(
     indicators: dict[str, Any],
     timeframe: str,  # noqa: ARG001
 ) -> dict[str, Any]:
-    """CHF cross exclusion + ADX floor (18). No RSI/BB or other hard gates."""
-    chf_only = [
-        "GBPCHF",
-        "AUDCHF",
-        "EURCHF",
-        "USDCHF",
-        "NZDCHF",
-        "CADCHF",
-    ]
+    """CHF pairs excluded + ADX floor (15). All SMC/ICT logic is in the Claude prompt."""
     sym = (ticker or "").strip().upper()
-    if sym in chf_only:
+    if sym in CHF_PAIRS:
         return {"pass": False, "reason": "CHF pair excluded"}
 
     adx = float(indicators.get("adx", 0) or 0)
-    if adx < 18:
-        return {"pass": False, "reason": f"ADX {adx:.1f} below 18"}
+    if adx < 15:
+        return {"pass": False, "reason": f"ADX {adx:.1f} below 15"}
 
     return {"pass": True, "reason": None}
 
 
 def validate_rr(plan: dict[str, Any]) -> dict[str, Any]:
-    """Ensure reward at TP1 vs stop risk meets minimum R/R (1.0); downgrade to NO TRADE if not."""
+    """Ensure reward at TP1 vs stop risk meets minimum R/R (1.8); downgrade to NO TRADE if not."""
     if not isinstance(plan, dict):
         return {}
     direction = str(plan.get("direction", "")).strip().upper()
@@ -446,10 +433,10 @@ def validate_rr(plan: dict[str, Any]) -> dict[str, Any]:
 
     rr = reward / risk
 
-    if rr < 1.0:
-        log(f"[Backtest] RR {rr:.2f} too low — rejecting trade", level="info")
+    if rr < 1.8:
+        log(f"[Backtest] RR {rr:.2f} below 1.8 minimum", level="info")
         plan["direction"] = "NO TRADE"
-        plan["skip_reason"] = f"R/R {rr:.2f} below minimum 1.0"
+        plan["skip_reason"] = f"R/R {rr:.2f} below 1.8 minimum"
 
     plan["rr_ratio"] = f"1:{rr:.2f}"
     return plan
@@ -487,7 +474,7 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
         if price <= 0:
             return None
 
-        bbl, _bbm, bbu = _pick_bb_cols(past)
+        bbl, bbm, bbu = _pick_bb_cols(past)
 
         def safe(col: str, default: float = 0.0) -> float:
             try:
@@ -500,7 +487,7 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
             except Exception:  # noqa: BLE001
                 return default
 
-        ind = {
+        ind: dict[str, Any] = {
             "rsi": safe("RSI_14"),
             "macd_hist": safe("MACDh_12_26_9"),
             "ema20": safe("EMA_20", price),
@@ -512,18 +499,47 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
             "bb_lower": safe(bbl, price) if bbl else price,
         }
 
-        p = price
-        ema20, ema50, ema200 = ind["ema20"], ind["ema50"], ind["ema200"]
-        if p > ema20 > ema50 > ema200:
-            trend = "STRONG UPTREND"
-        elif p < ema20 < ema50 < ema200:
-            trend = "STRONG DOWNTREND"
-        elif p > ema50:
-            trend = "UPTREND"
-        elif p < ema50:
-            trend = "DOWNTREND"
-        else:
-            trend = "RANGING"
+        try:
+            if "MACD_12_26_9" in past.columns and "MACDs_12_26_9" in past.columns:
+                ind["macd_line"] = round(float(past["MACD_12_26_9"].iloc[-1]), 5)
+                ind["macd_signal"] = round(float(past["MACDs_12_26_9"].iloc[-1]), 5)
+            else:
+                ind["macd_line"] = 0.0
+                ind["macd_signal"] = 0.0
+        except Exception:  # noqa: BLE001
+            ind["macd_line"] = 0.0
+            ind["macd_signal"] = 0.0
+
+        try:
+            if bbm and bbm in past.columns:
+                ind["bb_mid"] = round(float(past[bbm].iloc[-1]), 5)
+            else:
+                ind["bb_mid"] = round((ind["bb_upper"] + ind["bb_lower"]) / 2, 5)
+        except Exception:  # noqa: BLE001
+            ind["bb_mid"] = round((ind["bb_upper"] + ind["bb_lower"]) / 2, 5)
+
+        try:
+            ind["high_52w"] = round(float(past["High"].max()), 5)
+            ind["low_52w"] = round(float(past["Low"].min()), 5)
+        except Exception:  # noqa: BLE001
+            ind["high_52w"] = ind["low_52w"] = round(float(price), 5)
+
+        swing_highs: list[float] = []
+        swing_lows: list[float] = []
+        recent = past.tail(50)
+        if len(recent) > 11:
+            for i in range(5, len(recent) - 5):
+                try:
+                    hi = float(recent["High"].iloc[i])
+                    if hi == float(recent["High"].iloc[i - 5 : i + 6].max()):
+                        swing_highs.append(round(hi, 5))
+                    lo = float(recent["Low"].iloc[i])
+                    if lo == float(recent["Low"].iloc[i - 5 : i + 6].min()):
+                        swing_lows.append(round(lo, 5))
+                except Exception:  # noqa: BLE001
+                    continue
+        ind["swing_highs"] = swing_highs[-5:]
+        ind["swing_lows"] = swing_lows[-5:]
 
         filters = apply_hard_filters(sym, {"adx": ind["adx"]}, tf_key)
         if not filters.get("pass", True):
@@ -540,63 +556,182 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
                 "entry_price": price,
             }
 
-        tf_desc = TF_DESCRIPTIONS.get(tf_key, TF_DESCRIPTIONS["4h"])
-        total_trades_so_far = len(_load_results_list())
-
-        # Learned rules disabled — letting Claude decide freely until 200+ real trades.
-        learned_section = ""
+        tf_desc = TF_DESCRIPTIONS.get(tf_key, tf_key)
+        sh = json.dumps(ind.get("swing_highs") or [])
+        sl = json.dumps(ind.get("swing_lows") or [])
 
         prompt = f"""
-You are APEX — a disciplined trading analyst evaluating a historical snapshot for backtesting.
+You are APEX — an elite autonomous trading system
+trained on institutional order flow, smart money
+concepts, and price action methodology.
 
-ASSET: {sym} | TYPE: {"FOREX" if is_forex else "STOCK"}
+ASSET: {sym}
 TIMEFRAME: {tf_desc}
 DATE: {analysis_date}
-PRICE: {price}
-(Backtests completed so far in this system: {total_trades_so_far}.)
+CURRENT PRICE: {price}
 
 MARKET DATA:
-Trend: {trend}
 RSI(14): {ind["rsi"]:.2f}
+MACD Line: {ind.get("macd_line", 0):.5f}
+MACD Signal: {ind.get("macd_signal", 0):.5f}
 MACD Histogram: {ind["macd_hist"]:.5f}
 EMA20: {ind["ema20"]:.5f}
 EMA50: {ind["ema50"]:.5f}
 EMA200: {ind["ema200"]:.5f}
-ATR: {ind["atr"]:.5f}
-ADX: {ind["adx"]:.2f}
+ATR(14): {ind["atr"]:.5f}
+ADX(14): {ind["adx"]:.2f}
 BB Upper: {ind["bb_upper"]:.5f}
+BB Middle: {ind["bb_mid"]:.5f}
 BB Lower: {ind["bb_lower"]:.5f}
-{learned_section}
-TRADING GUIDELINES:
-- Look for clear trend direction
-- ADX above 20 preferred
-- At least 2-3 signals aligning
-- Stop loss 1x ATR, TP1 1.5x ATR
-- Take trades when you see a clear setup
-- Aim to trade 30-40% of setups
-- NO TRADE only when truly no direction
+52w High: {ind.get("high_52w", 0):.5f}
+52w Low: {ind.get("low_52w", 0):.5f}
+Recent Swing Highs: {sh}
+Recent Swing Lows: {sl}
+
+ANALYSIS FRAMEWORK — USE ALL OF THESE:
+
+STEP 1 — HIGHER TIMEFRAME BIAS:
+Before anything else determine the HTF bias.
+Is price above or below the 200 EMA?
+Is the 50 EMA above or below the 200 EMA?
+This determines the ONLY direction you trade.
+ONLY trade in the direction of HTF bias.
+Never trade counter-trend.
+
+STEP 2 — SMART MONEY CONCEPTS:
+Look for these institutional footprints:
+
+LIQUIDITY POOLS:
+Equal highs above price = buy-side liquidity (BSL)
+Smart money will hunt this before reversing down
+Equal lows below price = sell-side liquidity (SSL)
+Smart money will hunt this before reversing up
+Previous day/week high or low = liquidity targets
+
+ORDER BLOCKS:
+Last bearish candle before strong bullish move = bullish OB
+Last bullish candle before strong bearish move = bearish OB
+Price returning to OB = high probability entry zone
+Use swing_highs and swing_lows to identify these zones
+
+FAIR VALUE GAPS (FVG/Imbalance):
+Three candle pattern where middle candle leaves gap
+Price often returns to fill imbalance before continuing
+Use as entry confirmation
+
+MARKET STRUCTURE:
+Higher Highs + Higher Lows = uptrend (only take longs)
+Lower Highs + Lower Lows = downtrend (only take shorts)
+Break of Structure (BOS) = trend confirmed
+Change of Character (CHOCH) = potential reversal
+
+PREMIUM/DISCOUNT:
+Identify the range between last major high and low
+Above 50% of range = PREMIUM (only sell here)
+Below 50% of range = DISCOUNT (only buy here)
+Never buy in premium, never sell in discount
+This single rule eliminates most bad trades
+
+STEP 3 — ENTRY CONFIRMATION:
+Only enter when ALL of these align:
+1. HTF bias confirmed (price vs 200 EMA)
+2. Market structure supports direction (BOS/CHOCH)
+3. Price in correct zone (discount for longs/premium for shorts)
+4. At least one SMC concept present (OB, FVG, liquidity)
+5. ADX above 20 confirming trend has momentum
+6. RSI not extreme against trade direction
+   (not above 70 for longs, not below 30 for shorts)
+
+STEP 4 — CRITICAL R/R RULES:
+MINIMUM Risk/Reward: 1:2.0 (not 1:1.5)
+PREFERRED Risk/Reward: 1:2.5 to 1:3.0
+IDEAL Risk/Reward: 1:3.0 or better
+
+Stop loss: place BELOW structure for longs
+           place ABOVE structure for shorts
+           Never use simple ATR stop without structure logic
+           Stop goes below/above the order block or swing low/high
+
+TP1: at nearest liquidity pool or structure level
+TP2: at 2x the risk distance minimum
+TP3: runner to major HTF level
+
+If you cannot find a setup with minimum 1:2 R/R
+return NO TRADE — a bad R/R kills profitability
+
+STEP 5 — WHAT MAKES A HIGH PROBABILITY SETUP:
+The winning template looks like this:
+- HTF bias is clear (strong trend on 200 EMA)
+- Price has swept liquidity (faked below/above a level)
+- Price is now in discount/premium zone
+- There is an order block or FVG nearby as entry
+- ADX is above 25 confirming trend
+- RSI has room to run (40-60 range, not extreme)
+- R/R is at least 1:2
+
+This setup wins 50-60% of the time.
+Without these criteria do NOT enter.
+
+STEP 6 — WHAT TO AVOID:
+Never trade:
+- Into obvious support/resistance without a sweep first
+- When price is at BB extreme (wait for bounce confirmation)
+- When RSI is above 70 (long) or below 30 (short)
+- When MACD and price disagree (divergence)
+- When ADX is below 18 (no trend)
+- Counter to 200 EMA direction
+- When the move has already happened (chasing)
+- At random entry points — always need a specific reason
+
+STEP 7 — PAIR SPECIFIC RULES:
+Based on backtested performance apply these:
+Avoid GBPAUD, EURCAD — historically unreliable
+Avoid CHF pairs completely
+USDJPY, EURUSD, GBPUSD — most reliable pairs
+AUD pairs — good for trend following
+JPY crosses — strong trends but volatile stops
+
+STEP 8 — RETURN YOUR ANALYSIS:
+State clearly:
+1. HTF bias: BULLISH/BEARISH and why
+2. Market structure: last BOS/CHOCH observed
+3. Zone: is price in PREMIUM or DISCOUNT
+4. SMC concept present: OB/FVG/Liquidity/None
+5. Entry logic: specific reason to enter NOW
+6. Stop placement: specific level with reason
+7. TP levels: with specific target reason
+8. R/R ratio: must be 1:2 minimum
+
+If ANY of steps 1-6 don't align: return NO TRADE
+with specific reason why setup is incomplete.
 
 Return ONLY valid JSON:
 {{
   "verdict": "STRONG BUY|BUY|WAIT|SELL|STRONG SELL",
   "direction": "LONG|SHORT|NO TRADE",
   "confidence": "HIGH|MEDIUM|LOW",
+  "htf_bias": "BULLISH|BEARISH|NEUTRAL",
+  "market_structure": "UPTREND|DOWNTREND|RANGING",
+  "price_zone": "PREMIUM|DISCOUNT|EQUILIBRIUM",
+  "smc_concept": "ORDER_BLOCK|FVG|LIQUIDITY_SWEEP|NONE",
   "entry": {price},
   "stop_loss": 0.0,
   "tp1": 0.0,
   "tp2": 0.0,
+  "tp3": 0.0,
   "rr_ratio": "string",
   "signals_used": ["string"],
   "confluences": ["string"],
   "conflicts": ["string"],
-  "reasoning": "string"
+  "reasoning": "string",
+  "no_trade_reason": null
 }}
 """
 
         client = _client()
         resp = client.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=1500,
+            max_tokens=2500,
             messages=[{"role": "user", "content": prompt}],
         )
         raw = _message_text(resp)
@@ -609,6 +744,9 @@ Return ONLY valid JSON:
         direction = str(ai.get("direction", "NO TRADE")).strip().upper()
         if direction in ("NO TRADE", "WAIT", ""):
             rs = str(ai.get("skip_reason", "") or "").strip()
+            ntr = ai.get("no_trade_reason")
+            if not rs and ntr is not None and str(ntr).strip():
+                rs = str(ntr).strip()
             base_reason = str(ai.get("reasoning", ""))
             reasoning = f"{base_reason} [{rs}]" if rs else base_reason
             return {
@@ -622,12 +760,18 @@ Return ONLY valid JSON:
                 "skip_reason": rs,
                 "reasoning": reasoning,
                 "rr_ratio": str(ai.get("rr_ratio", "")),
+                "htf_bias": str(ai.get("htf_bias") or ""),
+                "market_structure": str(ai.get("market_structure") or ""),
+                "price_zone": str(ai.get("price_zone") or ""),
+                "smc_concept": str(ai.get("smc_concept") or ""),
+                "no_trade_reason": ntr if ntr is not None else None,
             }
 
         entry = float(ai.get("entry", price) or price)
         stop = float(ai.get("stop_loss", 0) or 0)
         tp1 = float(ai.get("tp1", 0) or 0)
         tp2 = float(ai.get("tp2", 0) or 0)
+        tp3 = float(ai.get("tp3", 0) or 0)
 
         fut = future.head(fwd_n)
         highs = fut["High"].astype(float).values
@@ -672,6 +816,10 @@ Return ONLY valid JSON:
                     "skipped": True,
                     "entry_price": price,
                     "reasoning": "Unknown direction from model",
+                    "htf_bias": str(ai.get("htf_bias") or ""),
+                    "market_structure": str(ai.get("market_structure") or ""),
+                    "price_zone": str(ai.get("price_zone") or ""),
+                    "smc_concept": str(ai.get("smc_concept") or ""),
                 }
 
         if entry == 0:
@@ -737,10 +885,15 @@ Return ONLY valid JSON:
             "verdict": ai.get("verdict"),
             "direction": direction,
             "confidence": ai.get("confidence"),
+            "htf_bias": str(ai.get("htf_bias") or ""),
+            "market_structure": str(ai.get("market_structure") or ""),
+            "price_zone": str(ai.get("price_zone") or ""),
+            "smc_concept": str(ai.get("smc_concept") or ""),
             "entry_price": round(entry, 5),
             "stop_loss": round(stop, 5),
             "tp1": round(tp1, 5),
             "tp2": round(tp2, 5),
+            "tp3": round(tp3, 5),
             "exit_price": exit_p,
             "exit_reason": exit_r,
             "outcome": outcome,
@@ -765,6 +918,102 @@ Return ONLY valid JSON:
     except Exception as e:  # noqa: BLE001
         log(f"[ContinuousBacktest] Error {ticker} {analysis_date}: {e}", level="warning")
         return None
+
+
+def _parse_rr_ratio_numeric(rr: Any) -> float | None:
+    """Parse reward side from ``rr_ratio`` strings like ``1:2.35``."""
+    if rr is None:
+        return None
+    s = str(rr).strip()
+    if not s:
+        return None
+    if ":" in s:
+        tail = s.split(":", 1)[1].strip()
+        try:
+            return float(tail)
+        except ValueError:
+            return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _smc_stats_from_trades(trades: list[dict[str, Any]]) -> dict[str, Any]:
+    """HTF bias alignment, SMC concept, price zone, and R/R distribution for completed trades."""
+    htf_rows: list[tuple[bool, bool]] = []
+    for t in trades:
+        d = str(t.get("direction", "")).upper()
+        hb = str(t.get("htf_bias", "")).upper()
+        if d not in ("LONG", "SHORT") or hb not in ("BULLISH", "BEARISH"):
+            continue
+        aligned = (d == "LONG" and hb == "BULLISH") or (d == "SHORT" and hb == "BEARISH")
+        win = t.get("outcome") == "WIN"
+        htf_rows.append((aligned, win))
+
+    aligned = [w for a, w in htf_rows if a]
+    against = [w for a, w in htf_rows if not a]
+    htf_bias_stats = {
+        "aligned_with_bias_trades": len(aligned),
+        "aligned_win_rate_pct": round(100 * sum(1 for w in aligned if w) / len(aligned), 1) if aligned else None,
+        "against_bias_trades": len(against),
+        "against_bias_win_rate_pct": round(100 * sum(1 for w in against if w) / len(against), 1) if against else None,
+    }
+
+    smc_break: dict[str, dict[str, Any]] = {}
+    for t in trades:
+        k = str(t.get("smc_concept") or "UNKNOWN").strip().upper() or "UNKNOWN"
+        if k not in smc_break:
+            smc_break[k] = {"total": 0, "wins": 0, "losses": 0, "pnl": 0.0}
+        smc_break[k]["total"] += 1
+        if t.get("outcome") == "WIN":
+            smc_break[k]["wins"] += 1
+        elif t.get("outcome") == "LOSS":
+            smc_break[k]["losses"] += 1
+        smc_break[k]["pnl"] += float(t.get("pnl_dollars", 0) or 0)
+
+    zone_buckets: dict[str, dict[str, Any]] = {}
+    for t in trades:
+        d = str(t.get("direction", "")).upper()
+        z = str(t.get("price_zone", "")).upper()
+        if d not in ("LONG", "SHORT") or z not in ("PREMIUM", "DISCOUNT", "EQUILIBRIUM"):
+            continue
+        key = f"{d}_{z}"
+        if key not in zone_buckets:
+            zone_buckets[key] = {"total": 0, "wins": 0, "losses": 0, "pnl": 0.0}
+        zone_buckets[key]["total"] += 1
+        if t.get("outcome") == "WIN":
+            zone_buckets[key]["wins"] += 1
+        elif t.get("outcome") == "LOSS":
+            zone_buckets[key]["losses"] += 1
+        zone_buckets[key]["pnl"] += float(t.get("pnl_dollars", 0) or 0)
+
+    rr_bins = {"lt_1_8": 0, "1_8_to_2_5": 0, "gt_2_5": 0, "unknown": 0}
+    rr_vals: list[float] = []
+    for t in trades:
+        v = _parse_rr_ratio_numeric(t.get("rr_ratio"))
+        if v is None:
+            rr_bins["unknown"] += 1
+            continue
+        rr_vals.append(v)
+        if v < 1.8:
+            rr_bins["lt_1_8"] += 1
+        elif v <= 2.5:
+            rr_bins["1_8_to_2_5"] += 1
+        else:
+            rr_bins["gt_2_5"] += 1
+
+    rr_ratio_distribution = {
+        "buckets": rr_bins,
+        "mean_rr_reward_side": round(sum(rr_vals) / len(rr_vals), 3) if rr_vals else None,
+    }
+
+    return {
+        "htf_bias_stats": htf_bias_stats,
+        "smc_concept_performance": smc_break,
+        "price_zone_accuracy": zone_buckets,
+        "rr_ratio_distribution": rr_ratio_distribution,
+    }
 
 
 def calculate_kelly(trades: list[dict[str, Any]]) -> float:
@@ -804,6 +1053,7 @@ def calculate_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
     trades = [r for r in results if r and not r.get("skipped")]
     if not trades:
         k0 = calculate_kelly([])
+        smc_empty = _smc_stats_from_trades([])
         return {
             "generated_at": datetime.now().isoformat(),
             "total_trades": 0,
@@ -821,6 +1071,7 @@ def calculate_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
             "timeframe_performance": {},
             "excluded_tickers": list(CHF_PAIRS),
             "banned_signals": list(BANNED_SIGNALS),
+            **smc_empty,
         }
 
     wins = [t for t in trades if t.get("outcome") == "WIN"]
@@ -903,6 +1154,8 @@ def calculate_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
                 "pnl": round(sum(float(t.get("pnl_dollars", 0) or 0) for t in tf_trades), 2),
             }
 
+    smc_agg = _smc_stats_from_trades(trades)
+
     return {
         "generated_at": datetime.now().isoformat(),
         "starting_capital": STARTING_CAPITAL,
@@ -948,6 +1201,7 @@ def calculate_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
         "timeframe_performance": tf_perf,
         "excluded_tickers": list(CHF_PAIRS),
         "banned_signals": list(BANNED_SIGNALS),
+        **smc_agg,
     }
 
 
