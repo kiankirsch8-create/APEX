@@ -39,6 +39,129 @@ POSITION_SIZE_PCT = 0.05  # 5% of capital
 LEVERAGE = 50  # 50x on notional exposure
 IMPROVE_EVERY = 100
 
+STRATEGIES: dict[str, dict[str, Any]] = {
+    "S01_BREAKOUT_RETEST": {
+        "name": "Breakout Retest",
+        "description": (
+            "Price breaks significant level "
+            "then retests it as support/resistance"
+        ),
+        "timeframes": ["4h", "1d"],
+        "min_adx": 20,
+        "category": "TREND_FOLLOWING",
+    },
+    "S02_LIQUIDITY_SWEEP": {
+        "name": "Liquidity Sweep Reversal",
+        "description": (
+            "Price sweeps beyond swing cluster "
+            "then closes back inside"
+        ),
+        "timeframes": ["1h", "4h"],
+        "min_adx": 0,
+        "category": "SMART_MONEY",
+    },
+    "S03_EMA_PULLBACK": {
+        "name": "Trend Pullback to EMA",
+        "description": (
+            "In clear trend price pulls back "
+            "to EMA20 or EMA50"
+        ),
+        "timeframes": ["4h", "1d"],
+        "min_adx": 25,
+        "category": "TREND_FOLLOWING",
+    },
+    "S04_EXTREME_REVERSION": {
+        "name": "Extreme Zone Mean Reversion",
+        "description": (
+            "Price at 52w extreme with RSI "
+            "extreme, statistical reversion"
+        ),
+        "timeframes": ["1d", "1w"],
+        "min_adx": 0,
+        "category": "MEAN_REVERSION",
+    },
+    "S05_MACD_DIVERGENCE": {
+        "name": "MACD Divergence",
+        "description": (
+            "Price and MACD diverge showing "
+            "momentum exhaustion"
+        ),
+        "timeframes": ["4h", "1d"],
+        "min_adx": 0,
+        "category": "MOMENTUM",
+    },
+    "S06_ORDER_BLOCK": {
+        "name": "Institutional Order Block",
+        "description": (
+            "Last opposing candle before "
+            "impulse - price returns to it"
+        ),
+        "timeframes": ["1h", "4h"],
+        "min_adx": 0,
+        "category": "SMART_MONEY",
+    },
+    "S07_FAIR_VALUE_GAP": {
+        "name": "Fair Value Gap Fill",
+        "description": (
+            "Three candle imbalance gap "
+            "price returns to fill"
+        ),
+        "timeframes": ["1h", "4h"],
+        "min_adx": 0,
+        "category": "SMART_MONEY",
+    },
+    "S08_RANGE_BREAKOUT": {
+        "name": "Range Breakout",
+        "description": (
+            "Price consolidates then breaks "
+            "out with volume confirmation"
+        ),
+        "timeframes": ["4h", "1d"],
+        "min_adx": 0,
+        "category": "BREAKOUT",
+    },
+    "S09_NEWS_CATALYST": {
+        "name": "News Catalyst Momentum",
+        "description": (
+            "Major news release with strong "
+            "sentiment drives momentum"
+        ),
+        "timeframes": ["1h", "4h"],
+        "min_adx": 0,
+        "category": "NEWS_DRIVEN",
+    },
+    "S10_COT_DIVERGENCE": {
+        "name": "COT Institutional Divergence",
+        "description": (
+            "Institutions repositioning shown "
+            "in COT data not yet in price"
+        ),
+        "timeframes": ["1d", "1w"],
+        "min_adx": 0,
+        "category": "INSTITUTIONAL",
+    },
+    "S11_SR_FLIP": {
+        "name": "Support Resistance Flip",
+        "description": (
+            "Old resistance becomes support "
+            "or vice versa on retest"
+        ),
+        "timeframes": ["4h", "1d"],
+        "min_adx": 0,
+        "category": "STRUCTURE",
+    },
+    "S12_VOLATILITY_COMPRESSION": {
+        "name": "Volatility Compression Breakout",
+        "description": (
+            "Bollinger Band squeeze then "
+            "explosive breakout"
+        ),
+        "timeframes": ["4h", "1d"],
+        "min_adx": 0,
+        "category": "BREAKOUT",
+    },
+}
+
 # --- Hard exclusions: CHF + proven losers + illiquid (``run_one_backtest`` early return) ---
 CHF_PAIRS = frozenset(
     {
@@ -483,14 +606,30 @@ def validate_rr(plan: dict[str, Any]) -> dict[str, Any]:
     return plan
 
 
-def calculate_position_size(confidence: str, zone_pct: float, account_balance: float) -> dict[str, Any]:
-    """Dollar risk budget from declared confidence and zone (equilibrium halves risk)."""
+def calculate_position_size(
+    confidence: str,
+    zone_pct: float,
+    strategy_met: bool,
+    conviction_score: int,
+    account_balance: float,
+) -> dict[str, Any]:
+    """Dollar risk budget from confidence, zone, strategy match, and conviction."""
     c = (confidence or "MEDIUM").strip().upper()
-    risk_pct = {"HIGH": 0.02, "MEDIUM": 0.01, "LOW": 0.005}.get(c, 0.01)
+    if c == "HIGH" and strategy_met:
+        risk_pct = 0.02
+    elif c == "MEDIUM":
+        risk_pct = 0.01
+    else:
+        risk_pct = 0.005
+
+    if conviction_score >= 8 and strategy_met:
+        risk_pct = min(risk_pct * 1.5, 0.03)
+
     if 30 <= zone_pct <= 70:
-        risk_pct *= 0.5
-    max_risk_dollars = float(account_balance) * risk_pct
-    return {"max_risk_dollars": round(max_risk_dollars, 2), "risk_pct": risk_pct}
+        risk_pct *= 0.7
+
+    max_risk = float(account_balance) * risk_pct
+    return {"risk_pct": risk_pct, "max_risk_dollars": round(max_risk, 2)}
 
 
 def validate_stop_loss(entry: float, stop: float, direction: str, timeframe: str) -> float:
@@ -536,97 +675,157 @@ def _apply_exotic_confidence(confidence: str, is_exotic: bool) -> str:
     return c
 
 
-def _simulate_forward_path(
+def evaluate_forward_candles(
     direction: str,
     entry: float,
-    stop: float,
+    stop_loss: float,
     tp1: float,
     tp2: float,
     tp3: float,
-    highs: Any,
-    lows: Any,
-    closes: Any,
-) -> tuple[bool, bool, bool, bool, float, str, int]:
-    """Forward path with TP3/TP2 priority, breakeven after TP2 touch, then TP1 / stop / time exit."""
-    hit_tp1 = hit_tp2 = hit_tp3 = hit_stop = False
-    exit_p: float | None = None
-    exit_r = ""
-    candles_to_exit = len(closes) if len(closes) else 0
-    ep = float(entry)
-    current_stop = float(stop)
+    forward_df: pd.DataFrame,
+    strategy_id: str,
+) -> dict[str, Any]:
+    """Trailing-stop forward simulation through the post-entry window."""
+    _ = strategy_id
+    if forward_df is None or forward_df.empty:
+        return {
+            "outcome": "NO_DATA",
+            "exit_price": entry,
+            "exit_reason": "No forward data",
+            "pnl_pct": 0.0,
+            "hit_tp1": False,
+            "hit_tp2": False,
+            "hit_tp3": False,
+            "hit_stop": False,
+            "candles_to_exit": 0,
+            "trailing_activated": False,
+            "final_stop": stop_loss,
+        }
 
-    n = min(len(highs), len(lows), len(closes))
-    is_short = direction.strip().upper() == "SHORT"
+    current_stop = float(stop_loss)
+    hit_tp1 = False
+    hit_tp2 = False
+    hit_tp3 = False
+    hit_stop = False
+    trailing_activated = False
+    exit_price = float(entry)
+    exit_reason = "Window ended"
+    candle_count = 0
 
-    if n == 0:
-        return False, False, False, False, round(float(entry), 5), "No data", 0
+    d = str(direction or "").strip().upper()
+    if d == "LONG":
+        risk = float(entry) - float(stop_loss)
+    else:
+        risk = float(stop_loss) - float(entry)
 
-    for i in range(n):
-        h = float(highs[i])
-        l = float(lows[i])
-        if not is_short:
-            if l <= current_stop:
+    if risk <= 0:
+        return {
+            "outcome": "INVALID",
+            "exit_price": float(entry),
+            "exit_reason": "Invalid risk",
+            "pnl_pct": 0.0,
+            "hit_tp1": False,
+            "hit_tp2": False,
+            "hit_tp3": False,
+            "hit_stop": False,
+            "candles_to_exit": 0,
+            "trailing_activated": False,
+            "final_stop": float(stop_loss),
+        }
+
+    for _idx, candle in forward_df.iterrows():
+        candle_count += 1
+        try:
+            high = float(candle.get("High", entry))
+            low = float(candle.get("Low", entry))
+            close = float(candle.get("Close", entry))
+        except (TypeError, ValueError):
+            continue
+
+        if d == "LONG":
+            if low <= current_stop:
                 hit_stop = True
-                exit_p = current_stop
-                exit_r = "Stop loss hit"
-                candles_to_exit = i + 1
+                exit_price = current_stop
+                exit_reason = "Trailing stop hit" if trailing_activated else "Stop loss hit"
                 break
-            if tp3 > 0 and h >= tp3:
-                hit_tp3 = hit_tp2 = hit_tp1 = True
-                exit_p = float(tp3)
-                exit_r = "TP3 hit"
-                candles_to_exit = i + 1
-                break
-            if tp2 > 0 and h >= tp2:
+
+            if high >= tp3 and not hit_tp3:
+                hit_tp3 = True
+                current_stop = float(entry) + risk * 2
+                trailing_activated = True
+
+            if high >= tp2 and not hit_tp2:
                 hit_tp2 = True
+                if not hit_tp3:
+                    current_stop = float(entry) + risk * 1
+                trailing_activated = True
+
+            if high >= tp1 and not hit_tp1:
                 hit_tp1 = True
-                current_stop = ep
-            elif tp1 > 0 and h >= tp1:
-                hit_tp1 = True
+                if not hit_tp2 and not hit_tp3:
+                    current_stop = float(entry)
+                trailing_activated = True
+
+            if hit_tp1 and trailing_activated:
+                new_trail = close - risk * 1.5
+                if new_trail > current_stop:
+                    current_stop = new_trail
+
         else:
-            if h >= current_stop:
+            if high >= current_stop:
                 hit_stop = True
-                exit_p = current_stop
-                exit_r = "Stop loss hit"
-                candles_to_exit = i + 1
+                exit_price = current_stop
+                exit_reason = "Trailing stop hit" if trailing_activated else "Stop loss hit"
                 break
-            if tp3 > 0 and l <= tp3:
-                hit_tp3 = hit_tp2 = hit_tp1 = True
-                exit_p = float(tp3)
-                exit_r = "TP3 hit"
-                candles_to_exit = i + 1
-                break
-            if tp2 > 0 and l <= tp2:
+
+            if low <= tp3 and not hit_tp3:
+                hit_tp3 = True
+                current_stop = float(entry) - risk * 2
+                trailing_activated = True
+
+            if low <= tp2 and not hit_tp2:
                 hit_tp2 = True
-                hit_tp1 = True
-                current_stop = ep
-            elif tp1 > 0 and l <= tp1:
-                hit_tp1 = True
+                if not hit_tp3:
+                    current_stop = float(entry) - risk * 1
+                trailing_activated = True
 
-    if exit_p is None:
-        if hit_tp3:
-            exit_p = float(tp3)
-            exit_r = "TP3 hit"
-        elif hit_tp2:
-            exit_p = float(tp2)
-            exit_r = "TP2 hit"
-        elif hit_tp1 and not hit_stop:
-            exit_p = float(tp1)
-            exit_r = "TP1 hit"
-        elif hit_stop:
-            exit_p = float(current_stop)
-            exit_r = "Stop loss hit"
-        else:
-            try:
-                fc = float(closes[-1])
-            except (TypeError, ValueError, IndexError):
-                fc = ep
-            exit_p = round(fc, 5)
-            exit_r = "Window ended"
-            candles_to_exit = n
+            if low <= tp1 and not hit_tp1:
+                hit_tp1 = True
+                if not hit_tp2 and not hit_tp3:
+                    current_stop = float(entry)
+                trailing_activated = True
 
-    exit_p = round(float(exit_p), 5)
-    return hit_tp1, hit_tp2, hit_tp3, hit_stop, exit_p, exit_r, candles_to_exit
+            if hit_tp1 and trailing_activated:
+                new_trail = close + risk * 1.5
+                if new_trail < current_stop:
+                    current_stop = new_trail
+
+    if not hit_stop and not forward_df.empty:
+        try:
+            exit_price = float(forward_df["Close"].iloc[-1])
+        except (TypeError, ValueError, KeyError, IndexError):
+            exit_price = float(entry)
+
+    if d == "LONG":
+        pnl_pct = (exit_price - float(entry)) / float(entry) if entry else 0.0
+    else:
+        pnl_pct = (float(entry) - exit_price) / float(entry) if entry else 0.0
+
+    outcome = "WIN" if pnl_pct > 0 else "LOSS"
+
+    return {
+        "outcome": outcome,
+        "exit_price": round(exit_price, 5),
+        "exit_reason": exit_reason,
+        "pnl_pct": round(pnl_pct, 6),
+        "hit_tp1": hit_tp1,
+        "hit_tp2": hit_tp2,
+        "hit_tp3": hit_tp3,
+        "hit_stop": hit_stop,
+        "candles_to_exit": candle_count,
+        "trailing_activated": trailing_activated,
+        "final_stop": round(current_stop, 5),
+    }
 
 
 def _tp_target_and_smc_dashboard(trades: list[dict[str, Any]]) -> dict[str, Any]:
@@ -789,13 +988,13 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
         )
         zone_label = (
             "EXTREME_DISCOUNT"
-            if zone_pct < 10
+            if zone_pct < 8
             else "DISCOUNT"
             if zone_pct < 30
             else "EQUILIBRIUM"
             if zone_pct < 70
             else "PREMIUM"
-            if zone_pct < 90
+            if zone_pct < 92
             else "EXTREME_PREMIUM"
         )
 
@@ -804,169 +1003,486 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
         dist_hi_pct = round(((high_52w - fp) / fp * 100), 2) if fp else 0.0
         dist_lo_pct = round(((fp - low_52w) / fp * 100), 2) if fp else 0.0
 
-        sh = json.dumps(ind.get("swing_highs") or [])
-        sl = json.dumps(ind.get("swing_lows") or [])
+        bb_mid_val = float(ind.get("bb_mid", price) or price)
+        if not math.isfinite(bb_mid_val) or bb_mid_val <= 0:
+            bb_mid_val = float(price)
+        try:
+            bb_width = round(
+                (float(ind["bb_upper"]) - float(ind["bb_lower"])) / bb_mid_val * 100,
+                3,
+            )
+        except (TypeError, ValueError, ZeroDivisionError):
+            bb_width = 2.0
+        macd_line = float(ind.get("macd_line", 0) or 0)
+        macd_signal = float(ind.get("macd_signal", 0) or 0)
 
         intel_text = ""
+        news_sentiment = 0.0
+        cot_bias = "UNKNOWN"
+        fear_greed = 50.0
+        vix_val = 20.0
         try:
             from market_intelligence import format_for_prompt, get_complete_briefing
 
-            _br = get_complete_briefing(
-                ticker=sym,
-                date_str=analysis_date.strip(),
-                past_df=past,
+            briefing = get_complete_briefing(sym, analysis_date.strip(), past)
+            intel_text = format_for_prompt(briefing)
+            news_sentiment = float(briefing.get("news", {}).get("net_sentiment", 0) or 0)
+            cot_bias = str(briefing.get("cot_base", {}).get("bias", "UNKNOWN"))
+            fear_greed = float(briefing.get("fear_greed", {}).get("score", 50) or 50)
+            vix_val = float(
+                briefing.get("proxies", {})
+                .get("proxies", {})
+                .get("vix", {})
+                .get("value", 20)
+                or 20
             )
-            intel_text = format_for_prompt(_br)
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"[Intel] {e}")
 
         prompt = f"""
-You are APEX — learning to trade through
-backtested experience.
+You are APEX — an elite institutional trading AI.
 
-After 200+ trades the data shows clearly:
-- Daily timeframe: 53.8% win rate ✅
-- Extreme zones work: 45-66% win rate ✅
-- LIQUIDITY_SWEEP works: 66.7% win rate ✅
-- RSI_NEUTRAL works: 100% win rate ✅
-- Moderate zones fail: 18-25% win rate ❌
-- Hourly timeframe fails: 25% win rate ❌
+You do NOT predict direction randomly.
+You WAIT for structural confirmation that
+a move has already begun or a setup is
+clearly forming, then you enter with precision.
 
-Use this knowledge in every decision.
+You know 12 institutional strategies used by
+the best traders and funds in the world.
+You identify which strategy applies to the
+current market structure and enter accordingly.
 
 ASSET: {sym}
-TIMEFRAME: {tf_desc}
+TIMEFRAME: {TF_DESCRIPTIONS.get(tf_key, timeframe)}
 DATE: {analysis_date}
-PRICE: {price}
-ZONE: {zone_label} ({zone_pct:.1f}% of 52w range)
-52w High: {high_52w:.5f} | 52w Low: {low_52w:.5f}
+PRICE: {price:.5f}
 
-{intel_text if intel_text else ""}
+ZONE: {zone_label} ({zone_pct:.1f}% of 52-week range)
+52-week High: {high_52w:.5f}
+52-week Low: {low_52w:.5f}
 
 TECHNICAL INDICATORS:
-RSI(14): {ind['rsi']:.2f}
-MACD Histogram: {ind['macd_hist']:.6f}
-EMA20: {ind['ema20']:.5f}
-EMA50: {ind['ema50']:.5f}
-EMA200: {ind['ema200']:.5f}
-ATR(14): {ind['atr']:.5f}
-ADX(14): {ind['adx']:.2f}
-BB Upper: {ind['bb_upper']:.5f}
-BB Lower: {ind['bb_lower']:.5f}
-Swing Highs: {ind.get('swing_highs', [])}
-Swing Lows: {ind.get('swing_lows', [])}
+RSI(14): {ind["rsi"]:.2f}
+MACD Line: {macd_line:.6f}
+MACD Signal: {macd_signal:.6f}
+MACD Histogram: {ind["macd_hist"]:.6f}
+EMA20: {ind["ema20"]:.5f}
+EMA50: {ind["ema50"]:.5f}
+EMA200: {ind["ema200"]:.5f}
+ATR(14): {ind["atr"]:.5f}
+ADX(14): {ind["adx"]:.2f}
+BB Upper: {ind["bb_upper"]:.5f}
+BB Middle: {ind.get("bb_mid", price):.5f}
+BB Lower: {ind["bb_lower"]:.5f}
+BB Width %: {bb_width:.3f}
+Swing Highs (recent): {ind.get("swing_highs", [])}
+Swing Lows (recent): {ind.get("swing_lows", [])}
 
-CRITICAL — SIGNAL NAMES (MUST UPPERCASE):
-All entries in signals_used must be UPPERCASE_SNAKE_CASE.
-Use: LIQUIDITY_SWEEP not liquidity_sweep
-Use: EXTREME_PREMIUM_ZONE or EXTREME_DISCOUNT_ZONE not lowercase variants
-Use: PREMIUM_ZONE, DISCOUNT_ZONE, RSI_NEUTRAL not rsi_neutral
-Use: EMA_STACK_BULLISH not ema_stack_bullish
-Uppercase signal names are tracked separately from lowercase — always use UPPERCASE.
+{intel_text}
 
-ZONE TRADING RULES:
-EXTREME_PREMIUM (90-100%): SHORT bias STRONG — these work well; take the trade when aligned.
-EXTREME_DISCOUNT (0-10%): LONG bias STRONG — these work well; take the trade when aligned.
-PREMIUM (70-90%): SHORT bias MODERATE — only trade with 2+ confirming signals.
-DISCOUNT (10-30%): LONG bias MODERATE — only trade with 2+ confirming signals.
-EQUILIBRIUM (30-70%): NO ZONE EDGE — rely entirely on trend + momentum; require 3+ confirming signals (most losses occur here).
+════════════════════════════════════════
+THE 12 INSTITUTIONAL STRATEGIES
+════════════════════════════════════════
+Scan each strategy. Identify which ONE
+best fits the current market structure.
+Only enter if the non-negotiables are met.
 
-SIGNAL QUALITY HIERARCHY:
-TIER 1 (proven winners — require at least 1 when possible):
-- LIQUIDITY_SWEEP: confirmed institutional sweep
-- RSI_NEUTRAL: RSI between 40-60 with momentum context
-- EXTREME_PREMIUM_ZONE or EXTREME_DISCOUNT_ZONE
-- Strong ADX above 30 with clear EMA alignment
+────────────────────────────────────────
+S01: BREAKOUT RETEST
+────────────────────────────────────────
+What it is: Price broke a significant level
+and is now retesting it as new S/R.
 
-TIER 2 (supportive signals):
-- MACD histogram confirming direction
-- Volume above average in trade direction
-- Price at key S/R (52w high/low, EMA200)
-- COT institutions aligned (from briefing when present)
-- News sentiment confirming direction
+Non-negotiables:
+✓ Clear breakout candle closed beyond level
+✓ Price has pulled back to test that level
+✓ Retest candle shows rejection (closing away)
+✓ ADX above 20 (trend exists)
 
-MINIMUM REQUIREMENT:
-1 Tier 1 + 1 Tier 2 = take trade
-2 Tier 2 only = LOW confidence trade
-0 Tier 1 = reconsider carefully
+LONG trigger: Price breaks above resistance,
+retests it, holds above → BUY the retest
+SHORT trigger: Price breaks below support,
+retests it, holds below → SELL the retest
 
-NEVER trade on these alone:
-Bollinger Band position alone, RSI at extreme without sweep, MACD alone, EMA alignment alone.
+Stop: Beyond the retest candle
+Identify: Look at swing_highs/swing_lows for
+the broken level. Is price near one now?
 
-DAILY TIMEFRAME RULES (PRIMARY — 53.8% WR in data):
-Daily chart gives the cleanest signals. Each candle = 1 day; expect holds ~3–20 days.
-- Wait for daily candle CLOSE context as-of DATE (data is end-of-day through DATE).
-- Stop = below/above last 3-day swing + 0.3×ATR buffer when possible.
-- ADX above 25 preferred on daily.
-- Zone analysis most reliable on daily; ignore intraday noise.
+────────────────────────────────────────
+S02: LIQUIDITY SWEEP REVERSAL
+────────────────────────────────────────
+What it is: Institutions run stops beyond
+swing clusters then reverse direction.
 
-HOURLY AND 4H RULES (use rarely — 25–33% WR):
-Only take 1H/4H when ALL are true:
-- EXTREME zone confirmed (0–10% or 90–100% of 52w range), AND
-- Confirmed LIQUIDITY_SWEEP in signals_used, AND
-- RSI_NEUTRAL in signals_used.
-Otherwise bias toward daily/weekly trend and extreme zones only.
+Non-negotiables:
+✓ Equal highs or lows visible in swing data
+✓ Price spiked beyond those equal levels
+✓ Price closed BACK inside the range
+✓ RSI was at extreme during spike (>65 or <35)
 
-STEP 1 — ZONE (PRIMARY BIAS):
-EXTREME_PREMIUM (90–100%): STRONG SHORT bias.
-EXTREME_DISCOUNT (0–10%): STRONG LONG bias.
-PREMIUM (70–90%): moderate SHORT. DISCOUNT (10–30%): moderate LONG.
-EQUILIBRIUM (30–70%): no zone edge — follow trend.
+LONG trigger: Spike below equal lows, close back above
+SHORT trigger: Spike above equal highs, close back below
 
-STEP 2 — LIQUIDITY SWEEP:
-Use swing_highs / swing_lows; if sweep confirmed tag LIQUIDITY_SWEEP.
+Stop: Beyond the sweep wick extreme
+Identify: Check swing_lows for equal values.
+Did price go below them and recover?
+Check swing_highs for equal values.
+Did price go above them and pull back?
 
-STEP 3 — RSI:
-RSI 40–60 = RSI_NEUTRAL (tier-1 style signal in data).
+────────────────────────────────────────
+S03: TREND PULLBACK TO EMA
+────────────────────────────────────────
+What it is: In established trend, price
+pulls back to moving average support.
 
-STEP 4 — TREND:
-EMA200: price above = BULLISH, below = BEARISH. ADX above 30 = strong trend.
+Non-negotiables:
+✓ EMA20 > EMA50 > EMA200 (uptrend) OR
+  EMA20 < EMA50 < EMA200 (downtrend)
+✓ Price has pulled back to EMA20 or EMA50
+✓ RSI between 35-60 at the pullback
+✓ ADX above 25
 
-STEP 5 — INTELLIGENCE:
-Use news/COT/VIX from briefing block when present; align or reduce confidence if opposing.
+LONG trigger: In uptrend, price touches EMA20
+or EMA50, RSI was falling but now turning up
+SHORT trigger: In downtrend, price bounces to
+EMA20 or EMA50, RSI was rising but now turning down
 
-STEP 6 — STOP AND TARGET:
-Stop at nearest logical swing ± 0.3×ATR; minimum R/R 2.0 vs TP1.
-TP1 = 2× risk, TP2 = 3× risk, TP3 = 5× risk.
+Stop: Below EMA50 (long) or above EMA50 (short)
+Identify: Is price currently near EMA20 or EMA50?
+Is there a clear EMA stack?
 
-STEP 7 — CONFIDENCE:
-HIGH: extreme zone + LIQUIDITY_SWEEP + trend aligned (daily preferred).
-MEDIUM: clear zone + 2+ confirmations.
-LOW: equilibrium or weak / intraday-only edge.
+────────────────────────────────────────
+S04: EXTREME ZONE MEAN REVERSION
+────────────────────────────────────────
+What it is: Price at statistical extreme,
+mean reversion highly probable.
 
-MANDATORY:
-- direction must be LONG or SHORT
-- ALL signal names in signals_used UPPERCASE
-- Minimum R/R 2.0 on TP1 vs risk
+Non-negotiables:
+✓ Zone below 8% (EXTREME_DISCOUNT) for longs
+  OR zone above 92% (EXTREME_PREMIUM) for shorts
+✓ RSI below 25 (long) or above 75 (short)
+✓ ADX below 30 (not in strong trend)
+✓ Previous visit to this zone reversed
 
-Return ONLY JSON:
+LONG trigger: EXTREME_DISCOUNT + RSI below 25
+SHORT trigger: EXTREME_PREMIUM + RSI above 75
+
+Stop: 0.5x ATR beyond the extreme
+Identify: Zone is {zone_pct:.1f}%. RSI is {ind["rsi"]:.1f}.
+Does this qualify?
+
+────────────────────────────────────────
+S05: MACD DIVERGENCE
+────────────────────────────────────────
+What it is: Price and momentum diverge,
+indicating trend exhaustion.
+
+Non-negotiables:
+✓ BEARISH: Price makes higher high but
+  MACD histogram makes lower high
+✓ BULLISH: Price makes lower low but
+  MACD histogram makes higher low
+✓ Divergence spans at least 3 candles
+✓ RSI also showing divergence
+
+LONG trigger: Bullish divergence + MACD
+histogram turns positive
+SHORT trigger: Bearish divergence + MACD
+histogram turns negative
+
+Stop: Beyond the divergence extreme
+Identify: MACD is {ind["macd_hist"]:.6f}.
+Is there divergence between price and MACD?
+
+────────────────────────────────────────
+S06: INSTITUTIONAL ORDER BLOCK
+────────────────────────────────────────
+What it is: Institutions left unfilled orders
+at a price zone, returning there for execution.
+
+Non-negotiables:
+✓ Identify last bearish candle before
+  strong bullish move (bullish OB) OR
+  last bullish candle before strong
+  bearish move (bearish OB)
+✓ Price is currently returning to that zone
+✓ Higher timeframe trend supports direction
+✓ Zone not previously violated
+
+LONG trigger: Price returns to bullish OB,
+shows bullish reaction candle
+SHORT trigger: Price returns to bearish OB,
+shows bearish reaction candle
+
+Stop: Beyond the order block
+Identify: Look at swing_highs and swing_lows.
+What was the last strong impulse move?
+Where did it start?
+
+────────────────────────────────────────
+S07: FAIR VALUE GAP FILL
+────────────────────────────────────────
+What it is: Rapid price move leaves
+imbalance that price returns to fill.
+
+Non-negotiables:
+✓ Three candle pattern: candle 1 high,
+  big middle candle, candle 3 low
+✓ Gap between candle 1 high and candle 3 low
+  (bullish FVG) or candle 1 low and candle 3
+  high (bearish FVG)
+✓ Gap is at least 0.5x ATR in size
+✓ Price returning to fill the gap
+✓ Higher timeframe trend supports
+
+LONG trigger: Bullish FVG, price returns
+to gap level, holds as support
+SHORT trigger: Bearish FVG, price returns
+to gap level, holds as resistance
+
+Stop: Beyond the far edge of the gap
+Identify: Are there gaps in recent price
+action visible from swing data?
+ATR is {ind["atr"]:.5f} — gap needs to be
+at least {float(ind["atr"]) * 0.5:.5f}
+
+────────────────────────────────────────
+S08: RANGE BREAKOUT WITH VOLUME
+────────────────────────────────────────
+What it is: Price compresses then
+explodes out with institutional backing.
+
+Non-negotiables:
+✓ BB Width below 1.5% (compression)
+  Current BB Width: {bb_width:.3f}%
+✓ ADX below 20 during compression
+✓ At least 5 candles inside the range
+✓ Breakout candle closes clearly outside BB
+✓ Volume spike on breakout (if available)
+
+LONG trigger: Compression then close above BB upper
+SHORT trigger: Compression then close below BB lower
+
+Stop: Opposite BB band at breakout
+Identify: BB Width is {bb_width:.3f}%.
+Is this compressed? Did price just break out?
+
+────────────────────────────────────────
+S09: NEWS CATALYST MOMENTUM
+────────────────────────────────────────
+What it is: Major news drives price
+in clear direction, trade the momentum.
+
+Non-negotiables:
+✓ News sentiment strongly confirms
+  (above 0.5 bullish or below -0.5 bearish)
+✓ Price already moving in news direction
+✓ Not trading INTO existing major S/R
+✓ Momentum candles showing continuation
+
+LONG trigger: Strong bullish news + price
+breaking above recent resistance
+SHORT trigger: Strong bearish news + price
+breaking below recent support
+
+Stop: Pre-news level or recent swing
+Identify: News sentiment is {news_sentiment:.2f}.
+Does news strongly confirm a direction?
+
+────────────────────────────────────────
+S10: COT INSTITUTIONAL REPOSITIONING
+────────────────────────────────────────
+What it is: Institutions changing their
+positions in a currency — front-run them.
+
+Non-negotiables:
+✓ COT net position changed direction
+✓ Net change significant (trend change)
+✓ Price has not yet moved to reflect
+  the new institutional positioning
+✓ Zone supports same direction as COT
+
+LONG trigger: COT shows institutions
+building longs + discount zone
+SHORT trigger: COT shows institutions
+building shorts + premium zone
+
+Stop: Last major swing point
+Identify: COT bias is {cot_bias}.
+Does price zone align with COT direction?
+
+────────────────────────────────────────
+S11: SUPPORT/RESISTANCE FLIP
+────────────────────────────────────────
+What it is: A broken level flips its
+role - resistance becomes support etc.
+
+Non-negotiables:
+✓ Price clearly broke through a level
+  (full candle body, not just wick)
+✓ Price has returned to test the level
+✓ Level is holding in its new role
+✓ Rejection candle visible at the level
+
+LONG trigger: Old resistance now holding
+as support on retest
+SHORT trigger: Old support now holding
+as resistance on retest
+
+Stop: Beyond the flipped level
+Identify: Look at swing_highs/swing_lows.
+Is price near a previously significant level?
+Has that level role-reversed?
+
+────────────────────────────────────────
+S12: VOLATILITY COMPRESSION BREAKOUT
+────────────────────────────────────────
+What it is: After consolidation energy
+releases explosively.
+
+Non-negotiables:
+✓ BB Width below 1.0% (tight compression)
+  Current: {bb_width:.3f}%
+✓ ADX below 18 (no trend during compression)
+✓ Candle closes outside BB after compression
+✓ This candle has above-average range
+
+LONG trigger: Close above upper BB after squeeze
+SHORT trigger: Close below lower BB after squeeze
+
+Stop: Midpoint of the compression range
+Identify: Is current BB Width compressed?
+Did price just break out?
+
+════════════════════════════════════════
+DECISION FRAMEWORK
+════════════════════════════════════════
+
+STEP 1: SCAN ALL 12 STRATEGIES
+Go through each strategy above.
+Identify which strategy or strategies
+currently have their non-negotiables met.
+
+STEP 2: SELECT BEST MATCHING STRATEGY
+Pick the ONE strategy that best matches
+current market structure.
+State which strategy and why.
+
+If NO strategy non-negotiables are met:
+You may still take a trade but label it
+as "S00_BEST_AVAILABLE" and use:
+- Zone direction (primary)
+- HTF trend (EMA200)
+- Strongest momentum signal
+This is low confidence only.
+
+STEP 3: DETERMINE DIRECTION
+The strategy determines direction.
+Not indicators alone — the STRUCTURE determines it.
+
+STEP 4: FIND PRECISE ENTRY
+Where exactly does price confirm entry?
+Not "generally around here" but the
+specific price where structure confirms.
+
+STEP 5: PLACE STOP AT INVALIDATION POINT
+Where does this trade become wrong?
+Stop goes there plus 0.3x ATR buffer.
+This is not optional — every trade needs
+a specific structural invalidation level.
+
+STEP 6: SET TARGETS WITH TRAILING LOGIC
+TP1 = 2.0x risk distance (minimum)
+TP2 = 3.0x risk distance
+TP3 = 5.0x risk distance
+
+After TP1: stop moves to breakeven
+After TP2: stop moves to +1R
+After TP3: trail at 1.5R below/above price
+
+STEP 7: CONFIDENCE AND SIZING
+HIGH (2% risk): Strategy perfectly met +
+  intelligence confirms + zone confirms
+MEDIUM (1% risk): Strategy met +
+  at least 1 confirming factor
+LOW (0.5% risk): S00_BEST_AVAILABLE or
+  strategy met but factors conflict
+
+════════════════════════════════════════
+INTELLIGENCE INTEGRATION
+════════════════════════════════════════
+
+Fear & Greed {fear_greed:.0f}/100:
+- Below 25: Safe havens only, widen stops
+- Above 75: Contrarian signals more reliable
+
+VIX {vix_val:.1f}:
+- Above 30: Widen all stops by 25%
+- Below 15: Trend trades more reliable
+
+News {news_sentiment:+.2f}:
+- Above 0.5: Confirms bullish direction
+- Below -0.5: Confirms bearish direction
+- Between -0.3 and 0.3: Ignore news signal
+
+COT {cot_bias}:
+- Use to confirm or deny direction
+- Never trade against strong COT signal
+
+════════════════════════════════════════
+MANDATORY OUTPUT
+════════════════════════════════════════
+
+Return ONLY valid JSON:
 {{
+  "strategy_id": "S01_BREAKOUT_RETEST",
+  "strategy_name": "Strategy full name",
+  "strategy_met": true,
+  "non_negotiables_met": [
+    "list each non-negotiable that is confirmed"
+  ],
+  "non_negotiables_failed": [
+    "list any that are NOT met (empty if all met)"
+  ],
   "verdict": "STRONG BUY|BUY|SELL|STRONG SELL",
   "direction": "LONG|SHORT",
   "confidence": "HIGH|MEDIUM|LOW",
+  "conviction_score": 5,
   "zone_pct": {zone_pct},
   "zone_label": "{zone_label}",
   "htf_bias": "BULLISH|BEARISH|NEUTRAL",
-  "smc_concept": "LIQUIDITY_SWEEP|EQUAL_HIGHS|ORDER_BLOCK|NONE",
   "entry": {price},
+  "entry_reasoning": "exactly why entry here",
   "stop_loss": 0.0,
+  "stop_reasoning": "structural level that invalidates",
   "tp1": 0.0,
   "tp2": 0.0,
   "tp3": 0.0,
   "tp_target": "TP1|TP2|TP3",
   "rr_ratio": "1:2.00",
-  "signals_used": ["UPPERCASE_SIGNAL_NAME"],
-  "confluences": ["list"],
-  "conflicts": ["list"],
-  "conviction_score": 5,
-  "reasoning": "step by step analysis",
-  "intel_summary": "one line from briefing"
+  "trailing_plan": "how to trail after each TP",
+  "signals_used": ["UPPERCASE_SIGNAL_NAMES"],
+  "confluences": ["confirming factors"],
+  "conflicts": ["opposing factors"],
+  "intelligence_summary": "one line from briefing",
+  "reasoning": "step by step using framework above"
 }}
+
+CRITICAL RULES:
+1. direction must be LONG or SHORT always
+2. strategy_id must match one of the 12
+   or S00_BEST_AVAILABLE
+3. All signal names UPPERCASE
+4. Stop must be at structural level not
+   just ATR from entry
+5. Minimum R/R 2.0 - adjust TPs if needed
+6. Be honest about confidence level
 """
+
         client = _client()
         resp = client.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=2500,
+            max_tokens=8192,
             messages=[{"role": "user", "content": prompt}],
         )
         raw = _message_text(resp)
@@ -1000,6 +1516,20 @@ Return ONLY JSON:
             confidence = "MEDIUM"
         confidence = _apply_exotic_confidence(confidence, is_exotic)
         ai["confidence"] = confidence
+
+        try:
+            conviction_score = int(round(float(ai.get("conviction_score", 5))))
+            conviction_score = max(1, min(10, conviction_score))
+        except (TypeError, ValueError):
+            conviction_score = 5
+        ai["conviction_score"] = conviction_score
+        strategy_met = bool(ai.get("strategy_met", False))
+        sid_raw = str(ai.get("strategy_id", "") or "").strip().upper()
+        if sid_raw in STRATEGIES or sid_raw == "S00_BEST_AVAILABLE":
+            strategy_id_norm = sid_raw
+        else:
+            strategy_id_norm = "S00_BEST_AVAILABLE"
+        ai["strategy_id"] = strategy_id_norm
 
         current_capital = STARTING_CAPITAL
 
@@ -1076,7 +1606,13 @@ Return ONLY JSON:
         tp3 = float(ai["tp3"])
 
         risk_pct_of_price = risk / entry if entry > 0 else 0.0
-        sizing = calculate_position_size(confidence, zone_pct, current_capital)
+        sizing = calculate_position_size(
+            confidence,
+            zone_pct,
+            strategy_met,
+            conviction_score,
+            current_capital,
+        )
         max_risk_dollars = sizing["max_risk_dollars"]
         sizing_risk_pct = sizing["risk_pct"]
 
@@ -1089,21 +1625,36 @@ Return ONLY JSON:
         risk_pct_display = round(risk_pct_of_price * 100, 3)
 
         fut = future.head(fwd_n)
-        highs = fut["High"].astype(float).values
-        lows = fut["Low"].astype(float).values
-        closes = fut["Close"].astype(float).values
-        if len(closes) == 0:
+        if fut.empty or len(fut) == 0:
             return None
 
-        hit_tp1, hit_tp2, hit_tp3, hit_stop, exit_p, exit_r, candles_to_exit = _simulate_forward_path(
-            direction, entry, stop, tp1, tp2, tp3, highs, lows, closes
+        exit_data = evaluate_forward_candles(
+            direction,
+            entry,
+            stop,
+            tp1,
+            tp2,
+            tp3,
+            fut,
+            strategy_id_norm,
         )
+        if exit_data.get("outcome") in ("NO_DATA", "INVALID"):
+            return None
 
-        if direction == "LONG":
-            raw_pct = (float(exit_p) - entry) / entry
-        else:
-            raw_pct = (entry - float(exit_p)) / entry
-        outcome = "WIN" if raw_pct > 0 else "LOSS"
+        hit_tp1 = bool(exit_data.get("hit_tp1"))
+        hit_tp2 = bool(exit_data.get("hit_tp2"))
+        hit_tp3 = bool(exit_data.get("hit_tp3"))
+        hit_stop = bool(exit_data.get("hit_stop"))
+        exit_p = float(exit_data.get("exit_price", entry))
+        exit_r = str(exit_data.get("exit_reason", ""))
+        candles_to_exit = int(exit_data.get("candles_to_exit", 0) or 0)
+        trailing_activated = bool(exit_data.get("trailing_activated", False))
+        final_stop = float(exit_data.get("final_stop", stop) or stop)
+
+        raw_pct = float(exit_data.get("pnl_pct", 0) or 0)
+        outcome = str(exit_data.get("outcome", "LOSS"))
+        if outcome not in ("WIN", "LOSS"):
+            outcome = "WIN" if raw_pct > 0 else "LOSS"
         correct = outcome == "WIN"
 
         pnl_dollars = round(leveraged_exposure * raw_pct, 2)
@@ -1160,13 +1711,9 @@ Return ONLY JSON:
         ai["confluences"] = _upper_signal_list(ai.get("confluences"))
         ai["conflicts"] = _upper_signal_list(ai.get("conflicts"))
 
-        try:
-            conviction_score = int(round(float(ai.get("conviction_score", 5))))
-            conviction_score = max(1, min(10, conviction_score))
-        except (TypeError, ValueError):
-            conviction_score = 5
-        ai["conviction_score"] = conviction_score
-        intel_summary_stored = str(ai.get("intel_summary") or "")[:500]
+        intel_summary_stored = str(
+            ai.get("intelligence_summary") or ai.get("intel_summary") or "",
+        )[:500]
 
         return {
             "date": analysis_date,
@@ -1219,6 +1766,17 @@ Return ONLY JSON:
             "rr_ratio": str(ai.get("rr_ratio", "")),
             "conviction_score": conviction_score,
             "intel_summary": intel_summary_stored,
+            "strategy_id": strategy_id_norm,
+            "strategy_name": str(ai.get("strategy_name", "") or ""),
+            "strategy_met": strategy_met,
+            "non_negotiables_met": ai.get("non_negotiables_met")
+            if isinstance(ai.get("non_negotiables_met"), list)
+            else [],
+            "non_negotiables_failed": ai.get("non_negotiables_failed")
+            if isinstance(ai.get("non_negotiables_failed"), list)
+            else [],
+            "trailing_activated": trailing_activated,
+            "final_stop": round(final_stop, 5),
             "skipped": False,
         }
 
@@ -1356,6 +1914,58 @@ def calculate_kelly(trades: list[dict[str, Any]]) -> float:
     return round(kelly, 3)
 
 
+def _strategy_performance_stats(completed: list[dict[str, Any]]) -> dict[str, Any]:
+    """Per-strategy win rate and PnL for completed WIN/LOSS rows."""
+    strategy_stats: dict[str, dict[str, Any]] = {}
+    for sid, sdef in STRATEGIES.items():
+        s_trades = [t for t in completed if str(t.get("strategy_id", "") or "").upper() == sid]
+        if not s_trades:
+            continue
+        s_wins = [t for t in s_trades if t.get("outcome") == "WIN"]
+        s_losses = [t for t in s_trades if t.get("outcome") == "LOSS"]
+        nl = max(1, len(s_trades) - len(s_wins))
+        strategy_stats[sid] = {
+            "name": sdef["name"],
+            "category": sdef["category"],
+            "total": len(s_trades),
+            "wins": len(s_wins),
+            "losses": len(s_trades) - len(s_wins),
+            "win_rate": round(len(s_wins) / len(s_trades) * 100, 1),
+            "pnl": round(sum(float(t.get("pnl_dollars", 0) or 0) for t in s_trades), 2),
+            "avg_win": round(
+                sum(float(t.get("pnl_dollars", 0) or 0) for t in s_wins) / max(1, len(s_wins)),
+                2,
+            ),
+            "avg_loss": round(
+                sum(float(t.get("pnl_dollars", 0) or 0) for t in s_losses) / nl,
+                2,
+            ),
+        }
+    s00 = [t for t in completed if str(t.get("strategy_id", "") or "").upper() == "S00_BEST_AVAILABLE"]
+    if s00:
+        s_w = [t for t in s00 if t.get("outcome") == "WIN"]
+        s_l = [t for t in s00 if t.get("outcome") == "LOSS"]
+        n0 = max(1, len(s00) - len(s_w))
+        strategy_stats["S00_BEST_AVAILABLE"] = {
+            "name": "Best Available",
+            "category": "FALLBACK",
+            "total": len(s00),
+            "wins": len(s_w),
+            "losses": len(s00) - len(s_w),
+            "win_rate": round(len(s_w) / len(s00) * 100, 1),
+            "pnl": round(sum(float(t.get("pnl_dollars", 0) or 0) for t in s00), 2),
+            "avg_win": round(
+                sum(float(t.get("pnl_dollars", 0) or 0) for t in s_w) / max(1, len(s_w)),
+                2,
+            ),
+            "avg_loss": round(
+                sum(float(t.get("pnl_dollars", 0) or 0) for t in s_l) / n0,
+                2,
+            ),
+        }
+    return strategy_stats
+
+
 def calculate_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
     row_list = [r for r in (results or []) if isinstance(r, dict)]
     n_all = len(row_list)
@@ -1398,6 +2008,7 @@ def calculate_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
             **execution_meta,
             **smc_empty,
             **dash_empty,
+            "strategy_performance": {},
         }
 
     wins = [t for t in trades if t.get("outcome") == "WIN"]
@@ -1482,6 +2093,8 @@ def calculate_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
 
     smc_agg = _smc_stats_from_trades(trades)
     dash = _tp_target_and_smc_dashboard(trades)
+    completed_for_strat = [t for t in trades if t.get("outcome") in ("WIN", "LOSS")]
+    strat_perf = _strategy_performance_stats(completed_for_strat)
 
     return {
         "generated_at": datetime.now().isoformat(),
@@ -1531,6 +2144,7 @@ def calculate_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
         **execution_meta,
         **smc_agg,
         **dash,
+        "strategy_performance": strat_perf,
     }
 
 
