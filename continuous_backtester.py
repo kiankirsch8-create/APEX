@@ -2,6 +2,9 @@
 Continuous autonomous backtesting loop: random historical setups, forward outcomes,
 rolling stats, and periodic self-improvement (timestamped backup of ``learned_weights.json``,
 ``learned_v*.json`` + ``learned_latest.json`` snapshots).
+
+Persisted state uses ``RESULTS_DIR`` (file-backed). If PostgreSQL mirroring is enabled
+elsewhere in the app, keep writing through the same paths so DB sync layers stay consistent.
 """
 from __future__ import annotations
 
@@ -39,8 +42,66 @@ IMPROVE_DEBUG_FILE = RESULTS_DIR / "improve_debug.json"
 STARTING_CAPITAL = 10000.0
 POSITION_SIZE_PCT = 0.05  # 5% of capital
 LEVERAGE = 50  # 50x on notional exposure
-FORWARD_CANDLES = 30
 IMPROVE_EVERY = 100
+
+# --- Hard filters (learned-style exclusions applied before Claude) ---
+CHF_PAIRS = [
+    "GBPCHF",
+    "AUDCHF",
+    "EURCHF",
+    "USDCHF",
+    "NZDCHF",
+    "CADCHF",
+    "CHFJPY",
+]
+
+BANNED_SIGNALS = [
+    "Price near BB Lower",
+    "MACD Histogram bullish",
+    "MACD Histogram bearish",
+    "Price near BB Upper",
+]
+
+# --- Multi-timeframe backtest universe ---
+TF_WEIGHTS = {
+    "1h": 0.20,
+    "4h": 0.40,
+    "1d": 0.30,
+    "1w": 0.10,
+}
+
+TIMEFRAMES: list[str] = ["1h", "4h", "1d", "1w"]
+
+TF_FORWARD_CANDLES: dict[str, int] = {
+    "1h": 48,
+    "4h": 30,
+    "1d": 20,
+    "1w": 8,
+}
+
+TF_MAX_STOP_PCT: dict[str, float] = {
+    "1h": 0.008,
+    "4h": 0.012,
+    "1d": 0.018,
+    "1w": 0.030,
+}
+
+TF_MAX_TP_PCT: dict[str, float] = {
+    "1h": 0.012,
+    "4h": 0.020,
+    "1d": 0.030,
+    "1w": 0.060,
+}
+
+TF_DESCRIPTIONS: dict[str, str] = {
+    "1h": "1H intraday — hold 2-48 hours, tight stops",
+    "4h": "4H day trade — hold 4-48 hours, best confluence",
+    "1d": "Daily swing — hold 3-20 days, ADX 30+ required",
+    "1w": "Weekly position — highest conviction only",
+}
+
+# Legacy default horizon (prefer TF_FORWARD_CANDLES per timeframe).
+FORWARD_CANDLES = TF_FORWARD_CANDLES.get("4h", 30)
 
 BACKTEST_TICKERS = [
     # Major pairs
@@ -96,17 +157,6 @@ BACKTEST_TICKERS = [
     "USOIL",
     "UKOIL",
 ]
-
-TIMEFRAMES = ["1h", "4h", "1d"]
-
-_TF_MAP: dict[str, str] = {
-    "1h": "1h",
-    "4h": "1h",
-    "1d": "1d",
-    "daily": "1d",
-    "1w": "1wk",
-    "weekly": "1wk",
-}
 
 _backtest_thread: threading.Thread | None = None
 _stop_flag = threading.Event()
@@ -263,6 +313,90 @@ def _append_result(row: dict[str, Any]) -> list[dict[str, Any]]:
         return results
 
 
+def get_ohlcv(
+    yf_ticker: str,
+    timeframe: str,
+    analysis_date: str,
+) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
+    """Fetch OHLCV for backtest window; resample 1h→4h when needed."""
+    tf_key = timeframe.lower().strip()
+    tf_cfg: dict[str, dict[str, Any]] = {
+        "1h": {"interval": "1h", "days_back": 180, "days_fwd": 14},
+        "4h": {"interval": "1h", "resample": "4h", "days_back": 365, "days_fwd": 30},
+        "1d": {"interval": "1d", "days_back": 730, "days_fwd": 60},
+        "1w": {"interval": "1wk", "days_back": 1825, "days_fwd": 120},
+    }
+    cfg = tf_cfg.get(tf_key, tf_cfg["4h"])
+    target = datetime.strptime(analysis_date.strip(), "%Y-%m-%d")
+    start = target - timedelta(days=int(cfg["days_back"]))
+    end = target + timedelta(days=int(cfg["days_fwd"]))
+
+    df = yf.Ticker(yf_ticker).history(
+        start=start.strftime("%Y-%m-%d"),
+        end=end.strftime("%Y-%m-%d"),
+        interval=str(cfg["interval"]),
+    )
+    if df.empty:
+        return None, None
+
+    df = df.sort_index()
+    if cfg.get("resample"):
+        agg: dict[str, str] = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
+        if "Volume" in df.columns:
+            agg["Volume"] = "sum"
+        df = df.resample(str(cfg["resample"])).agg(agg).dropna()
+
+    df = _strip_tz(df)
+    day_end = pd.Timestamp(analysis_date).normalize() + pd.Timedelta(days=1) - pd.Timedelta(milliseconds=1)
+    past = df[df.index <= day_end].copy()
+    future = df[df.index > day_end].copy()
+    return past, future
+
+
+def apply_hard_filters(
+    ticker: str,
+    indicators: dict[str, Any],
+    timeframe: str,  # noqa: ARG001 — reserved for timeframe-specific rules
+) -> dict[str, Any]:
+    """Pre-Claude gates: CHF pairs, ADX, RSI extremes, BB upper long risk."""
+    result: dict[str, Any] = {"pass": True, "reason": None, "warnings": []}
+    sym = (ticker or "").strip().upper()
+
+    if sym in CHF_PAIRS:
+        result["pass"] = False
+        result["reason"] = "CHF pair excluded — 0% win rate across 10 trades (-$877)"
+        return result
+
+    adx = float(indicators.get("adx", 0) or 0)
+    rsi = float(indicators.get("rsi", 50) or 50)
+    bb_upper = float(indicators.get("bb_upper", 0) or 0)
+    bb_lower = float(indicators.get("bb_lower", 0) or 0)
+    price = float(indicators.get("current_price", 0) or 0)
+    ema20 = float(indicators.get("ema20", price) or price)
+
+    if adx < 25:
+        result["pass"] = False
+        result["reason"] = f"ADX {adx:.1f} below 25 minimum — weak trend"
+        return result
+
+    if price > ema20 and rsi > 65:
+        result["pass"] = False
+        result["reason"] = f"RSI {rsi:.1f} overbought on long — high failure rate"
+        return result
+
+    if price < ema20 and rsi < 35:
+        result["pass"] = False
+        result["reason"] = f"RSI {rsi:.1f} oversold on short — high failure rate"
+        return result
+
+    if bb_upper > 0 and price > 0 and price > bb_upper * 0.998:
+        result["pass"] = False
+        result["reason"] = "Price at BB Upper — no long entries"
+        return result
+
+    return result
+
+
 def validate_rr(plan: dict[str, Any]) -> dict[str, Any]:
     """Ensure reward at TP1 vs stop risk meets minimum R/R; downgrade to NO TRADE if not."""
     if not isinstance(plan, dict):
@@ -305,31 +439,19 @@ def validate_rr(plan: dict[str, Any]) -> dict[str, Any]:
 def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[str, Any] | None:
     try:
         sym = (ticker or "").strip().upper()
-        interval = _TF_MAP.get(timeframe.lower().strip(), "1d")
+        tf_key = timeframe.lower().strip()
         is_forex = len(sym) == 6 and sym.isalpha()
         yf_ticker = sym + "=X" if is_forex else sym
 
-        target = datetime.strptime(analysis_date.strip(), "%Y-%m-%d")
-        start = target - timedelta(days=730)
-        end = target + timedelta(days=200)
-
-        full_df = yf.Ticker(yf_ticker).history(
-            start=start.strftime("%Y-%m-%d"),
-            end=end.strftime("%Y-%m-%d"),
-            interval=interval,
-        )
-        if full_df.empty or len(full_df) < 60:
+        past, future = get_ohlcv(yf_ticker, tf_key, analysis_date.strip())
+        if past is None or future is None or past.empty or future.empty:
             return None
-
-        full_df = _strip_tz(full_df.sort_index())
-        day_end = pd.Timestamp(analysis_date).normalize() + pd.Timedelta(days=1) - pd.Timedelta(milliseconds=1)
-        past = full_df[full_df.index <= day_end].copy()
-        future = full_df[full_df.index > day_end].copy()
-
-        if len(past) < 50 or future.empty:
+        min_past = 30 if tf_key == "1w" else 50
+        if len(past) < min_past:
             return None
+        fwd_n = int(TF_FORWARD_CANDLES.get(tf_key, FORWARD_CANDLES))
         if len(future) < 5:
-            log(f"[Backtest] Not enough future data for {sym} {analysis_date}", level="info")
+            log(f"[Backtest] Not enough future data for {sym} {analysis_date} {tf_key}", level="info")
             return None
 
         past.ta.rsi(length=14, append=True)
@@ -384,64 +506,101 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
         else:
             trend = "RANGING"
 
-        learned = _load_learned_for_context()
-        adj = learned.get("signal_adjustments") if isinstance(learned, dict) else {}
-        learned_context = ""
-        if isinstance(adj, dict) and adj:
-            good = [s for s, v in adj.items() if str(v).upper().startswith("INCREASE")]
-            bad = [s for s, v in adj.items() if str(v).upper().startswith("DECREASE") or str(v).upper().startswith("REMOVE")]
-            if good or bad:
-                n = learned.get("total_trades_analyzed", 0) if isinstance(learned, dict) else 0
-                learned_context = f"""
-LEARNED FROM {n} past backtests:
-High reliability signals (prefer these): {good}
-Low reliability signals (be skeptical): {bad}
-Recommendation: {learned.get("recommendation", "") if isinstance(learned, dict) else ""}
-"""
+        filters = apply_hard_filters(
+            sym,
+            {
+                "adx": ind["adx"],
+                "rsi": ind["rsi"],
+                "macd_hist": ind["macd_hist"],
+                "bb_upper": ind["bb_upper"],
+                "bb_lower": ind["bb_lower"],
+                "ema20": ind["ema20"],
+                "current_price": price,
+            },
+            tf_key,
+        )
+        if not filters.get("pass", True):
+            log(f"[Backtest] FILTERED: {sym} — {filters.get('reason')}", level="info")
+            return {
+                "date": analysis_date,
+                "ticker": sym,
+                "timeframe": timeframe,
+                "verdict": "FILTERED",
+                "direction": "NO TRADE",
+                "skipped": True,
+                "skip_reason": str(filters.get("reason") or ""),
+                "reasoning": str(filters.get("reason") or ""),
+                "entry_price": price,
+            }
 
+        learned = _load_learned_for_context() or {}
+        if not isinstance(learned, dict):
+            learned = {}
+        new_rules = learned.get("new_rules", [])
+        reliable = learned.get("reliable_signals", [])
+        unreliable = learned.get("unreliable_signals", [])
+        learned_section = ""
+        if (isinstance(new_rules, list) and new_rules) or (isinstance(reliable, list) and reliable) or (
+            isinstance(unreliable, list) and unreliable
+        ):
+            chunks: list[str] = []
+            if isinstance(new_rules, list) and new_rules:
+                rules_text = "\n".join(f"- {r}" for r in new_rules if str(r).strip())
+                chunks.append(f"LEARNED RULES (apply strictly, discovered from backtesting):\n{rules_text}")
+            if isinstance(reliable, list) and reliable:
+                chunks.append("RELIABLE SIGNALS (prioritize these):\n" + "\n".join(f"+ {s}" for s in reliable[:5]))
+            if isinstance(unreliable, list) and unreliable:
+                chunks.append("UNRELIABLE SIGNALS (avoid or ignore these):\n" + "\n".join(f"- {s}" for s in unreliable[:5]))
+            learned_section = "\n\n".join(chunks)
+
+        total_trades_so_far = len(_load_results_list())
+        tf_desc = TF_DESCRIPTIONS.get(tf_key, TF_DESCRIPTIONS["4h"])
+        max_stop_pct = TF_MAX_STOP_PCT.get(tf_key, 0.012) * 100
+        max_tp_pct = TF_MAX_TP_PCT.get(tf_key, 0.020) * 100
         atr = ind["atr"]
+
         prompt = f"""
-Analyze {sym} on {analysis_date} as a trader.
-You see ONLY data up to this date. No future knowledge.
+You are APEX — an elite autonomous trading system.
+You execute with perfect discipline, no emotions.
+You have analyzed {total_trades_so_far} past trades
+and learned from every result.
 
+ASSET: {sym} | TYPE: {"FOREX" if is_forex else "STOCK"}
+TIMEFRAME: {tf_desc}
+DATE: {analysis_date}
 PRICE: {price}
-TREND: {trend}
-RSI(14): {ind["rsi"]} ({"oversold" if ind["rsi"] < 30 else "overbought" if ind["rsi"] > 70 else "neutral"})
-MACD Histogram: {ind["macd_hist"]} ({"bullish" if ind["macd_hist"] > 0 else "bearish"})
-EMA20: {ind["ema20"]} | EMA50: {ind["ema50"]} | EMA200: {ind["ema200"]}
-ATR: {atr} | ADX: {ind["adx"]} ({"strong" if ind["adx"] > 25 else "weak"} trend)
-BB Upper: {ind["bb_upper"]} | BB Lower: {ind["bb_lower"]}
-Asset type: {"FOREX" if is_forex else "STOCK"}
-{learned_context}
-TRADING RULES:
-- Only skip (NO TRADE) if trend is completely flat AND all indicators are neutral
-- ADX below 12 = truly no trend = WAIT
-- RSI between 48-52 with zero signals = WAIT
-- Otherwise find the best trade available
-- You should trade at least 50% of the time
-- Exotic pairs often trend strongly - trade them
-- Daily timeframe has clearer signals than 1H
-- When in doubt favor the trend direction
 
-STRICT RISK/REWARD RULES:
-- Minimum R/R ratio: 1:1.5
-- Preferred R/R ratio: 1:2.0 to 1:2.5
-- Stop loss: 0.5x ATR from entry (tight)
-- TP1: 1.5x ATR from entry (minimum)
-- TP2: 2.5x ATR from entry
-- TP3: 4x ATR from entry (runner)
+MARKET DATA:
+Trend: {trend}
+RSI(14): {ind["rsi"]:.2f}
+MACD Histogram: {ind["macd_hist"]:.5f}
+EMA20: {ind["ema20"]:.5f}
+EMA50: {ind["ema50"]:.5f}
+EMA200: {ind["ema200"]:.5f}
+ATR: {ind["atr"]:.5f}
+ADX: {ind["adx"]:.2f}
+BB Upper: {ind["bb_upper"]:.5f}
+BB Lower: {ind["bb_lower"]:.5f}
 
-For forex 4H/Daily:
-Stop loss maximum: 0.8% from entry
-TP1 minimum: 1.2% from entry
-TP2 minimum: 2.0% from entry
+{learned_section}
 
-NEVER place a stop loss wider than TP1.
-If you cannot find a setup with 1:1.5 R/R
-return NO TRADE instead.
-A bad R/R setup is worse than no trade.
+HARD RULES — non-negotiable:
+1. ADX must be above 25 for any trade
+2. No CHF pairs (already filtered before this prompt)
+3. No mean-reversion entries (no BB extremes as sole thesis)
+4. Only trade with STRONG trend confirmation
+5. Stop loss = 1x ATR (max {max_stop_pct:.1f}% of entry)
+6. TP1 = 1.5x ATR (max {max_tp_pct:.1f}% of entry)
+7. TP2 = 2.5x ATR
+8. Minimum R/R ratio: 1.5
+9. If fewer than 3 confluences = NO TRADE
 
-Current timeframe: {timeframe}. Use ATR={atr} with entry price for distances.
+BANNED SIGNALS — never use these as entry reasons:
+- Price near BB Lower
+- Price near BB Upper
+- MACD Histogram bullish
+- MACD Histogram bearish (alone)
+- Mean reversion signals
 
 Return ONLY valid JSON:
 {{
@@ -452,7 +611,6 @@ Return ONLY valid JSON:
   "stop_loss": 0.0,
   "tp1": 0.0,
   "tp2": 0.0,
-  "tp3": 0.0,
   "rr_ratio": "string",
   "signals_used": ["string"],
   "confluences": ["string"],
@@ -464,7 +622,7 @@ Return ONLY valid JSON:
         client = _client()
         resp = client.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=1000,
+            max_tokens=1500,
             messages=[{"role": "user", "content": prompt}],
         )
         raw = _message_text(resp)
@@ -497,7 +655,7 @@ Return ONLY valid JSON:
         tp1 = float(ai.get("tp1", 0) or 0)
         tp2 = float(ai.get("tp2", 0) or 0)
 
-        fut = future.head(FORWARD_CANDLES)
+        fut = future.head(fwd_n)
         highs = fut["High"].astype(float).values
         lows = fut["Low"].astype(float).values
         closes = fut["Close"].astype(float).values
@@ -686,6 +844,9 @@ def calculate_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
             "max_loss_per_trade": STARTING_CAPITAL * POSITION_SIZE_PCT * LEVERAGE * 0.015,
             "kelly_pct": round(k0 * 100, 2),
             "kelly_dollars": round(STARTING_CAPITAL * k0, 2),
+            "timeframe_performance": {},
+            "excluded_tickers": list(CHF_PAIRS),
+            "banned_signals": list(BANNED_SIGNALS),
         }
 
     wins = [t for t in trades if t.get("outcome") == "WIN"]
@@ -749,6 +910,25 @@ def calculate_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
 
     kelly_f = calculate_kelly(trades)
 
+    tf_perf: dict[str, Any] = {}
+    for tf in TIMEFRAMES:
+        tf_trades = [
+            t
+            for t in trades
+            if str(t.get("timeframe", "") or "").lower() == tf
+            and not t.get("skipped")
+            and t.get("outcome") in ("WIN", "LOSS")
+        ]
+        if tf_trades:
+            tf_wins = [t for t in tf_trades if t.get("outcome") == "WIN"]
+            tf_perf[tf] = {
+                "total": len(tf_trades),
+                "wins": len(tf_wins),
+                "losses": len(tf_trades) - len(tf_wins),
+                "win_rate": round(len(tf_wins) / len(tf_trades) * 100, 1),
+                "pnl": round(sum(float(t.get("pnl_dollars", 0) or 0) for t in tf_trades), 2),
+            }
+
     return {
         "generated_at": datetime.now().isoformat(),
         "starting_capital": STARTING_CAPITAL,
@@ -791,6 +971,9 @@ def calculate_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
         "capital_curve": curve,
         "signal_performance": sig_perf,
         "recent_trades": sorted(trades, key=lambda x: str(x.get("date", "")), reverse=True)[:50],
+        "timeframe_performance": tf_perf,
+        "excluded_tickers": list(CHF_PAIRS),
+        "banned_signals": list(BANNED_SIGNALS),
     }
 
 
@@ -1086,7 +1269,11 @@ def continuous_backtest_loop() -> None:
         existing_keys = {f"{r.get('ticker')}|{r.get('date')}|{r.get('timeframe')}" for r in results if isinstance(r, dict)}
 
         ticker = random.choice(BACKTEST_TICKERS)
-        timeframe = random.choice(TIMEFRAMES)
+        timeframe = random.choices(
+            list(TF_WEIGHTS.keys()),
+            weights=list(TF_WEIGHTS.values()),
+            k=1,
+        )[0]
         is_fx = len(ticker) == 6 and ticker.isalpha()
         date = get_random_date(skip_weekends=not is_fx)
         key = f"{ticker}|{date}|{timeframe}"
