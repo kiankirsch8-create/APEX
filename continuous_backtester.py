@@ -180,19 +180,15 @@ BANNED_SIGNALS: list[str] = []
 
 # --- Multi-timeframe backtest universe ---
 TF_WEIGHTS = {
-    "1h": 0.10,
-    "4h": 0.25,
-    "1d": 0.50,
-    "1w": 0.15,
+    "1h": 0.05,
+    "4h": 0.20,
+    "1d": 0.55,
+    "1w": 0.20,
 }
 
 ALLOWED_1H_STRATEGIES: frozenset[str] = frozenset(
     {
-        "S02_LIQUIDITY_SWEEP",
-        "S04_EXTREME_REVERSION",
-        "S08_RANGE_BREAKOUT",
         "S11_SR_FLIP",
-        "S12_VOLATILITY_COMPRESSION",
     }
 )
 
@@ -220,10 +216,10 @@ TF_MAX_TP_PCT: dict[str, float] = {
 }
 
 TF_DESCRIPTIONS: dict[str, str] = {
-    "1h": "1H — re-enabled for testing; only S02/S04/S08/S11/S12; system caps LOW confidence",
+    "1h": "1H — 23% WR in data; only S11_SR_FLIP; else skip (system enforced)",
     "4h": "4H — secondary; use rarely vs daily",
     "1d": "Daily PRIMARY — cleanest signals (~54% WR in backtests); hold ~3–20 days",
-    "1w": "Weekly — secondary HTF context (~40% WR vs intraday)",
+    "1w": "1W — 65% WR in data; S04 priority",
 }
 
 # Legacy default horizon (prefer TF_FORWARD_CANDLES per timeframe).
@@ -827,6 +823,94 @@ def _tp_target_and_smc_dashboard(trades: list[dict[str, Any]]) -> dict[str, Any]
     return {"tp_performance": tp_performance, "smc_performance": smc_performance}
 
 
+def _skipped_backtest_row(
+    *,
+    sym: str,
+    timeframe: str,
+    analysis_date: str,
+    price: float,
+    zone_pct: float,
+    zone_label: str,
+    skip_reason: str,
+    ai: dict[str, Any],
+    tf_key: str,
+    is_exotic: bool,
+) -> dict[str, Any]:
+    """Row persisted when APEX declines to trade (no forward simulation)."""
+    sid = str(ai.get("strategy_id") or "SKIP").strip().upper()
+    intel_summary_stored = str(
+        ai.get("intelligence_summary") or ai.get("intel_summary") or "",
+    )[:500]
+    core_met = ai.get("core_signals_met") if isinstance(ai.get("core_signals_met"), list) else []
+    core_failed = (
+        ai.get("core_signals_failed") if isinstance(ai.get("core_signals_failed"), list) else []
+    )
+    return {
+        "date": analysis_date,
+        "ticker": sym,
+        "timeframe": timeframe,
+        "verdict": "SKIP",
+        "direction": str(ai.get("direction") or "NONE").strip().upper() or "NONE",
+        "confidence": "SKIP",
+        "skipped": True,
+        "skip_trade": True,
+        "skip_reason": skip_reason[:500],
+        "outcome": "SKIPPED",
+        "pnl_dollars": 0.0,
+        "pnl_pct": 0.0,
+        "entry_price": round(float(price), 5),
+        "stop_loss": 0.0,
+        "tp1": 0.0,
+        "tp2": 0.0,
+        "tp3": 0.0,
+        "exit_price": round(float(price), 5),
+        "exit_reason": "SKIPPED",
+        "correct": False,
+        "hit_tp1": False,
+        "hit_tp2": False,
+        "hit_tp3": False,
+        "hit_stop": False,
+        "candles_to_exit": 0,
+        "trailing_activated": False,
+        "final_stop": round(float(price), 5),
+        "strategy_id": sid or "SKIP",
+        "strategy_name": str(ai.get("strategy_name") or ""),
+        "strategy_met": bool(ai.get("strategy_met", False)),
+        "core_signals_met": core_met,
+        "core_signals_failed": core_failed,
+        "non_negotiables_met": core_met,
+        "non_negotiables_failed": core_failed,
+        "reasoning": str(ai.get("reasoning") or "")[:4000],
+        "rr_ratio": str(ai.get("rr_ratio") or ""),
+        "conviction_score": int(ai.get("conviction_score") or 0),
+        "intel_summary": intel_summary_stored,
+        "zone_pct": zone_pct,
+        "zone_label": zone_label,
+        "zone_label_model": str(ai.get("zone_label") or "") or None,
+        "price_zone": "EQUILIBRIUM",
+        "zone_position_pct": zone_pct,
+        "tp_target": "TP1",
+        "signals_used": ai.get("signals_used") if isinstance(ai.get("signals_used"), list) else [],
+        "confluences": ai.get("confluences") if isinstance(ai.get("confluences"), list) else [],
+        "conflicts": ai.get("conflicts") if isinstance(ai.get("conflicts"), list) else [],
+        "htf_bias": str(ai.get("htf_bias") or ""),
+        "market_structure": str(ai.get("market_structure") or ""),
+        "smc_concept": "NONE",
+        "smc_direction": "",
+        "is_exotic": is_exotic,
+        "confluence_points": 0,
+        "leverage": LEVERAGE,
+        "position_size": 0.0,
+        "leveraged_exposure": 0.0,
+        "max_risk_dollars": 0.0,
+        "account_risk_pct": 0.0,
+        "risk_pct_of_price": 0.0,
+        "timeframe_restricted": tf_key == "1h",
+        "tf_strategy_allowed": tf_key != "1h" or sid in ALLOWED_1H_STRATEGIES,
+        "trailing_plan": str(ai.get("trailing_plan") or "")[:500],
+    }
+
+
 def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[str, Any] | None:
     try:
         sym = (ticker or "").strip().upper()
@@ -982,6 +1066,7 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
         macd_line = float(ind.get("macd_line", 0) or 0)
         macd_signal = float(ind.get("macd_signal", 0) or 0)
         macd_signal_line = macd_signal
+        macd_sig = macd_signal
 
         intel_text = ""
         news_sentiment = 0.0
@@ -1006,150 +1091,384 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
         except Exception as e:
             log(f"[Intel] {e}")
 
-        prompt = f"""You are APEX: institutional FX/CFD analyst. Pick one strategy (S01–S12 or S00), confirm structure, output tight JSON only.
+        prompt = f"""You are APEX — an elite institutional trading AI.
+
+You have completed 135 real backtested trades.
+Your performance data drives every decision.
+You trade based on EVIDENCE not guesses.
+
+You can and SHOULD skip trades when there is
+no clear edge. Skipping is not weakness —
+it is discipline. Professionals skip 70% of
+potential setups. Only trade the best ones.
 
 ═══════════════════════════════════════════
-MARKET DATA
+LIVE MARKET DATA
 ═══════════════════════════════════════════
-Asset: {sym} | TF: {TF_DESCRIPTIONS.get(tf_key, tf_key)} | Date: {analysis_date} | Price: {price:.5f}
-Zone: {zone_label} ({zone_pct:.1f}% of 52w) | 52w H/L: {high_52w:.5f} / {low_52w:.5f}
-RSI {ind["rsi"]:.1f} | MACD {macd_line:.5f}/{macd_signal_line:.5f} hist {ind["macd_hist"]:.5f}
-EMA20/50/200 {ind["ema20"]:.5f} / {ind["ema50"]:.5f} / {ind["ema200"]:.5f} | ATR {ind["atr"]:.5f} | ADX {ind["adx"]:.1f}
-BB {ind["bb_lower"]:.5f}–{ind.get("bb_mid", price):.5f}–{ind["bb_upper"]:.5f} | Width {bb_width:.2f}%
-Swings H/L: {ind.get("swing_highs", [])} / {ind.get("swing_lows", [])}
+Asset: {sym}
+Timeframe: {TF_DESCRIPTIONS.get(tf_key, tf_key)}
+Date: {analysis_date}
+Price: {price:.5f}
+
+52w Zone: {zone_label} ({zone_pct:.1f}%)
+52w High: {high_52w:.5f}
+52w Low: {low_52w:.5f}
+
+RSI: {ind["rsi"]:.1f}
+MACD Histogram: {ind["macd_hist"]:.6f}
+MACD Line vs Signal: {macd_line:.6f} / {macd_sig:.6f}
+EMA20: {ind["ema20"]:.5f}
+EMA50: {ind["ema50"]:.5f}
+EMA200: {ind["ema200"]:.5f}
+ATR: {ind["atr"]:.5f}
+ADX: {ind["adx"]:.1f}
+BB Width: {bb_width:.2f}%
+BB Upper: {ind["bb_upper"]:.5f}
+BB Lower: {ind["bb_lower"]:.5f}
+Swing Highs: {ind.get("swing_highs", [])}
+Swing Lows: {ind.get("swing_lows", [])}
 
 {intel_text}
 
-Zone bias: EXTREME_DISCOUNT<10% long edge | DISCOUNT 10–30 long lean | EQUILIBRIUM 30–70 neutral
-PREMIUM 70–90 short lean (shorts need bearish EMA or rejection) | EXTREME_PREMIUM>90 short edge
-
 ═══════════════════════════════════════════
-STRATEGY QUICK REFERENCE (S01–S12 + S00)
-Pick best fit; be generous if close to rules.
-═══════════════════════════════════════════
-S01 BREAKOUT RETEST: broke level + retesting it
-  Need: price within 2x ATR of broken swing
-  Direction: same as breakout
-
-S02 LIQUIDITY SWEEP: equal highs/lows + spike beyond + recovery
-  Need: cluster within 0.5%, spike and close back
-  Direction: opposite to sweep
-
-S03 EMA PULLBACK: aligned EMAs + price near EMA20/50
-  Need: EMA20 and EMA50 same side of EMA200
-  Direction: same as EMA alignment
-
-S04 EXTREME REVERSION: zone<15% or >85% + RSI<35 or >65
-  Need: 2 of those conditions
-  Direction: toward mean
-
-S05 MACD DIVERGENCE: price new extreme + MACD not confirming
-  Need: visible divergence over 2+ swings
-  Direction: toward MACD signal
-
-S06 ORDER BLOCK: strong impulse started from a zone
-  Need: price returning to impulse origin
-  Direction: same as original impulse
-
-S07 FAIR VALUE GAP: gap between swings larger than 0.5x ATR
-  Need: price moving to fill the gap
-  Direction: toward gap
-
-S08 RANGE BREAKOUT: BB Width < 3% + close outside BB
-  Need: 2 of 3 — compression, low ADX, outside BB
-  Direction: direction of breakout
-
-S09 NEWS CATALYST: sentiment above 0.3 or below -0.3
-  Need: news + price moving same direction
-  Direction: same as news
-
-S10 COT FLOW: COT bias confirmed + zone supports it
-  Need: COT not UNKNOWN + zone aligned
-  Direction: same as COT
-
-S11 SR FLIP: level tested twice + broke + retesting other side
-  Need: repeated level in swing data + current retest
-  Direction: same as break direction
-
-S12 VOLATILITY COMPRESSION: BB Width < 2% + candle outside
-  Need: tight squeeze + breakout candle
-  Direction: direction of breakout
-
-If no strategy qualifies: S00_BEST_AVAILABLE
-Use zone + EMA + momentum for direction.
-
-═══════════════════════════════════════════
-INTELLIGENCE SNAPSHOT
-═══════════════════════════════════════════
-F&G {fear_greed:.0f}/100 | VIX {vix_val:.1f} | News {news_sentiment:+.2f} | COT {cot_bias}
-Adjust conviction ±1 when intel confirms/opposes; VIX>30 → widen stops ~20%.
-
-7 STEPS (compact): (1) Scan S01–S12 vs quick ref (2) Pick best or S00
-(3) Direction from strategy + zone (4) Entry = specific price (5) Stop = invalidation + 0.3×ATR
-(6) TP1/2/3 = 2R/3R/5R; trail: BE @ TP1, +1R @ TP2, 1.5R trail after TP3
-(7) Confidence: HIGH=named+zone+intel | MED=mostly met or S00 3+ | LOW=S00 weak or conflicts
-
-RULES: SHORT in premium 65–89% needs bearish EMA OR RSI>65 OR price<EMA20 else cap conviction 4.
-NZD in ticker → may bump confidence one notch. Equilibrium 30–70% needs 3+ confluences.
-1H: only S02,S04,S08,S11,S12; system forces LOW size. Avoid S01,S03,S09,S00 on 1H.
-
-═══════════════════════════════════════════
-OUTPUT — RETURN ONLY VALID JSON
+YOUR PROVEN PERFORMANCE (135 real trades)
+Use this data to guide every decision
 ═══════════════════════════════════════════
 
+STRATEGY RESULTS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅ S03 EMA PULLBACK:     57.7% WR +$392 (26 trades)
+  4H: 66.7% WR ✅  1D: 50.0% WR ⚠️  1W: 66.7% WR ✅
+
+✅ S04 EXTREME REVERSION: 53.2% WR +$905 (47 trades)
+  1H: 20.0% WR ❌  4H: 37.5% WR ❌
+  1D: 66.7% WR ✅  1W: 75.0% WR ✅
+
+✅ S11 SR FLIP:           100% WR +$44  (2 trades - needs more data)
+
+⚠️ S08 RANGE BREAKOUT:   44.4% WR -$183 (9 trades - WEAK)
+  4H: 25.0% WR ❌  1D: 60.0% WR ⚠️
+
+❌ S00 BEST AVAILABLE:    40.8% WR +$518 (49 trades - AVOID)
+
+TIMEFRAME RESULTS:
+1H: 23.1% WR -$338 ❌ (avoid except extreme cases)
+4H: 41.7% WR +$103 ⚠️ (selective use)
+1D: 53.0% WR +$1440 ✅ (primary)
+1W: 65.0% WR +$401 ✅ (high priority)
+
+ZONE RESULTS:
+LONG in PREMIUM zone: 6W 3L +$690 ✅ (surprise winner)
+SHORT in PREMIUM zone: 26W 31L +$486 ⚠️ (marginal)
+LONG in DISCOUNT zone: 19W 18L +$237 ⚠️ (weak)
+LONG in EQUILIBRIUM:  10W 10L +$148 (neutral)
+
+KEY LESSON FROM DATA:
+Your best trade was +$464 (trailing stop hit TP3)
+Your worst trade was -$300 (HIGH confidence wrong)
+→ HIGH confidence does NOT mean guaranteed win
+→ Always use appropriate position sizing
+
+═══════════════════════════════════════════
+THE PROVEN STRATEGIES
+Only these have enough data to trust
+═══════════════════════════════════════════
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+S03: EMA TREND PULLBACK ✅ PROVEN
+57.7% WR overall — best on 4H and 1W
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+What works: In a trending market price pulls
+back to the moving averages then continues.
+
+Confirmed signals (need 3 of 4):
+→ EMA20 and EMA50 on same side of EMA200
+  (both above = uptrend, both below = downtrend)
+→ Price within 2x ATR of EMA20 or EMA50
+  EMA20 distance: {abs(price - ind["ema20"]):.5f}
+  EMA50 distance: {abs(price - ind["ema50"]):.5f}
+  2x ATR = {ind["atr"]*2:.5f}
+→ RSI between 25 and 70 (room to move)
+  Current RSI: {ind["rsi"]:.1f}
+→ ADX above 15 (trend exists)
+  Current ADX: {ind["adx"]:.1f}
+
+LONG: EMA20 > EMA50 > EMA200, price near EMA20/50
+SHORT: EMA20 < EMA50 < EMA200, price rejecting from EMA
+
+Stop: beyond EMA50 with 0.3x ATR buffer
+Best timeframes: 4H (66.7%), 1W (66.7%)
+Avoid: 1D alone without zone confirmation
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+S04: EXTREME ZONE REVERSION ✅ PROVEN
+53.2% WR overall — exceptional on 1D (66.7%) and 1W (75%)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+What works: Price at statistical yearly extreme
+reverts toward the mean.
+
+Confirmed signals (need 2 of 3):
+→ Zone below 15% (long) OR above 85% (short)
+  Current zone: {zone_pct:.1f}%
+→ RSI below 35 (long) OR above 65 (short)
+  Current RSI: {ind["rsi"]:.1f}
+→ ADX below 45 (not in runaway trend)
+  Current ADX: {ind["adx"]:.1f}
+
+LONG: zone below 15%, RSI below 35
+SHORT: zone above 85%, RSI above 65
+
+Stop: 1x ATR beyond the extreme point
+Best timeframes: 1D (66.7%), 1W (75%)
+
+CRITICAL RESTRICTIONS from your data:
+❌ DO NOT use S04 on 1H (20% WR in your data)
+❌ DO NOT use S04 on 4H (37.5% WR — losing money)
+✅ ONLY use S04 on 1D and 1W
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+S11: SR FLIP ✅ PROMISING (need more data)
+100% WR on 2 trades — not enough data yet
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+What works: A level tested multiple times
+flips its role after a clear break.
+
+Confirmed signals (need 2 of 3):
+→ Level in swing data appears 2+ times
+  (within 0.5% of same price)
+→ Price broke clearly through that level
+→ Price returning to test from other side
+
+LONG: old resistance now holding as support
+SHORT: old support now holding as resistance
+
+Stop: beyond the flipped level by 0.5x ATR
+Use on any timeframe — gather more data
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STRATEGIES UNDER TESTING (use cautiously)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+S02: LIQUIDITY SWEEP (1 trade, no conclusion)
+Equal highs/lows swept and recovered.
+Equal levels within 0.5%, spike beyond, recovery.
+Only use on 1H with extreme zones.
+
+S08: RANGE BREAKOUT (44.4% WR — currently losing)
+BB Width below 3%, ADX below 30, close outside BB.
+4H: 25% WR — AVOID on 4H
+1D: 60% WR — acceptable on daily only
+Use conservatively, require confirmed close outside BB.
+
+S12: VOLATILITY COMPRESSION (1 trade, no conclusion)
+BB Width below 2%, ADX below 20, explosive breakout.
+Only use on 1H when BB Width below 1%.
+
+S01: BREAKOUT RETEST (gathering data)
+Price breaks level, retests it as new S/R.
+Price within 2x ATR of broken swing level.
+ADX above 15. Use when clearly visible.
+
+S05: MACD DIVERGENCE (gathering data)
+Price makes new extreme but MACD does not confirm.
+Use as confirmation signal, not primary.
+
+S06: ORDER BLOCK (gathering data)
+Strong impulse started from a zone.
+Price returns to that origin zone.
+Hard to detect without candle data.
+
+S07: FAIR VALUE GAP (gathering data)
+Gap between swings larger than 0.5x ATR.
+Price returning to fill the gap.
+
+S09: NEWS CATALYST (gathering data)
+Sentiment above 0.3 or below -0.3.
+Current: {news_sentiment:.2f}
+
+S10: COT FLOW (gathering data)
+COT bias confirmed + zone supports it.
+Current COT: {cot_bias}
+
+═══════════════════════════════════════════
+INTELLIGENCE DATA
+═══════════════════════════════════════════
+Fear & Greed: {fear_greed:.0f}/100
+VIX: {vix_val:.1f}
+News sentiment: {news_sentiment:+.2f}
+COT: {cot_bias}
+
+Intelligence adds conviction but is rarely
+enough alone to take a trade.
+Use to boost or reduce conviction by 1 point.
+
+═══════════════════════════════════════════
+TIMEFRAME RULES (from your own data)
+═══════════════════════════════════════════
+
+DAILY (1D) — PRIMARY ✅
+53% WR. S04 here is exceptional (66.7%).
+Take all S03 and S04 setups that qualify.
+This is where most money is made.
+
+WEEKLY (1W) — HIGH VALUE ✅
+65% WR. Best timeframe overall.
+S04 on weekly is 75% WR — PRIORITY.
+Fewer trades but higher quality.
+
+4H — SELECTIVE ⚠️
+41.7% WR overall. Mixed results.
+Only take S03 (66.7% WR on 4H) setups.
+Avoid S04 on 4H (37.5% WR — losing).
+Avoid S08 on 4H (25% WR — terrible).
+
+1H — EMERGENCY ONLY ❌
+23.1% WR. Consistent loser.
+Only take S11 SR Flip on 1H (if visible).
+All 1H trades → LOW confidence → 0.5% risk.
+Skip if no clear S11 setup.
+
+═══════════════════════════════════════════
+HOW TO DECIDE — CLEAR PROCESS
+═══════════════════════════════════════════
+
+STEP 1: TIMEFRAME GATE
+If 1H: only proceed if S11 clearly visible.
+  Otherwise: output skip_trade: true
+If 4H: only proceed if S03 qualifies.
+  S04 on 4H = skip (37.5% WR, losing money)
+  S08 on 4H = skip (25% WR, terrible)
+If 1D or 1W: proceed to Step 2.
+
+STEP 2: STRATEGY SCAN
+Check S03 first (proven 57.7% WR):
+  Does price meet 3 of 4 signals? → USE S03
+Check S04 second (proven 53.2% WR on 1D/1W):
+  Does zone meet threshold + RSI/ADX? → USE S04
+Check S11 (promising, needs data):
+  Clear level flip visible? → USE S11
+Check S01, S08, S12 (testing):
+  Clear setup only, LOW confidence
+If nothing qualifies: SKIP THE TRADE
+
+STEP 3: SKIP DECISION
+Skip if:
+- No strategy qualifies with 2+ signals
+- 4H with S04 attempted (proven loser)
+- 1H without clear S11
+- Equilibrium zone with no strategy
+- Conflicting signals without clear winner
+- S00 BEST AVAILABLE is the only option
+  (40.8% WR — not worth the risk)
+
+Skipping is BETTER than S00 trades.
+S00 has 40.8% WR — below coin flip.
+Every S00 trade costs you money on average.
+
+STEP 4: DIRECTION AND ENTRY
+Strategy determines direction.
+Find the specific structural entry price.
+Not approximately — exactly where.
+
+STEP 5: STOP AT STRUCTURAL INVALIDATION
+Where does this trade become structurally wrong?
+Add 0.3x ATR buffer beyond that level.
+Never more than 2.5% from entry.
+
+STEP 6: TARGETS WITH TRAILING
+TP1 = risk × 2.0
+TP2 = risk × 3.0
+TP3 = risk × 5.0
+
+After TP1: stop → breakeven
+After TP2: stop → +1R
+After TP3: trail at 1.5R below/above price
+
+STEP 7: CONFIDENCE AND SIZE
+HIGH (2% risk):
+  S03 or S04 fully met on 1D or 1W
+  + zone confirms direction
+  + at least 1 intelligence confirms
+  MAXIMUM conviction 8 (worst trade was -$300
+  on HIGH confidence — respect this lesson)
+
+MEDIUM (1% risk):
+  S03 or S04 mostly met
+  OR S11 clear flip on any timeframe
+
+LOW (0.5% risk):
+  1H trades (always)
+  S08 on 1D only
+  S01/S12 testing trades
+
+SKIP (0% risk):
+  S00 only option
+  S04 on 4H or 1H
+  S08 on 4H
+  No clear strategy
+
+═══════════════════════════════════════════
+OUTPUT — VALID JSON ONLY
+═══════════════════════════════════════════
+
+If skipping:
 {{
-  "strategy_id": "S01_BREAKOUT_RETEST",
-  "strategy_name": "Full strategy name",
+  "skip_trade": true,
+  "skip_reason": "specific reason why no edge",
+  "strategy_id": "SKIP",
+  "direction": "NONE",
+  "confidence": "SKIP",
+  "conviction_score": 0,
+  "zone_pct": {zone_pct},
+  "zone_label": "{zone_label}",
+  "entry": 0,
+  "stop_loss": 0,
+  "tp1": 0,
+  "tp2": 0,
+  "tp3": 0,
+  "signals_used": [],
+  "reasoning": "why no valid setup exists"
+}}
+
+If trading:
+{{
+  "skip_trade": false,
+  "strategy_id": "S03_EMA_PULLBACK",
+  "strategy_name": "EMA Trend Pullback",
   "strategy_met": true,
-  "core_signals_met": [
-    "each core signal that confirmed"
-  ],
-  "core_signals_failed": [
-    "any core signal not met"
-  ],
-  "verdict": "STRONG BUY|BUY|SELL|STRONG SELL",
+  "core_signals_met": ["list each confirmed signal"],
+  "core_signals_failed": ["list any not met"],
+  "verdict": "BUY|SELL|STRONG BUY|STRONG SELL",
   "direction": "LONG|SHORT",
   "confidence": "HIGH|MEDIUM|LOW",
-  "conviction_score": 7,
+  "conviction_score": 6,
   "zone_pct": {zone_pct},
   "zone_label": "{zone_label}",
   "htf_bias": "BULLISH|BEARISH|NEUTRAL",
   "entry": {price},
-  "entry_reasoning": "why entry here",
+  "entry_reasoning": "why entry here (max 20 words)",
   "stop_loss": 0.0,
-  "stop_reasoning": "structural invalidation level",
+  "stop_reasoning": "structural level (max 20 words)",
   "tp1": 0.0,
   "tp2": 0.0,
   "tp3": 0.0,
-  "tp_target": "TP1|TP2|TP3",
+  "tp_target": "TP2",
   "rr_ratio": "1:2.0",
-  "trailing_plan": "how to trail after each TP",
-  "signals_used": ["UPPERCASE_SIGNAL_NAMES"],
-  "confluences": ["confirming factors"],
-  "conflicts": ["opposing factors"],
-  "intelligence_summary": "one line from briefing",
-  "reasoning": "step by step analysis"
+  "trailing_plan": "BE at TP1, +1R at TP2",
+  "signals_used": ["UPPERCASE_SIGNALS"],
+  "confluences": ["max 4 items"],
+  "conflicts": ["max 3 items"],
+  "intelligence_summary": "max 10 words",
+  "reasoning": "max 80 words total"
 }}
 
-MANDATORY:
-direction must be LONG or SHORT
-strategy_id must be S01-S12 or S00_BEST_AVAILABLE
-All signal names UPPERCASE
-Minimum RR 2.0
-Stop at structural level not just ATR
-
-IMPORTANT COST CONTROL:
-Keep your response concise:
-- reasoning: maximum 100 words
-- entry_reasoning: maximum 20 words
-- stop_reasoning: maximum 20 words
-- trailing_plan: maximum 20 words
-- intelligence_summary: maximum 15 words
-- confluences: maximum 4 items
-- conflicts: maximum 3 items
-
-Total JSON response should be under 400 tokens.
-Focus on the numbers, not the explanation.
+RULES:
+- direction: LONG or SHORT (never NONE for trades)
+- strategy_id: S01-S12 or SKIP (never S00)
+- All signals UPPERCASE
+- Minimum RR 2.0
+- conviction max 8 (learned from -$300 loss)
+- reasoning maximum 80 words
 """
         client = _client()
         resp = client.messages.create(
@@ -1161,70 +1480,78 @@ Focus on the numbers, not the explanation.
         parsed = _parse_json_response(raw)
         ai: dict[str, Any] = parsed if isinstance(parsed, dict) else {}
 
+        def _skip_out(reason: str, src: dict[str, Any] | None = None) -> dict[str, Any]:
+            log(f"[SKIP] {sym} {timeframe}: {reason}", level="info")
+            return _skipped_backtest_row(
+                sym=sym,
+                timeframe=timeframe,
+                analysis_date=analysis_date,
+                price=float(price),
+                zone_pct=zone_pct,
+                zone_label=zone_label,
+                skip_reason=reason,
+                ai=src if src is not None else ai,
+                tf_key=tf_key,
+                is_exotic=is_exotic,
+            )
+
+        if not ai:
+            return _skip_out("empty or invalid JSON from model", {})
+
+        if bool(ai.get("skip_trade")):
+            return _skip_out(str(ai.get("skip_reason") or "no edge identified"))
+
+        sid_raw = str(ai.get("strategy_id", "") or "").strip().upper()
+        if sid_raw == "S04_EXTREME_REVERSION" and tf_key in ("1h", "4h"):
+            return _skip_out(f"S04 blocked on {tf_key} — proven weak in data")
+        if sid_raw == "S08_RANGE_BREAKOUT" and tf_key == "4h":
+            return _skip_out("S08 blocked on 4H: 25% WR per backtested data")
+        if sid_raw == "S00_BEST_AVAILABLE":
+            return _skip_out("S00 blocked — 40.8% WR below acceptable threshold")
+
         direction_raw = str(ai.get("direction", "")).strip().upper()
         if direction_raw not in ("LONG", "SHORT"):
-            ema200 = float(ind.get("ema200", price) or price)
-            if float(price) > ema200:
-                direction_raw = "LONG"
-                ai["direction"] = "LONG"
-                ai["verdict"] = "BUY"
-            else:
-                direction_raw = "SHORT"
-                ai["direction"] = "SHORT"
-                ai["verdict"] = "SELL"
-            ai["confidence"] = "LOW"
-            prev_r = str(ai.get("reasoning", "") or "")
-            forced_note = " [FORCED: system requires trade on every analysis]"
-            ai["reasoning"] = prev_r + forced_note if forced_note not in prev_r else prev_r
-            log(f"[Loop] FORCED trade direction: {direction_raw}", level="info")
+            return _skip_out("no valid LONG/SHORT direction from model")
 
-        direction = str(ai.get("direction", direction_raw)).strip().upper()
-        if direction not in ("LONG", "SHORT"):
-            direction = direction_raw
+        direction = direction_raw
         ai["direction"] = direction
 
-        strategy_met = bool(ai.get("strategy_met", False))
-        sid_raw = str(ai.get("strategy_id", "") or "").strip().upper()
-        if sid_raw in STRATEGIES:
-            strategy_id_norm = sid_raw
-        else:
-            strategy_id_norm = "S00_BEST_AVAILABLE"
+        if sid_raw == "SKIP":
+            return _skip_out(str(ai.get("skip_reason") or "model returned SKIP"))
+        if sid_raw not in STRATEGIES:
+            return _skip_out(f"unsupported strategy_id: {sid_raw}")
+
+        strategy_id_norm = sid_raw
         ai["strategy_id"] = strategy_id_norm
+        strategy_met = bool(ai.get("strategy_met", False))
+
+        if tf_key == "1h" and strategy_id_norm not in ALLOWED_1H_STRATEGIES:
+            return _skip_out(f"1H only S11 allowed; got {strategy_id_norm}")
 
         confidence = str(ai.get("confidence", "MEDIUM")).strip().upper()
         if confidence not in ("HIGH", "MEDIUM", "LOW"):
             confidence = "MEDIUM"
         confidence = _apply_exotic_confidence(confidence, is_exotic)
 
-        if tf_key == "1h":
-            sid_1h = strategy_id_norm
-            if sid_1h not in ALLOWED_1H_STRATEGIES:
-                log(f"[1H Filter] {sid_1h} not allowed on 1H — forcing LOW", level="info")
-                try:
-                    cs0 = int(round(float(ai.get("conviction_score", 5) or 5)))
-                except (TypeError, ValueError):
-                    cs0 = 5
-                ai["conviction_score"] = min(max(1, cs0), 3)
-            try:
-                cs1 = int(round(float(ai.get("conviction_score", 5) or 5)))
-            except (TypeError, ValueError):
-                cs1 = 5
-            ai["conviction_score"] = min(max(1, cs1), 4)
-            confidence = "LOW"
-            ai["confidence"] = "LOW"
-            log(
-                f"[1H] Strategy: {sid_1h} — capped at LOW confidence",
-                level="info",
-            )
-        else:
-            ai["confidence"] = confidence
-
         try:
             conviction_score = int(round(float(ai.get("conviction_score", 5))))
             conviction_score = max(1, min(10, conviction_score))
         except (TypeError, ValueError):
             conviction_score = 5
+        conviction_score = min(conviction_score, 8)
         ai["conviction_score"] = conviction_score
+
+        if tf_key == "1h":
+            conviction_score = min(conviction_score, 4)
+            ai["conviction_score"] = conviction_score
+            confidence = "LOW"
+            ai["confidence"] = "LOW"
+            log(
+                f"[1H] Strategy {strategy_id_norm} — capped at LOW confidence",
+                level="info",
+            )
+        else:
+            ai["confidence"] = confidence
 
         current_capital = STARTING_CAPITAL
 
@@ -1513,6 +1840,7 @@ Focus on the numbers, not the explanation.
             "trailing_activated": trailing_activated,
             "final_stop": round(final_stop, 5),
             "skipped": False,
+            "skip_trade": False,
         }
 
     except Exception as e:  # noqa: BLE001
@@ -1714,7 +2042,20 @@ def calculate_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
     hard_filtered_n = sum(1 for r in row_list if str(r.get("verdict", "")).upper() == "FILTERED")
     eligible_after_hard = max(0, n_all - hard_filtered_n)
 
-    trades = [r for r in row_list if not r.get("skipped")]
+    skipped_rows = [
+        r for r in row_list if r.get("skipped") or str(r.get("outcome", "")).upper() == "SKIPPED"
+    ]
+    skip_reasons: dict[str, int] = {}
+    for t in skipped_rows:
+        rkey = str(t.get("skip_reason") or t.get("reasoning") or "unknown")[:50]
+        skip_reasons[rkey] = skip_reasons.get(rkey, 0) + 1
+    skip_meta = {
+        "skipped_trades": len(skipped_rows),
+        "skip_rate_pct": round(len(skipped_rows) / max(1, n_all) * 100, 1),
+        "skip_reasons": skip_reasons,
+    }
+
+    trades = [r for r in row_list if str(r.get("outcome", "")).upper() in ("WIN", "LOSS")]
     executed_trade_rate_pct = (
         round(100 * len(trades) / max(1, eligible_after_hard), 1) if eligible_after_hard else 0.0
     )
@@ -1751,6 +2092,7 @@ def calculate_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
             **smc_empty,
             **dash_empty,
             "strategy_performance": {},
+            **skip_meta,
         }
 
     wins = [t for t in trades if t.get("outcome") == "WIN"]
@@ -1887,6 +2229,7 @@ def calculate_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
         **smc_agg,
         **dash,
         "strategy_performance": strat_perf,
+        **skip_meta,
     }
 
 
@@ -2212,14 +2555,21 @@ def continuous_backtest_loop() -> None:
                 count = append_result(result)
                 added = count > prev_len
 
-                if added and not result.get("skipped"):
-                    outcome = result.get("outcome", "?")
-                    pnl = float(result.get("pnl_dollars", 0) or 0)
-                    log(
-                        f"[Loop] #{count} {ticker} {timeframe} {date}: {outcome} ${pnl:.2f}",
-                        level="info",
-                    )
-                    if result.get("outcome") in ("WIN", "LOSS"):
+                if added:
+                    if result.get("skipped"):
+                        log(
+                            f"[Loop] SKIP {ticker} {timeframe} {date}: "
+                            f"{result.get('skip_reason', '')}",
+                            level="info",
+                        )
+                    else:
+                        outcome = result.get("outcome", "?")
+                        pnl = float(result.get("pnl_dollars", 0) or 0)
+                        log(
+                            f"[Loop] #{count} {ticker} {timeframe} {date}: {outcome} ${pnl:.2f}",
+                            level="info",
+                        )
+                    if added and result.get("outcome") in ("WIN", "LOSS"):
                         tests_since_improve += 1
 
                 if added and count > 0 and count % 5 == 0:
