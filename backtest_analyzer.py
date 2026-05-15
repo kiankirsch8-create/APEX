@@ -16,7 +16,7 @@ import pandas_ta  # noqa: F401
 
 from utils import RESULTS_DIR, env, load_json, log, save_json, utcnow_iso
 
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+CLAUDE_MODEL = "claude-sonnet-4-5-20251022"
 MAX_TOKENS_SINGLE = 2000
 
 BACKTEST_HISTORY_PATH = RESULTS_DIR / "backtest_history.json"

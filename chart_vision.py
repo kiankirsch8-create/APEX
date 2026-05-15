@@ -11,7 +11,7 @@ from anthropic import Anthropic
 
 from utils import env, log, utcnow_iso
 
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+CLAUDE_MODEL = "claude-sonnet-4-5-20251022"
 MAX_TOKENS_SINGLE = 3000
 MAX_TOKENS_MULTI = 4000
 

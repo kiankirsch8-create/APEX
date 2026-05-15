@@ -24,7 +24,7 @@ import pandas_ta  # noqa: F401
 
 from utils import DATA_DIR, env, load_json, log, save_json, utcnow_iso
 
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+CLAUDE_MODEL = "claude-sonnet-4-5-20251022"
 
 RESULTS_FILE = DATA_DIR / "backtest_results.json"
 STATS_FILE = DATA_DIR / "backtest_stats.json"
@@ -2447,14 +2447,14 @@ Return ONLY this exact JSON structure, nothing else:
   "signal_adjustments": {{"SIGNAL_NAME": "INCREASE|DECREASE|REMOVE"}}
 }}"""
 
-    log("[Improve] Calling Claude claude-sonnet-4-20250514...", level="info")
+    log("[Improve] Calling Claude claude-sonnet-4-5-20251022...", level="info")
     log(f"[Improve] Prompt length: {len(prompt)} chars", level="info")
 
     raw = ""
     try:
         client = _client()
         resp = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-5-20251022",
             max_tokens=3000,
             messages=[{"role": "user", "content": prompt}],
         )

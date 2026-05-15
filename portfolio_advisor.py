@@ -16,7 +16,7 @@ from anthropic import Anthropic
 import analyzer
 from utils import RESULTS_DIR, env, log, load_json, save_json, utcnow_iso
 
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+CLAUDE_MODEL = "claude-sonnet-4-5-20251022"
 MAX_TOKENS = 12000
 
 CACHE_PATH = RESULTS_DIR / "portfolio_advice.json"

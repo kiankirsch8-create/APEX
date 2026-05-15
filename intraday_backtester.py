@@ -19,7 +19,7 @@ from news_stream import get_latest_news, get_recent_alerts
 from utils import DATA_DIR, load_json, log, save_json
 
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-MODEL = os.getenv("INTRADAY_CLAUDE_MODEL", "claude-sonnet-4-20250514")
+MODEL = os.getenv("INTRADAY_CLAUDE_MODEL", "claude-sonnet-4-5-20251022")
 
 RESULTS_FILE = DATA_DIR / "intraday_backtest_results.json"
 STATE_FILE = DATA_DIR / "intraday_state.json"
