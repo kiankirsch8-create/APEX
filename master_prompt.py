@@ -1,6 +1,6 @@
 """APEX master analyst system prompt — INSIDERMAX methodology.
 
-Single source of truth for Claude (claude-opus-4-5). The model must obey
+Single source of truth for Claude (claude-sonnet-4-20250514). The model must obey
 signal-derived timeframe logic, intelligence layers, conviction tiers, and
 JSON schema downstream in analyzer.py.
 """

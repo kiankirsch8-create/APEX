@@ -19,7 +19,7 @@ import pandas_ta  # noqa: F401  — registers ``df.ta`` accessor on pandas
 
 from utils import env
 
-CLAUDE_MODEL = "claude-opus-4-5"
+CLAUDE_MODEL = "claude-sonnet-4-20250514"
 MAX_TOKENS = 3000
 
 _TF_MAP: dict[str, tuple[str, str]] = {
