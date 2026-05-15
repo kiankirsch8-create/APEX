@@ -941,8 +941,6 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
                 "entry_price": price,
             }
 
-        tf_desc = TF_DESCRIPTIONS.get(tf_key, tf_key)
-
         high_52w = float(ind.get("high_52w") or price * 1.1)
         low_52w = float(ind.get("low_52w") or price * 0.9)
         if not math.isfinite(high_52w):
