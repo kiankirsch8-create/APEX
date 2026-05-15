@@ -107,38 +107,54 @@ STRATEGIES: dict[str, dict[str, Any]] = {
     },
 }
 
-# --- Hard exclusions: CHF + proven losers + illiquid (``run_one_backtest`` early return) ---
-CHF_PAIRS = frozenset(
-    {
-        "GBPCHF",
-        "AUDCHF",
-        "EURCHF",
-        "USDCHF",
-        "NZDCHF",
-        "CADCHF",
-        "CHFJPY",
-    }
-)
+# --- Hard exclusions (``run_one_backtest`` early return) ---
+CHF_PAIRS = frozenset({p for p in (
+    "AUDCAD",
+    "AUDCHF",
+    "AUDNZD",
+    "CADCHF",
+    "CHFJPY",
+    "EURCAD",
+    "EURCHF",
+    "EURJPY",
+    "GBPAUD",
+    "GBPCAD",
+    "GBPCHF",
+    "NZDCHF",
+    "NZDJPY",
+    "USDCHF",
+    "USDCZK",
+    "USDDKK",
+    "USDHKD",
+    "USDHUF",
+    "USDPLN",
+    "USDSGD",
+    "USDTRY",
+) if "CHF" in p})
 
 EXCLUDED_PAIRS = frozenset(
     {
-        *CHF_PAIRS,
-        "EURJPY",
-        "AUDNZD",
-        "USDHKD",
-        "GBPAUD",
-        "NZDJPY",
-        "EURCAD",
         "AUDCAD",
+        "AUDCHF",
+        "AUDNZD",
+        "CADCHF",
+        "CHFJPY",
+        "EURCAD",
+        "EURCHF",
+        "EURJPY",
+        "GBPAUD",
+        "GBPCAD",
+        "GBPCHF",
+        "NZDCHF",
+        "NZDJPY",
+        "USDCHF",
         "USDCZK",
-        "USDPLN",
-        "USDHUF",
         "USDDKK",
+        "USDHKD",
+        "USDHUF",
+        "USDPLN",
         "USDSGD",
-        "USDTRY",  # structural carry trade, fights shorts
-        "EURGBP",  # Section 1C blacklist — proven loser
-        "AUDJPY",  # Section 1C blacklist
-        "USDMXN",  # Section 1C blacklist
+        "USDTRY",
     }
 )
 
@@ -1247,80 +1263,6 @@ def _skipped_backtest_row(
     }
 
 
-def _apply_zone_rsi_fallback(
-    tf_key: str,
-    zone_pct: float,
-    rsi: float,
-    adx: float,
-    ai: dict[str, Any],
-    price: float,
-) -> bool:
-    """1D/1W only: if the model skipped but zone+RSI+ADX show a modest edge, force a LOW-confidence S04-style trade."""
-    if tf_key not in ("1d", "1w"):
-        return False
-    try:
-        z = float(zone_pct)
-        r = float(rsi)
-        ax = float(adx)
-    except (TypeError, ValueError):
-        return False
-    if ax <= 15:
-        return False
-    fp = float(price)
-    if not math.isfinite(fp) or fp <= 0:
-        return False
-
-    def _fill_s04_long() -> None:
-        ai["skip_trade"] = False
-        ai["strategy_id"] = "S04_EXTREME_REVERSION"
-        ai["strategy_name"] = str(STRATEGIES.get("S04_EXTREME_REVERSION", {}).get("name", "Extreme Zone Reversion"))
-        ai["direction"] = "LONG"
-        ai["confidence"] = "LOW"
-        ai["strategy_met"] = False
-        try:
-            ai["conviction_score"] = max(3, min(4, int(round(float(ai.get("conviction_score", 4) or 4)))))
-        except (TypeError, ValueError):
-            ai["conviction_score"] = 4
-        ent = float(ai.get("entry", 0) or 0)
-        ai["entry"] = round(ent if ent > 0 else fp, 5)
-        ai["verdict"] = str(ai.get("verdict") or "BUY")
-        ai["skip_reason"] = ""
-        ai["reasoning"] = str(ai.get("reasoning") or "Zone RSI fallback LONG (1D/1W LOW)")[:500]
-
-    def _fill_s04_short() -> None:
-        ai["skip_trade"] = False
-        ai["strategy_id"] = "S04_EXTREME_REVERSION"
-        ai["strategy_name"] = str(STRATEGIES.get("S04_EXTREME_REVERSION", {}).get("name", "Extreme Zone Reversion"))
-        ai["direction"] = "SHORT"
-        ai["confidence"] = "LOW"
-        ai["strategy_met"] = False
-        try:
-            ai["conviction_score"] = max(3, min(4, int(round(float(ai.get("conviction_score", 4) or 4)))))
-        except (TypeError, ValueError):
-            ai["conviction_score"] = 4
-        ent = float(ai.get("entry", 0) or 0)
-        ai["entry"] = round(ent if ent > 0 else fp, 5)
-        ai["verdict"] = str(ai.get("verdict") or "SELL")
-        ai["skip_reason"] = ""
-        ai["reasoning"] = str(ai.get("reasoning") or "Zone RSI fallback SHORT (1D/1W LOW)")[:500]
-
-    if z < 20 and r < 45:
-        _fill_s04_long()
-        log(
-            f"[FALLBACK] Override skip → S04 LONG LOW (zone={z:.1f}% RSI={r:.1f} ADX={ax:.1f})",
-            level="info",
-        )
-        return True
-    if z > 80 and r > 55:
-        _fill_s04_short()
-        log(
-            f"[FALLBACK] Override skip → S04 SHORT LOW (zone={z:.1f}% RSI={r:.1f} ADX={ax:.1f})",
-            level="info",
-        )
-        return True
-    return False
-
-
 def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[str, Any] | None:
     try:
         sym = (ticker or "").strip().upper()
@@ -1902,18 +1844,35 @@ RULES:
 
         _sanitize_signal_lists(ai)
 
+        # FIX1 — cap stop distance on raw Claude output (before skip / full pipeline)
+        if not bool(ai.get("skip_trade")):
+            try:
+                e0 = float(ai.get("entry", price) or price)
+                st0 = float(ai.get("stop_loss", 0) or 0)
+                d0 = str(ai.get("direction", "LONG")).strip().upper()
+                max_stop_map = {"1h": 0.5, "4h": 1.0, "1d": 1.5, "1w": 2.5}
+                ms = float(max_stop_map.get(tf_key, 1.5))
+                if (
+                    st0
+                    and e0 > 0
+                    and abs(st0 - e0) > 1e-12
+                    and d0 in ("LONG", "SHORT")
+                    and math.isfinite(e0)
+                    and math.isfinite(st0)
+                ):
+                    sdp = abs(e0 - st0) / e0 * 100.0
+                    if sdp > ms + 1e-9:
+                        log(f"[StopFix] {sdp:.2f}% → capped at {ms}% (post-parse)", level="info")
+                        if d0 == "LONG":
+                            st0 = e0 * (1.0 - ms / 100.0)
+                        else:
+                            st0 = e0 * (1.0 + ms / 100.0)
+                        ai["stop_loss"] = round(st0, 5)
+            except (TypeError, ValueError):
+                pass
+
         if bool(ai.get("skip_trade")):
-            if _apply_zone_rsi_fallback(
-                tf_key,
-                zone_pct,
-                float(ind.get("rsi", 50) or 50),
-                float(ind.get("adx", 0) or 0),
-                ai,
-                float(price),
-            ):
-                _sanitize_signal_lists(ai)
-            else:
-                return _skip_out(str(ai.get("skip_reason") or "no edge identified"))
+            return _skip_out(str(ai.get("skip_reason") or "no edge identified"))
 
         sid_raw = str(ai.get("strategy_id", "") or "").strip().upper()
         if sid_raw == "S00_BEST_AVAILABLE":
@@ -1961,6 +1920,13 @@ RULES:
         strategy_id_norm = sid_raw
         ai["strategy_id"] = strategy_id_norm
         strategy_met = bool(ai.get("strategy_met", False))
+
+        if strategy_id_norm in (
+            "S03_EMA_PULLBACK",
+            "S04_EXTREME_REVERSION",
+            "S11_SR_FLIP",
+        ) and not strategy_met:
+            return _skip_out("strategy_met False — no fallback trades allowed", ai)
 
         if rec_mode == "PRESERVATION" and tf_key != "1w":
             return _skip_out("preservation mode: 1W swing timeframe only", ai)
@@ -2088,18 +2054,47 @@ RULES:
         else:
             risk = stop - entry
 
-        r1, r2, r3 = _tp_r_multiples(strategy_id_norm, tf_key)
+        # FIX1 — cap maximum stop distance (% of entry); fixed 2R/3R/5R TPs when capped
+        max_stop_map = {"1h": 0.5, "4h": 1.0, "1d": 1.5, "1w": 2.5}
+        max_stop_pct = float(max_stop_map.get(tf_key, 1.5))
+        stop = float(ai["stop_loss"])
+        capped_stop = False
+        if stop and entry > 0 and abs(stop - entry) > 1e-12:
+            stop_dist_pct = abs(entry - stop) / entry * 100.0
+            if stop_dist_pct > max_stop_pct + 1e-9:
+                log(f"[StopFix] {stop_dist_pct:.2f}% → capped at {max_stop_pct}%", level="info")
+                if direction == "LONG":
+                    stop = entry * (1.0 - max_stop_pct / 100.0)
+                else:
+                    stop = entry * (1.0 + max_stop_pct / 100.0)
+                stop = validate_stop_loss(entry, round(stop, 5), direction, tf_key)
+                ai["stop_loss"] = stop
+                if direction == "LONG":
+                    risk = entry - stop
+                else:
+                    risk = stop - entry
+                capped_stop = True
+        if risk <= 0 or not math.isfinite(risk):
+            return _skip_out("invalid risk after stop distance cap", ai)
 
-        if direction == "LONG":
-            ai["tp1"] = round(entry + risk * r1, 5)
-            ai["tp2"] = round(entry + risk * r2, 5)
-            ai["tp3"] = round(entry + risk * r3, 5)
+        if capped_stop:
+            mult = 1.0 if direction == "LONG" else -1.0
+            ai["tp1"] = round(entry + mult * risk * 2.0, 5)
+            ai["tp2"] = round(entry + mult * risk * 3.0, 5)
+            ai["tp3"] = round(entry + mult * risk * 5.0, 5)
             rew = abs(float(ai["tp2"]) - entry)
         else:
-            ai["tp1"] = round(entry - risk * r1, 5)
-            ai["tp2"] = round(entry - risk * r2, 5)
-            ai["tp3"] = round(entry - risk * r3, 5)
-            rew = abs(entry - float(ai["tp2"]))
+            r1, r2, r3 = _tp_r_multiples(strategy_id_norm, tf_key)
+            if direction == "LONG":
+                ai["tp1"] = round(entry + risk * r1, 5)
+                ai["tp2"] = round(entry + risk * r2, 5)
+                ai["tp3"] = round(entry + risk * r3, 5)
+                rew = abs(float(ai["tp2"]) - entry)
+            else:
+                ai["tp1"] = round(entry - risk * r1, 5)
+                ai["tp2"] = round(entry - risk * r2, 5)
+                ai["tp3"] = round(entry - risk * r3, 5)
+                rew = abs(entry - float(ai["tp2"]))
 
         if risk > 0:
             rr_tp2 = abs(float(ai["tp2"]) - entry) / risk
