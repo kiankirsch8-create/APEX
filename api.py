@@ -23,6 +23,8 @@ import backtest_analyzer
 import chart_analyzer_v2
 import chart_vision
 import continuous_backtester
+import intraday_backtester
+import news_stream
 import portfolio_advisor
 import screener_big_players
 import screener_small_caps
@@ -41,6 +43,10 @@ from utils import CONFIG_DIR, DATA_DIR, RESULTS_DIR, env, load_json, log, save_j
 async def _lifespan(app: FastAPI):
     yield
     continuous_backtester.shutdown_continuous_backtest()
+    try:
+        intraday_backtester.stop_intraday_daemon()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 app = FastAPI(
@@ -75,6 +81,12 @@ async def on_startup_resume_backtester() -> None:
             log("[Startup] Backtester auto-resumed")
         else:
             log("[Startup] Backtester is disabled")
+        if os.getenv("BENZINGA_API_KEY"):
+            try:
+                news_stream.start_news_stream_thread()
+                log("[Startup] Benzinga news stream started")
+            except Exception as e:  # noqa: BLE001
+                log(f"[Startup] Benzinga stream not started: {e}")
     except Exception as e:  # noqa: BLE001
         log(f"[Startup] Backtester error: {e}")
 
@@ -159,6 +171,12 @@ class BacktestSeriesIn(BaseModel):
 
 class BacktestContinuousToggleIn(BaseModel):
     """Enable or disable the daemon continuous backtest loop."""
+
+    enabled: bool
+
+
+class IntradayToggleIn(BaseModel):
+    """Enable or disable the intraday backtest daemon loop."""
 
     enabled: bool
 
@@ -981,6 +999,145 @@ async def backtest_improving() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Intraday backtester (15m / 30m) + Benzinga news alerts
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/intraday/results")
+async def get_intraday_results(limit: int = Query(50, ge=1, le=500)) -> dict[str, Any]:
+    try:
+        if not intraday_backtester.RESULTS_FILE.exists():
+            return {"results": [], "total": 0, "all_including_skips": 0}
+        results = load_json(intraday_backtester.RESULTS_FILE, default=[])
+        if not isinstance(results, list):
+            return {"results": [], "total": 0, "all_including_skips": 0, "error": "invalid results file"}
+        trades = [r for r in results if isinstance(r, dict) and not r.get("skipped", True)]
+        return {
+            "total": len(trades),
+            "results": trades[-limit:],
+            "all_including_skips": len(results),
+        }
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)}
+
+
+@app.get("/api/intraday/stats")
+async def get_intraday_stats() -> dict[str, Any]:
+    try:
+        if not intraday_backtester.RESULTS_FILE.exists():
+            return {
+                "total_trades": 0,
+                "total_skipped": 0,
+                "skip_rate_pct": 0.0,
+                "win_rate_pct": 0.0,
+                "total_pnl_dollars": 0.0,
+                "strategy_performance": {},
+                "timeframe_performance": {},
+            }
+        all_results = load_json(intraday_backtester.RESULTS_FILE, default=[])
+        if not isinstance(all_results, list):
+            return {"error": "invalid results file"}
+        total_all = len(all_results)
+        trades = [r for r in all_results if isinstance(r, dict) and not r.get("skipped", True)]
+        skipped_n = total_all - len(trades)
+        skip_rate = round(skipped_n / max(1, total_all) * 100, 1)
+
+        if not trades:
+            return {
+                "total_trades": 0,
+                "total_skipped": skipped_n,
+                "skip_rate_pct": skip_rate,
+                "win_rate_pct": 0.0,
+                "total_pnl_dollars": 0.0,
+                "strategy_performance": {},
+                "timeframe_performance": {},
+            }
+
+        wins = [t for t in trades if t.get("outcome") == "WIN"]
+        total_pnl = sum(float(t.get("pnl_dollars", 0) or 0) for t in trades)
+
+        canonical = {
+            "S14_OPENING_RANGE": "S14_OPENING_RANGE_BREAKOUT",
+            "S16_HTF_REJECTION": "S16_HTF_LEVEL_REJECTION",
+        }
+
+        def norm_sid(raw: Any) -> str:
+            s = str(raw or "").strip().upper()
+            return canonical.get(s, s)
+
+        strategy_ids = (
+            "S13_NEWS_MOMENTUM",
+            "S14_OPENING_RANGE_BREAKOUT",
+            "S15_VWAP_DEVIATION",
+            "S16_HTF_LEVEL_REJECTION",
+        )
+        strategy_stats: dict[str, Any] = {}
+        for sid in strategy_ids:
+            s_trades = [t for t in trades if norm_sid(t.get("strategy_id")) == sid]
+            if not s_trades:
+                continue
+            s_wins = [t for t in s_trades if t.get("outcome") == "WIN"]
+            strategy_stats[sid] = {
+                "total": len(s_trades),
+                "wins": len(s_wins),
+                "win_rate": round(len(s_wins) / len(s_trades) * 100, 1),
+                "pnl": round(sum(float(t.get("pnl_dollars", 0) or 0) for t in s_trades), 2),
+            }
+
+        timeframe_stats: dict[str, Any] = {}
+        for tf in ("15m", "30m"):
+            tf_trades = [t for t in trades if str(t.get("timeframe", "")).lower() == tf]
+            if not tf_trades:
+                continue
+            tf_wins = [t for t in tf_trades if t.get("outcome") == "WIN"]
+            timeframe_stats[tf] = {
+                "total": len(tf_trades),
+                "wins": len(tf_wins),
+                "win_rate": round(len(tf_wins) / len(tf_trades) * 100, 1),
+                "pnl": round(sum(float(t.get("pnl_dollars", 0) or 0) for t in tf_trades), 2),
+            }
+
+        return {
+            "total_trades": len(trades),
+            "total_skipped": skipped_n,
+            "skip_rate_pct": skip_rate,
+            "win_rate_pct": round(len(wins) / max(1, len(trades)) * 100, 1),
+            "total_pnl_dollars": round(total_pnl, 2),
+            "strategy_performance": strategy_stats,
+            "timeframe_performance": timeframe_stats,
+        }
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)}
+
+
+@app.get("/api/intraday/enabled")
+async def intraday_enabled() -> dict[str, Any]:
+    return {"enabled": intraday_backtester.is_enabled()}
+
+
+@app.post("/api/intraday/toggle")
+async def intraday_toggle(body: IntradayToggleIn) -> dict[str, Any]:
+    intraday_backtester.set_enabled(body.enabled)
+    if body.enabled:
+        intraday_backtester.ensure_intraday_daemon()
+        return {"status": "enabled", "enabled": True}
+    return {"status": "disabled", "enabled": False}
+
+
+@app.get("/api/news/alerts")
+async def get_news_alerts(limit: int = Query(20, ge=1, le=200)) -> dict[str, Any]:
+    try:
+        if not news_stream.ALERT_FILE.exists():
+            return {"alerts": [], "total": 0}
+        alerts = load_json(news_stream.ALERT_FILE, default=[])
+        if not isinstance(alerts, list):
+            return {"alerts": [], "total": 0, "error": "invalid alerts file"}
+        return {"alerts": alerts[-limit:], "total": len(alerts)}
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)}
+
+
+# ---------------------------------------------------------------------------
 @app.get("/")
 async def root() -> dict:
     return {
@@ -1016,6 +1173,11 @@ async def root() -> dict:
             "GET /api/backtest/learned",
             "GET /api/backtest/learned/history",
             "GET /api/backtest/improving",
+            "GET /api/intraday/results",
+            "GET /api/intraday/stats",
+            "GET /api/intraday/enabled",
+            "POST /api/intraday/toggle",
+            "GET /api/news/alerts",
             "GET /api/status",
             "POST /api/run",
             "GET|POST /api/run-scan",
