@@ -1223,8 +1223,8 @@ Best timeframes: 1D (66.7%), 1W (75%)
 
 CRITICAL RESTRICTIONS from your data:
 ❌ DO NOT use S04 on 1H (20% WR in your data)
-❌ DO NOT use S04 on 4H (37.5% WR — losing money)
-✅ ONLY use S04 on 1D and 1W
+⚠️ S04 on 4H: only if 52w zone is EXTREME (<10% or >90%); Python enforces skip otherwise
+✅ S04 on 1D and 1W remains primary
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 S11: SR FLIP ✅ PROMISING (need more data)
@@ -1319,7 +1319,7 @@ Fewer trades but higher quality.
 4H — SELECTIVE ⚠️
 41.7% WR overall. Mixed results.
 Only take S03 (66.7% WR on 4H) setups.
-Avoid S04 on 4H (37.5% WR — losing).
+S04 on 4H: only with EXTREME zone (<10% or >90%); else skip
 Avoid S08 on 4H (25% WR — terrible).
 
 1H — EMERGENCY ONLY ❌
@@ -1335,8 +1335,7 @@ HOW TO DECIDE — CLEAR PROCESS
 STEP 1: TIMEFRAME GATE
 If 1H: only proceed if S11 clearly visible.
   Otherwise: output skip_trade: true
-If 4H: only proceed if S03 qualifies.
-  S04 on 4H = skip (37.5% WR, losing money)
+If 4H: only proceed if S03 qualifies, or S04 only with EXTREME zone (<10% or >90%).
   S08 on 4H = skip (25% WR, terrible)
 If 1D or 1W: proceed to Step 2.
 
@@ -1349,21 +1348,26 @@ Check S11 (promising, needs data):
   Clear level flip visible? → USE S11
 Check S01, S08, S12 (testing):
   Clear setup only, LOW confidence
-If nothing qualifies: SKIP THE TRADE
+If nothing in S03/S04/S11 qualifies:
+Use S00 only if:
+- Timeframe is 1D or 1W
+- Conviction score is 6 or higher
+- At least 3 clear signals present (list in core_signals_met)
+- Zone is not EQUILIBRIUM (30-70%)
+
+Otherwise skip.
+This means S00 is a last resort on daily/weekly only — not a free pass.
 
 STEP 3: SKIP DECISION
 Skip if:
-- No strategy qualifies with 2+ signals
-- 4H with S04 attempted (proven loser)
+- No strategy qualifies with 2+ signals (and S00 rules above not met)
+- 4H S04 when zone is NOT extreme (<10% or >90%)
 - 1H without clear S11
-- Equilibrium zone with no strategy
+- Equilibrium zone with no strategy (including S00 — no S00 in 30-70% zone)
 - Conflicting signals without clear winner
-- S00 BEST AVAILABLE is the only option
-  (40.8% WR — not worth the risk)
+- S00 on 1H or 4H, or S00 on 1D/1W with conviction under 6
 
-Skipping is BETTER than S00 trades.
-S00 has 40.8% WR — below coin flip.
-Every S00 trade costs you money on average.
+S00 is weak in aggregate data — use only as last resort on 1D/1W with high conviction and clear signals.
 
 STEP 4: DIRECTION AND ENTRY
 Strategy determines direction.
@@ -1402,8 +1406,8 @@ LOW (0.5% risk):
   S01/S12 testing trades
 
 SKIP (0% risk):
-  S00 only option
-  S04 on 4H or 1H
+  S00 on 1H/4H, or S00 on 1D/1W without conviction 6+ or in EQUILIBRIUM zone
+  S04 on 1H, or S04 on 4H without extreme zone
   S08 on 4H
   No clear strategy
 
@@ -1464,7 +1468,7 @@ If trading:
 
 RULES:
 - direction: LONG or SHORT (never NONE for trades)
-- strategy_id: S01-S12 or SKIP (never S00)
+- strategy_id: S01-S12, S00 (only per S00 rules above), or SKIP
 - All signals UPPERCASE
 - Minimum RR 2.0
 - conviction max 8 (learned from -$300 loss)
@@ -1502,12 +1506,61 @@ RULES:
             return _skip_out(str(ai.get("skip_reason") or "no edge identified"))
 
         sid_raw = str(ai.get("strategy_id", "") or "").strip().upper()
-        if sid_raw == "S04_EXTREME_REVERSION" and tf_key in ("1h", "4h"):
-            return _skip_out(f"S04 blocked on {tf_key} — proven weak in data")
+        if sid_raw == "S04_EXTREME_REVERSION":
+            if tf_key == "1h":
+                return _skip_out("S04 blocked on 1H: 20% WR")
+            if tf_key == "4h":
+                try:
+                    zp_s04 = float(ai.get("zone_pct", zone_pct))
+                    if not math.isfinite(zp_s04):
+                        zp_s04 = zone_pct
+                except (TypeError, ValueError):
+                    zp_s04 = zone_pct
+                if zp_s04 > 10 and zp_s04 < 90:
+                    return _skip_out(
+                        f"S04 on 4H requires zone <10% or >90% (current: {zp_s04:.1f}%)"
+                    )
+                log(
+                    f"[ENFORCE] S04 on 4H ALLOWED — zone {zp_s04:.1f}% is extreme",
+                    level="info",
+                )
+                ai["confidence"] = "LOW"
+                try:
+                    cs_s04 = int(round(float(ai.get("conviction_score", 5) or 5)))
+                except (TypeError, ValueError):
+                    cs_s04 = 5
+                ai["conviction_score"] = min(max(1, cs_s04), 5)
         if sid_raw == "S08_RANGE_BREAKOUT" and tf_key == "4h":
             return _skip_out("S08 blocked on 4H: 25% WR per backtested data")
         if sid_raw == "S00_BEST_AVAILABLE":
-            return _skip_out("S00 blocked — 40.8% WR below acceptable threshold")
+            if tf_key in ("1h", "4h"):
+                return _skip_out("S00 blocked on short timeframes — use 1D/1W only")
+            try:
+                cs_s00 = int(round(float(ai.get("conviction_score", 0) or 0)))
+            except (TypeError, ValueError):
+                cs_s00 = 0
+            if cs_s00 < 6:
+                return _skip_out(
+                    f"S00 conviction too low: {cs_s00}/6 required on {tf_key}"
+                )
+            try:
+                zp_s00 = float(ai.get("zone_pct", zone_pct))
+                if not math.isfinite(zp_s00):
+                    zp_s00 = zone_pct
+            except (TypeError, ValueError):
+                zp_s00 = zone_pct
+            if 30.0 <= zp_s00 <= 70.0:
+                return _skip_out(
+                    f"S00 blocked in EQUILIBRIUM zone ({zp_s00:.1f}% in 30-70%)"
+                )
+            core_m = ai.get("core_signals_met")
+            n_sig = len(core_m) if isinstance(core_m, list) else 0
+            if n_sig < 3:
+                return _skip_out(f"S00 requires 3+ core_signals_met (got {n_sig})")
+            log(
+                f"[ENFORCE] S00 allowed on {tf_key} with conviction {cs_s00}",
+                level="info",
+            )
 
         direction_raw = str(ai.get("direction", "")).strip().upper()
         if direction_raw not in ("LONG", "SHORT"):
