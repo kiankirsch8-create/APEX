@@ -1321,6 +1321,60 @@ def _apply_zone_rsi_fallback(
     return False
 
 
+def _s04_three_core_met(direction: str, zone_pct: float, rsi: float, adx: float) -> bool:
+    """S04 prompt rules: all three core signals (zone + RSI + ADX)."""
+    d = (direction or "").strip().upper()
+    try:
+        z, r, ax = float(zone_pct), float(rsi), float(adx)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(z) or not math.isfinite(r) or not math.isfinite(ax):
+        return False
+    if d == "LONG":
+        return z < 15.0 and r < 35.0 and ax < 45.0
+    if d == "SHORT":
+        return z > 85.0 and r > 65.0 and ax < 45.0
+    return False
+
+
+def _s03_four_core_met(
+    direction: str,
+    price: float,
+    ema20: float,
+    ema50: float,
+    ema200: float,
+    rsi: float,
+    adx: float,
+    atr: float,
+) -> bool:
+    """S03 four core signals met (for weekly-bias bypass with conviction 7+)."""
+    d = (direction or "").strip().upper()
+    try:
+        p, e20, e50, e200 = float(price), float(ema20), float(ema50), float(ema200)
+        r, ax = float(rsi), float(adx)
+        a = float(atr)
+    except (TypeError, ValueError):
+        return False
+    if not all(math.isfinite(x) for x in (p, e20, e50, e200, r, ax)):
+        return False
+    if a <= 0 or not math.isfinite(a):
+        a = abs(p) * 0.0001
+    if d == "LONG":
+        if not (e20 > e50 > e200):
+            return False
+    elif d == "SHORT":
+        if not (e20 < e50 < e200):
+            return False
+    else:
+        return False
+    dist = min(abs(p - e20), abs(p - e50))
+    if dist > 2.0 * a:
+        return False
+    if not (25.0 <= r <= 70.0):
+        return False
+    return ax > 15.0
+
+
 def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[str, Any] | None:
     try:
         sym = (ticker or "").strip().upper()
@@ -1782,9 +1836,24 @@ Skip if:
 - S00 BEST AVAILABLE is the only option
   (40.8% WR — not worth the risk)
 
+IMPORTANT: Do not skip S04 trades when:
+- All 3 core signals are confirmed (zone + RSI + ADX per S04 rules)
+- Zone is above 90% or below 10%
+These are your highest WR setups. The AUDUSD at 95% zone with RSI 67.8 is
+exactly the type of trade that generates +$200 to +$464 wins. Never skip these.
+
 Skipping is BETTER than S00 trades.
 S00 has 40.8% WR — below coin flip.
 Every S00 trade costs you money on average.
+
+WEEKLY BIAS vs 4H/1D (Python mirrors this):
+By default do not take 4H/1D LONGs into a bearish 1W trend (or SHORTs into a bullish 1W).
+EXCEPTION — always allow:
+• S04 with all 3 core signals met AND zone extreme (below 10% or above 90%) — trade S04 at
+  extremes even counter to weekly bias; data supports this.
+• S03 with all 4 core signals met AND conviction_score 7+ — allow with MEDIUM confidence
+  and smaller effective size (Python may cap confidence to MEDIUM).
+Otherwise keep the weekly bias filter.
 
 STEP 4: DIRECTION AND ENTRY
 Strategy determines direction.
@@ -1976,11 +2045,6 @@ RULES:
         if corr_reason:
             return _skip_out(corr_reason, ai)
 
-        if tf_key in ("4h", "1d") and weekly_bias == "BEARISH" and direction == "LONG":
-            return _skip_out("weekly bias filter: no LONG on 4H/1D vs bearish 1W", ai)
-        if tf_key in ("4h", "1d") and weekly_bias == "BULLISH" and direction == "SHORT":
-            return _skip_out("weekly bias filter: no SHORT on 4H/1D vs bullish 1W", ai)
-
         if tf_key in ("4h", "1d") and near_major_news_calendar(sym, analysis_date.strip()):
             return _skip_out("major economic event window — swing skipped for this pair/day", ai)
 
@@ -2012,6 +2076,39 @@ RULES:
         if sym == "GBPJPY" and confidence == "HIGH":
             confidence = "MEDIUM"
             ai["confidence"] = "MEDIUM"
+
+        if tf_key in ("4h", "1d") and weekly_bias in ("BULLISH", "BEARISH"):
+            zf = float(zone_pct)
+            rsi_ch = float(ind.get("rsi", 50) or 50)
+            adx_ch = float(ind.get("adx", 0) or 0)
+            px = float(price)
+            ema20v = float(ind.get("ema20", px) or px)
+            ema50v = float(ind.get("ema50", px) or px)
+            ema200v = float(ind.get("ema200", px) or px)
+            atr_ch = float(ind.get("atr", 0) or 0)
+            s04_core = _s04_three_core_met(direction, zf, rsi_ch, adx_ch)
+            s04_extreme = zf < 10.0 or zf > 90.0
+            s03_all = _s03_four_core_met(
+                direction, px, ema20v, ema50v, ema200v, rsi_ch, adx_ch, atr_ch
+            )
+            if weekly_bias == "BEARISH" and direction == "LONG":
+                allow = (strategy_id_norm == "S04_EXTREME_REVERSION" and s04_core and s04_extreme) or (
+                    strategy_id_norm == "S03_EMA_PULLBACK" and s03_all and conviction_score >= 7
+                )
+                if not allow:
+                    return _skip_out("weekly bias filter: no LONG on 4H/1D vs bearish 1W", ai)
+                if strategy_id_norm == "S03_EMA_PULLBACK" and s03_all and conviction_score >= 7:
+                    confidence = "MEDIUM"
+                    ai["confidence"] = "MEDIUM"
+            elif weekly_bias == "BULLISH" and direction == "SHORT":
+                allow = (strategy_id_norm == "S04_EXTREME_REVERSION" and s04_core and s04_extreme) or (
+                    strategy_id_norm == "S03_EMA_PULLBACK" and s03_all and conviction_score >= 7
+                )
+                if not allow:
+                    return _skip_out("weekly bias filter: no SHORT on 4H/1D vs bullish 1W", ai)
+                if strategy_id_norm == "S03_EMA_PULLBACK" and s03_all and conviction_score >= 7:
+                    confidence = "MEDIUM"
+                    ai["confidence"] = "MEDIUM"
 
         if conviction_score < 3:
             return _skip_out("conviction below minimum (3)", ai)
@@ -2088,6 +2185,29 @@ RULES:
         else:
             risk = stop - entry
 
+        # Maximum stop distance (% of entry) — cap overly wide Claude stops
+        max_stop_pct_map = {"1h": 0.5, "4h": 1.0, "1d": 1.5, "1w": 2.5}
+        max_stop_pct = float(max_stop_pct_map.get(tf_key, 1.5))
+        if stop and entry > 0 and math.isfinite(stop) and math.isfinite(entry):
+            stop_dist_pct = abs(entry - stop) / entry * 100.0
+            if stop_dist_pct > max_stop_pct + 1e-9:
+                log(
+                    f"[StopFix] Stop too wide {stop_dist_pct:.2f}% > {max_stop_pct}% max — adjusting to {max_stop_pct}%",
+                    level="info",
+                )
+                if direction == "LONG":
+                    stop = entry * (1.0 - max_stop_pct / 100.0)
+                else:
+                    stop = entry * (1.0 + max_stop_pct / 100.0)
+                stop = validate_stop_loss(entry, round(stop, 5), direction, tf_key)
+                ai["stop_loss"] = stop
+                if direction == "LONG":
+                    risk = entry - stop
+                else:
+                    risk = stop - entry
+        if risk <= 0 or not math.isfinite(risk):
+            return _skip_out("invalid risk after maximum stop cap", ai)
+
         r1, r2, r3 = _tp_r_multiples(strategy_id_norm, tf_key)
 
         if direction == "LONG":
@@ -2153,6 +2273,14 @@ RULES:
         else:
             position_size = min(500.0, max_risk_dollars * 10.0)
         leveraged_exposure = position_size * LEVERAGE
+        min_exposure = 2000.0
+        if leveraged_exposure < min_exposure - 1e-6:
+            log(
+                f"[SizeFix] Exposure too small ${leveraged_exposure:.0f} — forcing minimum ${min_exposure:.0f}",
+                level="info",
+            )
+            position_size = min_exposure / max(float(LEVERAGE), 1e-9)
+            leveraged_exposure = position_size * LEVERAGE
         risk_pct_display = round(risk_pct_of_price * 100, 3)
 
         fut = future.head(fwd_n)
