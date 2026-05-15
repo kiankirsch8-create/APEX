@@ -1006,489 +1006,92 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
         except Exception as e:
             log(f"[Intel] {e}")
 
-        prompt = f"""You are APEX — an elite institutional trading AI.
-
-You analyze markets using 12 proven strategies
-used by the best traders and institutions.
-You scan ALL strategies and pick the best fit.
-You do NOT predict randomly — you wait for
-structure to confirm before entering.
+        prompt = f"""You are APEX: institutional FX/CFD analyst. Pick one strategy (S01–S12 or S00), confirm structure, output tight JSON only.
 
 ═══════════════════════════════════════════
 MARKET DATA
 ═══════════════════════════════════════════
-Asset: {sym}
-Timeframe: {TF_DESCRIPTIONS.get(tf_key, tf_key)}
-Date: {analysis_date}
-Price: {price:.5f}
-
-Zone: {zone_label} ({zone_pct:.1f}% of 52w range)
-52w High: {high_52w:.5f}
-52w Low: {low_52w:.5f}
-
-RSI(14): {ind["rsi"]:.2f}
-MACD Line: {macd_line:.6f}
-MACD Signal: {macd_signal_line:.6f}
-MACD Histogram: {ind["macd_hist"]:.6f}
-EMA20: {ind["ema20"]:.5f}
-EMA50: {ind["ema50"]:.5f}
-EMA200: {ind["ema200"]:.5f}
-ATR(14): {ind["atr"]:.5f}
-ADX(14): {ind["adx"]:.2f}
-BB Upper: {ind["bb_upper"]:.5f}
-BB Middle: {ind.get("bb_mid", price):.5f}
-BB Lower: {ind["bb_lower"]:.5f}
-BB Width: {bb_width:.3f}%
-Swing Highs: {ind.get("swing_highs", [])}
-Swing Lows: {ind.get("swing_lows", [])}
+Asset: {sym} | TF: {TF_DESCRIPTIONS.get(tf_key, tf_key)} | Date: {analysis_date} | Price: {price:.5f}
+Zone: {zone_label} ({zone_pct:.1f}% of 52w) | 52w H/L: {high_52w:.5f} / {low_52w:.5f}
+RSI {ind["rsi"]:.1f} | MACD {macd_line:.5f}/{macd_signal_line:.5f} hist {ind["macd_hist"]:.5f}
+EMA20/50/200 {ind["ema20"]:.5f} / {ind["ema50"]:.5f} / {ind["ema200"]:.5f} | ATR {ind["atr"]:.5f} | ADX {ind["adx"]:.1f}
+BB {ind["bb_lower"]:.5f}–{ind.get("bb_mid", price):.5f}–{ind["bb_upper"]:.5f} | Width {bb_width:.2f}%
+Swings H/L: {ind.get("swing_highs", [])} / {ind.get("swing_lows", [])}
 
 {intel_text}
 
-═══════════════════════════════════════════
-ZONE BIAS (primary directional guide)
-═══════════════════════════════════════════
-Current zone: {zone_label} at {zone_pct:.1f}%
-
-EXTREME_DISCOUNT (0-10%): Strong LONG bias
-  Price at statistical yearly low
-  Institutions historically buy here
-  
-DISCOUNT (10-30%): LONG bias
-  Value zone, favor longs
-  Require trend or momentum confirmation
-  
-EQUILIBRIUM (30-70%): No zone edge
-  Price fairly valued
-  Rely entirely on strategy structure
-  
-PREMIUM (70-90%): SHORT bias
-  Overvalued zone, favor shorts
-  Require bearish trend confirmation
-  IMPORTANT: Only short if EMA stack bearish
-  OR if price rejected from this zone
-  
-EXTREME_PREMIUM (90-100%): Strong SHORT bias
-  Price at statistical yearly high
-  Institutions historically sell here
+Zone bias: EXTREME_DISCOUNT<10% long edge | DISCOUNT 10–30 long lean | EQUILIBRIUM 30–70 neutral
+PREMIUM 70–90 short lean (shorts need bearish EMA or rejection) | EXTREME_PREMIUM>90 short edge
 
 ═══════════════════════════════════════════
-THE 12 INSTITUTIONAL STRATEGIES
-Scan ALL of them. Pick the BEST fit.
-Be GENEROUS with thresholds — if a strategy
-is close to qualifying, USE it.
+STRATEGY QUICK REFERENCE (S01–S12 + S00)
+Pick best fit; be generous if close to rules.
 ═══════════════════════════════════════════
+S01 BREAKOUT RETEST: broke level + retesting it
+  Need: price within 2x ATR of broken swing
+  Direction: same as breakout
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-S01: BREAKOUT RETEST
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-What: Price breaks a significant level then
-retests it as new support or resistance.
+S02 LIQUIDITY SWEEP: equal highs/lows + spike beyond + recovery
+  Need: cluster within 0.5%, spike and close back
+  Direction: opposite to sweep
 
-Core signals (need 2 of 3):
-→ Price clearly broke above/below swing level
-→ Price has pulled back to test that level
-→ ADX above 15 (any trend present)
+S03 EMA PULLBACK: aligned EMAs + price near EMA20/50
+  Need: EMA20 and EMA50 same side of EMA200
+  Direction: same as EMA alignment
 
-LONG: broke above resistance, retesting it
-SHORT: broke below support, retesting it
+S04 EXTREME REVERSION: zone<15% or >85% + RSI<35 or >65
+  Need: 2 of those conditions
+  Direction: toward mean
 
-Stop: beyond the retest candle extreme
-Identify: Check swing_highs and swing_lows.
-Is price near a previously broken level?
-Current ATR = {ind["atr"]:.5f}
-Price within 2x ATR of any swing = qualifies
+S05 MACD DIVERGENCE: price new extreme + MACD not confirming
+  Need: visible divergence over 2+ swings
+  Direction: toward MACD signal
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-S02: LIQUIDITY SWEEP REVERSAL
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-What: Price hunts stops beyond swing clusters
-then sharply reverses direction.
+S06 ORDER BLOCK: strong impulse started from a zone
+  Need: price returning to impulse origin
+  Direction: same as original impulse
 
-Core signals (need 2 of 3):
-→ Equal highs or lows visible in swing data
-  (within 0.5% of each other)
-→ Price moved beyond that cluster
-→ Price closed back inside the range
+S07 FAIR VALUE GAP: gap between swings larger than 0.5x ATR
+  Need: price moving to fill the gap
+  Direction: toward gap
 
-LONG: swept below equal lows, recovered
-SHORT: swept above equal highs, pulled back
+S08 RANGE BREAKOUT: BB Width < 3% + close outside BB
+  Need: 2 of 3 — compression, low ADX, outside BB
+  Direction: direction of breakout
 
-Stop: beyond the sweep extreme
-Identify: Look for clusters in swing data.
-GBPNZD swing_lows 2.27/2.28 = equal lows.
-Did price go through them and come back?
-RSI at extremes during sweep adds confidence
-but is NOT required.
+S09 NEWS CATALYST: sentiment above 0.3 or below -0.3
+  Need: news + price moving same direction
+  Direction: same as news
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-S03: EMA TREND PULLBACK
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-What: In trending market price pulls back to
-moving average support then continues.
+S10 COT FLOW: COT bias confirmed + zone supports it
+  Need: COT not UNKNOWN + zone aligned
+  Direction: same as COT
 
-Core signals (need 3 of 4):
-→ EMA20 and EMA50 aligned (both above or
-  below EMA200) — perfect stack not required
-→ Price is within 2x ATR of EMA20 or EMA50
-→ RSI between 25-70 (room to move)
-→ ADX above 15
+S11 SR FLIP: level tested twice + broke + retesting other side
+  Need: repeated level in swing data + current retest
+  Direction: same as break direction
 
-LONG: EMA20 > EMA50 or both above EMA200,
-  price near EMA20/50 from above
-SHORT: EMA20 < EMA50 or both below EMA200,
-  price bouncing to EMA20/50 from below
+S12 VOLATILITY COMPRESSION: BB Width < 2% + candle outside
+  Need: tight squeeze + breakout candle
+  Direction: direction of breakout
 
-Stop: below EMA50 (long) or above EMA50 (short)
-Current distances:
-EMA20 distance: {abs(price - ind["ema20"]):.5f}
-EMA50 distance: {abs(price - ind["ema50"]):.5f}
-2x ATR = {ind["atr"] * 2:.5f}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-S04: EXTREME ZONE MEAN REVERSION
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-What: Price at statistical extreme reverts
-toward the yearly mean.
-
-Core signals (need 2 of 3):
-→ Zone below 15% (long) or above 85% (short)
-  Current zone: {zone_pct:.1f}%
-→ RSI below 35 (long) or above 65 (short)
-  Current RSI: {ind["rsi"]:.1f}
-→ ADX below 45 (not in extreme runaway trend)
-  Current ADX: {ind["adx"]:.1f}
-
-LONG: zone below 15, RSI below 35
-SHORT: zone above 85, RSI above 65
-
-Stop: 1x ATR beyond the extreme
-Note: This strategy works AGAINST the trend.
-That is acceptable — extremes revert.
-Even in uptrends, 90%+ zone often pulls back.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-S05: MACD DIVERGENCE
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-What: Price and momentum diverge, signaling
-trend exhaustion before reversal.
-
-Core signals (need 2 of 3):
-→ BULLISH: Price making lower lows but MACD
-  histogram making higher lows (or less negative)
-→ BEARISH: Price making higher highs but MACD
-  histogram making lower highs (or less positive)
-→ Divergence visible over at least 2 swings
-
-Current MACD histogram: {ind["macd_hist"]:.6f}
-MACD line vs signal: {macd_line:.6f} vs {macd_signal_line:.6f}
-
-LONG: bullish divergence + histogram turning up
-SHORT: bearish divergence + histogram turning down
-
-Stop: beyond the divergence extreme
-Identify: Compare recent swing_highs to MACD.
-Is price at high but MACD histogram declining?
-Is price at low but MACD histogram rising?
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-S06: INSTITUTIONAL ORDER BLOCK
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-What: Institutions left unfilled orders at
-a price zone. Price returns to fill them.
-
-Core signals (need 2 of 3):
-→ Strong impulse move visible in swing data
-  (price moved 3x ATR in one direction)
-→ Price is returning to where that move started
-→ Higher timeframe trend supports direction
-
-LONG: bearish candle before strong bullish impulse,
-  price returns to that candle's level
-SHORT: bullish candle before strong bearish impulse,
-  price returns to that candle's level
-
-Stop: beyond the order block zone
-Identify: Look at the swing structure.
-Where did the last strong directional move
-START from? That is the order block.
-Is price near there now?
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-S07: FAIR VALUE GAP FILL
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-What: Rapid price move leaves imbalance.
-Price returns to fill the gap.
-
-Core signals (need 2 of 3):
-→ Large gap visible between swing levels
-  (gap larger than 0.5x ATR = {ind["atr"]*0.5:.5f})
-→ Price moving back toward the gap
-→ HTF trend supports gap direction
-
-LONG: bullish FVG below current price,
-  price returning to fill from above
-SHORT: bearish FVG above current price,
-  price returning to fill from below
-
-Stop: beyond the far edge of the gap
-Identify: Look at gaps between swing_highs
-and swing_lows. Is there empty space between
-consecutive swing levels larger than 0.5x ATR?
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-S08: RANGE BREAKOUT
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-What: Price compresses then breaks out with
-energy release.
-
-Core signals (need 2 of 3):
-→ BB Width below 3.0% (compression)
-  Current BB Width: {bb_width:.3f}%
-→ ADX below 30 (ranging not trending)
-  Current ADX: {ind["adx"]:.1f}
-→ Price near BB Upper (long setup) or
-  BB Lower (short setup)
-
-LONG: compression then close above BB upper
-SHORT: compression then close below BB lower
-
-Stop: opposite BB band
-Note: BB Width below 2.0% = strong compression
-BB Width 2.0-3.0% = mild compression, still valid
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-S09: NEWS CATALYST MOMENTUM
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-What: Strong news drives directional momentum.
-Trade in direction of news.
-
-Core signals (need 1 of 2):
-→ News sentiment above 0.3 or below -0.3
-  Current sentiment: {news_sentiment:.2f}
-→ Price already moving in news direction
-
-LONG: bullish news (above 0.3) + price rising
-SHORT: bearish news (below -0.3) + price falling
-
-Stop: pre-news structure level
-Note: Even mild news confirmation (0.2+)
-counts as supporting signal for other strategies.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-S10: COT INSTITUTIONAL FLOW
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-What: Institutions repositioning shown in
-COT data. Front-run their direction.
-
-Core signals (need 1 of 2):
-→ COT bias strongly directional
-  Current COT: {cot_bias}
-→ Zone supports same direction as COT
-
-LONG: COT BULLISH + discount zone
-SHORT: COT BEARISH + premium zone
-
-Stop: last major swing point
-Note: COT UNKNOWN = cannot use this strategy
-as primary but can use as supporting signal
-if other strategies qualify.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-S11: SUPPORT RESISTANCE FLIP
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-What: A level that was resistance becomes
-support after a break, or vice versa.
-
-Core signals (need 2 of 3):
-→ Price previously tested a swing level
-  multiple times (at least 2 touches)
-→ Price broke through that level clearly
-→ Price has returned to test it from other side
-
-LONG: old resistance holding as new support
-SHORT: old support holding as new resistance
-
-Stop: beyond the flipped level by 0.5x ATR
-Identify: Look at swing_highs and swing_lows.
-Any level that appears multiple times in the
-data has been tested multiple times.
-Is price near one of those repeated levels?
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-S12: VOLATILITY COMPRESSION BREAKOUT
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-What: After extreme compression energy
-releases explosively in one direction.
-
-Core signals (need 2 of 3):
-→ BB Width below 2.0% (tight squeeze)
-  Current BB Width: {bb_width:.3f}%
-→ ADX below 20 (no trend during squeeze)
-  Current ADX: {ind["adx"]:.1f}
-→ Candle closes clearly outside BB bands
-
-LONG: close above upper BB after squeeze
-SHORT: close below lower BB after squeeze
-
-Stop: midpoint of compression range
-Note: Tighter squeeze = more explosive breakout
-BB Width below 1.0% is extremely compressed
+If no strategy qualifies: S00_BEST_AVAILABLE
+Use zone + EMA + momentum for direction.
 
 ═══════════════════════════════════════════
-PERFORMANCE DATA FROM LIVE BACKTESTING
-Use this knowledge in every decision
+INTELLIGENCE SNAPSHOT
 ═══════════════════════════════════════════
+F&G {fear_greed:.0f}/100 | VIX {vix_val:.1f} | News {news_sentiment:+.2f} | COT {cot_bias}
+Adjust conviction ±1 when intel confirms/opposes; VIX>30 → widen stops ~20%.
 
-WHAT IS WORKING (confirmed over 145 trades):
-✅ DISCOUNT_ZONE longs: 64% win rate
-✅ EMA_STACK_BULLISH trades: 53.7% win rate
-✅ EXTREME_PREMIUM_ZONE shorts: 53% win rate
-✅ NZD cross pairs (EURNZD, NZDCAD, GBPNZD)
-✅ Daily timeframe: 53% win rate
-✅ Weekly timeframe: 55.6% win rate
+7 STEPS (compact): (1) Scan S01–S12 vs quick ref (2) Pick best or S00
+(3) Direction from strategy + zone (4) Entry = specific price (5) Stop = invalidation + 0.3×ATR
+(6) TP1/2/3 = 2R/3R/5R; trail: BE @ TP1, +1R @ TP2, 1.5R trail after TP3
+(7) Confidence: HIGH=named+zone+intel | MED=mostly met or S00 3+ | LOW=S00 weak or conflicts
 
-WHAT IS NOT WORKING:
-❌ PREMIUM_ZONE shorts without bearish EMA: 37%
-❌ 1H timeframe trades: 20% win rate
-❌ Trades against strong ADX trend (>45)
-
-PAIR KNOWLEDGE:
-EURNZD, NZDCAD, GBPNZD, NZDUSD: highest WR
-CADJPY, EURUSD, EURAUD: positive
-GBPUSD, GBPCAD: historically poor
-
-═══════════════════════════════════════════
-INTELLIGENCE INTEGRATION
-═══════════════════════════════════════════
-
-Fear & Greed: {fear_greed:.0f}/100
-VIX: {vix_val:.1f}
-News: {news_sentiment:+.2f}
-COT: {cot_bias}
-
-Use intelligence to boost or reduce confidence:
-+1 conviction: news confirms direction
-+1 conviction: COT confirms direction
-+1 conviction: Fear/Greed extreme and agrees
--1 conviction: any factor strongly opposes
-
-VIX above 30: widen all stops by 20%
-Fear/Greed below 20: safe haven demand (JPY up)
-Fear/Greed above 80: risk off approaching
-
-═══════════════════════════════════════════
-HOW TO DECIDE — 7 STEPS
-═══════════════════════════════════════════
-
-STEP 1: SCAN ALL 12 STRATEGIES
-Go through S01 to S12 above.
-For each: does it meet its core signals?
-Be generous — if 2 of 3 core signals met,
-the strategy QUALIFIES.
-Note which strategies qualify.
-
-STEP 2: SELECT BEST MATCH
-Pick the strategy that fits BEST.
-If multiple qualify, pick the one with the
-most signal confirmation.
-If none qualify: use S00_BEST_AVAILABLE
-using zone + trend + momentum.
-
-STEP 3: DETERMINE DIRECTION
-The strategy determines direction.
-Zone bias confirms or warns.
-EMA stack provides HTF context.
-
-STEP 4: FIND PRECISE ENTRY
-Where exactly does price confirm entry?
-Not approximate — give the specific price.
-
-STEP 5: PLACE STOP AT INVALIDATION
-Where does this trade become structurally wrong?
-Add 0.3x ATR buffer beyond that level.
-Stop must be at a STRUCTURAL point.
-
-STEP 6: SET TARGETS WITH TRAILING
-TP1 = entry ± (risk × 2.0)
-TP2 = entry ± (risk × 3.0)  
-TP3 = entry ± (risk × 5.0)
-
-Trail plan:
-After TP1: move stop to breakeven
-After TP2: move stop to +1R
-After TP3: trail at 1.5R below/above price
-
-STEP 7: CONFIDENCE AND CONVICTION
-HIGH (2% risk):
-  Named strategy fully met (S01-S12)
-  + zone confirms
-  + at least 1 intelligence factor confirms
-  
-MEDIUM (1% risk):
-  Named strategy mostly met
-  OR S00 with 3+ strong signals
-  
-LOW (0.5% risk):
-  S00 with 2 signals
-  OR strategy met but major conflicts
-
-CONVICTION SCORE 1-10:
-8-10: Take aggressively
-6-7: Standard size
-4-5: Minimum size
-Below 4: Still trade but note conflicts
-
-═══════════════════════════════════════════
-SPECIAL RULES (learned from data)
-═══════════════════════════════════════════
-
-PREMIUM ZONE SHORT RULE:
-If direction=SHORT and zone between 65-89%:
-You MUST have at least one of:
-- EMA stack bearish (EMA20 < EMA50)
-- RSI above 65
-- Price below EMA20
-Without these: lower conviction to 4 max
-
-NZD CROSS BOOST:
-If ticker contains NZD:
-These pairs have historically 70%+ win rate.
-Boost confidence one level if other signals ok.
-
-EQUILIBRIUM ZONE RULE:
-Zone 30-70% gives no edge from zone alone.
-Must rely on strategy structure entirely.
-Require 3+ confirming signals minimum.
-
-1H TIMEFRAME RULES (re-enabled for testing):
-Hourly had 20% win rate before — we are now
-testing if relaxed strategies improve this.
-
-For 1H timeframe ONLY trade these setups:
-
-ALLOWED on 1H:
-✅ S02 LIQUIDITY SWEEP: equal highs/lows swept
-   and recovered — this works on 1H
-✅ S08 RANGE BREAKOUT: extreme BB compression
-   below 1.5% then breakout candle closes outside
-✅ S12 VOLATILITY COMPRESSION: BB below 1.0%
-   then explosive candle outside bands
-✅ S04 EXTREME REVERSION: zone below 10% or
-   above 90% with RSI below 30 or above 70
-✅ S11 SR FLIP: clear level flip with
-   multiple touches confirmed
-
-REDUCED SIZE on 1H:
-All 1H trades automatically get LOW confidence
-regardless of what Claude returns.
-This limits risk to 0.5% per trade while
-we gather data on 1H performance.
-
-DO NOT TRADE on 1H (skip these):
-❌ S03 EMA PULLBACK on 1H — too much noise
-❌ S01 BREAKOUT RETEST on 1H — too many fakes
-❌ S09 NEWS on 1H — too fast to catch
-❌ S00 BEST AVAILABLE on 1H — no edge proven
+RULES: SHORT in premium 65–89% needs bearish EMA OR RSI>65 OR price<EMA20 else cap conviction 4.
+NZD in ticker → may bump confidence one notch. Equilibrium 30–70% needs 3+ confluences.
+1H: only S02,S04,S08,S11,S12; system forces LOW size. Avoid S01,S03,S09,S00 on 1H.
 
 ═══════════════════════════════════════════
 OUTPUT — RETURN ONLY VALID JSON
@@ -1534,11 +1137,24 @@ strategy_id must be S01-S12 or S00_BEST_AVAILABLE
 All signal names UPPERCASE
 Minimum RR 2.0
 Stop at structural level not just ATR
+
+IMPORTANT COST CONTROL:
+Keep your response concise:
+- reasoning: maximum 100 words
+- entry_reasoning: maximum 20 words
+- stop_reasoning: maximum 20 words
+- trailing_plan: maximum 20 words
+- intelligence_summary: maximum 15 words
+- confluences: maximum 4 items
+- conflicts: maximum 3 items
+
+Total JSON response should be under 400 tokens.
+Focus on the numbers, not the explanation.
 """
         client = _client()
         resp = client.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=8192,
+            max_tokens=2500,
             messages=[{"role": "user", "content": prompt}],
         )
         raw = _message_text(resp)
