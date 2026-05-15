@@ -739,15 +739,15 @@ def compute_confluence_score(
     except (TypeError, ValueError):
         mh = 0.0
 
-    if z < 5 or z > 95:
+    if z < 15 or z > 85:
         score += 3
-    elif z < 10 or z > 90:
+    elif z < 20 or z > 80:
         score += 2
 
     if sid == "S04_EXTREME_REVERSION":
-        if (d == "LONG" and r < 30) or (d == "SHORT" and r > 70):
+        if (d == "LONG" and r < 35) or (d == "SHORT" and r > 65):
             score += 2
-        elif (d == "LONG" and r < 35) or (d == "SHORT" and r > 65):
+        elif (d == "LONG" and r < 40) or (d == "SHORT" and r > 60):
             score += 1
     else:
         if (d == "LONG" and r > 50) or (d == "SHORT" and r < 50):
@@ -758,14 +758,14 @@ def compute_confluence_score(
             score += 1
 
     if sid == "S04_EXTREME_REVERSION":
-        if 20 <= ax <= 35:
+        if ax < 45:
             score += 2
-        elif ax < 40:
+        elif ax < 50:
             score += 1
     else:
         if ax > 30:
             score += 2
-        elif ax > 25:
+        elif ax > 15:
             score += 1
 
     if (d == "LONG" and mh > 0) or (d == "SHORT" and mh < 0):
@@ -1247,6 +1247,80 @@ def _skipped_backtest_row(
     }
 
 
+def _apply_zone_rsi_fallback(
+    tf_key: str,
+    zone_pct: float,
+    rsi: float,
+    adx: float,
+    ai: dict[str, Any],
+    price: float,
+) -> bool:
+    """1D/1W only: if the model skipped but zone+RSI+ADX show a modest edge, force a LOW-confidence S04-style trade."""
+    if tf_key not in ("1d", "1w"):
+        return False
+    try:
+        z = float(zone_pct)
+        r = float(rsi)
+        ax = float(adx)
+    except (TypeError, ValueError):
+        return False
+    if ax <= 15:
+        return False
+    fp = float(price)
+    if not math.isfinite(fp) or fp <= 0:
+        return False
+
+    def _fill_s04_long() -> None:
+        ai["skip_trade"] = False
+        ai["strategy_id"] = "S04_EXTREME_REVERSION"
+        ai["strategy_name"] = str(STRATEGIES.get("S04_EXTREME_REVERSION", {}).get("name", "Extreme Zone Reversion"))
+        ai["direction"] = "LONG"
+        ai["confidence"] = "LOW"
+        ai["strategy_met"] = False
+        try:
+            ai["conviction_score"] = max(3, min(4, int(round(float(ai.get("conviction_score", 4) or 4)))))
+        except (TypeError, ValueError):
+            ai["conviction_score"] = 4
+        ent = float(ai.get("entry", 0) or 0)
+        ai["entry"] = round(ent if ent > 0 else fp, 5)
+        ai["verdict"] = str(ai.get("verdict") or "BUY")
+        ai["skip_reason"] = ""
+        ai["reasoning"] = str(ai.get("reasoning") or "Zone RSI fallback LONG (1D/1W LOW)")[:500]
+
+    def _fill_s04_short() -> None:
+        ai["skip_trade"] = False
+        ai["strategy_id"] = "S04_EXTREME_REVERSION"
+        ai["strategy_name"] = str(STRATEGIES.get("S04_EXTREME_REVERSION", {}).get("name", "Extreme Zone Reversion"))
+        ai["direction"] = "SHORT"
+        ai["confidence"] = "LOW"
+        ai["strategy_met"] = False
+        try:
+            ai["conviction_score"] = max(3, min(4, int(round(float(ai.get("conviction_score", 4) or 4)))))
+        except (TypeError, ValueError):
+            ai["conviction_score"] = 4
+        ent = float(ai.get("entry", 0) or 0)
+        ai["entry"] = round(ent if ent > 0 else fp, 5)
+        ai["verdict"] = str(ai.get("verdict") or "SELL")
+        ai["skip_reason"] = ""
+        ai["reasoning"] = str(ai.get("reasoning") or "Zone RSI fallback SHORT (1D/1W LOW)")[:500]
+
+    if z < 20 and r < 45:
+        _fill_s04_long()
+        log(
+            f"[FALLBACK] Override skip → S04 LONG LOW (zone={z:.1f}% RSI={r:.1f} ADX={ax:.1f})",
+            level="info",
+        )
+        return True
+    if z > 80 and r > 55:
+        _fill_s04_short()
+        log(
+            f"[FALLBACK] Override skip → S04 SHORT LOW (zone={z:.1f}% RSI={r:.1f} ADX={ax:.1f})",
+            level="info",
+        )
+        return True
+    return False
+
+
 def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[str, Any] | None:
     try:
         sym = (ticker or "").strip().upper()
@@ -1448,6 +1522,7 @@ Every trade must have minimum 1:2 R/R from structural stop to TP2 before entry (
 ADX between 15-29 does NOT confirm a trend — that range is consolidation or noise.
 Only ADX > 30 confirms trend-following entries. The label ADX_TRENDING is ABOLISHED (28.6% WR, -$363);
 never reference it. Use ADX_TREND_CONFIRMED only when ADX > 30 (and rising for S03).
+For S03 EMA pullback specifically, the minimum trend filter is ADX above 15 (57.7% WR in your data); ADX > 25 was too strict and killed valid trades.
 RSI_NEUTRAL_ROOM is ABOLISHED (29.4% WR, -$432). For directional momentum: LONG requires RSI > 50;
 SHORT requires RSI < 50. Exception: S04 extreme reversion where RSI extreme IS the primary signal.
 
@@ -1461,8 +1536,7 @@ WHAT HAS BEEN PROVEN TO LOSE:
 - EURGBP any setup: BLACKLISTED in Python (-$459 cluster)
 - AUDJPY any setup: BLACKLISTED in Python (Jan cluster losses)
 - USDMXN: BLACKLISTED in Python (0% WR runs)
-- S03 on 1D with weak ADX: avoid — use TIER 2 rules only on 1D
-- S04 with only 2 of 3 signals: marginal edge — prefer full tiers
+- S04 with only 1 of 3 core signals: marginal edge — prefer 2 of 3
 - ADX_TRENDING / RSI_NEUTRAL_ROOM: never use these labels again
 
 ═══════════════════════════════════════════
@@ -1539,49 +1613,29 @@ Only these have enough data to trust
 ═══════════════════════════════════════════
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-S03: EMA TREND PULLBACK — TIGHTENED (Section 2A)
+S03: EMA TREND PULLBACK (simple rules — no tiers)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Timeframe priority: 1W = full rules (HIGH allowed). 4H = TIER 2 only (MEDIUM max).
-1D = TIER 2 only AND only if 1W trend aligns with direction.
+S03 qualifies when you have 3 of 4:
+→ EMA20 and EMA50 on the same side of EMA200 (both above = uptrend; both below = downtrend)
+→ Price within 2x ATR of EMA20 or EMA50 (use ATR distance — not fixed %; exotics need room)
+  EMA20 distance: {abs(price - ind["ema20"]):.5f}  EMA50: {abs(price - ind["ema50"]):.5f}  2x ATR = {ind["atr"]*2:.5f}
+→ RSI between 25 and 70
+→ ADX above 15 (minimum trend filter for this strategy)
 
-TIER 1 — FULL (HIGH confidence allowed, 1W only):
-✓ EMA20 > EMA50 > EMA200 (long) or inverse (short)
-✓ Price within 0.5% of EMA20 (touching / bouncing EMA20)
-✓ RSI 45–55 (pause in trend, not neutral "room")
-✓ ADX > 30 AND rising vs prior bar
-✓ MACD histogram turning in trade direction
-✓ Current volume < 20-day average volume (healthy pullback)
-
-TIER 2 — PARTIAL (MEDIUM only, max 1% risk idea, TP2 focus):
-✓ EMA alignment confirmed
-✓ Price within 1% of EMA20 or EMA50
-✓ RSI 40–60
-✓ ADX > 25
-
-NEVER S03 if: ADX < 25; price >1.5% from nearest EMA; RSI >65 or <35;
-MACD histogram strongly against direction; 4H with weak 4H edge.
-
-Current: RSI {ind["rsi"]:.1f}, ADX {ind["adx"]:.1f}, dist to EMA20
-{abs(price - ind["ema20"]) / price * 100:.3f}% of price, EMA50
-{abs(price - ind["ema50"]) / price * 100:.3f}% of price.
+LONG: EMA20 > EMA50 > EMA200 with pullback to EMA zone. SHORT: inverse.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-S04: EXTREME ZONE REVERSION — THREE TIERS (Section 2B)
+S04: EXTREME ZONE REVERSION (simple rules — no tiers)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Python blocks S04 on 1H and 4H entirely — never output S04 for those TFs.
 
-TIER 1 PERFECT (HIGH, up to 2.5% risk idea): ALL THREE — zone <5% or >95%,
-RSI <30 (long) or >70 (short), ADX <35 (sweet spot ~20–35). Prefer 1W; 1D ok.
-
-TIER 2 STRONG (MEDIUM): TWO of three core + one extra: zone <10% or >90%,
-RSI <33 or >67, ADX <40, plus MACD divergence OR BB extreme OR 52w extreme.
-
-TIER 3 MARGINAL (LOW, TP1 only intent): zone <15% or >85%, RSI <35 or >65,
-ADX <45 — ONLY on 1W. If only 2-of-3 without clear tier, SKIP.
-
-NEVER S04: RSI 40–60; zone 20–80%; ADX >45; blacklisted pairs; 4H/1H.
-
-Current zone {zone_pct:.1f}%, RSI {ind["rsi"]:.1f}, ADX {ind["adx"]:.1f}
+S04 qualifies when you have 2 of 3:
+→ Zone: LONG = below 15% of 52w range; SHORT = above 85% of 52w range
+  Current zone: {zone_pct:.1f}%
+→ RSI: LONG = below 35; SHORT = above 65
+  Current RSI: {ind["rsi"]:.1f}
+→ ADX below 45 (not a runaway trend)
+  Current ADX: {ind["adx"]:.1f}
 
 Stop: 1x ATR beyond the extreme / invalidation.
 
@@ -1701,12 +1755,22 @@ STEP 2: STRATEGY SCAN
 Check S03 first (proven 57.7% WR):
   Does price meet 3 of 4 signals? → USE S03
 Check S04 second (proven 53.2% WR on 1D/1W):
-  Does zone meet threshold + RSI/ADX? → USE S04
+  Does zone meet threshold + RSI/ADX (2 of 3)? → USE S04
 Check S11 (promising, needs data):
   Clear level flip visible? → USE S11
 Check S01, S08, S12 (testing):
   Clear setup only, LOW confidence
-If nothing qualifies: SKIP THE TRADE
+If nothing qualifies: prefer skip_trade: true
+UNLESS FALLBACK (1D/1W only) below applies — then take LOW confidence zone trade.
+
+FALLBACK — 1D OR 1W ONLY (prevents long skip droughts):
+If no S03/S04/S11 qualifies BUT all of:
+  • Timeframe is 1D or 1W
+  • Zone below 20% (for LONG) OR above 80% (for SHORT)
+  • RSI confirms: below 45 for LONG, above 55 for SHORT
+  • ADX above 15
+Then output a real trade (not skip): strategy_id S04_EXTREME_REVERSION, confidence LOW,
+conviction_score 3–4, strategy_met false. Still respect minimum R/R to TP2 and valid JSON.
 
 STEP 3: SKIP DECISION
 Skip if:
@@ -1839,7 +1903,17 @@ RULES:
         _sanitize_signal_lists(ai)
 
         if bool(ai.get("skip_trade")):
-            return _skip_out(str(ai.get("skip_reason") or "no edge identified"))
+            if _apply_zone_rsi_fallback(
+                tf_key,
+                zone_pct,
+                float(ind.get("rsi", 50) or 50),
+                float(ind.get("adx", 0) or 0),
+                ai,
+                float(price),
+            ):
+                _sanitize_signal_lists(ai)
+            else:
+                return _skip_out(str(ai.get("skip_reason") or "no edge identified"))
 
         sid_raw = str(ai.get("strategy_id", "") or "").strip().upper()
         if sid_raw == "S00_BEST_AVAILABLE":
