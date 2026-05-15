@@ -1502,12 +1502,57 @@ RULES:
             return _skip_out(str(ai.get("skip_reason") or "no edge identified"))
 
         sid_raw = str(ai.get("strategy_id", "") or "").strip().upper()
-        if sid_raw == "S04_EXTREME_REVERSION" and tf_key in ("1h", "4h"):
-            return _skip_out(f"S04 blocked on {tf_key} — proven weak in data")
+        if sid_raw == "S00_BEST_AVAILABLE":
+            if tf_key in ("1h", "4h"):
+                ai["skip_trade"] = True
+                ai["skip_reason"] = "S00 blocked on 1H/4H"
+                return _skip_out("S00 blocked on 1H/4H", ai)
+            try:
+                cs_s00 = float(ai.get("conviction_score", 0) or 0)
+            except (TypeError, ValueError):
+                cs_s00 = 0.0
+            if cs_s00 < 6:
+                ai["skip_trade"] = True
+                ai["skip_reason"] = f"S00 conviction {ai.get('conviction_score')}/6 required"
+                return _skip_out(
+                    f"S00 conviction {ai.get('conviction_score')}/6 required",
+                    ai,
+                )
+            log(
+                f"[ENFORCE] S00 allowed on {tf_key} conviction {ai.get('conviction_score')}",
+                level="info",
+            )
+        if sid_raw == "S04_EXTREME_REVERSION":
+            if tf_key == "1h":
+                ai["skip_trade"] = True
+                ai["skip_reason"] = "S04 blocked on 1H"
+                return _skip_out("S04 blocked on 1H", ai)
+            if tf_key == "4h":
+                try:
+                    zone_s04 = float(ai.get("zone_pct", zone_pct))
+                    if not math.isfinite(zone_s04):
+                        zone_s04 = float(zone_pct)
+                except (TypeError, ValueError):
+                    zone_s04 = 50.0
+                if 10 <= zone_s04 <= 90:
+                    ai["skip_trade"] = True
+                    ai["skip_reason"] = f"S04 on 4H needs zone <10 or >90 (got {zone_s04}%)"
+                    return _skip_out(
+                        f"S04 on 4H needs zone <10 or >90 (got {zone_s04}%)",
+                        ai,
+                    )
+                ai["confidence"] = "LOW"
+                try:
+                    cs4 = int(round(float(ai.get("conviction_score", 5) or 5)))
+                except (TypeError, ValueError):
+                    cs4 = 5
+                ai["conviction_score"] = min(cs4, 5)
+                log(
+                    f"[ENFORCE] S04 on 4H allowed - extreme zone {zone_s04}%",
+                    level="info",
+                )
         if sid_raw == "S08_RANGE_BREAKOUT" and tf_key == "4h":
             return _skip_out("S08 blocked on 4H: 25% WR per backtested data")
-        if sid_raw == "S00_BEST_AVAILABLE":
-            return _skip_out("S00 blocked — 40.8% WR below acceptable threshold")
 
         direction_raw = str(ai.get("direction", "")).strip().upper()
         if direction_raw not in ("LONG", "SHORT"):
