@@ -36,12 +36,12 @@ INTRADAY_PAIRS: list[str] = [
     "AUDUSD",
     "USDCAD",
     "NZDUSD",
-    "EURGBP",
     "GBPJPY",
     "EURJPY",
     "CADJPY",
     "EURNZD",
     "GBPNZD",
+    "USDSEK",
 ]
 
 MARKET_PROXIES: dict[str, str] = {
@@ -50,6 +50,26 @@ MARKET_PROXIES: dict[str, str] = {
     "GLD": "Gold",
     "USO": "Oil",
 }
+
+
+def is_active_session_utc() -> bool:
+    """London 07:00–12:00 UTC and New York 13:00–17:00 UTC only (Section 3)."""
+    h = datetime.now(timezone.utc).hour
+    return (7 <= h < 12) or (13 <= h < 17)
+
+
+def in_tight_high_impact_news_window(minutes: int = 32) -> bool:
+    """Skip generic intraday tests during immediate post-shock window (Section 3)."""
+    try:
+        alerts = get_recent_alerts(minutes=minutes, min_sentiment=0.0)
+    except Exception:  # noqa: BLE001
+        return False
+    for a in alerts:
+        imp = str(a.get("impact") or "")
+        if imp.startswith("HIGH_") and abs(float(a.get("sentiment", 0) or 0)) >= 0.45:
+            return True
+    return False
+
 
 STARTING_CAPITAL = 10000.0
 LEVERAGE = 50.0
@@ -447,12 +467,24 @@ Check if within 0.3% of any swing level
 INTRADAY RULES
 ═══════════════════════════════════════════
 
-TIME FILTERS:
-Best trading windows (UTC):
-✅ 07:00-10:00 London open
-✅ 13:30-16:00 NY open overlap
-⚠️ 10:00-13:00 Mid-session (quieter)
-❌ 21:00-07:00 Asian session (avoid forex)
+TIME FILTERS (mandatory — Python also skips outside these windows):
+London active: 07:00–12:00 UTC
+New York active: 13:00–17:00 UTC
+❌ Dead zone: 17:00–07:00 UTC — do not trade forex intraday
+❌ Skip if major Benzinga HIGH_FOREX alert in last ~32 minutes (handled upstream)
+
+S13 NEWS MOMENTUM (15M): wait 2–3 candles after shock; >0.3% move from pre-news;
+pullback to 15M EMA9; stop beyond pre-news pivot; TP1 1.5R (then BE), TP2 3R, TP3 5R; max hold 2h.
+
+S14 OPENING RANGE (30M): London range build 07:00–09:00 UTC, trade 09:00–12:00;
+NY range 13:00–14:30 UTC, trade 14:30–17:00 UTC; first 60m range 0.2%–0.8% ideal; ADX>20 on 30M;
+stop beyond opposite side of range + buffer; targets 1x / 2x / 3x range size (2R/4R/6R style).
+
+S15 VWAP REVERSION (15M): >1.5 SD from VWAP; RSI <30 long / >70 short; ADX <25 on 15M;
+stop beyond 2.5 SD; TP1 VWAP, TP2 opposite 0.5 SD; max 90m; skip if 30M ADX >30.
+
+S16 HTF REJECTION (30M): daily/weekly level + rejection candle + 15M RSI divergence + volume >1.5x avg;
+stop 1 ATR beyond level; TP1 2R, TP2 4R, TP3 6R; trail +1R after TP1.
 
 Current time: {utc_now}
 
@@ -473,8 +505,7 @@ Maximum risk: 0.5% per trade
 Stop distance: Never more than 0.3% from entry
 Hold time: Maximum 4 hours
 
-MINIMUM R/R: 1.5 (intraday — lower than swing)
-Reason: Faster moves, quicker profits
+MINIMUM R/R: 2.0 measured to TP2 vs stop (mirrors swing system; Python may skip if violated)
 
 Use strategy_id one of:
 S13_NEWS_MOMENTUM, S14_OPENING_RANGE_BREAKOUT, S15_VWAP_DEVIATION, S16_HTF_LEVEL_REJECTION
@@ -645,6 +676,13 @@ def save_intraday_result(result: dict[str, Any]) -> None:
 
 def run_intraday_backtest() -> None:
     log("[Intraday] Starting backtest cycle")
+    if not is_active_session_utc():
+        log("[Intraday] Outside London/NY session (UTC) — skipping cycle")
+        return
+    if in_tight_high_impact_news_window():
+        log("[Intraday] Tight high-impact news window — skipping cycle")
+        return
+
     ticker = random.choice(INTRADAY_PAIRS)
     timeframe = random.choice(list(TIMEFRAMES.keys()))
     bar_mins = 15 if timeframe == "15m" else 30
@@ -707,6 +745,17 @@ def run_intraday_backtest() -> None:
     tp1 = float(ai.get("tp1", 0) or 0)
     tp2 = float(ai.get("tp2", 0) or 0)
     direction = str(ai.get("direction", "LONG")).strip().upper()
+    if direction in ("LONG", "SHORT") and entry > 0 and stop > 0 and tp2 > 0:
+        risk = abs(entry - stop)
+        if risk > 1e-9:
+            rr2 = abs(tp2 - entry) / risk
+            if rr2 < 2.0 - 1e-9:
+                result["skipped"] = True
+                result["skip_reason"] = f"Insufficient R/R vs TP2: {rr2:.2f}"
+                save_intraday_result(result)
+                log(f"[Intraday] SKIP R/R: {rr2:.2f}")
+                return
+
     if direction not in ("LONG", "SHORT"):
         result["skipped"] = True
         result["skip_reason"] = "invalid direction"
