@@ -667,11 +667,10 @@ def compute_confluence_score(
         elif (d == "LONG" and r < 40) or (d == "SHORT" and r > 60):
             score += 1
     else:
-        if (d == "LONG" and r > 50) or (d == "SHORT" and r < 50):
+        # S03 window (no RSI>50 / directional-momentum tier)
+        if 25 <= r <= 70:
             score += 2
-        elif 45 <= r <= 55:
-            score += 0
-        elif (d == "LONG" and r > 45) or (d == "SHORT" and r < 55):
+        elif 20 <= r < 25 or 70 < r <= 75:
             score += 1
 
     if sid == "S04_EXTREME_REVERSION":
@@ -697,28 +696,25 @@ def compute_confluence_score(
 
 
 def calculate_trade_risk(
-    confluence_score: int,
     account_balance: float,
     *,
-    ticker: str,
+    confidence: str,
 ) -> dict[str, Any]:
-    """Position risk from confluence score only (strategy gates handle edge quality)."""
-    cs = max(0, min(10, int(confluence_score)))
-    if cs >= 9:
-        pct = 0.025
-    elif cs >= 7:
-        pct = 0.015
-    elif cs >= 5:
-        pct = 0.010
-    else:
+    """Max loss budget from confidence: HIGH 2%, MEDIUM 1%, LOW 0.5% of account."""
+    c = (confidence or "MEDIUM").strip().upper()
+    if c == "HIGH":
+        pct = 0.02
+    elif c == "LOW":
         pct = 0.005
-    pct = min(pct, 0.025)
+    else:
+        pct = 0.01
+    pct = min(float(pct), 0.025)
     return {
         "skip": False,
         "reason": "",
         "risk_pct": pct,
         "max_risk_dollars": round(float(account_balance) * pct, 2),
-        "confluence_score": cs,
+        "confidence_tier": c,
     }
 
 
@@ -749,7 +745,7 @@ def calculate_position_size(
     conviction_score: int,
     account_balance: float,
 ) -> dict[str, Any]:
-    """Legacy sizing — superseded by ``calculate_trade_risk`` in the main path."""
+    """Legacy sizing — main path uses ``calculate_trade_risk`` (confidence-based)."""
     c = (confidence or "MEDIUM").strip().upper()
     if c == "HIGH" and strategy_met:
         risk_pct = 0.02
@@ -1341,8 +1337,7 @@ ADX between 15-29 does NOT confirm a trend — that range is consolidation or no
 Only ADX > 30 confirms trend-following entries. The label ADX_TRENDING is ABOLISHED (28.6% WR, -$363);
 never reference it. Use ADX_TREND_CONFIRMED only when ADX > 30 (and rising for S03).
 For S03 EMA pullback specifically, the minimum trend filter is ADX above 15 (57.7% WR in your data); ADX > 25 was too strict and killed valid trades.
-RSI_NEUTRAL_ROOM is ABOLISHED (29.4% WR, -$432). For directional momentum: LONG requires RSI > 50;
-SHORT requires RSI < 50. Exception: S04 extreme reversion where RSI extreme IS the primary signal.
+RSI_NEUTRAL_ROOM is ABOLISHED (29.4% WR, -$432); never use that label. S03 uses RSI between 25 and 70 only (Python chart gate — no separate RSI>50 rule).
 
 WHAT HAS BEEN PROVEN TO WORK (real backtest data):
 - USDCAD S04 extreme discount: +$909 cluster across standout trades
@@ -1948,14 +1943,12 @@ RULES:
             news_sentiment=news_sentiment,
             fear_greed=fear_greed,
         )
-        sizing = calculate_trade_risk(
-            conf_score,
-            current_capital,
-            ticker=sym,
-        )
+        sizing = calculate_trade_risk(current_capital, confidence=confidence)
         max_risk_dollars = sizing["max_risk_dollars"]
         sizing_risk_pct = sizing["risk_pct"]
 
+        # Notional exposure = max_risk_dollars / stop_distance * entry
+        # (algebraically same as position_size * LEVERAGE with prior definition)
         denom = risk_pct_of_price * LEVERAGE
         if denom > 1e-12:
             position_size = min(max_risk_dollars / denom, 500.0)
