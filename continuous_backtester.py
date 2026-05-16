@@ -24,7 +24,7 @@ import pandas_ta  # noqa: F401
 
 from utils import DATA_DIR, env, load_json, log, save_json, utcnow_iso
 
-CLAUDE_MODEL = "claude-sonnet-4-5"
+CLAUDE_MODEL = "claude-sonnet-4-20250514"
 
 RESULTS_FILE = DATA_DIR / "backtest_results.json"
 STATS_FILE = DATA_DIR / "backtest_stats.json"
@@ -108,30 +108,6 @@ STRATEGIES: dict[str, dict[str, Any]] = {
 }
 
 # --- Hard exclusions (``run_one_backtest`` early return) ---
-CHF_PAIRS = frozenset({p for p in (
-    "AUDCAD",
-    "AUDCHF",
-    "AUDNZD",
-    "CADCHF",
-    "CHFJPY",
-    "EURCAD",
-    "EURCHF",
-    "EURJPY",
-    "GBPAUD",
-    "GBPCAD",
-    "GBPCHF",
-    "NZDCHF",
-    "NZDJPY",
-    "USDCHF",
-    "USDCZK",
-    "USDDKK",
-    "USDHKD",
-    "USDHUF",
-    "USDPLN",
-    "USDSGD",
-    "USDTRY",
-) if "CHF" in p})
-
 EXCLUDED_PAIRS = frozenset(
     {
         "AUDCAD",
@@ -143,7 +119,6 @@ EXCLUDED_PAIRS = frozenset(
         "EURCHF",
         "EURJPY",
         "GBPAUD",
-        "GBPCAD",
         "GBPCHF",
         "NZDCHF",
         "NZDJPY",
@@ -171,12 +146,6 @@ PRIORITY_PAIRS = frozenset(
         "USDJPY",
     }
 )
-
-# Pairs with elevated loss rate — cap risk (Section 1C)
-CAUTIOUS_PAIRS: frozenset[str] = frozenset({"USDNOK"})
-
-# Confidence cap — no HIGH (Section 1C)
-GBPJPY_MAX_CONFIDENCE = "MEDIUM"
 
 HARD_EXCLUDED_TICKERS = sorted(EXCLUDED_PAIRS)
 
@@ -576,7 +545,7 @@ def get_ohlcv(
 
 
 def validate_rr(plan: dict[str, Any]) -> dict[str, Any]:
-    """R/R validation disabled — every non-CHF analysis must produce a trade."""
+    """R/R validation disabled — model plan passes through."""
     return plan
 
 
@@ -595,130 +564,63 @@ def _tp_r_multiples(strategy_id: str, tf_key: str) -> tuple[float, float, float]
     return (2.0, 3.0, 5.0)
 
 
-def _recent_backtest_rows(max_n: int = 80) -> list[dict[str, Any]]:
-    """Recent saved rows for drawdown / correlation guards (best-effort)."""
-    try:
-        with _results_lock:
-            rows = _read_backtest_results_file()
-    except Exception:  # noqa: BLE001
-        return []
-    tail = rows[-max_n:] if len(rows) > max_n else rows
-    return [r for r in tail if isinstance(r, dict)]
-
-
-def _recovery_state(recent: list[dict[str, Any]]) -> tuple[str, float]:
-    """NORMAL | RECOVERY | PRESERVATION and position-size multiplier (Section 4F)."""
-    trades = [
-        r
-        for r in recent
-        if not r.get("skipped") and str(r.get("outcome", "")).upper() in ("WIN", "LOSS")
-    ]
-    cons_loss = 0
-    for t in reversed(trades):
-        if str(t.get("outcome", "")).upper() == "LOSS":
-            cons_loss += 1
-        else:
-            break
-    eq = float(STARTING_CAPITAL)
-    peak = eq
-    max_dd_pct = 0.0
-    for t in trades:
-        try:
-            eq += float(t.get("pnl_dollars", 0) or 0)
-        except (TypeError, ValueError):
-            continue
-        if eq > peak:
-            peak = eq
-        if peak > 0:
-            dd = (peak - eq) / peak * 100.0
-            if dd > max_dd_pct:
-                max_dd_pct = dd
-    if max_dd_pct > 8.0 or cons_loss >= 7:
-        return ("PRESERVATION", 0.25)
-    if max_dd_pct > 5.0 or cons_loss >= 4:
-        return ("RECOVERY", 0.5)
-    return ("NORMAL", 1.0)
-
-
-def _weekly_bias_from_df(past_wk: pd.DataFrame | None) -> str:
-    """Rough 1W trend label from last weekly close vs EMA50 (Section 4C)."""
-    try:
-        if past_wk is None or past_wk.empty or len(past_wk) < 10:
-            return "NEUTRAL"
-        dfc = past_wk.copy()
-        dfc.ta.ema(length=50, append=True)
-        if "EMA_50" not in dfc.columns:
-            return "NEUTRAL"
-        close = float(dfc["Close"].iloc[-1])
-        ema50 = float(dfc["EMA_50"].iloc[-1])
-        if not math.isfinite(close) or not math.isfinite(ema50):
-            return "NEUTRAL"
-        if close > ema50 * 1.002:
-            return "BULLISH"
-        if close < ema50 * 0.998:
-            return "BEARISH"
-        return "NEUTRAL"
-    except Exception:  # noqa: BLE001
-        return "NEUTRAL"
-
-
-def _pair_base_ccy(ticker: str) -> str:
-    t = (ticker or "").strip().upper()
-    if len(t) != 6 or not t.isalpha():
-        return ""
-    return t[:3]
-
-
-def _pair_quote_ccy(ticker: str) -> str:
-    t = (ticker or "").strip().upper()
-    if len(t) != 6 or not t.isalpha():
-        return ""
-    return t[3:]
-
-
-def _is_usd_base(ticker: str) -> bool:
-    return _pair_base_ccy(ticker) == "USD"
-
-
-def _correlation_guard_reason(sym: str, direction: str, recent: list[dict[str, Any]]) -> str | None:
-    """Limit correlated exposure from recent executed rows (Section 4D, simplified)."""
-    d = (direction or "").strip().upper()
-    if d not in ("LONG", "SHORT"):
-        return None
-    window = [r for r in recent[-12:] if not r.get("skipped") and r.get("outcome") in ("WIN", "LOSS")]
-    usd_long = 0
-    gbp_long = 0
-    eur_long = 0
-    exotic_w = 0.0
-    exotic_syms = frozenset({"USDZAR", "USDSEK", "USDNOK", "USDMXN", "USDTRY", "USDPLN"})
-    for r in window:
-        t = str(r.get("ticker", "") or "").upper()
-        rd = str(r.get("direction", "") or "").upper()
-        if rd != "LONG":
-            continue
-        if _is_usd_base(t):
-            usd_long += 1
-        if _pair_base_ccy(t) == "GBP" or _pair_quote_ccy(t) == "GBP":
-            gbp_long += 1
-        if _pair_base_ccy(t) == "EUR" or _pair_quote_ccy(t) == "EUR":
-            eur_long += 1
-        if t in exotic_syms:
-            exotic_w += 0.5
-    if d == "LONG":
-        if _is_usd_base(sym) and usd_long >= 2:
-            return "correlation: max 2 concurrent USD-base longs"
-        if (_pair_base_ccy(sym) == "GBP" or _pair_quote_ccy(sym) == "GBP") and gbp_long >= 1:
-            return "correlation: max 1 concurrent GBP exposure long"
-        if (_pair_base_ccy(sym) == "EUR" or _pair_quote_ccy(sym) == "EUR") and eur_long >= 1:
-            return "correlation: max 1 concurrent EUR exposure long"
-        if sym in exotic_syms and exotic_w >= 1.5:
-            return "correlation: exotic USD-block exposure limit"
-    return None
-
-
 def near_major_news_calendar(_sym: str, _analysis_date: str) -> bool:
     """Reserved: economic calendar proximity (Section 4E). Not wired — returns False."""
     return False
+
+
+def _s04_zone_extreme_ok(direction: str, zone_pct: float) -> tuple[bool, str]:
+    """S04 allowed only in 52w zone extreme (Python hard gate — no RSI/ADX workaround)."""
+    try:
+        z = float(zone_pct)
+    except (TypeError, ValueError):
+        return False, "S04 zone gate: invalid zone_pct"
+    if not math.isfinite(z):
+        return False, "S04 zone gate: non-finite zone_pct"
+    d = (direction or "").strip().upper()
+    if d == "LONG":
+        if z >= 15.0:
+            return False, f"S04 zone gate: LONG needs zone <15% (got {z:.1f}%)"
+    elif d == "SHORT":
+        if z <= 85.0:
+            return False, f"S04 zone gate: SHORT needs zone >85% (got {z:.1f}%)"
+    else:
+        return False, "S04 zone gate: invalid direction"
+    return True, ""
+
+
+def _s03_chart_three_of_four_ok(
+    direction: str, price: float, ind: dict[str, Any]
+) -> tuple[bool, str]:
+    """S03 requires 3 of 4 chart facts (same definitions as the master prompt)."""
+    d = (direction or "").strip().upper()
+    try:
+        e20 = float(ind.get("ema20") or 0)
+        e50 = float(ind.get("ema50") or 0)
+        e200 = float(ind.get("ema200") or 0)
+        atr = float(ind.get("atr") or 0)
+        rsi = float(ind.get("rsi") or 50)
+        adx = float(ind.get("adx") or 0)
+        px = float(price)
+    except (TypeError, ValueError):
+        return False, "S03 chart gate: invalid indicators"
+    if not all(math.isfinite(x) for x in (e20, e50, e200, atr, rsi, adx, px)):
+        return False, "S03 chart gate: non-finite indicators"
+    if d == "LONG":
+        sig_ema = e20 > e50 > e200
+    elif d == "SHORT":
+        sig_ema = e20 < e50 < e200
+    else:
+        return False, "S03 chart gate: invalid direction"
+    sig_pullback = atr > 0 and min(abs(px - e20), abs(px - e50)) <= 2.0 * atr
+    sig_rsi = 25.0 <= rsi <= 70.0
+    sig_adx = adx > 15.0
+    n = int(sig_ema) + int(sig_pullback) + int(sig_rsi) + int(sig_adx)
+    if n < 3:
+        return False, (
+            f"S03 chart gate: {n}/4 (need EMA stack, 2xATR to EMA20/50, RSI 25–70, ADX>15)"
+        )
+    return True, ""
 
 
 def compute_confluence_score(
@@ -730,11 +632,10 @@ def compute_confluence_score(
     adx: float,
     macd_hist: float,
     strategy_id: str,
-    weekly_bias: str,
     news_sentiment: float,
     fear_greed: float,
 ) -> int:
-    """0–10 confluence score for position sizing (Section 4A)."""
+    """0–10 confluence score for logging / optional sizing (not a trade gate)."""
     score = 0
     d = (direction or "").strip().upper()
     sid = (strategy_id or "").strip().upper()
@@ -787,11 +688,6 @@ def compute_confluence_score(
     if (d == "LONG" and mh > 0) or (d == "SHORT" and mh < 0):
         score += 1
 
-    if weekly_bias == "BULLISH" and d == "LONG":
-        score += 1
-    elif weekly_bias == "BEARISH" and d == "SHORT":
-        score += 1
-
     if (d == "LONG" and news_sentiment > 0.15) or (d == "SHORT" and news_sentiment < -0.15):
         score += 1
     if (d == "LONG" and fear_greed < 35) or (d == "SHORT" and fear_greed > 65):
@@ -805,34 +701,24 @@ def calculate_trade_risk(
     account_balance: float,
     *,
     ticker: str,
-    recovery_mult: float,
 ) -> dict[str, Any]:
-    """Confluence-based risk budget; score <3 = no trade (Section 4A)."""
-    if confluence_score < 3:
-        return {
-            "skip": True,
-            "reason": "confluence score below 3 — insufficient edge",
-            "risk_pct": 0.0,
-            "max_risk_dollars": 0.0,
-            "confluence_score": confluence_score,
-        }
-    if confluence_score >= 9:
+    """Position risk from confluence score only (strategy gates handle edge quality)."""
+    cs = max(0, min(10, int(confluence_score)))
+    if cs >= 9:
         pct = 0.025
-    elif confluence_score >= 7:
+    elif cs >= 7:
         pct = 0.015
-    elif confluence_score >= 5:
+    elif cs >= 5:
         pct = 0.010
     else:
         pct = 0.005
-    if ticker in CAUTIOUS_PAIRS:
-        pct = min(pct, 0.005)
-    pct = min(pct * float(recovery_mult), 0.025)
+    pct = min(pct, 0.025)
     return {
         "skip": False,
         "reason": "",
         "risk_pct": pct,
         "max_risk_dollars": round(float(account_balance) * pct, 2),
-        "confluence_score": confluence_score,
+        "confluence_score": cs,
     }
 
 
@@ -884,7 +770,7 @@ def calculate_position_size(
 
 def validate_stop_loss(entry: float, stop: float, direction: str, timeframe: str) -> float:
     """Cap stop distance from entry by timeframe (max % move against position)."""
-    MAX_STOP_PCT = {"1h": 0.008, "4h": 0.015, "1d": 0.025, "1w": 0.040}
+    MAX_STOP_PCT = {"1h": 0.008, "4h": 0.015, "1d": 0.015, "1w": 0.025}
     tf = timeframe.lower().strip()
     max_pct = MAX_STOP_PCT.get(tf, 0.015)
     try:
@@ -1363,7 +1249,7 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
         ind["swing_lows"] = swing_lows[-5:]
 
         if sym in EXCLUDED_PAIRS:
-            reason = "CHF excluded" if sym in CHF_PAIRS else "Excluded pair (backtest data)"
+            reason = "Excluded pair (backtest data)"
             log(f"[Backtest] FILTERED: {sym} — {reason}", level="info")
             return {
                 "date": analysis_date,
@@ -1443,16 +1329,6 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
         except Exception as e:
             log(f"[Intel] {e}")
 
-        recent_guard_rows = _recent_backtest_rows(80)
-        rec_mode, rec_mult = _recovery_state(recent_guard_rows)
-
-        weekly_bias = "NEUTRAL"
-        try:
-            past_wk, _pw_unused = get_ohlcv(yf_ticker, "1w", analysis_date.strip())
-            weekly_bias = _weekly_bias_from_df(past_wk)
-        except Exception:  # noqa: BLE001
-            weekly_bias = "NEUTRAL"
-
         prompt = f"""You are APEX, the world's most disciplined quantitative forex trader.
 You have backtested 166 trades and learned exactly what works and what destroys capital.
 You are aggressive in pursuing high-quality setups but completely disciplined in refusing bad ones.
@@ -1475,10 +1351,7 @@ WHAT HAS BEEN PROVEN TO WORK (real backtest data):
 - S04 with ALL extreme signals aligned: historically 65%+ WR when fully qualified
 
 WHAT HAS BEEN PROVEN TO LOSE:
-- EURGBP any setup: BLACKLISTED in Python (-$459 cluster)
-- AUDJPY any setup: BLACKLISTED in Python (Jan cluster losses)
-- USDMXN: BLACKLISTED in Python (0% WR runs)
-- S04 with only 1 of 3 core signals: marginal edge — prefer 2 of 3
+- S04 when 52w zone is NOT extreme (Python skips — no exceptions)
 - ADX_TRENDING / RSI_NEUTRAL_ROOM: never use these labels again
 
 ═══════════════════════════════════════════
@@ -1488,7 +1361,6 @@ Asset: {sym}
 Timeframe: {TF_DESCRIPTIONS.get(tf_key, tf_key)}
 Date: {analysis_date}
 Price: {price:.5f}
-1W trend bias (EMA50): {weekly_bias}
 
 52w Zone: {zone_label} ({zone_pct:.1f}%)
 52w High: {high_52w:.5f}
@@ -1571,13 +1443,10 @@ S04: EXTREME ZONE REVERSION (simple rules — no tiers)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Python blocks S04 on 1H and 4H entirely — never output S04 for those TFs.
 
-S04 qualifies when you have 2 of 3:
-→ Zone: LONG = below 15% of 52w range; SHORT = above 85% of 52w range
+S04 is allowed ONLY in the extreme 52w zone (Python hard gate — no workarounds):
+→ LONG: zone below 15% of 52w range. SHORT: zone above 85%.
   Current zone: {zone_pct:.1f}%
-→ RSI: LONG = below 35; SHORT = above 65
-  Current RSI: {ind["rsi"]:.1f}
-→ ADX below 45 (not a runaway trend)
-  Current ADX: {ind["adx"]:.1f}
+RSI/ADX still inform your read, but Python only enforces the zone rule for S04.
 
 Stop: 1x ATR beyond the extreme / invalidation.
 
@@ -1697,26 +1566,16 @@ STEP 2: STRATEGY SCAN
 Check S03 first (proven 57.7% WR):
   Does price meet 3 of 4 signals? → USE S03
 Check S04 second (proven 53.2% WR on 1D/1W):
-  Does zone meet threshold + RSI/ADX (2 of 3)? → USE S04
+  Is zone in the extreme (<15% LONG, >85% SHORT)? → USE S04
 Check S11 (promising, needs data):
   Clear level flip visible? → USE S11
 Check S01, S08, S12 (testing):
   Clear setup only, LOW confidence
-If nothing qualifies: prefer skip_trade: true
-UNLESS FALLBACK (1D/1W only) below applies — then take LOW confidence zone trade.
-
-FALLBACK — 1D OR 1W ONLY (prevents long skip droughts):
-If no S03/S04/S11 qualifies BUT all of:
-  • Timeframe is 1D or 1W
-  • Zone below 20% (for LONG) OR above 80% (for SHORT)
-  • RSI confirms: below 45 for LONG, above 55 for SHORT
-  • ADX above 15
-Then output a real trade (not skip): strategy_id S04_EXTREME_REVERSION, confidence LOW,
-conviction_score 3–4, strategy_met false. Still respect minimum R/R to TP2 and valid JSON.
+If nothing qualifies: skip_trade: true. No fallback trades — ever.
 
 STEP 3: SKIP DECISION
 Skip if:
-- No strategy qualifies with 2+ signals
+- No strategy fully qualifies (S03 needs 3 of 4; S04 needs extreme zone)
 - 4H with S04 attempted (proven loser)
 - 1H without clear S11
 - Equilibrium zone with no strategy
@@ -1736,7 +1595,7 @@ Not approximately — exactly where.
 STEP 5: STOP AT STRUCTURAL INVALIDATION
 Where does this trade become structurally wrong?
 Add 0.3x ATR buffer beyond that level.
-Never more than 2.5% from entry.
+On 1D/1W, Python caps stop distance to 1.5% / 2.5% from entry if Claude is too wide.
 
 STEP 6: TARGETS (dynamic R multiples — Python applies final TPs)
 S04: TP1=2R, TP2=3.5R, TP3=6R
@@ -1745,10 +1604,9 @@ S03 4H: TP1=2R, TP2=3R, TP3=5R
 Default swing: TP1=2R, TP2=3R, TP3=5R
 Minimum: distance(entry, TP2) / distance(entry, stop) ≥ 2.0 (enforced in Python).
 
-STEP 7: CONFIDENCE AND CONFLUENCE
-Position size is driven by a 0–10 confluence score in Python (zone, RSI, ADX role,
-MACD, weekly alignment, intelligence). Score <3 → skip. Max single-trade risk 2.5%.
-Recovery / preservation modes may further reduce size.
+STEP 7: CONFIDENCE
+Set conviction honestly. Python may scale size from a simple score but will NOT
+skip a trade that passed strategy_met and the S03/S04 chart gates.
 
 ═══════════════════════════════════════════
 OUTPUT — VALID JSON ONLY
@@ -1806,6 +1664,7 @@ If trading:
 }}
 
 RULES:
+- strategy_met MUST be true on every trade JSON — otherwise Python skips
 - direction: LONG or SHORT (never NONE for trades)
 - strategy_id: S01-S12 or SKIP (never S00)
 - All signals UPPERCASE
@@ -1844,14 +1703,14 @@ RULES:
 
         _sanitize_signal_lists(ai)
 
-        # FIX1 — cap stop distance on raw Claude output (before skip / full pipeline)
-        if not bool(ai.get("skip_trade")):
+        # Cap stop distance on raw Claude output for 1D/1W only (before skip / full pipeline)
+        if not bool(ai.get("skip_trade")) and tf_key in ("1d", "1w"):
             try:
                 e0 = float(ai.get("entry", price) or price)
                 st0 = float(ai.get("stop_loss", 0) or 0)
                 d0 = str(ai.get("direction", "LONG")).strip().upper()
-                max_stop_map = {"1h": 0.5, "4h": 1.0, "1d": 1.5, "1w": 2.5}
-                ms = float(max_stop_map.get(tf_key, 1.5))
+                max_stop_map = {"1d": 1.5, "1w": 2.5}
+                ms = float(max_stop_map[tf_key])
                 if (
                     st0
                     and e0 > 0
@@ -1921,31 +1780,21 @@ RULES:
         ai["strategy_id"] = strategy_id_norm
         strategy_met = bool(ai.get("strategy_met", False))
 
-        if strategy_id_norm in (
-            "S03_EMA_PULLBACK",
-            "S04_EXTREME_REVERSION",
-            "S11_SR_FLIP",
-        ) and not strategy_met:
-            return _skip_out("strategy_met False — no fallback trades allowed", ai)
+        if not strategy_met:
+            return _skip_out("strategy_met False — no trade without full strategy qualification", ai)
 
-        if rec_mode == "PRESERVATION" and tf_key != "1w":
-            return _skip_out("preservation mode: 1W swing timeframe only", ai)
-        if rec_mode == "PRESERVATION" and tf_key == "1w" and strategy_id_norm != "S04_EXTREME_REVERSION":
-            return _skip_out("preservation mode: S04 on 1W only", ai)
-        if rec_mode == "RECOVERY" and tf_key != "1w":
-            return _skip_out("recovery mode: 1W swing timeframe only", ai)
+        if strategy_id_norm == "S04_EXTREME_REVERSION":
+            z_ok, z_msg = _s04_zone_extreme_ok(direction, zone_pct)
+            if not z_ok:
+                return _skip_out(z_msg, ai)
+
+        if strategy_id_norm == "S03_EMA_PULLBACK":
+            s3_ok, s3_msg = _s03_chart_three_of_four_ok(direction, float(price), ind)
+            if not s3_ok:
+                return _skip_out(s3_msg, ai)
 
         if tf_key == "1h" and strategy_id_norm not in ALLOWED_1H_STRATEGIES:
             return _skip_out(f"1H only S11 allowed; got {strategy_id_norm}")
-
-        corr_reason = _correlation_guard_reason(sym, direction, recent_guard_rows)
-        if corr_reason:
-            return _skip_out(corr_reason, ai)
-
-        if tf_key in ("4h", "1d") and weekly_bias == "BEARISH" and direction == "LONG":
-            return _skip_out("weekly bias filter: no LONG on 4H/1D vs bearish 1W", ai)
-        if tf_key in ("4h", "1d") and weekly_bias == "BULLISH" and direction == "SHORT":
-            return _skip_out("weekly bias filter: no SHORT on 4H/1D vs bullish 1W", ai)
 
         if tf_key in ("4h", "1d") and near_major_news_calendar(sym, analysis_date.strip()):
             return _skip_out("major economic event window — swing skipped for this pair/day", ai)
@@ -1978,9 +1827,6 @@ RULES:
         if sym == "GBPJPY" and confidence == "HIGH":
             confidence = "MEDIUM"
             ai["confidence"] = "MEDIUM"
-
-        if conviction_score < 3:
-            return _skip_out("conviction below minimum (3)", ai)
 
         current_capital = STARTING_CAPITAL
 
@@ -2035,31 +1881,11 @@ RULES:
             else:
                 risk = stop - entry
 
-        # Minimum stop distance = 1.5x ATR (Claude often places stops too tight)
-        stop = float(ai["stop_loss"])
-        if direction == "LONG":
-            min_stop = entry - (atr * 1.5)
-            if stop > min_stop:
-                stop = min_stop
-                log(f"[SL] Widened stop to 1.5x ATR: {stop:.5f}")
-        else:
-            max_stop = entry + (atr * 1.5)
-            if stop < max_stop:
-                stop = max_stop
-                log(f"[SL] Widened stop to 1.5x ATR: {stop:.5f}")
-        stop = validate_stop_loss(entry, round(stop, 5), direction, tf_key)
-        ai["stop_loss"] = stop
-        if direction == "LONG":
-            risk = entry - stop
-        else:
-            risk = stop - entry
-
-        # FIX1 — cap maximum stop distance (% of entry); fixed 2R/3R/5R TPs when capped
-        max_stop_map = {"1h": 0.5, "4h": 1.0, "1d": 1.5, "1w": 2.5}
-        max_stop_pct = float(max_stop_map.get(tf_key, 1.5))
+        # Cap maximum stop distance on 1D/1W (% of entry); fixed 2R/3R/5R TPs when capped
         stop = float(ai["stop_loss"])
         capped_stop = False
-        if stop and entry > 0 and abs(stop - entry) > 1e-12:
+        if tf_key in ("1d", "1w") and stop and entry > 0 and abs(stop - entry) > 1e-12:
+            max_stop_pct = 1.5 if tf_key == "1d" else 2.5
             stop_dist_pct = abs(entry - stop) / entry * 100.0
             if stop_dist_pct > max_stop_pct + 1e-9:
                 log(f"[StopFix] {stop_dist_pct:.2f}% → capped at {max_stop_pct}%", level="info")
@@ -2119,26 +1945,14 @@ RULES:
             adx=float(ind.get("adx", 0) or 0),
             macd_hist=float(ind.get("macd_hist", 0) or 0),
             strategy_id=strategy_id_norm,
-            weekly_bias=weekly_bias,
             news_sentiment=news_sentiment,
             fear_greed=fear_greed,
         )
-        if strategy_id_norm == "S03_EMA_PULLBACK" and tf_key == "1w" and weekly_bias in (
-            "BULLISH",
-            "BEARISH",
-        ):
-            if (direction == "LONG" and weekly_bias == "BULLISH") or (
-                direction == "SHORT" and weekly_bias == "BEARISH"
-            ):
-                conf_score = min(10, conf_score + 1)
         sizing = calculate_trade_risk(
             conf_score,
             current_capital,
             ticker=sym,
-            recovery_mult=rec_mult,
         )
-        if sizing.get("skip"):
-            return _skip_out(str(sizing.get("reason") or "low confluence"), ai)
         max_risk_dollars = sizing["max_risk_dollars"]
         sizing_risk_pct = sizing["risk_pct"]
 
@@ -2301,8 +2115,8 @@ RULES:
             "rr_ratio": str(ai.get("rr_ratio", "")),
             "conviction_score": conviction_score,
             "confluence_score_python": conf_score,
-            "risk_mode": rec_mode,
-            "weekly_bias_chart": weekly_bias,
+            "risk_mode": "NORMAL",
+            "weekly_bias_chart": "",
             "intel_summary": intel_summary_stored,
             "strategy_id": strategy_id_norm,
             "strategy_name": strat_name,
