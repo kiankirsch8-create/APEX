@@ -24,7 +24,7 @@ import pandas_ta  # noqa: F401
 
 from utils import DATA_DIR, env, load_json, log, save_json, utcnow_iso
 
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+CLAUDE_MODEL = "claude-sonnet-4-5-20251022"
 
 RESULTS_FILE = DATA_DIR / "backtest_results.json"
 STATS_FILE = DATA_DIR / "backtest_stats.json"
