@@ -32,6 +32,7 @@ import random
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -59,6 +60,12 @@ IMPROVE_DEBUG_FILE = DATA_DIR / "improve_debug.json"
 STARTING_CAPITAL = 10000.0
 LEVERAGE = 50
 IMPROVE_EVERY = 100
+
+# Parallel backtest loop (speed)
+MAX_WORKERS = 8
+BATCH_SIZE = 15
+BACKTEST_CLAUDE_MAX_TOKENS = 600
+CLAUDE_HTTP_TIMEOUT_SEC = 25.0
 
 RISK_BY_CONFIDENCE: dict[str, float] = {
     "HIGH": 0.020,
@@ -371,9 +378,49 @@ def pick_backtest_ticker() -> str:
     return random.choice(other or eligible)
 
 
+def eligible_backtest_tickers() -> list[str]:
+    """All symbols used for rolling batch construction (excludes hard-filtered pairs)."""
+    return [t for t in BACKTEST_TICKERS if t not in EXCLUDED_PAIRS]
+
+
+def eligible_backtest_tickers() -> list[str]:
+    """
+    Up to ``batch_size`` unique (ticker, timeframe, date) tuples not already in ``existing_keys``.
+    """
+    tickers = eligible_backtest_tickers()
+    if not tickers:
+        tickers = ["EURUSD"]
+    combos: list[tuple[str, str]] = [(t, tf) for t in tickers for tf in TIMEFRAMES]
+    random.shuffle(combos)
+    work: list[tuple[str, str, str]] = []
+    used_in_batch: set[str] = set()
+    for t, tf in combos:
+        if len(work) >= batch_size:
+            break
+        is_fx = len(t) == 6 and t.isalpha()
+        date = get_random_date(days_back_max=365, days_back_min=10, skip_weekends=not is_fx)
+        key = _result_dedup_key({"ticker": t, "date": date, "timeframe": tf})
+        if key in existing_keys or key in used_in_batch:
+            continue
+        used_in_batch.add(key)
+        work.append((t, tf, date))
+    return work
+
+
+def analyse_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[str, Any] | None:
+    """One full backtest job (safe for ThreadPoolExecutor workers)."""
+    try:
+        return run_one_backtest(ticker, timeframe, analysis_date)
+    except Exception as e:  # noqa: BLE001
+        log(f"[Error] {ticker} {timeframe}: {e}", level="warning")
+        log(traceback.format_exc(), level="warning")
+        return None
+
+
 _backtest_thread: threading.Thread | None = None
 _stop_flag = threading.Event()
 _results_lock = threading.Lock()
+_loop_counters_lock = threading.Lock()
 
 
 def log_learned_startup_preview() -> None:
@@ -430,7 +477,7 @@ def _client() -> Anthropic:
     key = env("ANTHROPIC_API_KEY")
     if not key:
         raise RuntimeError("ANTHROPIC_API_KEY is not set")
-    return Anthropic(api_key=key)
+    return Anthropic(api_key=key, timeout=CLAUDE_HTTP_TIMEOUT_SEC)
 
 
 def _parse_json_response(raw: str) -> dict[str, Any] | None:
@@ -1380,12 +1427,21 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
             fear_greed=fear_greed,
             vix_val=vix_val,
         )
-        client = _client()
-        resp = client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=2500,
-            messages=[{"role": "user", "content": prompt}],
-        )
+        try:
+            client = _client()
+            resp = client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=BACKTEST_CLAUDE_MAX_TOKENS,
+                messages=[{"role": "user", "content": prompt}],
+            )
+        except Exception as e:  # noqa: BLE001
+            et = type(e).__name__
+            em = str(e).lower()
+            if "timeout" in em or "timeout" in et.lower():
+                log(f"[Timeout] {sym} {timeframe} — skipping", level="warning")
+                return None
+            log(f"[Backtest] Claude API error {sym} {timeframe}: {e}", level="warning")
+            return None
         raw = _message_text(resp)
         parsed = _parse_json_response(raw)
         ai: dict[str, Any] = parsed if isinstance(parsed, dict) else {}
@@ -2334,7 +2390,7 @@ def continuous_backtest_loop() -> None:
 
             if is_improving():
                 log("[Loop] Improvement running, waiting...", level="info")
-                time.sleep(15)
+                time.sleep(10)
                 continue
 
             if not env("ANTHROPIC_API_KEY"):
@@ -2342,98 +2398,116 @@ def continuous_backtest_loop() -> None:
                 time.sleep(10)
                 continue
 
-            ticker = pick_backtest_ticker()
-            timeframe = random.choices(
-                list(TF_WEIGHTS.keys()),
-                weights=list(TF_WEIGHTS.values()),
-                k=1,
-            )[0]
-            is_fx = len(ticker) == 6 and ticker.isalpha()
-            date = get_random_date(days_back_max=365, days_back_min=10, skip_weekends=not is_fx)
-
             existing = _load_results_list()
-            key = _result_dedup_key({"ticker": ticker, "date": date, "timeframe": timeframe})
             existing_keys = {_result_dedup_key(r) for r in existing}
-
-            if key in existing_keys:
+            work_items = build_work_batch(existing_keys, BATCH_SIZE)
+            if not work_items:
+                log("[Loop] No new (ticker,date,tf) slots in batch — sleeping", level="info")
+                time.sleep(10)
                 continue
 
             update_state(
                 {
                     "status": "testing",
-                    "current_ticker": ticker,
-                    "current_date": date,
-                    "current_timeframe": timeframe,
+                    "current_ticker": work_items[0][0],
+                    "current_date": work_items[0][2],
+                    "current_timeframe": work_items[0][1],
                     "total_tests_run": len(existing),
                     "last_heartbeat": datetime.now().isoformat(),
                 }
             )
 
-            log(f"[Loop] Testing {ticker} {timeframe} {date}", level="info")
+            log(
+                f"[Loop] Batch {len(work_items)} jobs (max_workers={MAX_WORKERS})",
+                level="info",
+            )
 
-            result = run_one_backtest(ticker, timeframe, date)
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = {
+                    executor.submit(analyse_one_backtest, t, tf, d): (t, tf, d)
+                    for t, tf, d in work_items
+                }
+                for future in as_completed(futures):
+                    ticker, tf, date = futures[future]
+                    try:
+                        result = future.result()
+                    except Exception as e:  # noqa: BLE001
+                        log(f"[Thread error] {ticker} {tf}: {e}", level="warning")
+                        continue
 
-            if result is not None:
-                loop_completed_tests += 1
-                if loop_completed_tests % 10 == 0:
-                    log(
-                        f"[Loop] Running - tests: {len(_load_results_list())}",
-                        level="info",
-                    )
+                    if result is None:
+                        continue
 
-                prev_len = len(_load_results_list())
-                count = append_result(result)
-                added = count > prev_len
+                    with _loop_counters_lock:
+                        loop_completed_tests += 1
+                        lc = loop_completed_tests
 
-                if added:
-                    if result.get("skipped"):
+                    if lc % 10 == 0:
                         log(
-                            f"[Loop] SKIP {ticker} {timeframe} {date}: "
-                            f"{result.get('skip_reason', '')}",
+                            f"[Loop] Running - tests: {len(_load_results_list())}",
                             level="info",
                         )
-                    else:
-                        outcome = result.get("outcome", "?")
-                        pnl = float(result.get("pnl_dollars", 0) or 0)
+
+                    prev_len = len(_load_results_list())
+                    count = append_result(result)
+                    added = count > prev_len
+
+                    if added:
+                        if result.get("skipped"):
+                            log(
+                                f"[Loop] SKIP {ticker} {tf} {date}: "
+                                f"{result.get('skip_reason', '')}",
+                                level="info",
+                            )
+                        else:
+                            outcome = result.get("outcome", "?")
+                            pnl = float(result.get("pnl_dollars", 0) or 0)
+                            log(
+                                f"[Loop] #{count} {ticker} {tf} {date}: {outcome} ${pnl:.2f}",
+                                level="info",
+                            )
+
+                    should_improve = False
+                    with _loop_counters_lock:
+                        if added and result.get("outcome") in ("WIN", "LOSS"):
+                            tests_since_improve += 1
+                            if tests_since_improve >= IMPROVE_EVERY:
+                                tests_since_improve = 0
+                                should_improve = True
+
+                    if added and count > 0 and count % 5 == 0:
+                        all_results = _load_results_list()
+                        stats = calculate_stats(all_results)
+                        save_json(STATS_FILE, stats)
                         log(
-                            f"[Loop] #{count} {ticker} {timeframe} {date}: {outcome} ${pnl:.2f}",
+                            f"[Loop] Stats updated: WR={stats.get('win_rate_pct', 0)}% "
+                            f"Trades={stats.get('total_trades', 0)}",
                             level="info",
                         )
-                    if added and result.get("outcome") in ("WIN", "LOSS"):
-                        tests_since_improve += 1
 
-                if added and count > 0 and count % 5 == 0:
-                    all_results = _load_results_list()
-                    stats = calculate_stats(all_results)
-                    save_json(STATS_FILE, stats)
-                    log(
-                        f"[Loop] Stats updated: WR={stats.get('win_rate_pct', 0)}% "
-                        f"Trades={stats.get('total_trades', 0)}",
-                        level="info",
-                    )
+                    if should_improve:
+                        log("[Loop] Running improvement cycle...", level="info")
+                        snap = _load_results_list()
+                        threading.Thread(target=run_improvement_cycle, args=(snap,), daemon=True).start()
 
-                if tests_since_improve >= IMPROVE_EVERY:
-                    log("[Loop] Running improvement cycle...", level="info")
-                    tests_since_improve = 0
-                    snap = _load_results_list()
-                    threading.Thread(target=run_improvement_cycle, args=(snap,), daemon=True).start()
-
+            with _loop_counters_lock:
+                tsi_snapshot = tests_since_improve
             update_state(
                 {
                     "status": "idle",
                     "last_heartbeat": datetime.now().isoformat(),
                     "total_tests_run": len(_load_results_list()),
-                    "tests_since_improve": tests_since_improve,
+                    "tests_since_improve": tsi_snapshot,
                     "last_session_at": datetime.now().isoformat(),
                 }
             )
 
-            time.sleep(3)
+            time.sleep(10)
 
         except Exception as e:  # noqa: BLE001
             log(f"[Loop] Error: {e}", level="error")
             log(f"[Loop] {traceback.format_exc()}", level="error")
-            time.sleep(5)
+            time.sleep(0.5)
             continue
 
     log("[Loop] Stopped", level="info")
