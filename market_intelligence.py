@@ -4,7 +4,9 @@ Caches aggressively to limit API cost (macro changes slowly).
 """
 from __future__ import annotations
 
+import os
 import time
+from datetime import date, datetime, timezone
 from typing import Any
 
 import pandas as pd
@@ -58,20 +60,42 @@ def _get_fear_greed() -> dict[str, Any]:
     hit = _cache_get(key)
     if hit is not None:
         return hit
-    score = 50.0
     try:
         r = requests.get(
             "https://production.dataviz.cnn.io/index/fearandgreed/graphdata",
             timeout=8,
+            headers={"User-Agent": "Mozilla/5.0"},
         )
-        if r.ok:
-            j = r.json()
-            score = float(j.get("fear_and_greed", {}).get("score", 50) or 50)
+        if r.status_code == 200:
+            data = r.json()
+            score = float(data.get("fear_and_greed", {}).get("score", 50) or 50)
+            rating = str(data.get("fear_and_greed", {}).get("rating", "Neutral"))
+            out: dict[str, Any] = {"score": score, "rating": rating}
+            _cache_set(key, out, CACHE_HOURS_FEAR_GREED)
+            return out
     except Exception as e:  # noqa: BLE001
-        log(f"[Intel] Fear&Greed: {e}")
-    out = {"score": score}
+        log(f"[Intel] Fear&Greed CNN: {e}")
+    try:
+        r = requests.get("https://api.alternative.me/fng/", timeout=8)
+        if r.status_code == 200:
+            data = r.json()
+            score = int(data["data"][0]["value"])
+            out = {
+                "score": float(score),
+                "rating": str(data["data"][0]["value_classification"]),
+            }
+            _cache_set(key, out, CACHE_HOURS_FEAR_GREED)
+            return out
+    except Exception as e:  # noqa: BLE001
+        log(f"[Intel] Fear&Greed alt: {e}")
+    out = {"score": 50.0, "rating": "Neutral"}
     _cache_set(key, out, CACHE_HOURS_FEAR_GREED)
     return out
+
+
+def get_fear_greed() -> dict[str, Any]:
+    """Public alias — CNN Fear & Greed with Alternative.me fallback."""
+    return _get_fear_greed()
 
 
 def _get_proxies() -> dict[str, Any]:
@@ -92,14 +116,105 @@ def _get_proxies() -> dict[str, Any]:
     return out
 
 
-def _get_cot_stub() -> dict[str, Any]:
-    key = "cot_stub"
+def get_cftc_cot(ticker: str) -> dict[str, Any]:
+    sym = (ticker or "").strip().upper()
+    key = f"cot:{sym}"
     hit = _cache_get(key)
     if hit is not None:
         return hit
-    out = {"bias": "UNKNOWN"}
+    cftc_codes = {
+        "EURUSD": "099741",
+        "GBPUSD": "096742",
+        "USDJPY": "097741",
+        "AUDUSD": "232741",
+        "USDCAD": "090741",
+        "NZDUSD": "112741",
+    }
+    out: dict[str, Any] = {"bias": "UNKNOWN"}
+    try:
+        code = cftc_codes.get(sym, "")
+        if not code:
+            _cache_set(key, out, CACHE_HOURS_COT)
+            return out
+        url = (
+            "https://publicreporting.cftc.gov/api/views/6dca-aqww/rows.json"
+            f"?$where=cftc_contract_market_code='{code}'"
+            "&$order=report_date_as_yyyy_mm_dd DESC"
+            "&$limit=2"
+        )
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            rows = data.get("data", [])
+            if rows:
+                out = {"bias": "BULLISH", "raw": rows[0]}
+    except Exception as e:  # noqa: BLE001
+        log(f"[Intel] CFTC COT: {e}")
     _cache_set(key, out, CACHE_HOURS_COT)
     return out
+
+
+def get_economic_events_today() -> list[dict[str, Any]]:
+    key = f"econ:{date.today().isoformat()}"
+    hit = _cache_get(key)
+    if hit is not None:
+        return hit
+    finnhub_key = os.getenv("FINNHUB_API_KEY", "")
+    if not finnhub_key:
+        _cache_set(key, [], 0.25)
+        return []
+    try:
+        today = date.today().isoformat()
+        url = f"https://finnhub.io/api/v1/calendar/economic?from={today}&to={today}&token={finnhub_key}"
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200:
+            events = r.json().get("economicCalendar", [])
+            out = [e for e in events if e.get("impact") == "high"]
+            _cache_set(key, out, 0.25)
+            return out
+    except Exception as e:  # noqa: BLE001
+        log(f"[Intel] Finnhub calendar: {e}")
+    _cache_set(key, [], 0.25)
+    return []
+
+
+def is_news_blackout(minutes_buffer: int = 30) -> bool:
+    events = get_economic_events_today()
+    now = datetime.now(timezone.utc)
+    for event in events:
+        try:
+            event_time = datetime.fromisoformat(event.get("time", "").replace("Z", "+00:00"))
+            diff_mins = abs((event_time - now).total_seconds() / 60.0)
+            if diff_mins <= minutes_buffer:
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
+def get_alpha_vantage_sentiment(ticker: str) -> float:
+    av_key = os.getenv("ALPHAVANTAGE_API_KEY", "")
+    if not av_key:
+        return 0.0
+    sym = (ticker or "").strip().upper()
+    if len(sym) < 6:
+        return 0.0
+    base = sym[:3]
+    try:
+        url = (
+            "https://www.alphavantage.co/query?function=NEWS_SENTIMENT"
+            f"&tickers=FOREX:{base}&apikey={av_key}&limit=10"
+        )
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            articles = data.get("feed", [])
+            if articles:
+                scores = [float(a.get("overall_sentiment_score", 0)) for a in articles[:5]]
+                return round(sum(scores) / len(scores), 3)
+    except Exception as e:  # noqa: BLE001
+        log(f"[Intel] AlphaVantage sentiment: {e}")
+    return 0.0
 
 
 def _get_macro_stub() -> dict[str, Any]:
@@ -138,18 +253,19 @@ def get_complete_briefing(
         log(f"[Intel] Session cache hit: {ds}")
         merged = dict(cached)
         merged["news"] = _benzinga_news(ticker, ds)
+        merged["cot_base"] = get_cftc_cot(ticker)
         return merged
 
     result: dict[str, Any] = {
-        "fear_greed": _get_fear_greed(),
+        "fear_greed": get_fear_greed(),
         "proxies": _get_proxies(),
-        "cot_base": _get_cot_stub(),
+        "cot_base": get_cftc_cot(ticker),
         "macro": _get_macro_stub(),
         "news": _benzinga_news(ticker, ds),
         "sources_available": {
             "fear_greed": True,
             "proxies": True,
-            "cot": False,
+            "cot": True,
             "fred": False,
             "news": False,
         },

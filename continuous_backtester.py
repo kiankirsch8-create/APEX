@@ -5,6 +5,26 @@ rolling stats, and periodic self-improvement. All state is simple JSON on ``DATA
 """
 from __future__ import annotations
 
+STRATEGY_VERSION = "v3.0-definitive"
+# Built from 300+ backtested trades — May 2026
+#
+# Baseline performance this was built from:
+#   135 trades: 48.9% WR, +$1,606, 4.4% max drawdown
+#   149 trades: 51.4% WR, +$1,991, 3.1% max drawdown
+#
+# RULES THAT MUST NEVER BE CHANGED:
+#   S04 never on 1H or 4H (proven 20%/37% WR losers)
+#   S08 never on 4H (proven 25% WR loser)
+#   strategy_met must be True to trade (no fallback trades)
+#   No weekly bias filter (blocked valid S04 extreme trades)
+#   Position sizing: HIGH=2%, MEDIUM=1%, LOW=0.5%
+#   Trailing: breakeven at TP1, +1R at TP2, 1.5R trail after TP3
+#   Max conviction score: 8 (lesson from -$300 loss at HIGH conf)
+#
+# TO ADD NEW STRATEGIES: create S19+, add to STRATEGIES dict,
+# give them LOW confidence until 30+ trades of data exist.
+# Never rewrite enforcement rules, position sizing, or trailing.
+
 import json
 import math
 import os
@@ -14,6 +34,7 @@ import threading
 import time
 import traceback
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -24,7 +45,8 @@ import pandas_ta  # noqa: F401
 
 from utils import DATA_DIR, env, load_json, log, save_json, utcnow_iso
 
-CLAUDE_MODEL = "claude-sonnet-4-5-20250929"
+MODEL = "claude-sonnet-4-5-20250929"
+CLAUDE_MODEL = MODEL
 
 RESULTS_FILE = DATA_DIR / "backtest_results.json"
 STATS_FILE = DATA_DIR / "backtest_stats.json"
@@ -35,79 +57,199 @@ IMPROVING_FILE = DATA_DIR / "improving.json"
 IMPROVE_DEBUG_FILE = DATA_DIR / "improve_debug.json"
 
 STARTING_CAPITAL = 10000.0
-POSITION_SIZE_PCT = 0.05  # 5% of capital
-LEVERAGE = 50  # 50x on notional exposure
+LEVERAGE = 50
 IMPROVE_EVERY = 100
 
+RISK_BY_CONFIDENCE: dict[str, float] = {
+    "HIGH": 0.020,
+    "MEDIUM": 0.010,
+    "LOW": 0.005,
+}
+POSITION_SIZE_PCT = RISK_BY_CONFIDENCE["MEDIUM"]
+
+MAX_STOP_PCT: dict[str, float] = {
+    "1w": 2.5,
+    "1d": 1.5,
+    "4h": 1.0,
+    "1h": 0.5,
+    "30m": 0.3,
+    "15m": 0.2,
+}
+
+TF_WEIGHTS: dict[str, float] = {
+    "1w": 0.20,
+    "1d": 0.50,
+    "4h": 0.20,
+    "1h": 0.05,
+    "30m": 0.03,
+    "15m": 0.02,
+}
+
+ALLOWED_1H_STRATEGIES: frozenset[str] = frozenset(
+    {
+        "S11_SR_FLIP",
+        "S02_LIQUIDITY_SWEEP",
+        "S17_LONDON_OPEN_BREAKOUT",
+    }
+)
+
+TIMEFRAMES: list[str] = ["15m", "30m", "1h", "4h", "1d", "1w"]
+
+TF_FORWARD_CANDLES: dict[str, int] = {
+    "15m": 96,
+    "30m": 72,
+    "1h": 48,
+    "4h": 30,
+    "1d": 20,
+    "1w": 8,
+}
+
+TF_MAX_STOP_PCT: dict[str, float] = {
+    "15m": MAX_STOP_PCT["15m"] / 100.0,
+    "30m": MAX_STOP_PCT["30m"] / 100.0,
+    "1h": MAX_STOP_PCT["1h"] / 100.0,
+    "4h": MAX_STOP_PCT["4h"] / 100.0,
+    "1d": MAX_STOP_PCT["1d"] / 100.0,
+    "1w": MAX_STOP_PCT["1w"] / 100.0,
+}
+
+TF_MAX_TP_PCT: dict[str, float] = {
+    "15m": 0.006,
+    "30m": 0.010,
+    "1h": 0.012,
+    "4h": 0.020,
+    "1d": 0.030,
+    "1w": 0.060,
+}
+
+TF_DESCRIPTIONS: dict[str, str] = {
+    "15m": "15M — intraday S13–S18; LOW confidence; news blackout aware",
+    "30m": "30M — intraday S13–S18; LOW confidence",
+    "1h": "1H — 23% WR; only S11 / S02 / S17 (enforced)",
+    "4h": "4H — S03 primary; no S04/S08 on 4H",
+    "1d": "1D — primary swing timeframe",
+    "1w": "1W — highest WR swing; S04 priority on extremes",
+}
+
+FORWARD_CANDLES = TF_FORWARD_CANDLES.get("4h", 30)
+
+_PROMPT_V3_FILE = Path(__file__).resolve().parent / "prompts" / "apex_master_v3.txt"
+
 STRATEGIES: dict[str, dict[str, Any]] = {
-    "S01_BREAKOUT_RETEST": {
-        "name": "Breakout & Retest",
-        "category": "TREND_FOLLOWING",
-        "description": "Price breaks level, retests it",
-    },
-    "S02_LIQUIDITY_SWEEP": {
-        "name": "Liquidity Sweep Reversal",
-        "category": "SMART_MONEY",
-        "description": "Stop hunt beyond cluster, reversal",
-    },
     "S03_EMA_PULLBACK": {
         "name": "EMA Trend Pullback",
         "category": "TREND_FOLLOWING",
-        "description": "Pullback to EMA in trending market",
+        "proven_wr": 57.7,
+        "best_tf": ["4h", "1w"],
+        "blocked_tf": [],
     },
     "S04_EXTREME_REVERSION": {
         "name": "Extreme Zone Reversion",
         "category": "MEAN_REVERSION",
-        "description": "52w extreme plus RSI extreme",
-    },
-    "S05_MACD_DIVERGENCE": {
-        "name": "MACD Divergence",
-        "category": "MOMENTUM",
-        "description": "Price and MACD momentum diverge",
-    },
-    "S06_ORDER_BLOCK": {
-        "name": "Institutional Order Block",
-        "category": "SMART_MONEY",
-        "description": "Unfilled institutional orders",
-    },
-    "S07_FAIR_VALUE_GAP": {
-        "name": "Fair Value Gap Fill",
-        "category": "SMART_MONEY",
-        "description": "Imbalance price returns to fill",
-    },
-    "S08_RANGE_BREAKOUT": {
-        "name": "Range Breakout",
-        "category": "BREAKOUT",
-        "description": "BB squeeze then explosive move",
-    },
-    "S09_NEWS_CATALYST": {
-        "name": "News Catalyst",
-        "category": "NEWS_DRIVEN",
-        "description": "Strong news drives momentum",
-    },
-    "S10_COT_DIVERGENCE": {
-        "name": "COT Institutional Flow",
-        "category": "INSTITUTIONAL",
-        "description": "Institutions repositioning via COT",
+        "proven_wr": 66.7,
+        "best_tf": ["1d", "1w"],
+        "blocked_tf": ["1h", "4h"],
     },
     "S11_SR_FLIP": {
         "name": "Support Resistance Flip",
         "category": "STRUCTURE",
-        "description": "Broken level flips its role",
+        "proven_wr": 100.0,
+        "best_tf": ["1h", "4h", "1d"],
+        "blocked_tf": [],
+    },
+    "S01_BREAKOUT_RETEST": {
+        "name": "Breakout Retest",
+        "category": "TREND_FOLLOWING",
+        "proven_wr": None,
+        "best_tf": ["4h", "1d"],
+        "blocked_tf": [],
+    },
+    "S02_LIQUIDITY_SWEEP": {
+        "name": "Liquidity Sweep Reversal",
+        "category": "SMART_MONEY",
+        "proven_wr": None,
+        "best_tf": ["1h", "4h"],
+        "blocked_tf": [],
+    },
+    "S05_MACD_DIVERGENCE": {
+        "name": "MACD Divergence",
+        "category": "MOMENTUM",
+        "proven_wr": None,
+        "best_tf": ["4h", "1d"],
+        "blocked_tf": [],
+    },
+    "S06_ORDER_BLOCK": {
+        "name": "Institutional Order Block",
+        "category": "SMART_MONEY",
+        "proven_wr": None,
+        "best_tf": ["4h", "1d"],
+        "blocked_tf": [],
+    },
+    "S07_FAIR_VALUE_GAP": {
+        "name": "Fair Value Gap Fill",
+        "category": "SMART_MONEY",
+        "proven_wr": None,
+        "best_tf": ["4h", "1d"],
+        "blocked_tf": [],
+    },
+    "S08_RANGE_BREAKOUT": {
+        "name": "Range Breakout",
+        "category": "BREAKOUT",
+        "proven_wr": 44.4,
+        "best_tf": ["1d"],
+        "blocked_tf": ["4h"],
     },
     "S12_VOLATILITY_COMPRESSION": {
         "name": "Volatility Compression",
         "category": "BREAKOUT",
-        "description": "Tight BB then explosive breakout",
+        "proven_wr": None,
+        "best_tf": ["1d"],
+        "blocked_tf": [],
     },
-    "S00_BEST_AVAILABLE": {
-        "name": "Best Available",
-        "category": "FALLBACK",
-        "description": "Zone plus trend plus momentum",
+    "S13_NEWS_MOMENTUM": {
+        "name": "News Momentum",
+        "category": "NEWS_DRIVEN",
+        "proven_wr": None,
+        "best_tf": ["15m", "30m"],
+        "blocked_tf": ["1h", "4h", "1d", "1w"],
+    },
+    "S14_OPENING_RANGE_BREAKOUT": {
+        "name": "Opening Range Breakout",
+        "category": "INTRADAY",
+        "proven_wr": None,
+        "best_tf": ["15m", "30m"],
+        "blocked_tf": ["1h", "4h", "1d", "1w"],
+    },
+    "S15_VWAP_DEVIATION": {
+        "name": "VWAP Deviation Reversion",
+        "category": "INTRADAY",
+        "proven_wr": None,
+        "best_tf": ["15m", "30m"],
+        "blocked_tf": ["1h", "4h", "1d", "1w"],
+    },
+    "S16_HTF_LEVEL_REJECTION": {
+        "name": "HTF Level Rejection",
+        "category": "INTRADAY",
+        "proven_wr": None,
+        "best_tf": ["15m", "30m"],
+        "blocked_tf": ["1h", "4h", "1d", "1w"],
+    },
+    "S17_LONDON_OPEN_BREAKOUT": {
+        "name": "London Open Breakout",
+        "category": "INTRADAY",
+        "proven_wr": None,
+        "best_tf": ["15m", "30m", "1h"],
+        "blocked_tf": ["4h", "1d", "1w"],
+    },
+    "S18_NY_OPEN_MOMENTUM": {
+        "name": "NY Open Momentum",
+        "category": "INTRADAY",
+        "proven_wr": None,
+        "best_tf": ["15m", "30m"],
+        "blocked_tf": ["1h", "4h", "1d", "1w"],
     },
 }
 
-# --- Hard exclusions (``run_one_backtest`` early return) ---
 EXCLUDED_PAIRS = frozenset(
     {
         "AUDCAD",
@@ -133,88 +275,33 @@ EXCLUDED_PAIRS = frozenset(
     }
 )
 
-PRIORITY_PAIRS = frozenset(
-    {
-        "EURUSD",
-        "GBPUSD",
-        "USDCAD",
-        "USDSEK",
-        "NZDUSD",
-        "EURAUD",
-        "USDZAR",
-        "AUDUSD",
-        "USDJPY",
-    }
-)
+PRIORITY_ORDER: list[str] = [
+    "EURNZD",
+    "NZDCAD",
+    "GBPNZD",
+    "EURAUD",
+    "CADJPY",
+    "EURUSD",
+    "AUDUSD",
+    "USDCAD",
+    "EURGBP",
+    "USDSEK",
+    "USDNOK",
+    "USDMXN",
+    "GBPJPY",
+    "USDJPY",
+    "NZDUSD",
+    "USDZAR",
+    "AUDJPY",
+    "GBPUSD",
+]
+PRIORITY_PAIRS = frozenset(PRIORITY_ORDER)
 
 HARD_EXCLUDED_TICKERS = sorted(EXCLUDED_PAIRS)
 
-EXOTIC_REDUCE = frozenset(
-    {
-        "USDZAR",
-        "USDTRY",
-        "USDMXN",
-        "USDDKK",
-        "USDSEK",
-        "USDNOK",
-        "USDPLN",
-        "USDCZK",
-        "USDHUF",
-        "USDSGD",
-        "USDHKD",
-        "NZDCAD",
-        "GBPNZD",
-    }
-)
+EXOTIC_REDUCE: frozenset[str] = frozenset()
 
 BANNED_SIGNALS: list[str] = []
-
-# --- Multi-timeframe backtest universe ---
-TF_WEIGHTS = {
-    "1h": 0.05,
-    "4h": 0.20,
-    "1d": 0.55,
-    "1w": 0.20,
-}
-
-ALLOWED_1H_STRATEGIES: frozenset[str] = frozenset(
-    {
-        "S11_SR_FLIP",
-    }
-)
-
-TIMEFRAMES: list[str] = ["1h", "4h", "1d", "1w"]
-
-TF_FORWARD_CANDLES: dict[str, int] = {
-    "1h": 48,
-    "4h": 30,
-    "1d": 20,
-    "1w": 8,
-}
-
-TF_MAX_STOP_PCT: dict[str, float] = {
-    "1h": 0.008,
-    "4h": 0.012,
-    "1d": 0.018,
-    "1w": 0.030,
-}
-
-TF_MAX_TP_PCT: dict[str, float] = {
-    "1h": 0.012,
-    "4h": 0.020,
-    "1d": 0.030,
-    "1w": 0.060,
-}
-
-TF_DESCRIPTIONS: dict[str, str] = {
-    "1h": "1H — 23% WR in data; only S11_SR_FLIP; else skip (system enforced)",
-    "4h": "4H — secondary; use rarely vs daily",
-    "1d": "Daily PRIMARY — cleanest signals (~54% WR in backtests); hold ~3–20 days",
-    "1w": "1W — 65% WR in data; S04 priority",
-}
-
-# Legacy default horizon (prefer TF_FORWARD_CANDLES per timeframe).
-FORWARD_CANDLES = TF_FORWARD_CANDLES.get("4h", 30)
 
 BACKTEST_TICKERS = [
     # Major pairs
@@ -273,11 +360,11 @@ BACKTEST_TICKERS = [
 
 
 def pick_backtest_ticker() -> str:
-    """Prefer PRIORITY_PAIRS (~65%) among symbols not in EXCLUDED_PAIRS."""
+    """Prefer PRIORITY pairs among symbols not in EXCLUDED_PAIRS."""
     eligible = [t for t in BACKTEST_TICKERS if t not in EXCLUDED_PAIRS]
     if not eligible:
         return "EURUSD"
-    priority = [t for t in eligible if t in PRIORITY_PAIRS]
+    priority = [t for t in PRIORITY_ORDER if t in eligible]
     other = [t for t in eligible if t not in PRIORITY_PAIRS]
     if priority and random.random() < 0.65:
         return random.choice(priority)
@@ -512,6 +599,8 @@ def get_ohlcv(
     """Fetch OHLCV for backtest window; resample 1h→4h when needed."""
     tf_key = timeframe.lower().strip()
     tf_cfg: dict[str, dict[str, Any]] = {
+        "15m": {"interval": "15m", "days_back": 60, "days_fwd": 7},
+        "30m": {"interval": "30m", "days_back": 120, "days_fwd": 14},
         "1h": {"interval": "1h", "days_back": 180, "days_fwd": 14},
         "4h": {"interval": "1h", "resample": "4h", "days_back": 365, "days_fwd": 30},
         "1d": {"interval": "1d", "days_back": 730, "days_fwd": 60},
@@ -549,173 +638,170 @@ def validate_rr(plan: dict[str, Any]) -> dict[str, Any]:
     return plan
 
 
-def _tp_r_multiples(strategy_id: str, tf_key: str) -> tuple[float, float, float]:
-    """Risk multiples (R) for TP1/TP2/TP3 by strategy and timeframe (Section 1B)."""
-    sid = (strategy_id or "").strip().upper()
-    tf = (tf_key or "").lower().strip()
-    if sid == "S04_EXTREME_REVERSION":
-        return (2.0, 3.5, 6.0)
-    if sid == "S03_EMA_PULLBACK":
-        if tf == "1w":
-            return (2.0, 4.0, 7.0)
-        if tf == "4h":
-            return (2.0, 3.0, 5.0)
-        return (2.0, 3.0, 5.0)
-    return (2.0, 3.0, 5.0)
-
-
 def near_major_news_calendar(_sym: str, _analysis_date: str) -> bool:
-    """Reserved: economic calendar proximity (Section 4E). Not wired — returns False."""
+    """Reserved hook — Finnhub calendar handled in ``market_intelligence.is_news_blackout``."""
     return False
 
 
-def _s04_zone_extreme_ok(direction: str, zone_pct: float) -> tuple[bool, str]:
-    """S04 allowed only in 52w zone extreme (Python hard gate — no RSI/ADX workaround)."""
-    try:
-        z = float(zone_pct)
-    except (TypeError, ValueError):
-        return False, "S04 zone gate: invalid zone_pct"
-    if not math.isfinite(z):
-        return False, "S04 zone gate: non-finite zone_pct"
-    d = (direction or "").strip().upper()
-    if d == "LONG":
-        if z >= 15.0:
-            return False, f"S04 zone gate: LONG needs zone <15% (got {z:.1f}%)"
-    elif d == "SHORT":
-        if z <= 85.0:
-            return False, f"S04 zone gate: SHORT needs zone >85% (got {z:.1f}%)"
-    else:
-        return False, "S04 zone gate: invalid direction"
-    return True, ""
-
-
-def _s03_chart_three_of_four_ok(
-    direction: str, price: float, ind: dict[str, Any]
-) -> tuple[bool, str]:
-    """S03 requires 3 of 4 chart facts (same definitions as the master prompt)."""
-    d = (direction or "").strip().upper()
-    try:
-        e20 = float(ind.get("ema20") or 0)
-        e50 = float(ind.get("ema50") or 0)
-        e200 = float(ind.get("ema200") or 0)
-        atr = float(ind.get("atr") or 0)
-        rsi = float(ind.get("rsi") or 50)
-        adx = float(ind.get("adx") or 0)
-        px = float(price)
-    except (TypeError, ValueError):
-        return False, "S03 chart gate: invalid indicators"
-    if not all(math.isfinite(x) for x in (e20, e50, e200, atr, rsi, adx, px)):
-        return False, "S03 chart gate: non-finite indicators"
-    if d == "LONG":
-        sig_ema = e20 > e50 > e200
-    elif d == "SHORT":
-        sig_ema = e20 < e50 < e200
-    else:
-        return False, "S03 chart gate: invalid direction"
-    sig_pullback = atr > 0 and min(abs(px - e20), abs(px - e50)) <= 2.0 * atr
-    sig_rsi = 25.0 <= rsi <= 70.0
-    sig_adx = adx > 15.0
-    n = int(sig_ema) + int(sig_pullback) + int(sig_rsi) + int(sig_adx)
-    if n < 3:
-        return False, (
-            f"S03 chart gate: {n}/4 (need EMA stack, 2xATR to EMA20/50, RSI 25–70, ADX>15)"
-        )
-    return True, ""
-
-
-def compute_confluence_score(
+def _load_master_prompt_v3(
     *,
-    sym: str,
-    direction: str,
+    ticker: str,
+    tf_label: str,
+    analysis_date: str,
+    price: float,
+    zone_label: str,
     zone_pct: float,
-    rsi: float,
-    adx: float,
-    macd_hist: float,
-    strategy_id: str,
+    high_52w: float,
+    low_52w: float,
+    ind: dict[str, Any],
+    bb_width: float,
+    intel_text: str,
     news_sentiment: float,
+    cot_bias: str,
     fear_greed: float,
-) -> int:
-    """0–10 confluence score for logging / optional sizing (not a trade gate)."""
-    score = 0
-    d = (direction or "").strip().upper()
-    sid = (strategy_id or "").strip().upper()
+    vix_val: float,
+) -> str:
+    tpl = _PROMPT_V3_FILE.read_text(encoding="utf-8")
+    return tpl.format(
+        ticker=ticker,
+        tf_label=tf_label,
+        analysis_date=analysis_date,
+        price=price,
+        zone_label=zone_label,
+        zone_pct=zone_pct,
+        high_52w=high_52w,
+        low_52w=low_52w,
+        rsi=float(ind.get("rsi", 50) or 50),
+        macd_hist=float(ind.get("macd_hist", 0) or 0),
+        macd_line=float(ind.get("macd_line", 0) or 0),
+        macd_sig=float(ind.get("macd_signal", 0) or 0),
+        ema20=float(ind.get("ema20", price) or price),
+        ema50=float(ind.get("ema50", price) or price),
+        ema200=float(ind.get("ema200", price) or price),
+        atr=float(ind.get("atr", 0) or 0),
+        adx=float(ind.get("adx", 0) or 0),
+        bb_width=bb_width,
+        bb_upper=float(ind.get("bb_upper", price) or price),
+        bb_lower=float(ind.get("bb_lower", price) or price),
+        swing_highs=ind.get("swing_highs", []),
+        swing_lows=ind.get("swing_lows", []),
+        intel_text=intel_text,
+        news_sentiment=news_sentiment,
+        cot_bias=cot_bias,
+        fear_greed=fear_greed,
+        vix_val=vix_val,
+    )
+
+
+def enforce_rules(ai: dict[str, Any], timeframe: str, price: float, ticker: str) -> dict[str, Any]:
+    """Post-parse enforcement — cannot be overridden by model text."""
+    tf = (timeframe or "").strip().lower()
+    strategy_id = str(ai.get("strategy_id") or "SKIP").strip().upper()
+    direction = str(ai.get("direction", "NONE")).strip().upper()
     try:
-        z = float(zone_pct)
+        entry = float(ai.get("entry", price) or price)
     except (TypeError, ValueError):
-        z = 50.0
+        entry = float(price)
     try:
-        r = float(rsi)
+        stop = float(ai.get("stop_loss", 0) or 0)
     except (TypeError, ValueError):
-        r = 50.0
+        stop = 0.0
     try:
-        ax = float(adx)
+        zone_pct = float(ai.get("zone_pct", 50) or 50)
     except (TypeError, ValueError):
-        ax = 0.0
+        zone_pct = 50.0
+    strategy_met = bool(ai.get("strategy_met", False))
+
+    if ai.get("skip_trade", False):
+        return ai
+
+    if not strategy_met:
+        ai["skip_trade"] = True
+        ai["skip_reason"] = "strategy_met=False — no fallback trades allowed"
+        return ai
+
+    if strategy_id == "S04_EXTREME_REVERSION":
+        if tf in ("1h", "4h"):
+            ai["skip_trade"] = True
+            ai["skip_reason"] = f"S04 blocked on {tf}: proven loser (4H=37%, 1H=20%)"
+            return ai
+        if not (zone_pct <= 15 or zone_pct >= 85):
+            ai["skip_trade"] = True
+            ai["skip_reason"] = (
+                f"S04 zone {zone_pct:.1f}% not extreme — need below 15 or above 85"
+            )
+            return ai
+
+    if strategy_id == "S08_RANGE_BREAKOUT" and tf == "4h":
+        ai["skip_trade"] = True
+        ai["skip_reason"] = "S08 blocked on 4H — proven 25% WR"
+        return ai
+
+    if tf == "1h":
+        allowed_1h = ("S11_SR_FLIP", "S02_LIQUIDITY_SWEEP", "S17_LONDON_OPEN_BREAKOUT")
+        if strategy_id not in allowed_1h:
+            ai["skip_trade"] = True
+            ai["skip_reason"] = f"1H blocked: {strategy_id} not allowed (1H overall 23% WR)"
+            return ai
+        ai["confidence"] = "LOW"
+
+    intraday_only = (
+        "S13_NEWS_MOMENTUM",
+        "S14_OPENING_RANGE_BREAKOUT",
+        "S15_VWAP_DEVIATION",
+        "S16_HTF_LEVEL_REJECTION",
+        "S18_NY_OPEN_MOMENTUM",
+    )
+    if strategy_id in intraday_only and tf not in ("15m", "30m"):
+        ai["skip_trade"] = True
+        ai["skip_reason"] = f"{strategy_id} only on 15m/30m"
+        return ai
+
+    if strategy_id == "S17_LONDON_OPEN_BREAKOUT" and tf not in ("15m", "30m", "1h"):
+        ai["skip_trade"] = True
+        ai["skip_reason"] = "S17 only on 15m/30m/1h"
+        return ai
+
     try:
-        mh = float(macd_hist)
+        ai["conviction_score"] = min(int(round(float(ai.get("conviction_score", 5)))), 8)
     except (TypeError, ValueError):
-        mh = 0.0
+        ai["conviction_score"] = 5
 
-    if z < 15 or z > 85:
-        score += 3
-    elif z < 20 or z > 80:
-        score += 2
+    if stop and entry and abs(stop - entry) > 1e-12:
+        stop_dist_pct = abs(entry - stop) / entry * 100.0
+        max_stop = float(MAX_STOP_PCT.get(tf, 1.5))
+        if stop_dist_pct > max_stop + 1e-9:
+            log(f"[StopFix] {ticker} stop {stop_dist_pct:.2f}% capped at {max_stop}%", level="info")
+            mult = 1 if direction == "LONG" else -1
+            new_stop = entry * (1.0 - mult * max_stop / 100.0)
+            risk = abs(entry - new_stop)
+            ai["stop_loss"] = round(new_stop, 5)
+            ai["tp1"] = round(entry + mult * risk * 2.0, 5)
+            ai["tp2"] = round(entry + mult * risk * 3.0, 5)
+            ai["tp3"] = round(entry + mult * risk * 5.0, 5)
 
-    if sid == "S04_EXTREME_REVERSION":
-        if (d == "LONG" and r < 35) or (d == "SHORT" and r > 65):
-            score += 2
-        elif (d == "LONG" and r < 40) or (d == "SHORT" and r > 60):
-            score += 1
-    else:
-        # S03 window (no RSI>50 / directional-momentum tier)
-        if 25 <= r <= 70:
-            score += 2
-        elif 20 <= r < 25 or 70 < r <= 75:
-            score += 1
+    conf = str(ai.get("confidence", "LOW")).strip().upper()
+    if conf not in RISK_BY_CONFIDENCE:
+        conf = "LOW"
+    risk_pct = float(RISK_BY_CONFIDENCE.get(conf, 0.005))
+    risk_dollars = STARTING_CAPITAL * risk_pct
+    try:
+        entry = float(ai.get("entry", price) or price)
+        stop = float(ai.get("stop_loss", 0) or 0)
+    except (TypeError, ValueError):
+        entry, stop = float(price), 0.0
+    stop_dist = abs(entry - stop)
+    if stop_dist > 0:
+        pos_size = risk_dollars / stop_dist
+        exposure = pos_size * entry
+        if exposure < 1500:
+            pos_size = 1500.0 / entry
+        ai["_position_size"] = round(pos_size, 2)
+        ai["_leveraged_exposure"] = round(pos_size * entry, 2)
+        ai["_max_risk_dollars"] = round(risk_dollars, 2)
+        ai["_account_risk_pct"] = risk_pct
 
-    if sid == "S04_EXTREME_REVERSION":
-        if ax < 45:
-            score += 2
-        elif ax < 50:
-            score += 1
-    else:
-        if ax > 30:
-            score += 2
-        elif ax > 15:
-            score += 1
-
-    if (d == "LONG" and mh > 0) or (d == "SHORT" and mh < 0):
-        score += 1
-
-    if (d == "LONG" and news_sentiment > 0.15) or (d == "SHORT" and news_sentiment < -0.15):
-        score += 1
-    if (d == "LONG" and fear_greed < 35) or (d == "SHORT" and fear_greed > 65):
-        score += 1
-
-    return max(0, min(10, score))
-
-
-def calculate_trade_risk(
-    account_balance: float,
-    *,
-    confidence: str,
-) -> dict[str, Any]:
-    """Max loss budget from confidence: HIGH 2%, MEDIUM 1%, LOW 0.5% of account."""
-    c = (confidence or "MEDIUM").strip().upper()
-    if c == "HIGH":
-        pct = 0.02
-    elif c == "LOW":
-        pct = 0.005
-    else:
-        pct = 0.01
-    pct = min(float(pct), 0.025)
-    return {
-        "skip": False,
-        "reason": "",
-        "risk_pct": pct,
-        "max_risk_dollars": round(float(account_balance) * pct, 2),
-        "confidence_tier": c,
-    }
+    return ai
 
 
 def _sanitize_signal_lists(ai: dict[str, Any]) -> None:
@@ -745,7 +831,7 @@ def calculate_position_size(
     conviction_score: int,
     account_balance: float,
 ) -> dict[str, Any]:
-    """Legacy sizing — main path uses ``calculate_trade_risk`` (confidence-based)."""
+    """Legacy sizing helper — main backtest path uses ``enforce_rules`` position fields."""
     c = (confidence or "MEDIUM").strip().upper()
     if c == "HIGH" and strategy_met:
         risk_pct = 0.02
@@ -766,9 +852,8 @@ def calculate_position_size(
 
 def validate_stop_loss(entry: float, stop: float, direction: str, timeframe: str) -> float:
     """Cap stop distance from entry by timeframe (max % move against position)."""
-    MAX_STOP_PCT = {"1h": 0.008, "4h": 0.015, "1d": 0.015, "1w": 0.025}
     tf = timeframe.lower().strip()
-    max_pct = MAX_STOP_PCT.get(tf, 0.015)
+    max_pct = float(MAX_STOP_PCT.get(tf, 1.5)) / 100.0
     try:
         e = float(entry)
         s = float(stop)
@@ -815,17 +900,32 @@ def evaluate_forward_candles(
     tp2: float,
     tp3: float,
     forward_df: pd.DataFrame,
-    strategy_id: str,
-    timeframe_key: str = "4h",
+    strategy_id: str = "",
 ) -> dict[str, Any]:
-    """Trailing-stop forward simulation; profiles for 1W/1D vs 4H/1H (Section 4B)."""
+    """Trailing: breakeven at TP1, +1R at TP2, 1.5R trail from close after TP3 (master v3)."""
     _ = strategy_id
     if forward_df is None or forward_df.empty:
         return {
             "outcome": "NO_DATA",
             "exit_price": entry,
             "exit_reason": "No forward data",
-            "pnl_pct": 0.0,
+            "pnl_pct": 0,
+            "hit_tp1": False,
+            "hit_tp2": False,
+            "hit_tp3": False,
+            "hit_stop": False,
+            "candles_to_exit": 0,
+            "trailing_activated": False,
+            "final_stop": stop_loss,
+        }
+
+    risk = abs(float(entry) - float(stop_loss))
+    if risk <= 0:
+        return {
+            "outcome": "INVALID",
+            "exit_price": entry,
+            "exit_reason": "Invalid risk",
+            "pnl_pct": 0,
             "hit_tp1": False,
             "hit_tp2": False,
             "hit_tp3": False,
@@ -836,40 +936,14 @@ def evaluate_forward_candles(
         }
 
     current_stop = float(stop_loss)
-    hit_tp1 = False
-    hit_tp2 = False
-    hit_tp3 = False
-    hit_stop = False
+    hit_tp1 = hit_tp2 = hit_tp3 = hit_stop = False
     trailing_activated = False
     exit_price = float(entry)
     exit_reason = "Window ended"
     candle_count = 0
-
     d = str(direction or "").strip().upper()
-    if d == "LONG":
-        risk = float(entry) - float(stop_loss)
-    else:
-        risk = float(stop_loss) - float(entry)
 
-    if risk <= 0:
-        return {
-            "outcome": "INVALID",
-            "exit_price": float(entry),
-            "exit_reason": "Invalid risk",
-            "pnl_pct": 0.0,
-            "hit_tp1": False,
-            "hit_tp2": False,
-            "hit_tp3": False,
-            "hit_stop": False,
-            "candles_to_exit": 0,
-            "trailing_activated": False,
-            "final_stop": float(stop_loss),
-        }
-
-    tfk = (timeframe_key or "4h").lower().strip()
-    htf = tfk in ("1w", "1d")
-
-    for _idx, candle in forward_df.iterrows():
+    for _, candle in forward_df.iterrows():
         candle_count += 1
         try:
             high = float(candle.get("High", entry))
@@ -882,121 +956,55 @@ def evaluate_forward_candles(
             if low <= current_stop:
                 hit_stop = True
                 exit_price = current_stop
-                exit_reason = "Trailing stop hit" if trailing_activated else "Stop loss hit"
+                exit_reason = "Trailing stop" if trailing_activated else "Stop loss"
                 break
 
-            if htf:
-                if high >= tp3 and not hit_tp3:
-                    hit_tp3 = True
-                    current_stop = float(entry) + risk * 2.0
-                    trailing_activated = True
-                if high >= tp2 and not hit_tp2:
-                    hit_tp2 = True
-                    if not hit_tp3:
-                        current_stop = float(entry) + risk * 1.5
-                    trailing_activated = True
-                if high >= tp1 and not hit_tp1:
-                    hit_tp1 = True
-                    if not hit_tp2 and not hit_tp3:
-                        current_stop = float(entry) + risk * 0.5
-                    trailing_activated = True
-                freeze_trail = candle_count <= 5
-                if hit_tp1 and trailing_activated and not freeze_trail:
-                    if hit_tp3:
-                        trail_mult = 2.0
-                    elif hit_tp2:
-                        trail_mult = 1.0
-                    else:
-                        trail_mult = 0.0
-                    if trail_mult > 0:
-                        new_trail = close - risk * trail_mult
-                        if new_trail > current_stop:
-                            current_stop = new_trail
-            else:
-                if high >= tp3 and not hit_tp3:
-                    hit_tp3 = True
-                    current_stop = float(entry) + risk * 2
-                    trailing_activated = True
-                if high >= tp2 and not hit_tp2:
-                    hit_tp2 = True
-                    if not hit_tp3:
-                        current_stop = float(entry) + risk * 1
-                    trailing_activated = True
-                if high >= tp1 and not hit_tp1:
-                    hit_tp1 = True
-                    if not hit_tp2 and not hit_tp3:
-                        current_stop = float(entry)
-                    trailing_activated = True
-                if hit_tp1 and trailing_activated:
-                    if hit_tp3:
-                        trail_mult = 1.5
-                    elif hit_tp2:
-                        trail_mult = 1.0
-                    else:
-                        trail_mult = 1.5
-                    new_trail = close - risk * trail_mult
-                    if new_trail > current_stop:
-                        current_stop = new_trail
+            if high >= tp3 and not hit_tp3:
+                hit_tp3 = True
+                trailing_activated = True
+                current_stop = float(entry) + risk * 2.0
+
+            elif high >= tp2 and not hit_tp2:
+                hit_tp2 = True
+                trailing_activated = True
+                current_stop = float(entry) + risk * 1.0
+
+            elif high >= tp1 and not hit_tp1:
+                hit_tp1 = True
+                trailing_activated = True
+                current_stop = float(entry)
+
+            if hit_tp1 and trailing_activated:
+                trail_level = close - risk * 1.5
+                if trail_level > current_stop:
+                    current_stop = trail_level
 
         else:
             if high >= current_stop:
                 hit_stop = True
                 exit_price = current_stop
-                exit_reason = "Trailing stop hit" if trailing_activated else "Stop loss hit"
+                exit_reason = "Trailing stop" if trailing_activated else "Stop loss"
                 break
 
-            if htf:
-                if low <= tp3 and not hit_tp3:
-                    hit_tp3 = True
-                    current_stop = float(entry) - risk * 2.0
-                    trailing_activated = True
-                if low <= tp2 and not hit_tp2:
-                    hit_tp2 = True
-                    if not hit_tp3:
-                        current_stop = float(entry) - risk * 1.5
-                    trailing_activated = True
-                if low <= tp1 and not hit_tp1:
-                    hit_tp1 = True
-                    if not hit_tp2 and not hit_tp3:
-                        current_stop = float(entry) - risk * 0.5
-                    trailing_activated = True
-                freeze_trail = candle_count <= 5
-                if hit_tp1 and trailing_activated and not freeze_trail:
-                    if hit_tp3:
-                        trail_mult = 2.0
-                    elif hit_tp2:
-                        trail_mult = 1.0
-                    else:
-                        trail_mult = 0.0
-                    if trail_mult > 0:
-                        new_trail = close + risk * trail_mult
-                        if new_trail < current_stop:
-                            current_stop = new_trail
-            else:
-                if low <= tp3 and not hit_tp3:
-                    hit_tp3 = True
-                    current_stop = float(entry) - risk * 2
-                    trailing_activated = True
-                if low <= tp2 and not hit_tp2:
-                    hit_tp2 = True
-                    if not hit_tp3:
-                        current_stop = float(entry) - risk * 1
-                    trailing_activated = True
-                if low <= tp1 and not hit_tp1:
-                    hit_tp1 = True
-                    if not hit_tp2 and not hit_tp3:
-                        current_stop = float(entry)
-                    trailing_activated = True
-                if hit_tp1 and trailing_activated:
-                    if hit_tp3:
-                        trail_mult = 1.5
-                    elif hit_tp2:
-                        trail_mult = 1.0
-                    else:
-                        trail_mult = 1.5
-                    new_trail = close + risk * trail_mult
-                    if new_trail < current_stop:
-                        current_stop = new_trail
+            if low <= tp3 and not hit_tp3:
+                hit_tp3 = True
+                trailing_activated = True
+                current_stop = float(entry) - risk * 2.0
+
+            elif low <= tp2 and not hit_tp2:
+                hit_tp2 = True
+                trailing_activated = True
+                current_stop = float(entry) - risk * 1.0
+
+            elif low <= tp1 and not hit_tp1:
+                hit_tp1 = True
+                trailing_activated = True
+                current_stop = float(entry)
+
+            if hit_tp1 and trailing_activated:
+                trail_level = close + risk * 1.5
+                if trail_level < current_stop:
+                    current_stop = trail_level
 
     if not hit_stop and not forward_df.empty:
         try:
@@ -1009,10 +1017,8 @@ def evaluate_forward_candles(
     else:
         pnl_pct = (float(entry) - exit_price) / float(entry) if entry else 0.0
 
-    outcome = "WIN" if pnl_pct > 0 else "LOSS"
-
     return {
-        "outcome": outcome,
+        "outcome": "WIN" if pnl_pct > 0 else "LOSS",
         "exit_price": round(exit_price, 5),
         "exit_reason": exit_reason,
         "pnl_pct": round(pnl_pct, 6),
@@ -1155,7 +1161,13 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
         past, future = get_ohlcv(yf_ticker, tf_key, analysis_date.strip())
         if past is None or future is None or past.empty or future.empty:
             return None
-        min_past = 30 if tf_key == "1w" else 50
+        min_past = (
+            30
+            if tf_key == "1w"
+            else 40
+            if tf_key in ("15m", "30m")
+            else 50
+        )
         if len(past) < min_past:
             return None
         fwd_n = int(TF_FORWARD_CANDLES.get(tf_key, FORWARD_CANDLES))
@@ -1283,9 +1295,6 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
         )
 
         is_exotic = sym in EXOTIC_REDUCE
-        fp = float(price)
-        dist_hi_pct = round(((high_52w - fp) / fp * 100), 2) if fp else 0.0
-        dist_lo_pct = round(((fp - low_52w) / fp * 100), 2) if fp else 0.0
 
         bb_mid_val = float(ind.get("bb_mid", price) or price)
         if not math.isfinite(bb_mid_val) or bb_mid_val <= 0:
@@ -1299,7 +1308,6 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
             bb_width = 2.0
         macd_line = float(ind.get("macd_line", 0) or 0)
         macd_signal = float(ind.get("macd_signal", 0) or 0)
-        macd_signal_line = macd_signal
         macd_sig = macd_signal
 
         intel_text = ""
@@ -1308,7 +1316,11 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
         fear_greed = 50.0
         vix_val = 20.0
         try:
-            from market_intelligence import format_for_prompt, get_complete_briefing
+            from market_intelligence import (
+                format_for_prompt,
+                get_complete_briefing,
+                is_news_blackout,
+            )
 
             briefing = get_complete_briefing(sym, analysis_date.strip(), past)
             intel_text = format_for_prompt(briefing)
@@ -1322,352 +1334,52 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
                 .get("value", 20)
                 or 20
             )
+
+            if is_news_blackout(30) and tf_key in ("15m", "30m", "1h"):
+                log(
+                    f"[NewsBlackout] Skipping {sym} — high impact event within 30min",
+                    level="info",
+                )
+                return _skipped_backtest_row(
+                    sym=sym,
+                    timeframe=timeframe,
+                    analysis_date=analysis_date,
+                    price=float(price),
+                    zone_pct=zone_pct,
+                    zone_label=zone_label,
+                    skip_reason="News blackout — high impact event within 30min",
+                    ai={
+                        "skip_trade": True,
+                        "strategy_id": "SKIP",
+                        "strategy_met": False,
+                        "skip_reason": "News blackout — high impact event within 30min",
+                        "direction": "NONE",
+                        "conviction_score": 0,
+                    },
+                    tf_key=tf_key,
+                    is_exotic=is_exotic,
+                )
         except Exception as e:
             log(f"[Intel] {e}")
 
-        prompt = f"""You are APEX, the world's most disciplined quantitative forex trader.
-You have backtested 166 trades and learned exactly what works and what destroys capital.
-You are aggressive in pursuing high-quality setups but completely disciplined in refusing bad ones.
-You never rationalize 'close enough.' You never say RSI 62 is 'near' 65. Either the signal qualifies fully or it doesn't.
-
-Your edge comes from QUALITY not QUANTITY. You will skip about 70% of setups.
-Every trade must have minimum 1:2 R/R from structural stop to TP2 before entry (Python-enforced).
-
-ADX between 15-29 does NOT confirm a trend — that range is consolidation or noise.
-Only ADX > 30 confirms trend-following entries. The label ADX_TRENDING is ABOLISHED (28.6% WR, -$363);
-never reference it. Use ADX_TREND_CONFIRMED only when ADX > 30 (and rising for S03).
-For S03 EMA pullback specifically, the minimum trend filter is ADX above 15 (57.7% WR in your data); ADX > 25 was too strict and killed valid trades.
-RSI_NEUTRAL_ROOM is ABOLISHED (29.4% WR, -$432); never use that label. S03 uses RSI between 25 and 70 only (Python chart gate — no separate RSI>50 rule).
-
-WHAT HAS BEEN PROVEN TO WORK (real backtest data):
-- USDCAD S04 extreme discount: +$909 cluster across standout trades
-- USDSEK S04 extreme discount: +$367 combined
-- GBPUSD 1W S03 clean pullback: strong positive runs
-- S04 with ALL extreme signals aligned: historically 65%+ WR when fully qualified
-
-WHAT HAS BEEN PROVEN TO LOSE:
-- S04 when 52w zone is NOT extreme (Python skips — no exceptions)
-- ADX_TRENDING / RSI_NEUTRAL_ROOM: never use these labels again
-
-═══════════════════════════════════════════
-LIVE MARKET DATA
-═══════════════════════════════════════════
-Asset: {sym}
-Timeframe: {TF_DESCRIPTIONS.get(tf_key, tf_key)}
-Date: {analysis_date}
-Price: {price:.5f}
-
-52w Zone: {zone_label} ({zone_pct:.1f}%)
-52w High: {high_52w:.5f}
-52w Low: {low_52w:.5f}
-
-RSI: {ind["rsi"]:.1f}
-MACD Histogram: {ind["macd_hist"]:.6f}
-MACD Line vs Signal: {macd_line:.6f} / {macd_sig:.6f}
-EMA20: {ind["ema20"]:.5f}
-EMA50: {ind["ema50"]:.5f}
-EMA200: {ind["ema200"]:.5f}
-ATR: {ind["atr"]:.5f}
-ADX: {ind["adx"]:.1f}
-BB Width: {bb_width:.2f}%
-BB Upper: {ind["bb_upper"]:.5f}
-BB Lower: {ind["bb_lower"]:.5f}
-Swing Highs: {ind.get("swing_highs", [])}
-Swing Lows: {ind.get("swing_lows", [])}
-
-{intel_text}
-
-═══════════════════════════════════════════
-YOUR PROVEN PERFORMANCE (135 real trades)
-Use this data to guide every decision
-═══════════════════════════════════════════
-
-STRATEGY RESULTS:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✅ S03 EMA PULLBACK:     57.7% WR +$392 (26 trades)
-  4H: 66.7% WR ✅  1D: 50.0% WR ⚠️  1W: 66.7% WR ✅
-
-✅ S04 EXTREME REVERSION: 53.2% WR +$905 (47 trades)
-  1H: 20.0% WR ❌  4H: 37.5% WR ❌
-  1D: 66.7% WR ✅  1W: 75.0% WR ✅
-
-✅ S11 SR FLIP:           100% WR +$44  (2 trades - needs more data)
-
-⚠️ S08 RANGE BREAKOUT:   44.4% WR -$183 (9 trades - WEAK)
-  4H: 25.0% WR ❌  1D: 60.0% WR ⚠️
-
-❌ S00 BEST AVAILABLE:    40.8% WR +$518 (49 trades - AVOID)
-
-TIMEFRAME RESULTS:
-1H: 23.1% WR -$338 ❌ (avoid except extreme cases)
-4H: 41.7% WR +$103 ⚠️ (selective use)
-1D: 53.0% WR +$1440 ✅ (primary)
-1W: 65.0% WR +$401 ✅ (high priority)
-
-ZONE RESULTS:
-LONG in PREMIUM zone: 6W 3L +$690 ✅ (surprise winner)
-SHORT in PREMIUM zone: 26W 31L +$486 ⚠️ (marginal)
-LONG in DISCOUNT zone: 19W 18L +$237 ⚠️ (weak)
-LONG in EQUILIBRIUM:  10W 10L +$148 (neutral)
-
-KEY LESSON FROM DATA:
-Your best trade was +$464 (trailing stop hit TP3)
-Your worst trade was -$300 (HIGH confidence wrong)
-→ HIGH confidence does NOT mean guaranteed win
-→ Always use appropriate position sizing
-
-═══════════════════════════════════════════
-THE PROVEN STRATEGIES
-Only these have enough data to trust
-═══════════════════════════════════════════
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-S03: EMA TREND PULLBACK (simple rules — no tiers)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-S03 qualifies when you have 3 of 4:
-→ EMA20 and EMA50 on the same side of EMA200 (both above = uptrend; both below = downtrend)
-→ Price within 2x ATR of EMA20 or EMA50 (use ATR distance — not fixed %; exotics need room)
-  EMA20 distance: {abs(price - ind["ema20"]):.5f}  EMA50: {abs(price - ind["ema50"]):.5f}  2x ATR = {ind["atr"]*2:.5f}
-→ RSI between 25 and 70
-→ ADX above 15 (minimum trend filter for this strategy)
-
-LONG: EMA20 > EMA50 > EMA200 with pullback to EMA zone. SHORT: inverse.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-S04: EXTREME ZONE REVERSION (simple rules — no tiers)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Python blocks S04 on 1H and 4H entirely — never output S04 for those TFs.
-
-S04 is allowed ONLY in the extreme 52w zone (Python hard gate — no workarounds):
-→ LONG: zone below 15% of 52w range. SHORT: zone above 85%.
-  Current zone: {zone_pct:.1f}%
-RSI/ADX still inform your read, but Python only enforces the zone rule for S04.
-
-Stop: 1x ATR beyond the extreme / invalidation.
-
-CRITICAL RESTRICTIONS:
-❌ S04 on 1H — blocked in Python
-❌ S04 on 4H — blocked in Python (historical 37.5% WR)
-✅ S04 on 1D and 1W only
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-S11: SR FLIP — VOLUME UPGRADE (Section 2C)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✓ Level tested ≥2 times (swing list within 0.5%)
-✓ Break confirmed by CLOSE (not wick-only)
-✓ Retest candle volume LOWER than breakout candle volume
-✓ Stop: 1x ATR beyond flipped level (not 0.5x)
-✓ Target minimum 2R; 4R intent on weekly
-
-LONG: old resistance holds as support after flip.
-SHORT: old support holds as resistance after flip.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-STRATEGIES UNDER TESTING (use cautiously)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-S02: LIQUIDITY SWEEP (1 trade, no conclusion)
-Equal highs/lows swept and recovered.
-Equal levels within 0.5%, spike beyond, recovery.
-Only use on 1H with extreme zones.
-
-S08: RANGE BREAKOUT (44.4% WR — currently losing)
-BB Width below 3%, ADX below 30, close outside BB.
-4H: 25% WR — AVOID on 4H
-1D: 60% WR — acceptable on daily only
-Use conservatively, require confirmed close outside BB.
-
-S12: VOLATILITY COMPRESSION (1 trade, no conclusion)
-BB Width below 2%, ADX below 20, explosive breakout.
-Only use on 1H when BB Width below 1%.
-
-S01: BREAKOUT RETEST (gathering data)
-Price breaks level, retests it as new S/R.
-Price within 2x ATR of broken swing level.
-ADX above 15. Use when clearly visible.
-
-S05: MACD DIVERGENCE (gathering data)
-Price makes new extreme but MACD does not confirm.
-Use as confirmation signal, not primary.
-
-S06: ORDER BLOCK (gathering data)
-Strong impulse started from a zone.
-Price returns to that origin zone.
-Hard to detect without candle data.
-
-S07: FAIR VALUE GAP (gathering data)
-Gap between swings larger than 0.5x ATR.
-Price returning to fill the gap.
-
-S09: NEWS CATALYST (gathering data)
-Sentiment above 0.3 or below -0.3.
-Current: {news_sentiment:.2f}
-
-S10: COT FLOW (gathering data)
-COT bias confirmed + zone supports it.
-Current COT: {cot_bias}
-
-═══════════════════════════════════════════
-INTELLIGENCE DATA
-═══════════════════════════════════════════
-Fear & Greed: {fear_greed:.0f}/100
-VIX: {vix_val:.1f}
-News sentiment: {news_sentiment:+.2f}
-COT: {cot_bias}
-
-Intelligence adds conviction but is rarely
-enough alone to take a trade.
-Use to boost or reduce conviction by 1 point.
-
-═══════════════════════════════════════════
-TIMEFRAME RULES (from your own data)
-═══════════════════════════════════════════
-
-DAILY (1D) — PRIMARY ✅
-53% WR. S04 here is exceptional (66.7%).
-Take all S03 and S04 setups that qualify.
-This is where most money is made.
-
-WEEKLY (1W) — HIGH VALUE ✅
-65% WR. Best timeframe overall.
-S04 on weekly is 75% WR — PRIORITY.
-Fewer trades but higher quality.
-
-4H — SELECTIVE ⚠️
-41.7% WR overall. Mixed results.
-Only take S03 (66.7% WR on 4H) setups.
-Avoid S04 on 4H (37.5% WR — losing).
-Avoid S08 on 4H (25% WR — terrible).
-
-1H — EMERGENCY ONLY ❌
-23.1% WR. Consistent loser.
-Only take S11 SR Flip on 1H (if visible).
-All 1H trades → LOW confidence → 0.5% risk.
-Skip if no clear S11 setup.
-
-═══════════════════════════════════════════
-HOW TO DECIDE — CLEAR PROCESS
-═══════════════════════════════════════════
-
-STEP 1: TIMEFRAME GATE
-If 1H: only proceed if S11 clearly visible.
-  Otherwise: output skip_trade: true
-If 4H: only proceed if S03 qualifies.
-  S04 on 4H = skip (37.5% WR, losing money)
-  S08 on 4H = skip (25% WR, terrible)
-If 1D or 1W: proceed to Step 2.
-
-STEP 2: STRATEGY SCAN
-Check S03 first (proven 57.7% WR):
-  Does price meet 3 of 4 signals? → USE S03
-Check S04 second (proven 53.2% WR on 1D/1W):
-  Is zone in the extreme (<15% LONG, >85% SHORT)? → USE S04
-Check S11 (promising, needs data):
-  Clear level flip visible? → USE S11
-Check S01, S08, S12 (testing):
-  Clear setup only, LOW confidence
-If nothing qualifies: skip_trade: true. No fallback trades — ever.
-
-STEP 3: SKIP DECISION
-Skip if:
-- No strategy fully qualifies (S03 needs 3 of 4; S04 needs extreme zone)
-- 4H with S04 attempted (proven loser)
-- 1H without clear S11
-- Equilibrium zone with no strategy
-- Conflicting signals without clear winner
-- S00 BEST AVAILABLE is the only option
-  (40.8% WR — not worth the risk)
-
-Skipping is BETTER than S00 trades.
-S00 has 40.8% WR — below coin flip.
-Every S00 trade costs you money on average.
-
-STEP 4: DIRECTION AND ENTRY
-Strategy determines direction.
-Find the specific structural entry price.
-Not approximately — exactly where.
-
-STEP 5: STOP AT STRUCTURAL INVALIDATION
-Where does this trade become structurally wrong?
-Add 0.3x ATR buffer beyond that level.
-On 1D/1W, Python caps stop distance to 1.5% / 2.5% from entry if Claude is too wide.
-
-STEP 6: TARGETS (dynamic R multiples — Python applies final TPs)
-S04: TP1=2R, TP2=3.5R, TP3=6R
-S03 1W: TP1=2R, TP2=4R, TP3=7R
-S03 4H: TP1=2R, TP2=3R, TP3=5R
-Default swing: TP1=2R, TP2=3R, TP3=5R
-Minimum: distance(entry, TP2) / distance(entry, stop) ≥ 2.0 (enforced in Python).
-
-STEP 7: CONFIDENCE
-Set conviction honestly. Python may scale size from a simple score but will NOT
-skip a trade that passed strategy_met and the S03/S04 chart gates.
-
-═══════════════════════════════════════════
-OUTPUT — VALID JSON ONLY
-═══════════════════════════════════════════
-
-If skipping:
-{{
-  "skip_trade": true,
-  "skip_reason": "specific reason why no edge",
-  "strategy_id": "SKIP",
-  "direction": "NONE",
-  "confidence": "SKIP",
-  "conviction_score": 0,
-  "zone_pct": {zone_pct},
-  "zone_label": "{zone_label}",
-  "entry": 0,
-  "stop_loss": 0,
-  "tp1": 0,
-  "tp2": 0,
-  "tp3": 0,
-  "signals_used": [],
-  "reasoning": "why no valid setup exists"
-}}
-
-If trading:
-{{
-  "skip_trade": false,
-  "strategy_id": "S03_EMA_PULLBACK",
-  "strategy_name": "EMA Trend Pullback",
-  "strategy_met": true,
-  "core_signals_met": ["list each confirmed signal"],
-  "core_signals_failed": ["list any not met"],
-  "verdict": "BUY|SELL|STRONG BUY|STRONG SELL",
-  "direction": "LONG|SHORT",
-  "confidence": "HIGH|MEDIUM|LOW",
-  "conviction_score": 6,
-  "zone_pct": {zone_pct},
-  "zone_label": "{zone_label}",
-  "htf_bias": "BULLISH|BEARISH|NEUTRAL",
-  "entry": {price},
-  "entry_reasoning": "why entry here (max 20 words)",
-  "stop_loss": 0.0,
-  "stop_reasoning": "structural level (max 20 words)",
-  "tp1": 0.0,
-  "tp2": 0.0,
-  "tp3": 0.0,
-  "tp_target": "TP2",
-  "rr_ratio": "1:2.0",
-  "trailing_plan": "BE at TP1, +1R at TP2",
-  "signals_used": ["UPPERCASE_SIGNALS"],
-  "confluences": ["max 4 items"],
-  "conflicts": ["max 3 items"],
-  "intelligence_summary": "max 10 words",
-  "reasoning": "max 80 words total"
-}}
-
-RULES:
-- strategy_met MUST be true on every trade JSON — otherwise Python skips
-- direction: LONG or SHORT (never NONE for trades)
-- strategy_id: S01-S12 or SKIP (never S00)
-- All signals UPPERCASE
-- Minimum RR 2.0 to TP2 (Python-enforced)
-- conviction max 8 (learned from -$300 loss)
-- Never output ADX_TRENDING or RSI_NEUTRAL_ROOM
-- reasoning maximum 80 words
-"""
+        tf_label = TF_DESCRIPTIONS.get(tf_key, tf_key)
+        prompt = _load_master_prompt_v3(
+            ticker=sym,
+            tf_label=tf_label,
+            analysis_date=analysis_date,
+            price=float(price),
+            zone_label=zone_label,
+            zone_pct=zone_pct,
+            high_52w=high_52w,
+            low_52w=low_52w,
+            ind=ind,
+            bb_width=bb_width,
+            intel_text=intel_text,
+            news_sentiment=news_sentiment,
+            cot_bias=cot_bias,
+            fear_greed=fear_greed,
+            vix_val=vix_val,
+        )
         client = _client()
         resp = client.messages.create(
             model=CLAUDE_MODEL,
@@ -1697,264 +1409,84 @@ RULES:
             return _skip_out("empty or invalid JSON from model", {})
 
         _sanitize_signal_lists(ai)
+        ai["zone_pct"] = zone_pct
 
-        # Cap stop distance on raw Claude output for 1D/1W only (before skip / full pipeline)
-        if not bool(ai.get("skip_trade")) and tf_key in ("1d", "1w"):
+        if not bool(ai.get("skip_trade")):
+            d0 = str(ai.get("direction", "")).strip().upper()
+            if d0 not in ("LONG", "SHORT"):
+                return _skip_out("no valid LONG/SHORT direction from model", ai)
             try:
-                e0 = float(ai.get("entry", price) or price)
-                st0 = float(ai.get("stop_loss", 0) or 0)
-                d0 = str(ai.get("direction", "LONG")).strip().upper()
-                max_stop_map = {"1d": 1.5, "1w": 2.5}
-                ms = float(max_stop_map[tf_key])
-                if (
-                    st0
-                    and e0 > 0
-                    and abs(st0 - e0) > 1e-12
-                    and d0 in ("LONG", "SHORT")
-                    and math.isfinite(e0)
-                    and math.isfinite(st0)
-                ):
-                    sdp = abs(e0 - st0) / e0 * 100.0
-                    if sdp > ms + 1e-9:
-                        log(f"[StopFix] {sdp:.2f}% → capped at {ms}% (post-parse)", level="info")
-                        if d0 == "LONG":
-                            st0 = e0 * (1.0 - ms / 100.0)
-                        else:
-                            st0 = e0 * (1.0 + ms / 100.0)
-                        ai["stop_loss"] = round(st0, 5)
+                entry0 = float(ai.get("entry", price) or price)
             except (TypeError, ValueError):
-                pass
-
-        if bool(ai.get("skip_trade")):
-            return _skip_out(str(ai.get("skip_reason") or "no edge identified"))
-
-        sid_raw = str(ai.get("strategy_id", "") or "").strip().upper()
-        if sid_raw == "S00_BEST_AVAILABLE":
-            if tf_key in ("1h", "4h"):
-                ai["skip_trade"] = True
-                ai["skip_reason"] = "S00 blocked on 1H/4H"
-                return _skip_out("S00 blocked on 1H/4H", ai)
+                entry0 = float(price)
+            atr0 = float(ind.get("atr") or 0) or abs(entry0) * 0.01
             try:
-                cs_s00 = float(ai.get("conviction_score", 0) or 0)
+                st_m = float(ai.get("stop_loss") or 0)
             except (TypeError, ValueError):
-                cs_s00 = 0.0
-            if cs_s00 < 6:
-                ai["skip_trade"] = True
-                ai["skip_reason"] = f"S00 conviction {ai.get('conviction_score')}/6 required"
-                return _skip_out(
-                    f"S00 conviction {ai.get('conviction_score')}/6 required",
-                    ai,
-                )
-            log(
-                f"[ENFORCE] S00 allowed on {tf_key} conviction {ai.get('conviction_score')}",
-                level="info",
-            )
-        if sid_raw == "S04_EXTREME_REVERSION":
-            if tf_key == "1h":
-                ai["skip_trade"] = True
-                ai["skip_reason"] = "S04 blocked on 1H"
-                return _skip_out("S04 blocked on 1H", ai)
-            if tf_key == "4h":
-                return _skip_out("S04 blocked on 4H: historical 37.5% WR — no S04 on 4H", ai)
-        if sid_raw == "S08_RANGE_BREAKOUT" and tf_key == "4h":
-            return _skip_out("S08 blocked on 4H: 25% WR per backtested data")
+                st_m = 0.0
+            if st_m == 0:
+                if d0 == "LONG":
+                    ai["stop_loss"] = round(entry0 - atr0, 5)
+                else:
+                    ai["stop_loss"] = round(entry0 + atr0, 5)
+            c0 = str(ai.get("confidence", "MEDIUM")).strip().upper()
+            if c0 not in ("HIGH", "MEDIUM", "LOW"):
+                c0 = "MEDIUM"
+            ai["confidence"] = _apply_exotic_confidence(c0, is_exotic)
+            if sym == "GBPJPY" and str(ai.get("confidence", "")).strip().upper() == "HIGH":
+                ai["confidence"] = "MEDIUM"
 
-        direction_raw = str(ai.get("direction", "")).strip().upper()
-        if direction_raw not in ("LONG", "SHORT"):
-            return _skip_out("no valid LONG/SHORT direction from model")
+        ai = enforce_rules(ai, tf_key, float(price), sym)
 
-        direction = direction_raw
-        ai["direction"] = direction
+        if ai.get("skip_trade"):
+            return _skip_out(str(ai.get("skip_reason") or "enforcement skip"), ai)
 
-        if sid_raw == "SKIP":
-            return _skip_out(str(ai.get("skip_reason") or "model returned SKIP"))
-        if sid_raw not in STRATEGIES:
-            return _skip_out(f"unsupported strategy_id: {sid_raw}")
+        strategy_id_norm = str(ai.get("strategy_id", "")).strip().upper()
+        if strategy_id_norm not in STRATEGIES:
+            return _skip_out(f"unsupported strategy_id: {strategy_id_norm}", ai)
 
-        strategy_id_norm = sid_raw
-        ai["strategy_id"] = strategy_id_norm
+        direction = str(ai.get("direction", "")).strip().upper()
+        if direction not in ("LONG", "SHORT"):
+            return _skip_out("no valid LONG/SHORT after enforcement", ai)
+
         strategy_met = bool(ai.get("strategy_met", False))
-
-        if not strategy_met:
-            return _skip_out("strategy_met False — no trade without full strategy qualification", ai)
-
-        if strategy_id_norm == "S04_EXTREME_REVERSION":
-            z_ok, z_msg = _s04_zone_extreme_ok(direction, zone_pct)
-            if not z_ok:
-                return _skip_out(z_msg, ai)
-
-        if strategy_id_norm == "S03_EMA_PULLBACK":
-            s3_ok, s3_msg = _s03_chart_three_of_four_ok(direction, float(price), ind)
-            if not s3_ok:
-                return _skip_out(s3_msg, ai)
-
-        if tf_key == "1h" and strategy_id_norm not in ALLOWED_1H_STRATEGIES:
-            return _skip_out(f"1H only S11 allowed; got {strategy_id_norm}")
-
-        if tf_key in ("4h", "1d") and near_major_news_calendar(sym, analysis_date.strip()):
-            return _skip_out("major economic event window — swing skipped for this pair/day", ai)
-
-        confidence = str(ai.get("confidence", "MEDIUM")).strip().upper()
-        if confidence not in ("HIGH", "MEDIUM", "LOW"):
-            confidence = "MEDIUM"
-        confidence = _apply_exotic_confidence(confidence, is_exotic)
-
         try:
             conviction_score = int(round(float(ai.get("conviction_score", 5))))
-            conviction_score = max(1, min(10, conviction_score))
         except (TypeError, ValueError):
             conviction_score = 5
-        conviction_score = min(conviction_score, 8)
-        ai["conviction_score"] = conviction_score
+        conviction_score = max(0, min(10, conviction_score))
 
-        if tf_key == "1h":
-            conviction_score = min(conviction_score, 4)
-            ai["conviction_score"] = conviction_score
+        confidence = str(ai.get("confidence", "LOW")).strip().upper()
+        if confidence not in ("HIGH", "MEDIUM", "LOW"):
             confidence = "LOW"
-            ai["confidence"] = "LOW"
-            log(
-                f"[1H] Strategy {strategy_id_norm} — capped at LOW confidence",
-                level="info",
-            )
-        else:
-            ai["confidence"] = confidence
-
-        if sym == "GBPJPY" and confidence == "HIGH":
-            confidence = "MEDIUM"
-            ai["confidence"] = "MEDIUM"
-
-        current_capital = STARTING_CAPITAL
 
         entry = float(ai.get("entry", price) or price)
         if not math.isfinite(entry) or entry <= 0:
             entry = float(price)
-        atr = float(ind.get("atr") or 0) or (abs(float(entry)) * 0.01)
+        stop = float(ai.get("stop_loss", 0) or 0)
 
-        def _nz(x: Any) -> float:
-            try:
-                v = float(x or 0)
-                return v if math.isfinite(v) else 0.0
-            except (TypeError, ValueError):
-                return 0.0
+        mult = 1 if direction == "LONG" else -1
+        if direction == "LONG" and (not math.isfinite(stop) or stop >= entry):
+            return _skip_out("invalid stop for LONG", ai)
+        if direction == "SHORT" and (not math.isfinite(stop) or stop <= entry):
+            return _skip_out("invalid stop for SHORT", ai)
 
-        if _nz(ai.get("stop_loss")) == 0:
-            if direction == "LONG":
-                ai["stop_loss"] = round(entry - (atr * 1.0), 5)
-            else:
-                ai["stop_loss"] = round(entry + (atr * 1.0), 5)
-
-        stop = validate_stop_loss(entry, _nz(ai.get("stop_loss")), direction, tf_key)
-        ai["stop_loss"] = stop
-
-        if direction == "LONG":
-            risk = entry - stop
-            if risk <= 0:
-                stop = validate_stop_loss(
-                    entry, round(entry - max(atr * 1.5, entry * 0.001), 5), direction, tf_key
-                )
-                ai["stop_loss"] = stop
-                risk = entry - stop
-        else:
-            risk = stop - entry
-            if risk <= 0:
-                stop = validate_stop_loss(
-                    entry, round(entry + max(atr * 1.5, entry * 0.001), 5), direction, tf_key
-                )
-                ai["stop_loss"] = stop
-                risk = stop - entry
-
-        if risk <= 0:
-            risk = max(atr * 1.5, entry * 0.001)
-            if direction == "LONG":
-                stop = round(entry - risk, 5)
-            else:
-                stop = round(entry + risk, 5)
-            stop = validate_stop_loss(entry, stop, direction, tf_key)
-            ai["stop_loss"] = stop
-            if direction == "LONG":
-                risk = entry - stop
-            else:
-                risk = stop - entry
-
-        # Cap maximum stop distance on 1D/1W (% of entry); fixed 2R/3R/5R TPs when capped
-        stop = float(ai["stop_loss"])
-        capped_stop = False
-        if tf_key in ("1d", "1w") and stop and entry > 0 and abs(stop - entry) > 1e-12:
-            max_stop_pct = 1.5 if tf_key == "1d" else 2.5
-            stop_dist_pct = abs(entry - stop) / entry * 100.0
-            if stop_dist_pct > max_stop_pct + 1e-9:
-                log(f"[StopFix] {stop_dist_pct:.2f}% → capped at {max_stop_pct}%", level="info")
-                if direction == "LONG":
-                    stop = entry * (1.0 - max_stop_pct / 100.0)
-                else:
-                    stop = entry * (1.0 + max_stop_pct / 100.0)
-                stop = validate_stop_loss(entry, round(stop, 5), direction, tf_key)
-                ai["stop_loss"] = stop
-                if direction == "LONG":
-                    risk = entry - stop
-                else:
-                    risk = stop - entry
-                capped_stop = True
+        risk = abs(entry - stop)
         if risk <= 0 or not math.isfinite(risk):
-            return _skip_out("invalid risk after stop distance cap", ai)
+            return _skip_out("invalid risk", ai)
 
-        if capped_stop:
-            mult = 1.0 if direction == "LONG" else -1.0
-            ai["tp1"] = round(entry + mult * risk * 2.0, 5)
-            ai["tp2"] = round(entry + mult * risk * 3.0, 5)
-            ai["tp3"] = round(entry + mult * risk * 5.0, 5)
-            rew = abs(float(ai["tp2"]) - entry)
-        else:
-            r1, r2, r3 = _tp_r_multiples(strategy_id_norm, tf_key)
-            if direction == "LONG":
-                ai["tp1"] = round(entry + risk * r1, 5)
-                ai["tp2"] = round(entry + risk * r2, 5)
-                ai["tp3"] = round(entry + risk * r3, 5)
-                rew = abs(float(ai["tp2"]) - entry)
-            else:
-                ai["tp1"] = round(entry - risk * r1, 5)
-                ai["tp2"] = round(entry - risk * r2, 5)
-                ai["tp3"] = round(entry - risk * r3, 5)
-                rew = abs(entry - float(ai["tp2"]))
+        tp1 = round(entry + mult * risk * 2.0, 5)
+        tp2 = round(entry + mult * risk * 3.0, 5)
+        tp3 = round(entry + mult * risk * 5.0, 5)
+        ai["tp1"], ai["tp2"], ai["tp3"] = tp1, tp2, tp3
+        rr_tp2 = 3.0
+        ai["rr_ratio"] = f"1:{rr_tp2:.2f}"
 
-        if risk > 0:
-            rr_tp2 = abs(float(ai["tp2"]) - entry) / risk
-            if rr_tp2 < 2.0 - 1e-9:
-                log(f"[RR] Insufficient R/R vs TP2: {rr_tp2:.2f}", level="info")
-                return _skip_out(f"Insufficient R/R: {rr_tp2:.2f}", ai)
-            ai["rr_ratio"] = f"1:{rr_tp2:.2f}"
-        elif not str(ai.get("rr_ratio", "")).strip():
-            ai["rr_ratio"] = "1:2.00"
-
-        stop = float(ai["stop_loss"])
-        tp1 = float(ai["tp1"])
-        tp2 = float(ai["tp2"])
-        tp3 = float(ai["tp3"])
-
+        position_size = float(ai.get("_position_size", 0) or 0)
+        leveraged_exposure = float(ai.get("_leveraged_exposure", 0) or 0)
+        max_risk_dollars = float(ai.get("_max_risk_dollars", 0) or 0)
+        sizing_risk_pct = float(ai.get("_account_risk_pct", 0) or 0)
         risk_pct_of_price = risk / entry if entry > 0 else 0.0
-        conf_score = compute_confluence_score(
-            sym=sym,
-            direction=direction,
-            zone_pct=zone_pct,
-            rsi=float(ind.get("rsi", 50) or 50),
-            adx=float(ind.get("adx", 0) or 0),
-            macd_hist=float(ind.get("macd_hist", 0) or 0),
-            strategy_id=strategy_id_norm,
-            news_sentiment=news_sentiment,
-            fear_greed=fear_greed,
-        )
-        sizing = calculate_trade_risk(current_capital, confidence=confidence)
-        max_risk_dollars = sizing["max_risk_dollars"]
-        sizing_risk_pct = sizing["risk_pct"]
-
-        # Notional exposure = max_risk_dollars / stop_distance * entry
-        # (algebraically same as position_size * LEVERAGE with prior definition)
-        denom = risk_pct_of_price * LEVERAGE
-        if denom > 1e-12:
-            position_size = min(max_risk_dollars / denom, 500.0)
-        else:
-            position_size = min(500.0, max_risk_dollars * 10.0)
-        leveraged_exposure = position_size * LEVERAGE
         risk_pct_display = round(risk_pct_of_price * 100, 3)
 
         fut = future.head(fwd_n)
@@ -1970,7 +1502,6 @@ RULES:
             tp3,
             fut,
             strategy_id_norm,
-            tf_key,
         )
         if exit_data.get("outcome") in ("NO_DATA", "INVALID"):
             return None
@@ -2107,7 +1638,7 @@ RULES:
             "reasoning": str(ai.get("reasoning", "")),
             "rr_ratio": str(ai.get("rr_ratio", "")),
             "conviction_score": conviction_score,
-            "confluence_score_python": conf_score,
+            "confluence_score_python": 0,
             "risk_mode": "NORMAL",
             "weekly_bias_chart": "",
             "intel_summary": intel_summary_stored,
@@ -2274,7 +1805,7 @@ def calculate_kelly(trades: list[dict[str, Any]]) -> float:
 
 
 def _strategy_performance_stats(completed: list[dict[str, Any]]) -> dict[str, Any]:
-    """Per-strategy win rate, PnL, profit factor, and timeframe breakdown."""
+    """Per-strategy win rate, PnL, profit factor, timeframe breakdown (v3 master)."""
     strategy_performance: dict[str, dict[str, Any]] = {}
     for sid, sdef in STRATEGIES.items():
         s_trades = [t for t in completed if str(t.get("strategy_id", "") or "").upper() == sid]
@@ -2302,22 +1833,8 @@ def _strategy_performance_stats(completed: list[dict[str, Any]]) -> dict[str, An
         else:
             profit_factor = 0.0
 
-        strategy_performance[sid] = {
-            "name": sdef["name"],
-            "category": sdef["category"],
-            "description": sdef.get("description", ""),
-            "total": len(s_trades),
-            "wins": len(s_wins),
-            "losses": len(s_losses),
-            "win_rate": round(len(s_wins) / len(s_trades) * 100, 1) if s_trades else 0.0,
-            "pnl": round(total_pnl, 2),
-            "avg_win": round(avg_win, 2),
-            "avg_loss": round(avg_loss, 2),
-            "profit_factor": round(profit_factor, 2),
-        }
-
         tf_breakdown: dict[str, Any] = {}
-        for tf in ["1h", "4h", "1d", "1w"]:
+        for tf in ("15m", "30m", "1h", "4h", "1d", "1w"):
             tf_trades = [t for t in s_trades if str(t.get("timeframe", "") or "").lower() == tf]
             if tf_trades:
                 tf_wins = [t for t in tf_trades if t.get("outcome") == "WIN"]
@@ -2327,7 +1844,21 @@ def _strategy_performance_stats(completed: list[dict[str, Any]]) -> dict[str, An
                     "win_rate": round(len(tf_wins) / len(tf_trades) * 100, 1),
                     "pnl": round(sum(float(t.get("pnl_dollars", 0) or 0) for t in tf_trades), 2),
                 }
-        strategy_performance[sid]["timeframe_breakdown"] = tf_breakdown
+
+        strategy_performance[sid] = {
+            "name": sdef["name"],
+            "category": sdef["category"],
+            "proven_wr": sdef.get("proven_wr"),
+            "total": len(s_trades),
+            "wins": len(s_wins),
+            "losses": len(s_losses),
+            "win_rate": round(len(s_wins) / len(s_trades) * 100, 1) if s_trades else 0.0,
+            "pnl": round(total_pnl, 2),
+            "avg_win": round(avg_win, 2),
+            "avg_loss": round(avg_loss, 2),
+            "profit_factor": round(profit_factor, 2),
+            "timeframe_breakdown": tf_breakdown,
+        }
 
     return strategy_performance
 
@@ -2338,6 +1869,8 @@ def calculate_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
     hard_filtered_n = sum(1 for r in row_list if str(r.get("verdict", "")).upper() == "FILTERED")
     eligible_after_hard = max(0, n_all - hard_filtered_n)
 
+    trades = [r for r in row_list if str(r.get("outcome", "")).upper() in ("WIN", "LOSS")]
+
     skipped_rows = [
         r for r in row_list if r.get("skipped") or str(r.get("outcome", "")).upper() == "SKIPPED"
     ]
@@ -2346,12 +1879,13 @@ def calculate_stats(results: list[dict[str, Any]]) -> dict[str, Any]:
         rkey = str(t.get("skip_reason") or t.get("reasoning") or "unknown")[:50]
         skip_reasons[rkey] = skip_reasons.get(rkey, 0) + 1
     skip_meta = {
+        "total_analyses": n_all,
+        "trades_taken": len(trades),
         "skipped_trades": len(skipped_rows),
         "skip_rate_pct": round(len(skipped_rows) / max(1, n_all) * 100, 1),
         "skip_reasons": skip_reasons,
     }
 
-    trades = [r for r in row_list if str(r.get("outcome", "")).upper() in ("WIN", "LOSS")]
     executed_trade_rate_pct = (
         round(100 * len(trades) / max(1, eligible_after_hard), 1) if eligible_after_hard else 0.0
     )
