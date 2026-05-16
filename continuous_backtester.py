@@ -721,6 +721,38 @@ def near_major_news_calendar(_sym: str, _analysis_date: str) -> bool:
     return False
 
 
+def _s04_chart_extremes_ok(
+    direction: str, zone_pct: float, rsi: float, adx: float
+) -> tuple[bool, str]:
+    """S04 must satisfy zone + RSI + ADX on the chart snapshot (no 2-of-3 workaround)."""
+    try:
+        z = float(zone_pct)
+        r = float(rsi)
+        a = float(adx)
+    except (TypeError, ValueError):
+        return False, "S04 chart gate: invalid zone/RSI/ADX"
+    if not all(math.isfinite(x) for x in (z, r, a)):
+        return False, "S04 chart gate: non-finite zone/RSI/ADX"
+    d = (direction or "").strip().upper()
+    if d == "LONG":
+        if z >= 15.0:
+            return False, f"S04 chart gate: zone {z:.1f}% needs <15 (discount extreme)"
+        if r >= 35.0:
+            return False, f"S04 chart gate: RSI {r:.1f} needs <35 for LONG"
+        if a >= 45.0:
+            return False, f"S04 chart gate: ADX {a:.1f} needs <45 (not runaway trend)"
+    elif d == "SHORT":
+        if z <= 85.0:
+            return False, f"S04 chart gate: zone {z:.1f}% needs >85 (premium extreme)"
+        if r <= 65.0:
+            return False, f"S04 chart gate: RSI {r:.1f} needs >65 for SHORT"
+        if a >= 45.0:
+            return False, f"S04 chart gate: ADX {a:.1f} needs <45 (not runaway trend)"
+    else:
+        return False, "S04 chart gate: direction must be LONG or SHORT"
+    return True, ""
+
+
 def compute_confluence_score(
     *,
     sym: str,
@@ -1478,7 +1510,7 @@ WHAT HAS BEEN PROVEN TO LOSE:
 - EURGBP any setup: BLACKLISTED in Python (-$459 cluster)
 - AUDJPY any setup: BLACKLISTED in Python (Jan cluster losses)
 - USDMXN: BLACKLISTED in Python (0% WR runs)
-- S04 with only 1 of 3 core signals: marginal edge — prefer 2 of 3
+- S04 without all three chart gates (zone + RSI + ADX): blocked in Python — was a 2-of-3 loser
 - ADX_TRENDING / RSI_NEUTRAL_ROOM: never use these labels again
 
 ═══════════════════════════════════════════
@@ -1571,7 +1603,7 @@ S04: EXTREME ZONE REVERSION (simple rules — no tiers)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Python blocks S04 on 1H and 4H entirely — never output S04 for those TFs.
 
-S04 qualifies when you have 2 of 3:
+S04 qualifies only when ALL 3 match the chart (Python enforces — no 2-of-3):
 → Zone: LONG = below 15% of 52w range; SHORT = above 85% of 52w range
   Current zone: {zone_pct:.1f}%
 → RSI: LONG = below 35; SHORT = above 65
@@ -1697,26 +1729,17 @@ STEP 2: STRATEGY SCAN
 Check S03 first (proven 57.7% WR):
   Does price meet 3 of 4 signals? → USE S03
 Check S04 second (proven 53.2% WR on 1D/1W):
-  Does zone meet threshold + RSI/ADX (2 of 3)? → USE S04
+  Do zone + RSI + ADX all meet the S04 thresholds (3 of 3)? → USE S04
 Check S11 (promising, needs data):
   Clear level flip visible? → USE S11
 Check S01, S08, S12 (testing):
   Clear setup only, LOW confidence
-If nothing qualifies: prefer skip_trade: true
-UNLESS FALLBACK (1D/1W only) below applies — then take LOW confidence zone trade.
-
-FALLBACK — 1D OR 1W ONLY (prevents long skip droughts):
-If no S03/S04/S11 qualifies BUT all of:
-  • Timeframe is 1D or 1W
-  • Zone below 20% (for LONG) OR above 80% (for SHORT)
-  • RSI confirms: below 45 for LONG, above 55 for SHORT
-  • ADX above 15
-Then output a real trade (not skip): strategy_id S04_EXTREME_REVERSION, confidence LOW,
-conviction_score 3–4, strategy_met false. Still respect minimum R/R to TP2 and valid JSON.
+If nothing qualifies: output skip_trade: true.
+There is no S04 “fallback” or 2-of-3: Python skips S04 unless zone, RSI, and ADX all qualify.
 
 STEP 3: SKIP DECISION
 Skip if:
-- No strategy qualifies with 2+ signals
+- No strategy qualifies (for S04, all three extremes must pass — partial confluence is not enough)
 - 4H with S04 attempted (proven loser)
 - 1H without clear S11
 - Equilibrium zone with no strategy
@@ -1927,6 +1950,13 @@ RULES:
             "S11_SR_FLIP",
         ) and not strategy_met:
             return _skip_out("strategy_met False — no fallback trades allowed", ai)
+
+        if strategy_id_norm == "S04_EXTREME_REVERSION":
+            rsi_v = float(ind.get("rsi", 50) or 50)
+            adx_v = float(ind.get("adx", 0) or 0)
+            s04_ok, s04_msg = _s04_chart_extremes_ok(direction, zone_pct, rsi_v, adx_v)
+            if not s04_ok:
+                return _skip_out(s04_msg, ai)
 
         if rec_mode == "PRESERVATION" and tf_key != "1w":
             return _skip_out("preservation mode: 1W swing timeframe only", ai)
