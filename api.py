@@ -1020,6 +1020,15 @@ async def start_chrono_backtest(
     """Start a walk-forward chronological backtest (runs in a background thread)."""
     if not env("ANTHROPIC_API_KEY"):
         raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY is not configured.")
+    prev_active = continuous_backtester.get_active_chrono()
+    prev_job_id: str | None = None
+    if isinstance(prev_active, dict):
+        raw = prev_active.get("job_id")
+        if raw is not None and str(raw).strip():
+            prev_job_id = str(raw).strip()
+            continuous_backtester.request_chrono_stop(prev_job_id)
+            log(f"[Chrono API] Requested stop for previous job {prev_job_id} before starting new run")
+
     job_id = str(uuid.uuid4())[:8]
     background_tasks.add_task(
         _spawn_chronological_backtest,
@@ -1027,12 +1036,39 @@ async def start_chrono_backtest(
         end_date.strip(),
         job_id,
     )
-    return {
+    out: dict[str, Any] = {
         "job_id": job_id,
         "status": "started",
         "start_date": start_date,
         "end_date": end_date,
     }
+    if prev_job_id:
+        out["previous_job_stop_requested"] = prev_job_id
+    return out
+
+
+@app.get("/api/chrono/active")
+async def get_active_chrono_job() -> dict[str, Any]:
+    """Return the persisted active chrono job (if any) plus latest progress from disk."""
+    active = continuous_backtester.get_active_chrono()
+    if not active:
+        return {"active": False}
+    job_id = str(active.get("job_id", "") or "").strip()
+    if not job_id:
+        return {"active": False}
+    chrono_file = continuous_backtester.chrono_results_path(job_id)
+    if chrono_file.is_file():
+        data = load_json(chrono_file, default=None)
+        if isinstance(data, dict):
+            return {
+                "active": True,
+                "job_id": job_id,
+                "current_date": data.get("current_date"),
+                "capital": data.get("capital"),
+                "status": data.get("status"),
+                "daily_pnl": data.get("daily_pnl", []),
+            }
+    return {"active": True, "job_id": job_id, "current_date": None}
 
 
 @app.get("/api/chrono/{job_id}/daily")
@@ -1046,6 +1082,7 @@ async def get_chrono_daily(job_id: str) -> dict[str, Any]:
         return {"error": "Job not found"}
     return {
         "job_id": job_id,
+        "current_date": data.get("current_date"),
         "daily_pnl": data.get("daily_pnl", []),
         "summary": data.get("summary", {}),
         "capital": data.get("capital"),
