@@ -80,7 +80,7 @@ CLAUDE_HTTP_TIMEOUT_SEC = 25.0
 # Chronological walk-forward backtest (API-triggered; separate from rolling loop)
 CHRONO_START_DATE = "2023-01-01"
 CHRONO_END_DATE = "2026-05-17"
-CHRONO_TIMEFRAMES: list[str] = ["15m", "30m", "1d", "1w"]
+CHRONO_TIMEFRAMES: list[str] = ["1d", "1w"]
 CHRONO_TICKERS = [
     "EURUSD",
     "GBPUSD",
@@ -3161,6 +3161,10 @@ def run_chronological_backtest(
                         chrono_abort = True
                         break
                     for timeframe in CHRONO_TIMEFRAMES:
+                        if timeframe in ("15m", "30m"):
+                            days_ago = (datetime.today() - datetime.strptime(date_str, "%Y-%m-%d")).days
+                            if days_ago > 55:
+                                continue
                         if chrono_stop_requested(job_id):
                             chrono_abort = True
                             break
