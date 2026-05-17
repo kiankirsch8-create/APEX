@@ -80,7 +80,7 @@ CLAUDE_HTTP_TIMEOUT_SEC = 25.0
 # Chronological walk-forward backtest (API-triggered; separate from rolling loop)
 CHRONO_START_DATE = "2023-01-01"
 CHRONO_END_DATE = "2026-05-17"
-CHRONO_TIMEFRAMES: list[str] = ["1d", "1w"]  # Chrono only: fewer intraday yfinance calls
+CHRONO_TIMEFRAMES: list[str] = ["15m", "30m", "1d", "1w"]
 CHRONO_TICKERS = [
     "EURUSD",
     "GBPUSD",
@@ -806,7 +806,13 @@ def get_ohlcv(
         "1d": {"interval": "1d", "days_back": 730, "days_fwd": 60},
         "1w": {"interval": "1wk", "days_back": 1825, "days_fwd": 120},
     }
-    cfg = tf_cfg.get(tf_key, tf_cfg["4h"])
+    cfg = dict(tf_cfg.get(tf_key, tf_cfg["4h"]))
+    if chrono_yfinance and tf_key == "15m":
+        cfg["days_back"] = 55
+        cfg["interval"] = "15m"
+    elif chrono_yfinance and tf_key == "30m":
+        cfg["days_back"] = 55
+        cfg["interval"] = "30m"
     target = datetime.strptime(analysis_date.strip(), "%Y-%m-%d")
     start = target - timedelta(days=int(cfg["days_back"]))
     end = target + timedelta(days=int(cfg["days_fwd"]))

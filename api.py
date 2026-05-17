@@ -79,11 +79,13 @@ async def on_startup_resume_backtester() -> None:
         (DATA_DIR / "daily_picks").mkdir(parents=True, exist_ok=True)
         log(f"[Startup] Persist directory: {DATA_DIR}")
         continuous_backtester.log_learned_startup_preview()
-        if continuous_backtester.is_enabled():
-            continuous_backtester.start_continuous_backtest()
-            log("[Startup] Backtester auto-resumed")
-        else:
-            log("[Startup] Backtester is disabled")
+        # Random batch engine must not start on boot.
+        # if continuous_backtester.is_enabled():
+        #     continuous_backtester.start_continuous_backtest()
+        #     log("[Startup] Backtester auto-resumed")
+        # else:
+        #     log("[Startup] Backtester is disabled")
+        log("[Startup] Continuous random backtester not auto-started")
         if os.getenv("BENZINGA_API_KEY"):
             try:
                 news_stream.start_news_stream_thread()
@@ -869,6 +871,12 @@ async def backtest_stats() -> dict[str, Any]:
         return data
     except Exception as e:  # noqa: BLE001
         return {"error": str(e)}
+
+
+@app.get("/api/stats")
+async def get_stats_alias() -> dict[str, Any]:
+    """Alias for ``GET /api/backtest/stats``."""
+    return await backtest_stats()
 
 
 @app.get("/api/backtest/results")
