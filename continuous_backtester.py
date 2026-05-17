@@ -383,30 +383,6 @@ def eligible_backtest_tickers() -> list[str]:
     return [t for t in BACKTEST_TICKERS if t not in EXCLUDED_PAIRS]
 
 
-def eligible_backtest_tickers() -> list[str]:
-    """
-    Up to ``batch_size`` unique (ticker, timeframe, date) tuples not already in ``existing_keys``.
-    """
-    tickers = eligible_backtest_tickers()
-    if not tickers:
-        tickers = ["EURUSD"]
-    combos: list[tuple[str, str]] = [(t, tf) for t in tickers for tf in TIMEFRAMES]
-    random.shuffle(combos)
-    work: list[tuple[str, str, str]] = []
-    used_in_batch: set[str] = set()
-    for t, tf in combos:
-        if len(work) >= batch_size:
-            break
-        is_fx = len(t) == 6 and t.isalpha()
-        date = get_random_date(days_back_max=365, days_back_min=10, skip_weekends=not is_fx)
-        key = _result_dedup_key({"ticker": t, "date": date, "timeframe": tf})
-        if key in existing_keys or key in used_in_batch:
-            continue
-        used_in_batch.add(key)
-        work.append((t, tf, date))
-    return work
-
-
 def analyse_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[str, Any] | None:
     """One full backtest job (safe for ThreadPoolExecutor workers)."""
     try:
@@ -2375,6 +2351,63 @@ Return ONLY this exact JSON structure, nothing else:
             IMPROVING_FILE,
             {"running": False, "completed_at": datetime.now().isoformat()},
         )
+
+
+def pick_random_date(timeframe: str) -> str:
+    """Random historical date in a window suited to ``timeframe`` (weekdays only)."""
+    days_back = {
+        "1w": 365 * 3,
+        "1d": 365 * 2,
+        "4h": 365,
+        "1h": 180,
+        "30m": 90,
+        "15m": 60,
+    }.get((timeframe or "").strip().lower(), 365)
+
+    start = datetime.now() - timedelta(days=days_back)
+    end = datetime.now() - timedelta(days=30)
+    if start > end:
+        start, end = end, start
+
+    delta_days = max((end - start).days, 0)
+    for _ in range(20):
+        random_day = start + timedelta(days=random.randint(0, delta_days))
+        if random_day.weekday() < 5:
+            return random_day.strftime("%Y-%m-%d")
+
+    d = end
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d.strftime("%Y-%m-%d")
+
+
+def build_work_batch(existing_keys: set[str], batch_size: int) -> list[tuple[str, str, str]]:
+    tickers = eligible_backtest_tickers()
+    if not tickers:
+        tickers = ["EURUSD"]
+    timeframe_list = list(TIMEFRAMES)
+
+    candidates: list[tuple[str, str, str]] = []
+    for ticker in tickers:
+        for tf in timeframe_list:
+            date = pick_random_date(tf)
+            key = _result_dedup_key({"ticker": ticker, "date": date, "timeframe": tf})
+            if key and key not in existing_keys:
+                candidates.append((ticker, tf, date))
+
+    random.shuffle(candidates)
+
+    seen: set[str] = set()
+    batch: list[tuple[str, str, str]] = []
+    for ticker, tf, date in candidates:
+        dedup = _result_dedup_key({"ticker": ticker, "date": date, "timeframe": tf})
+        if dedup not in seen:
+            seen.add(dedup)
+            batch.append((ticker, tf, date))
+        if len(batch) >= batch_size:
+            break
+
+    return batch
 
 
 def continuous_backtest_loop() -> None:
