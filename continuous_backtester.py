@@ -62,8 +62,8 @@ LEVERAGE = 50
 IMPROVE_EVERY = 100
 
 # Parallel backtest loop (speed)
-MAX_WORKERS = 8
-BATCH_SIZE = 25
+MAX_WORKERS = 4
+BATCH_SIZE = 15
 BACKTEST_CLAUDE_MAX_TOKENS = 1200
 CLAUDE_HTTP_TIMEOUT_SEC = 25.0
 
@@ -2432,73 +2432,77 @@ def continuous_backtest_loop() -> None:
                 level="info",
             )
 
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                futures = {
-                    executor.submit(analyse_one_backtest, t, tf, d): (t, tf, d)
-                    for t, tf, d in work_items
-                }
-                for future in as_completed(futures):
-                    ticker, tf, date = futures[future]
-                    try:
-                        result = future.result()
-                    except Exception as e:  # noqa: BLE001
-                        log(f"[Thread error] {ticker} {tf}: {e}", level="warning")
-                        continue
+            try:
+                with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                    futures = {
+                        executor.submit(analyse_one_backtest, t, tf, d): (t, tf, d)
+                        for t, tf, d in work_items
+                    }
+                    for future in as_completed(futures, timeout=120):
+                        ticker, tf, date = futures[future]
+                        try:
+                            result = future.result(timeout=60)
+                        except Exception as e:  # noqa: BLE001
+                            log(f"[Thread error] {ticker} {tf}: {e}", level="error")
+                            continue
 
-                    if result is None:
-                        continue
+                        if result is None:
+                            continue
 
-                    with _loop_counters_lock:
-                        loop_completed_tests += 1
-                        lc = loop_completed_tests
+                        with _loop_counters_lock:
+                            loop_completed_tests += 1
+                            lc = loop_completed_tests
 
-                    if lc % 10 == 0:
-                        log(
-                            f"[Loop] Running - tests: {len(_load_results_list())}",
-                            level="info",
-                        )
-
-                    prev_len = len(_load_results_list())
-                    count = append_result(result)
-                    added = count > prev_len
-
-                    if added:
-                        if result.get("skipped"):
+                        if lc % 10 == 0:
                             log(
-                                f"[Loop] SKIP {ticker} {tf} {date}: "
-                                f"{result.get('skip_reason', '')}",
-                                level="info",
-                            )
-                        else:
-                            outcome = result.get("outcome", "?")
-                            pnl = float(result.get("pnl_dollars", 0) or 0)
-                            log(
-                                f"[Loop] #{count} {ticker} {tf} {date}: {outcome} ${pnl:.2f}",
+                                f"[Loop] Running - tests: {len(_load_results_list())}",
                                 level="info",
                             )
 
-                    should_improve = False
-                    with _loop_counters_lock:
-                        if added and result.get("outcome") in ("WIN", "LOSS"):
-                            tests_since_improve += 1
-                            if tests_since_improve >= IMPROVE_EVERY:
-                                tests_since_improve = 0
-                                should_improve = True
+                        prev_len = len(_load_results_list())
+                        count = append_result(result)
+                        added = count > prev_len
 
-                    if added and count > 0 and count % 5 == 0:
-                        all_results = _load_results_list()
-                        stats = calculate_stats(all_results)
-                        save_json(STATS_FILE, stats)
-                        log(
-                            f"[Loop] Stats updated: WR={stats.get('win_rate_pct', 0)}% "
-                            f"Trades={stats.get('total_trades', 0)}",
-                            level="info",
-                        )
+                        if added:
+                            if result.get("skipped"):
+                                log(
+                                    f"[Loop] SKIP {ticker} {tf} {date}: "
+                                    f"{result.get('skip_reason', '')}",
+                                    level="info",
+                                )
+                            else:
+                                outcome = result.get("outcome", "?")
+                                pnl = float(result.get("pnl_dollars", 0) or 0)
+                                log(
+                                    f"[Loop] #{count} {ticker} {tf} {date}: {outcome} ${pnl:.2f}",
+                                    level="info",
+                                )
 
-                    if should_improve:
-                        log("[Loop] Running improvement cycle...", level="info")
-                        snap = _load_results_list()
-                        threading.Thread(target=run_improvement_cycle, args=(snap,), daemon=True).start()
+                        should_improve = False
+                        with _loop_counters_lock:
+                            if added and result.get("outcome") in ("WIN", "LOSS"):
+                                tests_since_improve += 1
+                                if tests_since_improve >= IMPROVE_EVERY:
+                                    tests_since_improve = 0
+                                    should_improve = True
+
+                        if added and count > 0 and count % 5 == 0:
+                            all_results = _load_results_list()
+                            stats = calculate_stats(all_results)
+                            save_json(STATS_FILE, stats)
+                            log(
+                                f"[Loop] Stats updated: WR={stats.get('win_rate_pct', 0)}% "
+                                f"Trades={stats.get('total_trades', 0)}",
+                                level="info",
+                            )
+
+                        if should_improve:
+                            log("[Loop] Running improvement cycle...", level="info")
+                            snap = _load_results_list()
+                            threading.Thread(target=run_improvement_cycle, args=(snap,), daemon=True).start()
+
+            except Exception as e:  # noqa: BLE001
+                log(f"[Batch crashed] {e} — continuing", level="error")
 
             with _loop_counters_lock:
                 tsi_snapshot = tests_since_improve
