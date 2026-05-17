@@ -101,6 +101,7 @@ ALLOWED_1H_STRATEGIES: frozenset[str] = frozenset(
     }
 )
 
+# 1h excluded — wastes batch slots in rolling scan (see TF_* maps if OHLCV needs 1h elsewhere).
 TIMEFRAMES: list[str] = ["15m", "30m", "4h", "1d", "1w"]
 
 TF_FORWARD_CANDLES: dict[str, int] = {
@@ -711,7 +712,14 @@ def _load_master_prompt_v3(
     )
 
 
-def enforce_rules(ai: dict[str, Any], timeframe: str, price: float, ticker: str) -> dict[str, Any]:
+def enforce_rules(
+    ai: dict[str, Any],
+    timeframe: str,
+    price: float,
+    ticker: str,
+    *,
+    rsi: float | None = None,
+) -> dict[str, Any]:
     """Post-parse enforcement — cannot be overridden by model text."""
     tf = (timeframe or "").strip().lower()
     strategy_id = str(ai.get("strategy_id") or "SKIP").strip().upper()
@@ -748,6 +756,20 @@ def enforce_rules(ai: dict[str, Any], timeframe: str, price: float, ticker: str)
             ai["skip_reason"] = (
                 f"S04 zone {zone_pct:.1f}% not extreme — need below 15 or above 85"
             )
+            return ai
+        try:
+            rsi_val = float(rsi) if rsi is not None else float(ai.get("rsi", 50) or 50)
+        except (TypeError, ValueError):
+            rsi_val = 50.0
+        if not math.isfinite(rsi_val):
+            rsi_val = 50.0
+        if direction == "LONG" and zone_pct <= 15 and rsi_val >= 40:
+            ai["skip_trade"] = True
+            ai["skip_reason"] = f"S04 LONG at zone≤15 needs RSI<40 (RSI={rsi_val:.1f})"
+            return ai
+        if direction == "SHORT" and zone_pct >= 85 and rsi_val <= 60:
+            ai["skip_trade"] = True
+            ai["skip_reason"] = f"S04 SHORT at zone≥85 needs RSI>60 (RSI={rsi_val:.1f})"
             return ai
 
     if strategy_id == "S08_RANGE_BREAKOUT" and tf == "4h":
@@ -1465,7 +1487,7 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
             if sym == "GBPJPY" and str(ai.get("confidence", "")).strip().upper() == "HIGH":
                 ai["confidence"] = "MEDIUM"
 
-        ai = enforce_rules(ai, tf_key, float(price), sym)
+        ai = enforce_rules(ai, tf_key, float(price), sym, rsi=float(ind.get("rsi", 50) or 50))
 
         if ai.get("skip_trade"):
             return _skip_out(str(ai.get("skip_reason") or "enforcement skip"), ai)
