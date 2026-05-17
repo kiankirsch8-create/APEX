@@ -39,6 +39,7 @@ import random
 import re
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import traceback
 from datetime import datetime, timedelta
@@ -73,6 +74,16 @@ MAX_WORKERS = 3
 BATCH_SIZE = 10
 BACKTEST_CLAUDE_MAX_TOKENS = 1200
 CLAUDE_HTTP_TIMEOUT_SEC = 25.0
+
+# Chronological walk-forward backtest (API-triggered; separate from rolling loop)
+CHRONO_START_DATE = "2023-01-01"
+CHRONO_END_DATE = "2026-05-17"
+CHRONO_TIMEFRAMES: list[str] = ["15m", "30m", "1h", "4h", "1d", "1w"]
+SESSION_WINDOWS: dict[str, tuple[int, int]] = {
+    "asia": (22, 8),
+    "london": (7, 12),
+    "new_york": (12, 21),
+}
 
 RISK_BY_CONFIDENCE: dict[str, float] = {
     "HIGH": 0.020,
@@ -2572,6 +2583,317 @@ def continuous_backtest_loop() -> None:
 
     log("[Loop] Stopped", level="info")
     update_state({"status": "stopped"})
+
+
+def chrono_results_path(job_id: str) -> Path:
+    """Persisted chronological backtest state (``DATA_DIR`` / volume on Railway)."""
+    return DATA_DIR / f"chrono_results_{job_id}.json"
+
+
+def _chrono_session_for_timeframe(timeframe: str) -> str:
+    """Session bucket for P&L rollups (UTC-oriented labels; see ``SESSION_WINDOWS``)."""
+    tf = (timeframe or "").strip().lower()
+    if tf in ("15m", "30m"):
+        return "london"
+    if tf == "1h":
+        return "london"
+    return "new_york"
+
+
+def _calc_session_performance(trades: list[dict[str, Any]]) -> dict[str, Any]:
+    sessions: dict[str, Any] = {}
+    for s in ("asia", "london", "new_york"):
+        s_trades = [t for t in trades if t.get("session") == s]
+        if not s_trades:
+            continue
+        wins = [t for t in s_trades if t.get("outcome") == "WIN"]
+        losses = [t for t in s_trades if t.get("outcome") == "LOSS"]
+        sessions[s] = {
+            "total": len(s_trades),
+            "wins": len(wins),
+            "losses": len(losses),
+            "win_rate": round(len(wins) / max(1, len(s_trades)) * 100, 1),
+            "pnl": round(sum(float(t.get("pnl_dollars", 0) or 0) for t in s_trades), 2),
+        }
+    return sessions
+
+
+def _calc_ticker_performance(trades: list[dict[str, Any]]) -> dict[str, Any]:
+    tickers: dict[str, Any] = {}
+    for t in trades:
+        tk = str(t.get("ticker", "") or "")
+        if not tk:
+            continue
+        if tk not in tickers:
+            tickers[tk] = {"total": 0, "wins": 0, "losses": 0, "pnl": 0.0}
+        tickers[tk]["total"] += 1
+        if t.get("outcome") == "WIN":
+            tickers[tk]["wins"] += 1
+        elif t.get("outcome") == "LOSS":
+            tickers[tk]["losses"] += 1
+        tickers[tk]["pnl"] = round(
+            float(tickers[tk]["pnl"]) + float(t.get("pnl_dollars", 0) or 0),
+            2,
+        )
+    for tk in tickers:
+        tickers[tk]["win_rate"] = round(
+            tickers[tk]["wins"] / max(1, tickers[tk]["total"]) * 100,
+            1,
+        )
+    return tickers
+
+
+def _calc_strategy_performance(trades: list[dict[str, Any]]) -> dict[str, Any]:
+    strats: dict[str, Any] = {}
+    for t in trades:
+        sid = str(t.get("strategy_id", "") or "UNKNOWN")
+        if sid not in strats:
+            strats[sid] = {"total": 0, "wins": 0, "losses": 0, "pnl": 0.0}
+        strats[sid]["total"] += 1
+        if t.get("outcome") == "WIN":
+            strats[sid]["wins"] += 1
+        elif t.get("outcome") == "LOSS":
+            strats[sid]["losses"] += 1
+        strats[sid]["pnl"] = round(
+            float(strats[sid]["pnl"]) + float(t.get("pnl_dollars", 0) or 0),
+            2,
+        )
+    for s in strats:
+        strats[s]["win_rate"] = round(
+            strats[s]["wins"] / max(1, strats[s]["total"]) * 100,
+            1,
+        )
+    return strats
+
+
+def _calc_tf_performance(trades: list[dict[str, Any]]) -> dict[str, Any]:
+    tfs: dict[str, Any] = {}
+    for t in trades:
+        tf = str(t.get("timeframe", "") or "")
+        if tf in ("15m", "30m"):
+            continue
+        if not tf:
+            continue
+        if tf not in tfs:
+            tfs[tf] = {"total": 0, "wins": 0, "losses": 0, "pnl": 0.0}
+        tfs[tf]["total"] += 1
+        if t.get("outcome") == "WIN":
+            tfs[tf]["wins"] += 1
+        elif t.get("outcome") == "LOSS":
+            tfs[tf]["losses"] += 1
+        tfs[tf]["pnl"] = round(
+            float(tfs[tf]["pnl"]) + float(t.get("pnl_dollars", 0) or 0),
+            2,
+        )
+    for tf in tfs:
+        tfs[tf]["win_rate"] = round(
+            tfs[tf]["wins"] / max(1, tfs[tf]["total"]) * 100,
+            1,
+        )
+    return tfs
+
+
+def run_chronological_backtest(
+    start_date: str = CHRONO_START_DATE,
+    end_date: str = CHRONO_END_DATE,
+    job_id: str | None = None,
+) -> dict[str, Any]:
+    """
+    Walk forward calendar day by day from ``start_date`` to ``end_date``.
+    Each weekday scans every eligible ticker × ``CHRONO_TIMEFRAMES`` via
+    ``run_one_backtest`` (same Claude path as the rolling engine).
+    Persists to ``chrono_results_{job_id}.json`` under ``DATA_DIR`` (resumable).
+    """
+    if job_id is None:
+        job_id = str(uuid.uuid4())[:8]
+
+    if not env("ANTHROPIC_API_KEY"):
+        log("[Chrono] ANTHROPIC_API_KEY missing — cannot run chronological backtest", level="warning")
+        return {
+            "job_id": job_id,
+            "status": "failed",
+            "error": "ANTHROPIC_API_KEY is not configured",
+        }
+
+    chrono_path = chrono_results_path(job_id)
+    log(f"[Chrono] Starting chronological backtest {job_id}: {start_date} → {end_date}", level="info")
+
+    chrono_data: dict[str, Any]
+    if chrono_path.is_file():
+        chrono_data = load_json(chrono_path, default={}) or {}
+        if chrono_data.get("status") == "complete":
+            log(f"[Chrono {job_id}] Job already complete — returning saved file", level="info")
+            return chrono_data
+    else:
+        chrono_data = {
+            "job_id": job_id,
+            "start_date": start_date,
+            "end_date": end_date,
+            "status": "running",
+            "current_date": start_date,
+            "capital": STARTING_CAPITAL,
+            "daily_pnl": [],
+            "all_trades": [],
+            "skipped": [],
+        }
+        save_json(chrono_path, chrono_data)
+
+    for _k, _v in (
+        ("daily_pnl", []),
+        ("all_trades", []),
+        ("skipped", []),
+        ("capital", STARTING_CAPITAL),
+    ):
+        chrono_data.setdefault(_k, _v)
+
+    try:
+        end_dt = datetime.strptime(end_date.strip(), "%Y-%m-%d")
+    except ValueError:
+        log(f"[Chrono {job_id}] Invalid end_date {end_date}", level="error")
+        chrono_data["status"] = "failed"
+        chrono_data["error"] = "invalid end_date"
+        save_json(chrono_path, chrono_data)
+        return chrono_data
+
+    capital = float(chrono_data.get("capital", STARTING_CAPITAL) or STARTING_CAPITAL)
+    daily = chrono_data.get("daily_pnl") or []
+    if daily:
+        try:
+            last_day = datetime.strptime(str(daily[-1]["date"]), "%Y-%m-%d")
+            current = last_day + timedelta(days=1)
+            capital = float(daily[-1].get("capital", capital) or capital)
+            chrono_data["capital"] = round(capital, 2)
+        except (ValueError, KeyError, TypeError):
+            try:
+                current = datetime.strptime(
+                    str(chrono_data.get("current_date", start_date)),
+                    "%Y-%m-%d",
+                )
+            except ValueError:
+                current = datetime.strptime(start_date.strip(), "%Y-%m-%d")
+    else:
+        try:
+            current = datetime.strptime(start_date.strip(), "%Y-%m-%d")
+        except ValueError:
+            log(f"[Chrono {job_id}] Invalid start_date {start_date}", level="error")
+            chrono_data["status"] = "failed"
+            chrono_data["error"] = "invalid start_date"
+            save_json(chrono_path, chrono_data)
+            return chrono_data
+
+    tickers = list(BACKTEST_TICKERS)
+    if not tickers:
+        tickers = ["EURUSD"]
+
+    while current <= end_dt:
+        date_str = current.strftime("%Y-%m-%d")
+        if current.weekday() >= 5:
+            current += timedelta(days=1)
+            continue
+
+        log(f"[Chrono {job_id}] Processing {date_str}", level="info")
+        day_trades: list[dict[str, Any]] = []
+        day_skipped: list[dict[str, Any]] = []
+        day_pnl = 0.0
+
+        for ticker in tickers:
+            for timeframe in CHRONO_TIMEFRAMES:
+                session = _chrono_session_for_timeframe(timeframe)
+                try:
+                    res = run_one_backtest(ticker, timeframe, date_str)
+                except Exception as e:  # noqa: BLE001
+                    log(f"[Chrono {job_id}] Error {ticker} {timeframe} {date_str}: {e}", level="warning")
+                    continue
+
+                if res is None:
+                    continue
+
+                if res.get("skipped"):
+                    row = {
+                        "date": date_str,
+                        "ticker": str(res.get("ticker", ticker)),
+                        "timeframe": str(res.get("timeframe", timeframe)),
+                        "session": session,
+                        "job_id": job_id,
+                        "skipped": True,
+                        "outcome": "SKIPPED",
+                        "pnl_dollars": 0.0,
+                        "skip_reason": str(res.get("skip_reason", "") or ""),
+                        "verdict": res.get("verdict"),
+                    }
+                    day_skipped.append(row)
+                    continue
+
+                oc = str(res.get("outcome", "") or "")
+                if oc not in ("WIN", "LOSS"):
+                    continue
+
+                pnl = float(res.get("pnl_dollars", 0) or 0)
+                row = dict(res)
+                row["job_id"] = job_id
+                row["session"] = session
+                row.setdefault("date", date_str)
+                day_trades.append(row)
+                day_pnl += pnl
+                capital += pnl
+
+        daily_summary = {
+            "date": date_str,
+            "pnl": round(day_pnl, 2),
+            "trades": len(day_trades),
+            "skipped": len(day_skipped),
+            "capital": round(capital, 2),
+            "wins": sum(1 for t in day_trades if t.get("outcome") == "WIN"),
+            "losses": sum(1 for t in day_trades if t.get("outcome") == "LOSS"),
+        }
+
+        chrono_data.setdefault("daily_pnl", []).append(daily_summary)
+        chrono_data.setdefault("all_trades", []).extend(day_trades)
+        chrono_data.setdefault("skipped", []).extend(day_skipped)
+        chrono_data["capital"] = round(capital, 2)
+        chrono_data["current_date"] = date_str
+        chrono_data["status"] = "running"
+        save_json(chrono_path, chrono_data)
+
+        log(
+            f"[Chrono {job_id}] {date_str}: {len(day_trades)} trades, P&L {day_pnl:+.2f}, capital {capital:.2f}",
+            level="info",
+        )
+        current += timedelta(days=1)
+
+    all_trades: list[dict[str, Any]] = list(chrono_data.get("all_trades") or [])
+    wins = [t for t in all_trades if t.get("outcome") == "WIN"]
+    losses = [t for t in all_trades if t.get("outcome") == "LOSS"]
+
+    chrono_data["status"] = "complete"
+    chrono_data["final_capital"] = round(capital, 2)
+    chrono_data["total_pnl"] = round(capital - STARTING_CAPITAL, 2)
+    chrono_data["summary"] = {
+        "total_trades": len(all_trades),
+        "total_wins": len(wins),
+        "total_losses": len(losses),
+        "win_rate": round(len(wins) / max(1, len(all_trades)) * 100, 1),
+        "total_pnl": round(capital - STARTING_CAPITAL, 2),
+        "total_pnl_pct": round((capital - STARTING_CAPITAL) / STARTING_CAPITAL * 100, 1),
+        "avg_win": round(
+            sum(float(t.get("pnl_dollars", 0) or 0) for t in wins) / max(1, len(wins)),
+            2,
+        ),
+        "avg_loss": round(
+            sum(float(t.get("pnl_dollars", 0) or 0) for t in losses) / max(1, len(losses)),
+            2,
+        ),
+        "session_performance": _calc_session_performance(all_trades),
+        "ticker_performance": _calc_ticker_performance(all_trades),
+        "strategy_performance": _calc_strategy_performance(all_trades),
+        "timeframe_performance": _calc_tf_performance(all_trades),
+    }
+    save_json(chrono_path, chrono_data)
+    log(
+        f"[Chrono {job_id}] Complete. Capital: {capital:.2f}, P&L: {capital - STARTING_CAPITAL:+.2f}",
+        level="info",
+    )
+    return chrono_data
 
 
 def start_continuous_backtest() -> bool:

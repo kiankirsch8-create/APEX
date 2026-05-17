@@ -8,13 +8,15 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Any
 
 import yfinance as yf
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, model_validator
 
@@ -996,6 +998,96 @@ async def backtest_learned() -> dict[str, Any]:
 async def backtest_improving() -> dict[str, Any]:
     """Whether an improvement job is currently running (``improving.json``)."""
     return continuous_backtester.get_improving_state()
+
+
+def _spawn_chronological_backtest(start_date: str, end_date: str, job_id: str) -> None:
+    """Fire-and-forget worker so the HTTP handler returns immediately."""
+    threading.Thread(
+        target=continuous_backtester.run_chronological_backtest,
+        args=(start_date, end_date, job_id),
+        daemon=True,
+        name=f"chrono_{job_id}",
+    ).start()
+
+
+@app.post("/api/chrono/start")
+async def start_chrono_backtest(
+    background_tasks: BackgroundTasks,
+    start_date: str = Query(default=continuous_backtester.CHRONO_START_DATE),
+    end_date: str = Query(default=continuous_backtester.CHRONO_END_DATE),
+) -> dict[str, Any]:
+    """Start a walk-forward chronological backtest (runs in a background thread)."""
+    if not env("ANTHROPIC_API_KEY"):
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY is not configured.")
+    job_id = str(uuid.uuid4())[:8]
+    background_tasks.add_task(
+        _spawn_chronological_backtest,
+        start_date.strip(),
+        end_date.strip(),
+        job_id,
+    )
+    return {
+        "job_id": job_id,
+        "status": "started",
+        "start_date": start_date,
+        "end_date": end_date,
+    }
+
+
+@app.get("/api/chrono/{job_id}/daily")
+async def get_chrono_daily(job_id: str) -> dict[str, Any]:
+    """Daily P&L series and summary for equity-curve charts."""
+    chrono_path = continuous_backtester.chrono_results_path(job_id)
+    if not chrono_path.is_file():
+        return {"error": "Job not found"}
+    data = load_json(chrono_path, default=None)
+    if not isinstance(data, dict):
+        return {"error": "Job not found"}
+    return {
+        "job_id": job_id,
+        "daily_pnl": data.get("daily_pnl", []),
+        "summary": data.get("summary", {}),
+        "capital": data.get("capital"),
+        "status": data.get("status"),
+    }
+
+
+@app.get("/api/chrono/{job_id}")
+async def get_chrono_results(job_id: str) -> dict[str, Any]:
+    """Full chronological job payload from the persisted JSON file."""
+    chrono_path = continuous_backtester.chrono_results_path(job_id)
+    if not chrono_path.is_file():
+        return {"error": "Job not found"}
+    data = load_json(chrono_path, default=None)
+    if not isinstance(data, dict):
+        return {"error": "Job not found"}
+    return data
+
+
+@app.get("/api/chrono")
+async def list_chrono_jobs() -> dict[str, Any]:
+    """List all ``chrono_results_*.json`` jobs under ``DATA_DIR``."""
+    jobs: list[dict[str, Any]] = []
+    for p in sorted(DATA_DIR.glob("chrono_results_*.json")):
+        try:
+            data = load_json(p, default=None)
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(data, dict):
+            continue
+        jobs.append(
+            {
+                "job_id": data.get("job_id"),
+                "status": data.get("status"),
+                "start_date": data.get("start_date"),
+                "end_date": data.get("end_date"),
+                "current_date": data.get("current_date"),
+                "capital": data.get("capital"),
+                "total_trades": len(data.get("all_trades", []) or []),
+            }
+        )
+    jobs.sort(key=lambda x: str(x.get("job_id", "")), reverse=True)
+    return {"jobs": jobs}
 
 
 # ---------------------------------------------------------------------------
