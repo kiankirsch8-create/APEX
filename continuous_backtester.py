@@ -64,7 +64,7 @@ IMPROVE_EVERY = 100
 # Parallel backtest loop (speed)
 MAX_WORKERS = 8
 BATCH_SIZE = 15
-BACKTEST_CLAUDE_MAX_TOKENS = 600
+BACKTEST_CLAUDE_MAX_TOKENS = 1200
 CLAUDE_HTTP_TIMEOUT_SEC = 25.0
 
 RISK_BY_CONFIDENCE: dict[str, float] = {
@@ -2382,30 +2382,28 @@ def pick_random_date(timeframe: str) -> str:
 
 
 def build_work_batch(existing_keys: set[str], batch_size: int) -> list[tuple[str, str, str]]:
+    """Random (ticker, tf, date) slots until ``batch_size`` unique keys not in ``existing_keys``."""
     tickers = eligible_backtest_tickers()
     if not tickers:
         tickers = ["EURUSD"]
+    # TIMEFRAMES is a list of timeframe strings (not a dict).
     timeframe_list = list(TIMEFRAMES)
 
-    candidates: list[tuple[str, str, str]] = []
-    for ticker in tickers:
-        for tf in timeframe_list:
-            date = pick_random_date(tf)
-            key = _result_dedup_key({"ticker": ticker, "date": date, "timeframe": tf})
-            if key and key not in existing_keys:
-                candidates.append((ticker, tf, date))
-
-    random.shuffle(candidates)
-
-    seen: set[str] = set()
     batch: list[tuple[str, str, str]] = []
-    for ticker, tf, date in candidates:
-        dedup = _result_dedup_key({"ticker": ticker, "date": date, "timeframe": tf})
-        if dedup not in seen:
-            seen.add(dedup)
+    seen_in_batch: set[str] = set()
+    attempts = 0
+    max_attempts = batch_size * 20
+
+    while len(batch) < batch_size and attempts < max_attempts:
+        attempts += 1
+        ticker = random.choice(tickers)
+        tf = random.choice(timeframe_list)
+        date = pick_random_date(tf)
+        key = _result_dedup_key({"ticker": ticker, "date": date, "timeframe": tf})
+
+        if key and key not in existing_keys and key not in seen_in_batch:
+            seen_in_batch.add(key)
             batch.append((ticker, tf, date))
-        if len(batch) >= batch_size:
-            break
 
     return batch
 
@@ -2535,7 +2533,10 @@ def continuous_backtest_loop() -> None:
                 }
             )
 
-            time.sleep(10)
+            if len(work_items) < 5:
+                time.sleep(10)
+            else:
+                time.sleep(1)
 
         except Exception as e:  # noqa: BLE001
             log(f"[Loop] Error: {e}", level="error")
