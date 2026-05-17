@@ -42,7 +42,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import traceback
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +64,7 @@ STATE_FILE = DATA_DIR / "backtest_state.json"
 ENABLED_FILE = DATA_DIR / "backtest_enabled.json"
 IMPROVING_FILE = DATA_DIR / "improving.json"
 IMPROVE_DEBUG_FILE = DATA_DIR / "improve_debug.json"
+SESSION_CONFIG_FILE = DATA_DIR / "session_config.json"
 
 STARTING_CAPITAL = 10000.0
 LEVERAGE = 50
@@ -83,6 +84,42 @@ SESSION_WINDOWS: dict[str, tuple[int, int]] = {
     "asia": (22, 8),
     "london": (7, 12),
     "new_york": (12, 21),
+}
+
+# Rolling batch: only scan pairs relevant to the active UTC session (Lovable toggles via session_config).
+SESSION_PAIRS: dict[str, tuple[str, ...]] = {
+    "asia": (
+        "AUDUSD",
+        "NZDUSD",
+        "USDJPY",
+        "AUDJPY",
+        "CADJPY",
+        "NZDCAD",
+        "GBPJPY",
+    ),
+    "london": (
+        "EURUSD",
+        "GBPUSD",
+        "EURGBP",
+        "EURNZD",
+        "GBPNZD",
+        "EURAUD",
+        "GBPAUD",
+        "USDSEK",
+        "USDNOK",
+        "USDCHF",
+    ),
+    "new_york": (
+        "USDCAD",
+        "USDMXN",
+        "USDZAR",
+        "NZDUSD",
+        "EURUSD",
+        "GBPUSD",
+        "USDJPY",
+        "USDNOK",
+        "USDSEK",
+    ),
 }
 
 RISK_BY_CONFIDENCE: dict[str, float] = {
@@ -395,6 +432,45 @@ def eligible_backtest_tickers() -> list[str]:
     return [t for t in BACKTEST_TICKERS if t not in EXCLUDED_PAIRS]
 
 
+def get_current_session() -> str:
+    """Return which session is active right now (UTC)."""
+    hour = datetime.now(timezone.utc).hour
+    if hour >= 22 or hour < 8:
+        return "asia"
+    if 7 <= hour < 12:
+        return "london"
+    if 12 <= hour < 21:
+        return "new_york"
+    return "off_hours"
+
+
+def is_ticker_in_session(ticker: str, session: str) -> bool:
+    """Return True if ticker belongs to the given session list."""
+    sym = (ticker or "").strip().upper()
+    if session == "off_hours":
+        return False
+    allowed = SESSION_PAIRS.get(session, ())
+    return sym in allowed
+
+
+def load_session_config() -> dict[str, bool]:
+    """Persisted session toggles for the rolling engine (``SESSION_CONFIG_FILE``)."""
+    raw = load_json(SESSION_CONFIG_FILE, default=None)
+    defaults = {"asia": True, "london": True, "new_york": True, "off_hours": False}
+    if not isinstance(raw, dict):
+        return dict(defaults)
+    out = dict(defaults)
+    for k in defaults:
+        if k in raw:
+            out[k] = bool(raw[k])
+    return out
+
+
+def save_session_config(config: dict[str, Any]) -> None:
+    """Overwrite session toggles JSON."""
+    save_json(SESSION_CONFIG_FILE, dict(config))
+
+
 def analyse_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[str, Any] | None:
     """One full backtest job (safe for ThreadPoolExecutor workers)."""
     try:
@@ -588,6 +664,11 @@ def _read_backtest_results_file() -> list[dict[str, Any]]:
 def _load_results_list() -> list[dict[str, Any]]:
     with _results_lock:
         return _read_backtest_results_file()
+
+
+def load_all_results() -> list[dict[str, Any]]:
+    """Public read of persisted rolling backtest rows (same backing store as ``_load_results_list``)."""
+    return _load_results_list()
 
 
 def append_result(result: dict[str, Any]) -> int:
@@ -2435,9 +2516,16 @@ def pick_random_date(timeframe: str) -> str:
 def build_work_batch(existing_keys: set[str], batch_size: int) -> list[tuple[str, str, str]]:
     """Build ``batch_size`` random (ticker, timeframe, date) jobs. ``existing_keys`` is unused (append_result dedupes)."""
     _ = existing_keys
-    tickers = eligible_backtest_tickers()
+    session = get_current_session()
+    cfg = load_session_config()
+    if session == "off_hours":
+        return []
+    if not cfg.get(session, True):
+        return []
+
+    tickers = [t for t in eligible_backtest_tickers() if is_ticker_in_session(t, session)]
     if not tickers:
-        tickers = ["EURUSD"]
+        return []
     timeframe_list = list(TIMEFRAMES)
 
     batch: list[tuple[str, str, str]] = []
@@ -2472,6 +2560,15 @@ def continuous_backtest_loop() -> None:
                 continue
 
             work_items = build_work_batch(set(), BATCH_SIZE)
+            if not work_items:
+                log(
+                    "[Loop] No batch jobs (off-hours, session disabled, or no pairs for session) — sleeping",
+                    level="info",
+                )
+                time.sleep(30)
+                continue
+
+            batch_session = get_current_session()
 
             update_state(
                 {
@@ -2481,11 +2578,12 @@ def continuous_backtest_loop() -> None:
                     "current_timeframe": work_items[0][1],
                     "total_tests_run": len(_load_results_list()),
                     "last_heartbeat": datetime.now().isoformat(),
+                    "session": batch_session,
                 }
             )
 
             log(
-                f"[Loop] Batch {len(work_items)} jobs (max_workers={MAX_WORKERS})",
+                f"[Loop] Batch {len(work_items)} jobs (max_workers={MAX_WORKERS}, session={batch_session})",
                 level="info",
             )
 
@@ -2505,6 +2603,9 @@ def continuous_backtest_loop() -> None:
 
                         if result is None:
                             continue
+
+                        if isinstance(result, dict):
+                            result["session"] = batch_session
 
                         with _loop_counters_lock:
                             loop_completed_tests += 1

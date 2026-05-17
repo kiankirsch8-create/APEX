@@ -16,7 +16,7 @@ from typing import Any
 
 import yfinance as yf
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, Body, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, model_validator
 
@@ -25,6 +25,7 @@ import backtest_analyzer
 import chart_analyzer_v2
 import chart_vision
 import continuous_backtester
+import funded_simulator
 import intraday_backtester
 import news_stream
 import portfolio_advisor
@@ -1088,6 +1089,201 @@ async def list_chrono_jobs() -> dict[str, Any]:
         )
     jobs.sort(key=lambda x: str(x.get("job_id", "")), reverse=True)
     return {"jobs": jobs}
+
+
+@app.get("/api/config/sessions")
+async def get_session_config_route() -> dict[str, Any]:
+    """Session toggles for the rolling backtester (stored on ``DATA_DIR``)."""
+    return continuous_backtester.load_session_config()
+
+
+@app.post("/api/config/sessions")
+async def set_session_config_route(config: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    """Update session toggles; keys: ``asia``, ``london``, ``new_york``, optional ``off_hours``."""
+    continuous_backtester.save_session_config(config)
+    return {"status": "saved", "config": continuous_backtester.load_session_config()}
+
+
+@app.get("/api/results")
+async def get_results(
+    limit: int = Query(500, ge=1, le=20000),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    """Paginated rolling backtest rows (Lovable trade list)."""
+    all_results = list(continuous_backtester.load_all_results())
+    all_results.sort(key=lambda x: str(x.get("date", "") or ""), reverse=True)
+    total = len(all_results)
+    page = all_results[offset : offset + limit]
+    return {"total": total, "limit": limit, "offset": offset, "results": page}
+
+
+@app.get("/api/patterns")
+async def get_patterns() -> dict[str, Any]:
+    """Aggregate (ticker, session, strategy, timeframe) buckets with min 5 trades."""
+    from collections import defaultdict
+
+    all_results = continuous_backtester.load_all_results()
+    completed = [r for r in all_results if r.get("outcome") in ("WIN", "LOSS")]
+    if len(completed) < 5:
+        return {"patterns": []}
+
+    buckets: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for t in completed:
+        ticker = str(t.get("ticker", "") or "")
+        session = str(t.get("session", "unknown") or "unknown")
+        strategy = str(t.get("strategy_id", "") or "UNKNOWN")
+        tf = str(t.get("timeframe", "") or "")
+        buckets[(ticker, session, strategy, tf)].append(t)
+
+    strategies = continuous_backtester.STRATEGIES
+    patterns: list[dict[str, Any]] = []
+    for (ticker, session, strategy, tf), trades in buckets.items():
+        if len(trades) < 5:
+            continue
+        wins = [x for x in trades if x.get("outcome") == "WIN"]
+        wr = round(len(wins) / len(trades) * 100, 1)
+        avg_pnl = round(
+            sum(float(x.get("pnl_dollars", 0) or 0) for x in trades) / len(trades),
+            2,
+        )
+        if len(trades) >= 15 and wr >= 55:
+            confidence = "HIGH"
+        elif len(trades) >= 8 and wr >= 45:
+            confidence = "MEDIUM"
+        else:
+            confidence = "LOW"
+        srow = strategies.get(strategy) if isinstance(strategies, dict) else None
+        strategy_name = (
+            str(srow.get("name", strategy)) if isinstance(srow, dict) else str(strategy)
+        )
+        session_label = {"asia": "Asia", "london": "London", "new_york": "New York"}.get(
+            session,
+            session,
+        )
+        patterns.append(
+            {
+                "pattern": f"{ticker} on {session_label} session ({tf.upper()}) with {strategy_name}",
+                "ticker": ticker,
+                "session": session,
+                "strategy": strategy,
+                "timeframe": tf,
+                "trades": len(trades),
+                "wins": len(wins),
+                "win_rate": wr,
+                "avg_pnl": avg_pnl,
+                "confidence": confidence,
+            }
+        )
+
+    patterns.sort(
+        key=lambda x: ({"HIGH": 0, "MEDIUM": 1, "LOW": 2}[x["confidence"]], -x["win_rate"]),
+    )
+    return {"patterns": patterns[:30]}
+
+
+def _spawn_funded_sim(
+    job_id: str,
+    start_date: str,
+    starting_balance: float,
+    profit_target_pct: float,
+    daily_loss_pct: float,
+    max_drawdown_pct: float,
+    trailing_drawdown: bool,
+    num_simulations: int,
+) -> None:
+    threading.Thread(
+        target=funded_simulator.run_funded_simulation,
+        kwargs={
+            "job_id": job_id,
+            "start_date": start_date,
+            "starting_balance": starting_balance,
+            "profit_target_pct": profit_target_pct,
+            "daily_loss_pct": daily_loss_pct,
+            "max_drawdown_pct": max_drawdown_pct,
+            "trailing_drawdown": trailing_drawdown,
+            "num_simulations": num_simulations,
+        },
+        daemon=True,
+        name=f"funded_{job_id}",
+    ).start()
+
+
+@app.get("/api/funded/configs")
+async def get_funded_configs() -> dict[str, Any]:
+    return {"configs": funded_simulator.FIRM_CONFIGS}
+
+
+@app.post("/api/funded/simulate")
+async def start_funded_simulation(
+    background_tasks: BackgroundTasks,
+    start_date: str = Query(default="2023-01-01"),
+    firm: str = Query(default="stella_one_step"),
+    starting_balance: float = Query(default=10000.0),
+    profit_target_pct: float = Query(default=10.0),
+    daily_loss_pct: float = Query(default=4.0),
+    max_drawdown_pct: float = Query(default=8.0),
+    trailing_drawdown: bool = Query(default=True),
+    num_simulations: int = Query(default=1, ge=1, le=500),
+) -> dict[str, Any]:
+    job_id = str(uuid.uuid4())[:8]
+    pt, dl, md, tr = profit_target_pct, daily_loss_pct, max_drawdown_pct, trailing_drawdown
+    if firm in funded_simulator.FIRM_CONFIGS:
+        cfg = funded_simulator.FIRM_CONFIGS[firm]
+        pt = float(cfg["profit_target_pct"])
+        dl = float(cfg["daily_loss_pct"])
+        md = float(cfg["max_drawdown_pct"])
+        tr = bool(cfg["trailing_drawdown"])
+    background_tasks.add_task(
+        _spawn_funded_sim,
+        job_id,
+        start_date.strip(),
+        float(starting_balance),
+        float(pt),
+        float(dl),
+        float(md),
+        bool(tr),
+        int(num_simulations),
+    )
+    return {"job_id": job_id, "status": "started"}
+
+
+@app.get("/api/funded/{job_id}")
+async def get_funded_result(job_id: str) -> dict[str, Any]:
+    data = funded_simulator.load_funded(job_id)
+    if not data:
+        return {"error": "Job not found"}
+    return data
+
+
+@app.get("/api/funded")
+async def list_funded_jobs() -> dict[str, Any]:
+    jobs: list[dict[str, Any]] = []
+    for fp in sorted(funded_simulator.FUNDED_RESULTS_DIR.glob("funded_*.json")):
+        try:
+            data = load_json(fp, default=None)
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(data, dict):
+            continue
+        jobs.append(
+            {
+                "job_id": data.get("job_id"),
+                "status": data.get("status"),
+                "num_sims": data.get("num_simulations"),
+                "sims_done": data.get("sims_complete", 0),
+                "pass_rate": (data.get("summary") or {}).get("pass_rate_pct"),
+            }
+        )
+    jobs.sort(key=lambda x: str(x.get("job_id", "")), reverse=True)
+    return {"jobs": jobs}
+
+
+@app.post("/api/funded/{job_id}/stop")
+async def stop_funded_job(job_id: str) -> dict[str, Any]:
+    flag = funded_simulator.funded_stop_flag_path(job_id)
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.write_text("stop", encoding="utf-8")
+    return {"status": "stop_requested", "job_id": job_id}
 
 
 # ---------------------------------------------------------------------------
