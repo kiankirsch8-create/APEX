@@ -1047,15 +1047,28 @@ async def start_chrono_backtest(
     return out
 
 
+@app.get("/api/chrono/live")
+async def get_chrono_live() -> dict[str, Any]:
+    """Current scan cursor for the chrono engine (poll ~3s in UIs)."""
+    return continuous_backtester.CHRONO_LIVE_STATUS.copy()
+
+
+@app.post("/api/chrono/{job_id}/stop")
+async def stop_chrono_backtest(job_id: str) -> dict[str, Any]:
+    continuous_backtester.request_chrono_stop(job_id.strip())
+    return {"job_id": job_id.strip(), "status": "stop_requested"}
+
+
 @app.get("/api/chrono/active")
 async def get_active_chrono_job() -> dict[str, Any]:
     """Return the persisted active chrono job (if any) plus latest progress from disk."""
     active = continuous_backtester.get_active_chrono()
+    live = continuous_backtester.CHRONO_LIVE_STATUS.copy()
     if not active:
-        return {"active": False}
+        return {"active": False, "live_status": live}
     job_id = str(active.get("job_id", "") or "").strip()
     if not job_id:
-        return {"active": False}
+        return {"active": False, "live_status": live}
     chrono_file = continuous_backtester.chrono_results_path(job_id)
     if chrono_file.is_file():
         data = load_json(chrono_file, default=None)
@@ -1066,9 +1079,11 @@ async def get_active_chrono_job() -> dict[str, Any]:
                 "current_date": data.get("current_date"),
                 "capital": data.get("capital"),
                 "status": data.get("status"),
+                "days_processed": data.get("days_processed", 0),
                 "daily_pnl": data.get("daily_pnl", []),
+                "live_status": live,
             }
-    return {"active": True, "job_id": job_id, "current_date": None}
+    return {"active": True, "job_id": job_id, "current_date": None, "live_status": live}
 
 
 @app.get("/api/chrono/{job_id}/daily")
@@ -1087,6 +1102,8 @@ async def get_chrono_daily(job_id: str) -> dict[str, Any]:
         "summary": data.get("summary", {}),
         "capital": data.get("capital"),
         "status": data.get("status"),
+        "days_processed": data.get("days_processed", 0),
+        "live_status": continuous_backtester.CHRONO_LIVE_STATUS.copy(),
     }
 
 
@@ -1121,6 +1138,7 @@ async def list_chrono_jobs() -> dict[str, Any]:
                 "end_date": data.get("end_date"),
                 "current_date": data.get("current_date"),
                 "capital": data.get("capital"),
+                "days_processed": data.get("days_processed", 0),
                 "total_trades": len(data.get("all_trades", []) or []),
             }
         )
