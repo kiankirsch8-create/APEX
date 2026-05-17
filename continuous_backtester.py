@@ -65,7 +65,7 @@ IMPROVE_EVERY = 100
 # Parallel backtest loop (speed)
 MAX_WORKERS = 3
 BATCH_SIZE = 10
-BACKTEST_CLAUDE_MAX_TOKENS = 800
+BACKTEST_CLAUDE_MAX_TOKENS = 1200
 CLAUDE_HTTP_TIMEOUT_SEC = 25.0
 
 RISK_BY_CONFIDENCE: dict[str, float] = {
@@ -101,7 +101,7 @@ ALLOWED_1H_STRATEGIES: frozenset[str] = frozenset(
     }
 )
 
-TIMEFRAMES: list[str] = ["15m", "30m", "1h", "4h", "1d", "1w"]
+TIMEFRAMES: list[str] = ["15m", "30m", "4h", "1d", "1w"]
 
 TF_FORWARD_CANDLES: dict[str, int] = {
     "15m": 96,
@@ -246,7 +246,7 @@ STRATEGIES: dict[str, dict[str, Any]] = {
         "name": "London Open Breakout",
         "category": "INTRADAY",
         "proven_wr": None,
-        "best_tf": ["15m", "30m", "1h"],
+        "best_tf": ["15m", "30m"],
         "blocked_tf": ["4h", "1d", "1w"],
     },
     "S18_NY_OPEN_MOMENTUM": {
@@ -775,9 +775,9 @@ def enforce_rules(ai: dict[str, Any], timeframe: str, price: float, ticker: str)
         ai["skip_reason"] = f"{strategy_id} only on 15m/30m"
         return ai
 
-    if strategy_id == "S17_LONDON_OPEN_BREAKOUT" and tf not in ("15m", "30m", "1h"):
+    if strategy_id == "S17_LONDON_OPEN_BREAKOUT" and tf not in ("15m", "30m"):
         ai["skip_trade"] = True
-        ai["skip_reason"] = "S17 only on 15m/30m/1h"
+        ai["skip_reason"] = "S17 only on 15m/30m"
         return ai
 
     try:
@@ -1355,7 +1355,7 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
                 or 20
             )
 
-            if is_news_blackout(30) and tf_key in ("15m", "30m", "1h"):
+            if is_news_blackout(30) and tf_key in ("15m", "30m"):
                 log(
                     f"[NewsBlackout] Skipping {sym} — high impact event within 30min",
                     level="info",
@@ -1867,7 +1867,7 @@ def _strategy_performance_stats(completed: list[dict[str, Any]]) -> dict[str, An
             profit_factor = 0.0
 
         tf_breakdown: dict[str, Any] = {}
-        for tf in ("15m", "30m", "1h", "4h", "1d", "1w"):
+        for tf in TIMEFRAMES:
             tf_trades = [t for t in s_trades if str(t.get("timeframe", "") or "").lower() == tf]
             if tf_trades:
                 tf_wins = [t for t in tf_trades if t.get("outcome") == "WIN"]

@@ -40,11 +40,10 @@ YOUR PROVEN PERFORMANCE — 300+ REAL TRADES
 
 PROVEN STRATEGIES (trust these):
 S03 EMA Pullback:      57.7% WR overall — 4H 66.7%, 1D 50%, 1W 66.7% — need 3 of 4 non-negotiables met
-S04 Extreme Reversion: 66.7% on 1D, 75% on 1W — 1H/4H BLOCKED — zone extreme + RSI extreme (2 of 3 with ADX<45)
-S11 SR Flip:           100% WR (small sample) — 1H/4H/1D when flip visible
+S04 Extreme Reversion: 66.7% on 1D, 75% on 1W — 4H BLOCKED — zone extreme + RSI extreme (2 of 3 with ADX<45)
+S11 SR Flip:           100% WR (small sample) — 4H/1D/1W when flip visible
 
 TIMEFRAME WIN RATES:
-1H:  23% WR — only S11 / S02 / S17 allowed
 4H:  41% WR — S03 works (66.7%); S04/S08 on 4H = SKIP
 1D:  53% WR — primary
 1W:  65% WR — highest win rate
@@ -53,13 +52,13 @@ ZONE KNOWLEDGE:
 Discount zone longs strong; NZD crosses historically strong; premium shorts weak without confirmation.
 
 TESTING (LOW confidence only): S01 S02 S05 S06 S07 S08 (avoid S08 on 4H) S12
-INTRADAY (15M/30M — always LOW): S13 S14 S15 S16 S18; S17 also on 1H
+INTRADAY (15M/30M — always LOW): S13 S14 S15 S16 S18; S17 London open on 15M/30M only
 
 =======================================================
 STRATEGY SCAN — PICK BEST MATCH
 =======================================================
 
-S03: 3 of 4 — EMA20/50 same side of EMA200; price within 2x ATR of EMA20 or EMA50; RSI 25–70; ADX>15
+S03: 3 of 4 — EMA20/50 same side of EMA200; price within 2x ATR of EMA20 or EMA50; RSI 25–70; ADX>12
 S04: 2 of 3 on 1D/1W only — zone <15 LONG or >85 SHORT; RSI <35 LONG or >65 SHORT; ADX<45
 S11: 2 of 3 — level 2+ touches (0.5%); clear break; retest from other side
 
@@ -80,9 +79,9 @@ Use intelligence to adjust conviction by +1 or -1 only. Never trade on intellige
 HOW TO DECIDE — 7 STEPS
 =======================================================
 
-STEP 1: TIMEFRAME GATE — 1H: S11/S02/S17 only; 4H: S03 (no S04/S08); 15M/30M: S13–S18; 1D/1W: full scan
+STEP 1: TIMEFRAME GATE — 4H: S03 (no S04/S08); 15M/30M: S13–S18; 1D/1W: full scan
 STEP 2: SCAN — S03 first, then S04 (1D/1W), S11, then testing/intraday; else SKIP
-STEP 3: SKIP if no edge, S04 on 1H/4H, S08 on 4H, weak equilibrium without structure, conviction 1–2
+STEP 3: SKIP if no edge, S04 on 4H, S08 on 4H, weak equilibrium without structure, conviction 1–2
 STEP 4: DIRECTION from strategy + zone/EMA200 context
 STEP 5: STOP at structural invalidation + 0.3x ATR; Python caps width
 STEP 6: TP1=2R TP2=3R TP3=5R; trail BE at TP1, +1R at TP2, 1.5R trail after TP3 activation
