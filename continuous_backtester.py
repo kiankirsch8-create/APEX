@@ -25,6 +25,7 @@ STRATEGY_VERSION = "v3.0-definitive"
 # give them LOW confidence until 30+ trades of data exist.
 # Never rewrite enforcement rules, position sizing, or trailing.
 
+import gc
 import json
 import math
 import os
@@ -62,9 +63,9 @@ LEVERAGE = 50
 IMPROVE_EVERY = 100
 
 # Parallel backtest loop (speed)
-MAX_WORKERS = 4
-BATCH_SIZE = 15
-BACKTEST_CLAUDE_MAX_TOKENS = 1200
+MAX_WORKERS = 3
+BATCH_SIZE = 10
+BACKTEST_CLAUDE_MAX_TOKENS = 800
 CLAUDE_HTTP_TIMEOUT_SEC = 25.0
 
 RISK_BY_CONFIDENCE: dict[str, float] = {
@@ -1192,6 +1193,8 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
             log(f"[Backtest] Not enough future data for {sym} {analysis_date} {tf_key}", level="info")
             return None
 
+        gc.collect()
+
         past.ta.rsi(length=14, append=True)
         past.ta.macd(append=True)
         past.ta.ema(length=20, append=True)
@@ -1529,6 +1532,10 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dict[st
             fut,
             strategy_id_norm,
         )
+        del fut
+        del past
+        del future
+        gc.collect()
         if exit_data.get("outcome") in ("NO_DATA", "INVALID"):
             return None
 
@@ -2503,6 +2510,8 @@ def continuous_backtest_loop() -> None:
 
             except Exception as e:  # noqa: BLE001
                 log(f"[Batch crashed] {e} — continuing", level="error")
+
+            time.sleep(5)
 
             with _loop_counters_lock:
                 tsi_snapshot = tests_since_improve
