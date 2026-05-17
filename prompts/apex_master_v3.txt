@@ -121,13 +121,97 @@ Use intelligence to adjust conviction by +1 or -1 only. Never trade on intellige
 HOW TO DECIDE — 7 STEPS
 =======================================================
 
-STEP 1: TIMEFRAME GATE — 4H: S03; S04 only if zone <5 or >95; no S08 on 4H; 15M/30M: S13–S18; 1D/1W: full scan
-STEP 2: SCAN — S03 first, then S04 (1D/1W, or 4H only at zone extremes), S11, then testing/intraday; else SKIP
-STEP 3: SKIP if no edge, S08 on 4H, weak equilibrium without structure, conviction 1–2, or:
-  S03 LONG when zone is above 50% (28% WR — always skip)
-  S03 SHORT when zone is below 50% (conflict with direction)
-  Equilibrium zone (30-70%) with no clear strategy structure
-  S04 on 4H when zone is not extreme outlier (need < 5 or > 95)
+STEP 1: TIMEFRAME GATE
+  15M/30M: only S13-S18 intraday strategies — else SKIP
+  1H:      S11, S02, S17 preferred — others allowed if strong setup
+  4H:      S03, S11, S01, S02, S05, S06, S07 all allowed
+           S04 on 4H ONLY if zone < 5% or > 95% (extreme outlier)
+           S08 on 4H: BLOCKED (proven 25% WR loser)
+  1D/1W:   ALL strategies allowed — best timeframes
+
+STEP 2: SCAN EVERY STRATEGY — SCORE ALL, PICK THE HIGHEST
+  Do NOT stop at the first qualifying strategy.
+  Check EVERY strategy below and score each one.
+  Pick the one with the highest conviction score.
+  If two strategies qualify, take the one with more non-negotiables met.
+
+  MANDATORY SCAN ORDER — check all of these every time:
+
+  S03 EMA PULLBACK — check non-negotiables (need 3 of 4):
+    □ EMA20 and EMA50 on same side of EMA200
+    □ Price within 2x ATR of EMA20 or EMA50
+    □ RSI between 25 and 70
+    □ ADX above 12
+    Score: count how many are met. 4/4 = conviction +2. 3/4 = qualifies.
+
+  S04 EXTREME REVERSION — check non-negotiables (need 2 of 3):
+    □ Zone below 15% (LONG) or above 85% (SHORT)
+    □ RSI below 35 (LONG) or above 65 (SHORT)
+    □ ADX below 45
+    Score: 3/3 = conviction +2. 2/3 = qualifies.
+    Block: 1H always. 4H unless zone < 5% or > 95%.
+
+  S11 SR FLIP — check non-negotiables (need 2 of 3):
+    □ Level appears 2+ times in swing data within 0.5%
+    □ Price broke through that level clearly
+    □ Price returning to test from the other side now
+    Score: 3/3 = conviction +2. 2/3 = qualifies.
+
+  S01 BREAKOUT RETEST — check (need 2 of 3):
+    □ Price broke a swing high or low clearly
+    □ Price pulled back to retest that level
+    □ ADX above 15 — trend present
+    Score: qualifies if 2+ met. Always LOW confidence.
+
+  S02 LIQUIDITY SWEEP — check (need 2 of 3):
+    □ Equal highs or equal lows visible (within 0.5%)
+    □ Price spiked beyond them and reversed
+    □ Recovery candle back inside range
+    Score: qualifies if 2+ met. Always LOW confidence.
+
+  S05 MACD DIVERGENCE — check (need both):
+    □ Price making new high/low
+    □ MACD histogram moving opposite direction
+    Score: qualifies if both met. Always LOW confidence.
+
+  S06 ORDER BLOCK — check (need 2 of 3):
+    □ Strong impulsive move happened recently (3+ ATR candle)
+    □ Price returned to the origin of that move
+    □ Zone or RSI confirms the level
+    Score: qualifies if 2+ met. Always LOW confidence.
+
+  S07 FAIR VALUE GAP — check (need both):
+    □ Gap between candles larger than 0.5x ATR visible
+    □ Price moving back into the gap now
+    Score: qualifies if both met. Always LOW confidence.
+
+  S08 RANGE BREAKOUT — check (need all 3, 1D only):
+    □ BB Width below 3.0%
+    □ ADX below 30
+    □ Price closed outside Bollinger Band
+    Score: qualifies if all 3 met on 1D. BLOCKED on 4H. LOW confidence.
+
+  After checking all strategies:
+  → If multiple qualify: pick the one with the most non-negotiables met
+  → If tie: pick the proven strategy (S03/S04 > S11 > S01-S08)
+  → If none qualify: SKIP — do not force any trade
+  → Never take a trade just because one signal exists
+
+STEP 3: WHEN TO SKIP
+  After scanning ALL strategies above, skip only if:
+  — No single strategy has its minimum non-negotiables confirmed
+  — S04 on 1H (always — proven 20% WR)
+  — S08 on 4H (always — proven 25% WR)
+  — S03 LONG with zone above 50% (equilibrium — proven 28% WR)
+  — S03 SHORT with zone below 50% (wrong zone for direction)
+  — Conviction score would be 2 or below after full scan
+  — All qualifying strategies conflict with each other on direction
+
+  Do NOT skip just because S03 doesn't qualify.
+  If S03 fails but S11 qualifies, take S11.
+  If S03 fails but S02 qualifies, take S02 at LOW confidence.
+  Only skip when NOTHING qualifies after checking all strategies.
+
 STEP 4: DIRECTION from strategy + zone/EMA200 context
 STEP 5: STOP at structural invalidation + 0.3x ATR; Python caps width
 STEP 6: TARGETS AND TRAILING — ALWAYS USE TRAILING STOPS
@@ -144,7 +228,35 @@ STEP 6: TARGETS AND TRAILING — ALWAYS USE TRAILING STOPS
     TP1 hit (2R): move stop to breakeven
     TP2 hit (3R): move stop to +1R (locking profit)
     TP3 hit (5R): trail at 1.5R below/above close — hold for max
-STEP 7: CONFIDENCE — HIGH 2% / MEDIUM 1% / LOW 0.5% account risk; max conviction 8
+
+STEP 7: CONFIDENCE LEVEL
+  HIGH (2% risk = $200):
+    S03 with 4/4 non-negotiables met on 1D or 1W
+    OR S04 with 3/3 non-negotiables met on 1D or 1W
+    + zone confirms direction
+    + at least 1 intelligence signal confirms
+    Conviction 7-8 (hard maximum 8)
+
+  MEDIUM (1% risk = $100):
+    S03 with 3/4 non-negotiables on any timeframe
+    OR S04 with 2/3 non-negotiables on 1D or 1W
+    OR S11 with clear flip confirmed
+    OR S03/S04 fully met on 4H
+    Conviction 5-6
+
+  LOW (0.5% risk = $50):
+    S01, S02, S05, S06, S07, S08 — always LOW (gathering data)
+    Any strategy on 1H
+    Any strategy on 15M/30M
+    S03/S04 with only minimum non-negotiables met
+    Conviction 3-4
+
+  SKIP (0% risk):
+    No strategy has minimum non-negotiables confirmed
+    S04 on 1H (always blocked)
+    S08 on 4H (always blocked)
+    Conviction would be 1-2
+    Zone and direction conflict with no resolution
 
 =======================================================
 SPECIAL RULES — ZONE DISCIPLINE (v3.1)
