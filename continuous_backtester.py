@@ -63,7 +63,7 @@ IMPROVE_EVERY = 100
 
 # Parallel backtest loop (speed)
 MAX_WORKERS = 8
-BATCH_SIZE = 15
+BATCH_SIZE = 25
 BACKTEST_CLAUDE_MAX_TOKENS = 1200
 CLAUDE_HTTP_TIMEOUT_SEC = 25.0
 
@@ -2382,28 +2382,19 @@ def pick_random_date(timeframe: str) -> str:
 
 
 def build_work_batch(existing_keys: set[str], batch_size: int) -> list[tuple[str, str, str]]:
-    """Random (ticker, tf, date) slots until ``batch_size`` unique keys not in ``existing_keys``."""
+    """Build ``batch_size`` random (ticker, timeframe, date) jobs. ``existing_keys`` is unused (append_result dedupes)."""
+    _ = existing_keys
     tickers = eligible_backtest_tickers()
     if not tickers:
         tickers = ["EURUSD"]
-    # TIMEFRAMES is a list of timeframe strings (not a dict).
     timeframe_list = list(TIMEFRAMES)
 
     batch: list[tuple[str, str, str]] = []
-    seen_in_batch: set[str] = set()
-    attempts = 0
-    max_attempts = batch_size * 20
-
-    while len(batch) < batch_size and attempts < max_attempts:
-        attempts += 1
+    for _ in range(batch_size):
         ticker = random.choice(tickers)
         tf = random.choice(timeframe_list)
         date = pick_random_date(tf)
-        key = _result_dedup_key({"ticker": ticker, "date": date, "timeframe": tf})
-
-        if key and key not in existing_keys and key not in seen_in_batch:
-            seen_in_batch.add(key)
-            batch.append((ticker, tf, date))
+        batch.append((ticker, tf, date))
 
     return batch
 
@@ -2429,13 +2420,7 @@ def continuous_backtest_loop() -> None:
                 time.sleep(10)
                 continue
 
-            existing = _load_results_list()
-            existing_keys = {_result_dedup_key(r) for r in existing}
-            work_items = build_work_batch(existing_keys, BATCH_SIZE)
-            if not work_items:
-                log("[Loop] No new (ticker,date,tf) slots in batch — sleeping", level="info")
-                time.sleep(10)
-                continue
+            work_items = build_work_batch(set(), BATCH_SIZE)
 
             update_state(
                 {
@@ -2443,7 +2428,7 @@ def continuous_backtest_loop() -> None:
                     "current_ticker": work_items[0][0],
                     "current_date": work_items[0][2],
                     "current_timeframe": work_items[0][1],
-                    "total_tests_run": len(existing),
+                    "total_tests_run": len(_load_results_list()),
                     "last_heartbeat": datetime.now().isoformat(),
                 }
             )
@@ -2532,11 +2517,6 @@ def continuous_backtest_loop() -> None:
                     "last_session_at": datetime.now().isoformat(),
                 }
             )
-
-            if len(work_items) < 5:
-                time.sleep(10)
-            else:
-                time.sleep(1)
 
         except Exception as e:  # noqa: BLE001
             log(f"[Loop] Error: {e}", level="error")
