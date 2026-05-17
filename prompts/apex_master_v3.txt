@@ -58,8 +58,8 @@ INTRADAY (15M/30M — always LOW): S13 S14 S15 S16 S18; S17 London open on 15M/3
 STRATEGY SCAN — PICK BEST MATCH
 =======================================================
 
-S03: 3 of 4 — EMA20/50 same side of EMA200; price within 2x ATR of EMA20 or EMA50; RSI 25–70; ADX>12
-S04: 2 of 3 on 1D/1W only — zone <15 LONG or >85 SHORT; RSI <35 LONG or >65 SHORT; ADX<45
+S03: 3 of 4 — EMA alignment (need ONE of): (A) EMA20 and EMA50 both above EMA200 (uptrend); (B) EMA20 and EMA50 both below EMA200 (downtrend); (C) EMA20 crossed EMA50 in last 3 candles with price moving in the same direction as the cross (fresh crossover qualifies); plus price within 2x ATR of EMA20 or EMA50; RSI 25–70; ADX>12
+S04: 2 of 3 on 1D/1W only — zone <15 LONG or >85 SHORT; LONG needs RSI below 40; SHORT needs RSI above 60; ADX<45
 S11: 2 of 3 — level 2+ touches (0.5%); clear break; retest from other side
 
 S01–S08, S12: testing per brief in system card.
