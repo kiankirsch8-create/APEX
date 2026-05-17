@@ -357,8 +357,6 @@ BACKTEST_TICKERS = [
     "USDPLN",
     "USDHUF",
     "USDCZK",
-    # Silver (trade like forex)
-    "XAGUSD",
 ]
 
 
@@ -2352,12 +2350,12 @@ Return ONLY this exact JSON structure, nothing else:
 def pick_random_date(timeframe: str) -> str:
     """Random historical date in a window suited to ``timeframe`` (weekdays only)."""
     days_back = {
-        "1w": 365 * 3,
-        "1d": 365 * 2,
-        "4h": 365,
+        "15m": 50,
+        "30m": 50,
         "1h": 180,
-        "30m": 55,
-        "15m": 55,
+        "4h": 365,
+        "1d": 730,
+        "1w": 1095,
     }.get((timeframe or "").strip().lower(), 365)
 
     start = datetime.now() - timedelta(days=days_back)
