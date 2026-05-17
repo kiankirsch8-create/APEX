@@ -5,21 +5,27 @@ rolling stats, and periodic self-improvement. All state is simple JSON on ``DATA
 """
 from __future__ import annotations
 
-STRATEGY_VERSION = "v3.0-definitive"
-# Built from 300+ backtested trades — May 2026
+STRATEGY_VERSION = "v3.1-zone-filter"
+# STRATEGY_VERSION = "v3.1-zone-filter"
+# Built from 528 backtested trades — May 2026
 #
-# Baseline performance this was built from:
-#   135 trades: 48.9% WR, +$1,606, 4.4% max drawdown
-#   149 trades: 51.4% WR, +$1,991, 3.1% max drawdown
+# v3.1 CHANGES FROM v3.0-definitive:
+#   1. S03 LONG blocked when zone_pct > 50 (equilibrium kills WR)
+#      Data: LONG in DISCOUNT = 53% WR +$3,597
+#            LONG in EQUILIBRIUM = 28% WR -$4,065
+#   2. S04 now allowed on 4H ONLY when zone < 5 OR zone > 95
+#      (extreme extremes have reversion edge even on 4H)
+#   3. Trailing stop now always active — TP1 at 2R minimum
+#      Avg win must be $400+ to justify the 38% WR cost
 #
 # RULES THAT MUST NEVER BE CHANGED:
-#   S04 never on 1H or 4H (proven 20%/37% WR losers)
-#   S08 never on 4H (proven 25% WR loser)
 #   strategy_met must be True to trade (no fallback trades)
 #   No weekly bias filter (blocked valid S04 extreme trades)
 #   Position sizing: HIGH=2%, MEDIUM=1%, LOW=0.5%
-#   Trailing: breakeven at TP1, +1R at TP2, 1.5R trail after TP3
-#   Max conviction score: 8 (lesson from -$300 loss at HIGH conf)
+#   Trailing: breakeven at TP1(2R), +1R at TP2(3R), 1.5R trail after TP3(5R)
+#   Max conviction score: 8
+#   S08 never on 4H (proven 25% WR loser)
+#   S04 on 1H: always blocked
 #
 # TO ADD NEW STRATEGIES: create S19+, add to STRATEGIES dict,
 # give them LOW confidence until 30+ trades of data exist.
@@ -738,15 +744,48 @@ def enforce_rules(ai: dict[str, Any], timeframe: str, price: float, ticker: str)
         ai["skip_reason"] = "strategy_met=False — no fallback trades allowed"
         return ai
 
+    # RULE 2: S04 blocked on 1H always. On 4H only allowed at extreme extremes.
     if strategy_id == "S04_EXTREME_REVERSION":
-        if tf in ("1h", "4h"):
+        if tf == "1h":
             ai["skip_trade"] = True
-            ai["skip_reason"] = f"S04 blocked on {tf}: proven loser (4H=37%, 1H=20%)"
+            ai["skip_reason"] = "S04 blocked on 1H: proven 20% WR loser"
             return ai
-        if not (zone_pct <= 15 or zone_pct >= 85):
+        if tf == "4h":
+            # Allow S04 on 4H ONLY for extreme extremes (< 5% or > 95%)
+            # These are statistical outliers with genuine reversion edge
+            if not (zone_pct <= 5 or zone_pct >= 95):
+                ai["skip_trade"] = True
+                ai["skip_reason"] = (
+                    f"S04 blocked on 4H: zone {zone_pct:.1f}% not extreme enough "
+                    f"— need below 5 or above 95 for 4H reversion"
+                )
+                return ai
+        # For 1D and 1W: standard zone threshold (below 15 or above 85)
+        if tf in ("1d", "1w"):
+            if not (zone_pct <= 15 or zone_pct >= 85):
+                ai["skip_trade"] = True
+                ai["skip_reason"] = (
+                    f"S04 zone {zone_pct:.1f}% not extreme — "
+                    f"need below 15 or above 85"
+                )
+                return ai
+
+    # RULE 2B: S03 LONG blocked in equilibrium zone (zone > 50%)
+    # Data shows: LONG DISCOUNT = 53% WR +$3,597
+    #             LONG EQUILIBRIUM = 28% WR -$4,065
+    if strategy_id == "S03_EMA_PULLBACK":
+        if direction == "LONG" and zone_pct > 50:
             ai["skip_trade"] = True
             ai["skip_reason"] = (
-                f"S04 zone {zone_pct:.1f}% not extreme — need below 15 or above 85"
+                f"S03 LONG blocked: zone {zone_pct:.1f}% above 50% "
+                f"— discount zone required for long edge (53% WR vs 28%)"
+            )
+            return ai
+        if direction == "SHORT" and zone_pct < 50:
+            ai["skip_trade"] = True
+            ai["skip_reason"] = (
+                f"S03 SHORT blocked: zone {zone_pct:.1f}% below 50% "
+                f"— premium zone required for short edge"
             )
             return ai
 
