@@ -12,6 +12,7 @@ MARKET DATA
 =======================================================
 Asset:     {ticker}
 Timeframe: {tf_label}
+Session:   {session_context}
 Date:      {analysis_date}
 Price:     {price:.5f}
 

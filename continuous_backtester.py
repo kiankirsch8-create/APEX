@@ -42,7 +42,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import traceback
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -80,26 +80,41 @@ CLAUDE_HTTP_TIMEOUT_SEC = 25.0
 # Chronological walk-forward backtest (API-triggered; separate from rolling loop)
 CHRONO_START_DATE = "2023-01-01"
 CHRONO_END_DATE = "2026-05-17"
-CHRONO_TIMEFRAMES: list[str] = ["1d", "1w"]
+CHRONO_TIMEFRAMES: list[str] = ["4h", "1d", "1w"]  # 15m/30m appended in chrono loop when scan date is recent
 CHRONO_TICKERS = [
+    # Majors (USD)
     "EURUSD",
     "GBPUSD",
     "USDJPY",
     "AUDUSD",
     "USDCAD",
     "NZDUSD",
+    "USDCHF",
+    # EUR crosses
     "EURGBP",
+    "EURJPY",
+    "EURAUD",
     "EURNZD",
+    "EURCAD",
+    # GBP crosses
+    "GBPJPY",
     "GBPNZD",
+    "GBPAUD",
+    "GBPCAD",
+    # AUD / NZD crosses
+    "AUDJPY",
+    "AUDCAD",
+    "AUDNZD",
+    "NZDCAD",
+    "NZDJPY",
+    # JPY crosses
     "CADJPY",
-    "USDZAR",
+    "CHFJPY",
+    # Commodity / EM
     "USDMXN",
+    "USDZAR",
     "USDNOK",
     "USDSEK",
-    "GBPJPY",
-    "EURAUD",
-    "NZDCAD",
-    "AUDJPY",
 ]
 
 # Live scan status for Lovable (updated each ticker during chrono)
@@ -112,7 +127,13 @@ CHRONO_LIVE_STATUS: dict[str, Any] = {
     "trades_today": 0,
     "capital": STARTING_CAPITAL,
     "days_processed": 0,
+    "ticker_position": 0,
+    "total_tickers": 0,
+    "scan_counts": {},
 }
+
+# Fairness: how many times each ticker has been scanned this chrono run (session)
+CHRONO_SCAN_COUNTS: dict[str, int] = {}
 
 SESSION_WINDOWS: dict[str, tuple[int, int]] = {
     "asia": (22, 8),
@@ -813,6 +834,8 @@ def get_ohlcv(
     elif chrono_yfinance and tf_key == "30m":
         cfg["days_back"] = 55
         cfg["interval"] = "30m"
+    elif chrono_yfinance and tf_key == "4h":
+        cfg = {"interval": "4h", "days_back": 50, "days_fwd": 30}
     target = datetime.strptime(analysis_date.strip(), "%Y-%m-%d")
     start = target - timedelta(days=int(cfg["days_back"]))
     end = target + timedelta(days=int(cfg["days_fwd"]))
@@ -879,6 +902,7 @@ def _load_master_prompt_v3(
     cot_bias: str,
     fear_greed: float,
     vix_val: float,
+    session_context: str,
 ) -> str:
     tpl = _PROMPT_V3_FILE.read_text(encoding="utf-8")
     return tpl.format(
@@ -905,6 +929,7 @@ def _load_master_prompt_v3(
         swing_highs=ind.get("swing_highs", []),
         swing_lows=ind.get("swing_lows", []),
         intel_text=intel_text,
+        session_context=session_context,
         news_sentiment=news_sentiment,
         cot_bias=cot_bias,
         fear_greed=fear_greed,
@@ -1616,6 +1641,22 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str, *, chrono_
         except Exception as e:
             log(f"[Intel] {e}")
 
+        _utc_hour = datetime.now(timezone.utc).hour
+        if 22 <= _utc_hour or _utc_hour < 8:
+            _session_context = (
+                "ACTIVE SESSION: Asia (22:00-08:00 UTC) — JPY, AUD, NZD pairs most active"
+            )
+        elif 7 <= _utc_hour < 12:
+            _session_context = (
+                "ACTIVE SESSION: London (07:00-12:00 UTC) — EUR, GBP pairs most active"
+            )
+        elif 12 <= _utc_hour < 21:
+            _session_context = (
+                "ACTIVE SESSION: New York (12:00-21:00 UTC) — USD pairs most active"
+            )
+        else:
+            _session_context = "ACTIVE SESSION: Off-hours (21:00-22:00 UTC) — low liquidity"
+
         tf_label = TF_DESCRIPTIONS.get(tf_key, tf_key)
         prompt = _load_master_prompt_v3(
             ticker=sym,
@@ -1633,6 +1674,7 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str, *, chrono_
             cot_bias=cot_bias,
             fear_greed=fear_greed,
             vix_val=vix_val,
+            session_context=_session_context,
         )
         try:
             client = _client()
@@ -2966,8 +3008,9 @@ def run_chronological_backtest(
 ) -> dict[str, Any]:
     """
     Walk forward calendar day by day from ``start_date`` to ``end_date``.
-    Each weekday scans every eligible ticker × ``CHRONO_TIMEFRAMES`` via
-    ``run_one_backtest`` (same Claude path as the rolling engine).
+    Each weekday scans every ticker in ``CHRONO_TICKERS`` in fixed order; timeframes
+    are ``4h``/``1d``/``1w`` plus ``15m``/``30m`` when the scan date is within 55 days
+    of today (Yahoo intraday window). Uses ``run_one_backtest`` (same Claude path).
     Persists to ``chrono_results_{job_id}.json`` under ``DATA_DIR`` (resumable).
     """
     if job_id is None:
@@ -3007,6 +3050,7 @@ def run_chronological_backtest(
 
     global CHRONO_RUNNING
     CHRONO_RUNNING = True
+    CHRONO_SCAN_COUNTS.clear()
     clear_chrono_stop_flag(job_id)
     set_active_chrono(job_id)
     try:
@@ -3029,6 +3073,9 @@ def run_chronological_backtest(
                 "trades_today": 0,
                 "capital": round(float(chrono_data.get("capital", STARTING_CAPITAL) or STARTING_CAPITAL), 2),
                 "days_processed": int(chrono_data.get("days_processed", 0) or 0),
+                "ticker_position": 0,
+                "total_tickers": len(CHRONO_TICKERS),
+                "scan_counts": {},
             }
         )
         try:
@@ -3150,6 +3197,9 @@ def run_chronological_backtest(
                     "trades_today": len(day_trades),
                     "capital": round(capital, 2),
                     "days_processed": int(chrono_data.get("days_processed", 0) or 0),
+                    "ticker_position": 0,
+                    "total_tickers": len(CHRONO_TICKERS),
+                    "scan_counts": dict(CHRONO_SCAN_COUNTS),
                 }
             )
 
@@ -3160,21 +3210,31 @@ def run_chronological_backtest(
                     if chrono_stop_requested(job_id):
                         chrono_abort = True
                         break
-                    for timeframe in CHRONO_TIMEFRAMES:
-                        if timeframe in ("15m", "30m"):
-                            days_ago = (datetime.today() - datetime.strptime(date_str, "%Y-%m-%d")).days
-                            if days_ago > 55:
-                                continue
+
+                    scan_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+                    days_ago = (date.today() - scan_date).days
+                    if days_ago <= 55:
+                        timeframes_to_scan = ["15m", "30m", "4h", "1d", "1w"]
+                    else:
+                        timeframes_to_scan = ["4h", "1d", "1w"]
+
+                    for timeframe in timeframes_to_scan:
                         if chrono_stop_requested(job_id):
                             chrono_abort = True
                             break
                         session = _chrono_session_for_timeframe(timeframe)
+                        tpos = CHRONO_TICKERS.index(ticker) + 1 if ticker in CHRONO_TICKERS else 0
                         CHRONO_LIVE_STATUS.update(
                             {
                                 "current_ticker": ticker,
                                 "current_timeframe": timeframe,
+                                "current_date": date_str,
                                 "trades_today": len(day_trades),
                                 "capital": round(capital, 2),
+                                "status": "scanning",
+                                "ticker_position": tpos,
+                                "total_tickers": len(CHRONO_TICKERS),
+                                "scan_counts": dict(CHRONO_SCAN_COUNTS),
                             }
                         )
                         try:
@@ -3221,6 +3281,8 @@ def run_chronological_backtest(
                     if chrono_abort:
                         break
 
+                    CHRONO_SCAN_COUNTS[ticker] = CHRONO_SCAN_COUNTS.get(ticker, 0) + 1
+
                     chrono_data["chrono_intraday"] = {
                         "date": date_str,
                         "next_ticker_idx": ti + 1,
@@ -3234,7 +3296,7 @@ def run_chronological_backtest(
                     chrono_data["status"] = "running"
                     save_json(chrono_path, chrono_data)
 
-                    time.sleep(3.0)
+                    time.sleep(2.0)
 
             if chrono_stop_requested(job_id) or chrono_abort:
                 log(f"[Chrono {job_id}] Stop requested — exiting early", level="info")
@@ -3279,6 +3341,9 @@ def run_chronological_backtest(
                     "trades_today": 0,
                     "capital": round(capital, 2),
                     "days_processed": int(chrono_data.get("days_processed", 0) or 0),
+                    "ticker_position": 0,
+                    "total_tickers": len(CHRONO_TICKERS),
+                    "scan_counts": dict(CHRONO_SCAN_COUNTS),
                 }
             )
 
@@ -3336,8 +3401,12 @@ def run_chronological_backtest(
                 "trades_today": 0,
                 "capital": STARTING_CAPITAL,
                 "days_processed": 0,
+                "ticker_position": 0,
+                "total_tickers": len(CHRONO_TICKERS),
+                "scan_counts": {},
             }
         )
+        CHRONO_SCAN_COUNTS.clear()
 
 
 def start_continuous_backtest() -> bool:
