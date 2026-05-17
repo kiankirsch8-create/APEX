@@ -367,6 +367,190 @@ STRATEGIES: dict[str, dict[str, Any]] = {
     },
 }
 
+
+def python_prefilter(
+    _ticker: str,
+    timeframe: str,
+    price: float,
+    ind: dict,
+    zone_pct: float,
+) -> list:
+    """
+    Pure Python strategy pre-filter. Zero cost. Zero Claude calls.
+    Returns list of (strategy_id, direction, signals_met) tuples.
+    Empty list = skip immediately, no Claude call needed.
+    """
+
+    tf = timeframe.lower().strip()
+    qualifying: list[tuple[str, str, int]] = []
+
+    ema20 = ind.get("ema20", price)
+    ema50 = ind.get("ema50", price)
+    ema200 = ind.get("ema200", price)
+    rsi = ind.get("rsi", 50.0)
+    adx = ind.get("adx", 20.0)
+    atr = ind.get("atr", price * 0.01)
+    bb_width = ind.get("bb_width", 3.0)
+    if bb_width == 0:
+        bb_upper = ind.get("bb_upper", price * 1.01)
+        bb_lower = ind.get("bb_lower", price * 0.99)
+        bb_mid = ind.get("bb_mid", price)
+        bb_width = (bb_upper - bb_lower) / bb_mid * 100 if bb_mid > 0 else 3.0
+
+    macd_hist = ind.get("macd_hist", 0.0)
+    swing_highs = ind.get("swing_highs", [])
+    swing_lows = ind.get("swing_lows", [])
+
+    dist_ema20 = abs(price - ema20)
+    dist_ema50 = abs(price - ema50)
+    within_2atr = (dist_ema20 <= atr * 2) or (dist_ema50 <= atr * 2)
+
+    # ── S03: EMA TREND PULLBACK ──────────────────────────────────
+    # Non-negotiables (need 3 of 4)
+    ema_bull = ema20 > ema200 and ema50 > ema200
+    ema_bear = ema20 < ema200 and ema50 < ema200
+    rsi_room = 25 <= rsi <= 70
+    adx_ok = adx >= 12
+
+    s03_bull = sum([ema_bull, within_2atr, rsi_room, adx_ok])
+    s03_bear = sum([ema_bear, within_2atr, rsi_room, adx_ok])
+
+    # Zone filter — proven from 528 trades
+    if s03_bull >= 3 and zone_pct < 50:
+        qualifying.append(("S03_EMA_PULLBACK", "LONG", s03_bull))
+
+    if s03_bear >= 3 and zone_pct > 50:
+        qualifying.append(("S03_EMA_PULLBACK", "SHORT", s03_bear))
+
+    # ── S04: EXTREME ZONE REVERSION ─────────────────────────────
+    # Blocked on 1H always. On 4H only for extreme outliers.
+    if tf not in ("1h", "15m", "30m"):
+        # Zone thresholds
+        if tf == "4h":
+            zone_long_ok = zone_pct <= 5
+            zone_short_ok = zone_pct >= 95
+        else:  # 1d, 1w
+            zone_long_ok = zone_pct <= 15
+            zone_short_ok = zone_pct >= 85
+
+        adx_rev = adx <= 45
+
+        s04_long = sum([zone_long_ok, rsi <= 35, adx_rev])
+        s04_short = sum([zone_short_ok, rsi >= 65, adx_rev])
+
+        if s04_long >= 2:
+            qualifying.append(("S04_EXTREME_REVERSION", "LONG", s04_long))
+        if s04_short >= 2:
+            qualifying.append(("S04_EXTREME_REVERSION", "SHORT", s04_short))
+
+    # ── S11: SR FLIP ─────────────────────────────────────────────
+    # Look for levels tested 2+ times and price now retesting
+    all_swings = list(swing_highs) + list(swing_lows)
+    for level in all_swings:
+        if level <= 0:
+            continue
+        nearby = [s for s in all_swings if s > 0 and abs(s - level) / level < 0.005]
+        if len(nearby) >= 2:
+            # Price within 0.3% of the level now
+            if abs(price - level) / level < 0.003:
+                qualifying.append(("S11_SR_FLIP", "BOTH", 2))
+                break  # one SR flip per scan is enough
+
+    # ── S05: MACD DIVERGENCE ────────────────────────────────────
+    # Bullish: low zone + positive MACD momentum + RSI not overbought
+    if zone_pct < 25 and macd_hist > 0 and rsi < 50:
+        qualifying.append(("S05_MACD_DIVERGENCE", "LONG", 2))
+    # Bearish: high zone + negative MACD momentum + RSI not oversold
+    if zone_pct > 75 and macd_hist < 0 and rsi > 50:
+        qualifying.append(("S05_MACD_DIVERGENCE", "SHORT", 2))
+
+    # ── S08: RANGE BREAKOUT (1D only, blocked 4H) ───────────────
+    if tf == "1d" and bb_width < 3.0 and adx < 30:
+        qualifying.append(("S08_RANGE_BREAKOUT", "BOTH", 2))
+
+    # ── S01: BREAKOUT RETEST ────────────────────────────────────
+    # Price near a swing high/low that was recently broken
+    if adx >= 15 and within_2atr and swing_highs and swing_lows:
+        recent_high = max(swing_highs) if swing_highs else 0
+        recent_low = min(swing_lows) if swing_lows else 0
+        near_high = recent_high > 0 and abs(price - recent_high) / recent_high < 0.005
+        near_low = recent_low > 0 and abs(price - recent_low) / recent_low < 0.005
+        if near_high or near_low:
+            direction = "SHORT" if near_high else "LONG"
+            qualifying.append(("S01_BREAKOUT_RETEST", direction, 2))
+
+    # ── S02: LIQUIDITY SWEEP ────────────────────────────────────
+    # Equal highs/lows within 0.5% — price swept and recovered
+    if swing_highs and len(swing_highs) >= 2:
+        sorted_highs = sorted(swing_highs, reverse=True)
+        if abs(sorted_highs[0] - sorted_highs[1]) / sorted_highs[0] < 0.005:
+            if price < sorted_highs[1] * 0.998:  # recovered below
+                qualifying.append(("S02_LIQUIDITY_SWEEP", "SHORT", 2))
+    if swing_lows and len(swing_lows) >= 2:
+        sorted_lows = sorted(swing_lows)
+        if abs(sorted_lows[0] - sorted_lows[1]) / sorted_lows[0] < 0.005:
+            if price > sorted_lows[1] * 1.002:  # recovered above
+                qualifying.append(("S02_LIQUIDITY_SWEEP", "LONG", 2))
+
+    return qualifying
+
+
+def prefilter_skip_reason(
+    _ticker: str,
+    _timeframe: str,
+    price: float,
+    ind: dict,
+    zone_pct: float,
+) -> str:
+    """Generate a concise skip reason for pre-filtered trades."""
+    rsi = ind.get("rsi", 50)
+    adx = ind.get("adx", 20)
+    ema20 = ind.get("ema20", price)
+    ema50 = ind.get("ema50", price)
+    ema200 = ind.get("ema200", price)
+    atr = ind.get("atr", price * 0.01)
+
+    zone_label = (
+        "EXTREME_DISCOUNT"
+        if zone_pct < 10
+        else "DISCOUNT"
+        if zone_pct < 30
+        else "EQUILIBRIUM"
+        if zone_pct < 70
+        else "PREMIUM"
+        if zone_pct < 90
+        else "EXTREME_PREMIUM"
+    )
+
+    reasons: list[str] = []
+
+    # S03 checks
+    ema_bull = ema20 > ema200 and ema50 > ema200
+    ema_bear = ema20 < ema200 and ema50 < ema200
+    dist_min = min(abs(price - ema20), abs(price - ema50))
+    within = dist_min <= atr * 2
+
+    if not ema_bull and not ema_bear:
+        reasons.append("EMAs mixed — no clear trend")
+    if not within:
+        reasons.append(f"price {dist_min:.5f} from EMAs > 2xATR {atr * 2:.5f}")
+    if not (25 <= rsi <= 70):
+        reasons.append(f"RSI {rsi:.1f} outside 25-70 range")
+    if adx < 12:
+        reasons.append(f"ADX {adx:.1f} below 12 — no trend")
+    if zone_pct >= 50 and (ema_bull or not ema_bear):
+        reasons.append(f"zone {zone_pct:.1f}% equilibrium — LONG needs discount")
+
+    if not reasons:
+        reasons.append(
+            f"no strategy non-negotiables met "
+            f"(zone {zone_label} {zone_pct:.1f}%, "
+            f"RSI {rsi:.1f}, ADX {adx:.1f})"
+        )
+
+    return "Python pre-filter: " + "; ".join(reasons[:2])
+
+
 EXCLUDED_PAIRS = frozenset(
     {
         "AUDCAD",
@@ -1585,6 +1769,32 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str, *, chrono_
             )
         except (TypeError, ValueError, ZeroDivisionError):
             bb_width = 2.0
+        ind["bb_width"] = bb_width
+
+        qualifying = python_prefilter(sym, tf_key, float(price), ind, zone_pct)
+        if not qualifying:
+            pr = prefilter_skip_reason(sym, tf_key, float(price), ind, zone_pct)
+            log(f"[PreFilter] {sym} {timeframe} {analysis_date}: {pr}", level="info")
+            return _skipped_backtest_row(
+                sym=sym,
+                timeframe=timeframe,
+                analysis_date=analysis_date,
+                price=float(price),
+                zone_pct=zone_pct,
+                zone_label=zone_label,
+                skip_reason=pr,
+                ai={
+                    "skip_trade": True,
+                    "strategy_id": "SKIP",
+                    "strategy_met": False,
+                    "skip_reason": pr,
+                    "direction": "NONE",
+                    "conviction_score": 0,
+                },
+                tf_key=tf_key,
+                is_exotic=is_exotic,
+            )
+
         macd_line = float(ind.get("macd_line", 0) or 0)
         macd_signal = float(ind.get("macd_signal", 0) or 0)
         macd_sig = macd_signal
