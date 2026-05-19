@@ -3794,6 +3794,8 @@ def run_chronological_backtest(
                 except ValueError:
                     pass
 
+        last_trade_dates: dict[str, str] = {}
+
         while current <= end_dt:
             if chrono_stop_requested(job_id):
                 log(f"[Chrono {job_id}] Stop requested — exiting early", level="info")
@@ -3822,6 +3824,7 @@ def run_chronological_backtest(
             day_skipped: list[dict[str, Any]] = []
             day_pnl = 0.0
             capital = float(chrono_data.get("capital", STARTING_CAPITAL) or STARTING_CAPITAL)
+            open_positions: dict[str, dict[str, Any]] = {}
 
             if isinstance(intra, dict) and str(intra.get("date", "")) == date_str:
                 try:
@@ -3899,6 +3902,53 @@ def run_chronological_backtest(
                                 "scan_counts": dict(CHRONO_SCAN_COUNTS),
                             }
                         )
+                        pos_key = f"{ticker}_{timeframe}"
+                        if pos_key in open_positions:
+                            result = {
+                                "date": date_str,
+                                "ticker": ticker,
+                                "timeframe": timeframe,
+                                "session": session,
+                                "job_id": job_id,
+                                "skipped": True,
+                                "skip_trade": True,
+                                "outcome": "SKIPPED",
+                                "pnl_dollars": 0.0,
+                                "skip_reason": f"Already in open position: {pos_key}",
+                                "verdict": "SKIP",
+                            }
+                            append_result(result)
+                            day_skipped.append(result)
+                            continue
+
+                        tf_lc = timeframe.lower()
+                        if pos_key in last_trade_dates:
+                            last_date = last_trade_dates[pos_key]
+                            days_since = (
+                                datetime.strptime(date_str, "%Y-%m-%d")
+                                - datetime.strptime(last_date, "%Y-%m-%d")
+                            ).days
+                            cooldown = {"1w": 7, "1d": 2, "4h": 1}.get(tf_lc, 1)
+                            if days_since < cooldown:
+                                result = {
+                                    "date": date_str,
+                                    "ticker": ticker,
+                                    "timeframe": timeframe,
+                                    "session": session,
+                                    "job_id": job_id,
+                                    "skipped": True,
+                                    "skip_trade": True,
+                                    "outcome": "SKIPPED",
+                                    "pnl_dollars": 0.0,
+                                    "skip_reason": (
+                                        f"Cooldown: {ticker} {timeframe} traded {days_since}d ago"
+                                    ),
+                                    "verdict": "SKIP",
+                                }
+                                append_result(result)
+                                day_skipped.append(result)
+                                continue
+
                         try:
                             res = run_one_backtest(ticker, timeframe, date_str, chrono_yfinance=True)
                         except Exception as e:  # noqa: BLE001
@@ -3939,6 +3989,11 @@ def run_chronological_backtest(
                         day_trades.append(row)
                         day_pnl += pnl
                         capital += pnl
+
+                        open_positions[pos_key] = row
+                        if oc in ("WIN", "LOSS"):
+                            open_positions.pop(pos_key, None)
+                        last_trade_dates[pos_key] = date_str
 
                     if chrono_abort:
                         break
