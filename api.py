@@ -1021,7 +1021,6 @@ def _spawn_chronological_backtest(start_date: str, end_date: str, job_id: str) -
 
 @app.post("/api/chrono/start")
 async def start_chrono_backtest(
-    background_tasks: BackgroundTasks,
     start_date: str = Query(default=continuous_backtester.CHRONO_START_DATE),
     end_date: str = Query(default=continuous_backtester.CHRONO_END_DATE),
 ) -> dict[str, Any]:
@@ -1038,8 +1037,9 @@ async def start_chrono_backtest(
             log(f"[Chrono API] Requested stop for previous job {prev_job_id} before starting new run")
 
     job_id = str(uuid.uuid4())[:8]
-    background_tasks.add_task(
-        _spawn_chronological_backtest,
+    # Start the daemon thread here (not via BackgroundTasks) so work begins immediately
+    # instead of waiting for Starlette's post-response background queue.
+    _spawn_chronological_backtest(
         start_date.strip(),
         end_date.strip(),
         job_id,
