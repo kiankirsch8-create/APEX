@@ -5,9 +5,11 @@ rolling stats, and periodic self-improvement. All state is simple JSON on ``DATA
 """
 from __future__ import annotations
 
-STRATEGY_VERSION = "v7.0-session9"
-# v7.0: same-day ticker dedupe + per-day currency exposure cap (chrono); R01 RSI+ADX hard gates;
-# Layer 2 EMA200 / daily ADX post-filters; TP1 2R floor + 0.5R stop at TP1; stale-strategy fallbacks (chrono).
+STRATEGY_VERSION = "v7.1-session10"
+# v7.1: chrono phase scan (1w→1d→4h→intraday), risk/tp multipliers, separate 4H currency pool,
+# deterministic Layer-2 strategy order, $25 trailing floor + 0.75R/1.5R locks, exotic USD cap exemption,
+# consecutive-loss extended cooldown, expanded universe (CHF + QQQ).
+# v7.0 baseline: same-day ticker dedupe, currency caps, R01 RSI gates, L2 EMA200/ADX floor, TP1 2R floor.
 # v6 baseline: LAST_TRADE_DATES (never reset per day); Layer 2+ Python-forced; Layer 1 prompt.
 #
 # DO NOT CHANGE (contract):
@@ -47,6 +49,18 @@ LAST_TRADE_DATES: dict[str, str] = {}
 TRADED_TICKERS_TODAY: set[str] = set()
 # v7.0 chrono: completed trades per currency per scan day (sequential sim; caps clustering).
 OPEN_CURRENCY_COUNT: dict[str, int] = {}
+# v7.1 chrono: 4h + intraday share a separate per-day currency pool from 1w/1d.
+OPEN_CURRENCY_COUNT_4H: dict[str, int] = {}
+# USD side of these pairs is exempt from FIX 2 currency cap (FIX 15).
+EXOTIC_PAIRS: frozenset[str] = frozenset({"USDMXN", "USDZAR", "USDNOK", "USDSEK"})
+# Global completed-trade counts by strategy_id (hydrated at chrono job start from results + job file).
+STRATEGY_TRADE_COUNT: dict[str, int] = {}
+# Extended loss streak (FIX 16): key TICKER_tf_DIRECTION → consecutive loss count.
+CONSECUTIVE_LOSSES: dict[str, int] = {}
+# Last completed trade date per directional combo (for 21-day extended gate).
+LAST_COMBO_TRADE_DATE: dict[str, str] = {}
+# v7.18: strategies with zero trades get sort priority next scan day.
+ZERO_TRADE_STRATEGIES: set[str] = set()
 TRADE_COOLDOWN_DAYS: dict[str, int] = {
     "1w": 7,
     "1d": 2,
@@ -80,7 +94,7 @@ BACKTEST_CLAUDE_MAX_TOKENS = 1200
 CLAUDE_HTTP_TIMEOUT_SEC = 25.0
 
 # Chronological walk-forward backtest (API-triggered; separate from rolling loop)
-CHRONO_START_DATE = "2024-05-01"
+CHRONO_START_DATE = "2024-06-01"
 CHRONO_END_DATE = "2026-05-17"
 CHRONO_TIMEFRAMES: list[str] = ["4h", "1d", "1w"]  # 15m/30m appended in chrono loop when scan date is recent
 CHRONO_TICKERS = [
@@ -98,11 +112,13 @@ CHRONO_TICKERS = [
     "EURAUD",
     "EURNZD",
     "EURCAD",
+    "EURCHF",
     # GBP crosses
     "GBPJPY",
     "GBPNZD",
     "GBPAUD",
     "GBPCAD",
+    "GBPCHF",
     # AUD / NZD crosses
     "AUDJPY",
     "AUDCAD",
@@ -117,6 +133,8 @@ CHRONO_TICKERS = [
     "USDZAR",
     "USDNOK",
     "USDSEK",
+    # Index (non-forex; Yahoo symbol)
+    "QQQ",
 ]
 
 # Live scan status for Lovable (updated each ticker during chrono)
@@ -257,6 +275,8 @@ _PROMPT_V3_FILE = Path(__file__).resolve().parent / "prompts" / "apex_master_v3.
 
 from strategies_v5_data import STRATEGIES
 
+ALL_STRATEGY_IDS: tuple[str, ...] = tuple(sorted(STRATEGIES.keys()))
+
 LAYER1_STRATEGY_IDS: frozenset[str] = frozenset(
     {"T01_EMA_PULLBACK", "R01_EXTREME_ZONE_REVERSION"},
 )
@@ -298,14 +318,14 @@ from prefilter_v6 import python_prefilter
 
 
 def get_currencies(ticker: str) -> list[str]:
-    """Forex spot symbols as 6-letter AAA/BBB (e.g. EURUSD → EUR, USD)."""
+    """Forex spot symbols as 6-letter AAA/BBB; non-forex (e.g. QQQ) → no currencies (FIX 17)."""
     t = (ticker or "").strip().upper()
     if len(t) == 6 and t.isalpha():
         return [t[:3], t[3:]]
     return []
 
 
-# Prefilter has no rules for these ids — optional chrono sampling so they can emit trades (FIX 7).
+# Prefilter has no rules for these ids — v7.1 uses deterministic “turn” ordering instead of random (FIX 10).
 _V7_STALE_FALLBACK_IDS: frozenset[str] = frozenset(
     {
         "T05_SUPERTREND_FLIP",
@@ -323,9 +343,6 @@ _V7_STALE_FALLBACK_IDS: frozenset[str] = frozenset(
     }
 )
 
-# Chrono job: strategy_ids that have completed ≥1 trade (disables random fallback for that id).
-_CHRONO_V7_STRATEGY_FIRED: set[str] = set()
-
 
 def _v7_filter_layer2_qualifiers(
     qualifying: list[tuple[str, str, int]],
@@ -336,9 +353,10 @@ def _v7_filter_layer2_qualifiers(
     ind: dict[str, Any],
     price: float,
 ) -> list[tuple[str, str, int, dict[str, Any] | None]]:
-    """Layer 2 post-filters (FIX 5 / FIX 6). Layer 1 tuples pass through unchanged."""
+    """Layer 2 post-filters (FIX 5 / FIX 6 / FIX 12 / FIX 13 / FIX 14). Layer 1 tuples pass through unchanged."""
     out: list[tuple[str, str, int, dict[str, Any] | None]] = []
     tf_l = (tf_key or "").strip().lower()
+    sym_u = (sym or "").strip().upper()
     for sid, direction, score in qualifying:
         sid_u = str(sid).strip().upper()
         if sid_u in LAYER1_STRATEGY_IDS:
@@ -354,6 +372,28 @@ def _v7_filter_layer2_qualifiers(
             out.append((sid, direction, score, None))
             continue
 
+        if sym_u == "NZDUSD" and tf_l == "1w" and d_eff == "SHORT" and float(zone_pct) < 35.0:
+            log(
+                f"[PreFilterV7] {sym} {tf_key}: skip {sid_u} — NZDUSD 1w SHORT blocked: zone_pct "
+                f"{float(zone_pct)} below 35%, shorting at discount is not permitted",
+                level="info",
+            )
+            continue
+
+        if (
+            sym_u == "GBPUSD"
+            and tf_l == "1d"
+            and d_eff == "SHORT"
+            and sid_u in ("T03_HH_HL_CONTINUATION", "SMC10_CHOCH", "T07_MA_RIBBON_ALIGNMENT")
+            and float(zone_pct) < 80.0
+        ):
+            log(
+                f"[PreFilterV7] {sym} {tf_key}: skip {sid_u} — GBPUSD 1d SHORT suppressed: {sid_u} in zone "
+                f"{float(zone_pct)}% below 80% confirmed losing pattern",
+                level="info",
+            )
+            continue
+
         if tf_l == "1d":
             adx_raw = ind.get("adx") if ind.get("adx") is not None else ind.get("ADX")
             if adx_raw is not None:
@@ -361,10 +401,10 @@ def _v7_filter_layer2_qualifiers(
                     adx_f = float(adx_raw)
                 except (TypeError, ValueError):
                     adx_f = None
-                if adx_f is not None and adx_f < 18.0:
+                if adx_f is not None and adx_f < 14.0:
                     log(
                         f"[PreFilterV7] {sym} {tf_key}: skip {sid_u} — "
-                        f"Layer 2 daily blocked: ADX {adx_f} below 18 minimum",
+                        f"Layer 2 daily blocked: ADX {adx_f} below 14 minimum",
                         level="info",
                     )
                     continue
@@ -401,40 +441,6 @@ def _v7_filter_layer2_qualifiers(
     return out
 
 
-def _v7_append_stale_fallbacks(
-    base: list[tuple[str, str, int, dict[str, Any] | None]],
-    *,
-    sym: str,
-    tf_key: str,
-    zone_pct: float,
-    analysis_date: str,
-) -> list[tuple[str, str, int, dict[str, Any] | None]]:
-    """Random 5% probe for stale ids with no v6 rules yet (chrono jobs only; FIX 7)."""
-    if not CHRONO_RUNNING:
-        return list(base)
-    present = {str(t[0]).strip().upper() for t in base}
-    out = list(base)
-    z = float(zone_pct)
-    for fb_sid in _V7_STALE_FALLBACK_IDS:
-        if fb_sid in present:
-            continue
-        if fb_sid in _CHRONO_V7_STRATEGY_FIRED:
-            continue
-        if random.random() >= 0.05:
-            continue
-        dire = "LONG" if z < 50.0 else "SHORT"
-        reasoning = f"{fb_sid} FALLBACK: no detection conditions yet, gathering initial data"
-        meta: dict[str, Any] = {
-            "v7_fallback": True,
-            "reasoning": reasoning,
-            "confidence": "LOW",
-            "risk_mode": "PYTHON_LAYER2",
-        }
-        out.append((fb_sid, dire, 1, meta))
-        present.add(fb_sid)
-    return out
-
-
 def _v7_python_prefilter_bundle(
     sym: str,
     tf_key: str,
@@ -445,7 +451,7 @@ def _v7_python_prefilter_bundle(
     analysis_date: str | None,
     past: pd.DataFrame | None,
 ) -> tuple[bool, list[tuple[str, str, int, dict[str, Any] | None]], str]:
-    """Call ``python_prefilter`` then apply v7.0 Layer 2 gates + optional stale fallbacks."""
+    """Call ``python_prefilter`` then apply v7 Layer 2 gates (no random fallback; FIX 10)."""
     raw_ok, raw_list, raw_reason = python_prefilter(
         sym,
         tf_key,
@@ -464,27 +470,208 @@ def _v7_python_prefilter_bundle(
         ind=ind,
         price=float(price),
     )
-    post_fb = _v7_append_stale_fallbacks(
-        filtered,
-        sym=sym,
-        tf_key=tf_key,
-        zone_pct=float(zone_pct),
-        analysis_date=str(analysis_date or ""),
-    )
-    post_ids = [str(x[0]) for x in post_fb]
+    post_ids = [str(x[0]) for x in filtered]
     log(
         f"[PreFilterAudit] {sym} {tf_key} {analysis_date or ''}: raw={raw_ids} post_v7={post_ids}",
         level="info",
     )
-    if not post_fb:
+    if not filtered:
         if not raw_ok:
             return False, [], raw_reason
         return False, [], "v7 post-filter removed all strategy candidates"
-    reason = raw_reason if raw_ok else "v7.0 stale-strategy fallback probe"
-    return True, post_fb, reason
+    return True, filtered, raw_reason
 
 
-MAX_CORRELATED_POSITIONS = 2
+def _strategy_applicable_on_tf(strategy_id: str, tf_key: str) -> bool:
+    meta = STRATEGIES.get(strategy_id) or {}
+    tfs = meta.get("timeframes") or []
+    if not tfs:
+        return True
+    want = (tf_key or "").strip().lower()
+    return want in {str(x).strip().lower() for x in tfs}
+
+
+def _chrono_combo_key(ticker: str, timeframe: str, direction: str) -> str:
+    return (
+        f"{(ticker or '').strip().upper()}_"
+        f"{(timeframe or '').strip().lower()}_"
+        f"{(direction or '').strip().upper()}"
+    )
+
+
+def _rebuild_strategy_trade_counts_from_rows(rows: list[dict[str, Any]]) -> None:
+    STRATEGY_TRADE_COUNT.clear()
+    for r in rows:
+        if not isinstance(r, dict) or r.get("skipped"):
+            continue
+        if r.get("outcome") not in ("WIN", "LOSS"):
+            continue
+        sid = str(r.get("strategy_id", "")).strip().upper()
+        if sid and sid != "SKIP":
+            STRATEGY_TRADE_COUNT[sid] = STRATEGY_TRADE_COUNT.get(sid, 0) + 1
+
+
+def _rebuild_consecutive_losses_from_rows(rows: list[dict[str, Any]]) -> None:
+    CONSECUTIVE_LOSSES.clear()
+    LAST_COMBO_TRADE_DATE.clear()
+    completed = [
+        r
+        for r in rows
+        if isinstance(r, dict) and not r.get("skipped") and r.get("outcome") in ("WIN", "LOSS")
+    ]
+    completed.sort(key=lambda r: str(r.get("date", ""))[:10])
+    running: dict[str, int] = {}
+    for r in completed:
+        k = _chrono_combo_key(
+            str(r.get("ticker", "")),
+            str(r.get("timeframe", "")),
+            str(r.get("direction", "")),
+        )
+        d0 = str(r.get("date", ""))[:10]
+        if d0:
+            LAST_COMBO_TRADE_DATE[k] = d0
+        if r.get("outcome") == "LOSS":
+            running[k] = running.get(k, 0) + 1
+        else:
+            running[k] = 0
+    CONSECUTIVE_LOSSES.update(running)
+
+
+def _chrono_extended_loss_cooldown_block(
+    ticker: str,
+    timeframe: str,
+    direction: str,
+    date_str: str,
+) -> tuple[bool, str]:
+    """FIX 16 — block same ticker+tf+direction for 21d after 3+ consecutive losses."""
+    key = _chrono_combo_key(ticker, timeframe, direction)
+    if CONSECUTIVE_LOSSES.get(key, 0) < 3:
+        return True, ""
+    last = LAST_COMBO_TRADE_DATE.get(key)
+    if not last:
+        return True, ""
+    try:
+        last_dt = datetime.strptime(last, "%Y-%m-%d")
+        curr_dt = datetime.strptime(date_str.strip()[:10], "%Y-%m-%d")
+        days_since = (curr_dt - last_dt).days
+    except (TypeError, ValueError):
+        return True, ""
+    if days_since < 21:
+        return (
+            False,
+            f"Extended cooldown: {key} has 3+ consecutive losses, waiting 21 days "
+            f"(day {days_since}/21)",
+        )
+    return True, ""
+
+
+def _layer2_tuple_for_deterministic_pick(
+    sym: str,
+    tf_key: str,
+    zone_pct: float,
+    layer2_rows: list[tuple[str, str, int, dict[str, Any] | None]],
+) -> tuple[str, str, int, dict[str, Any] | None] | None:
+    """FIX 10 + FIX 18 — least-tested Layer 2 first; zero-trade priority; stale ids auto-fire on turn."""
+    by_sid: dict[str, list[tuple[str, str, int, dict[str, Any] | None]]] = {}
+    for row in layer2_rows:
+        sid_u = str(row[0]).strip().upper()
+        by_sid.setdefault(sid_u, []).append(row)
+
+    l2_ids = [s for s in ALL_STRATEGY_IDS if s not in LAYER1_STRATEGY_IDS]
+
+    def _sort_key(sid: str) -> tuple[int, int, str]:
+        if not _strategy_applicable_on_tf(sid, tf_key):
+            return (9_000_000, 9_000_000, sid)
+        pri = 0 if sid in ZERO_TRADE_STRATEGIES else 1
+        return (pri, STRATEGY_TRADE_COUNT.get(sid, 0), sid)
+
+    l2_sorted = sorted(l2_ids, key=_sort_key)
+    # Pass 1 — real prefilter hits only (never lose a qualified strategy to a stale fallback
+    # that sorts earlier at equal trade-count).
+    for sid in l2_sorted:
+        if _sort_key(sid)[0] >= 9_000_000:
+            continue
+        if sid in by_sid:
+            return by_sid[sid][0]
+    # Pass 2 — stale / no-conditions strategies on their deterministic turn
+    for sid in l2_sorted:
+        if _sort_key(sid)[0] >= 9_000_000:
+            continue
+        if sid in _V7_STALE_FALLBACK_IDS:
+            dire = "LONG" if float(zone_pct) < 50.0 else "SHORT"
+            reasoning = f"{sid} FALLBACK: no detection conditions yet, gathering initial data"
+            meta: dict[str, Any] = {
+                "v7_fallback": True,
+                "reasoning": reasoning,
+                "confidence": "LOW",
+                "risk_mode": "PYTHON_LAYER2",
+            }
+            return (sid, dire, 1, meta)
+    return None
+
+
+def _apply_chrono_risk_tp_multipliers(
+    ai: dict[str, Any],
+    *,
+    price: float,
+    chrono_risk_mult: float,
+    chrono_tp_mult: float,
+) -> None:
+    """FIX 9 — scale dollar risk and TP distances only (stop price unchanged)."""
+    if chrono_risk_mult != 1.0:
+        try:
+            mrd = float(ai.get("_max_risk_dollars", 0) or 0)
+            if mrd > 0:
+                ai["_max_risk_dollars"] = round(mrd * chrono_risk_mult, 2)
+        except (TypeError, ValueError):
+            pass
+        try:
+            entry_f = float(ai.get("entry", price) or price)
+            stop_f = float(ai.get("stop_loss", 0) or 0)
+            sd = abs(entry_f - stop_f)
+            mrd2 = float(ai.get("_max_risk_dollars", 0) or 0)
+            if sd > 0 and mrd2 > 0:
+                ps = mrd2 / sd
+                ai["_position_size"] = round(ps, 2)
+                ai["_leveraged_exposure"] = round(ps * entry_f, 2)
+        except (TypeError, ValueError):
+            pass
+
+    if chrono_tp_mult != 1.0:
+        try:
+            e = float(ai.get("entry", price) or price)
+            d0 = str(ai.get("direction", "")).strip().upper()
+            m = 1 if d0 == "LONG" else -1
+            for fld in ("tp1", "tp2", "tp3"):
+                if fld in ai and ai.get(fld) is not None:
+                    t = float(ai[fld])
+                    ai[fld] = round(e + (t - e) * chrono_tp_mult, 5)
+        except (TypeError, ValueError):
+            pass
+
+
+def _chrono_currency_cap_blocks(ticker: str, *, use_4h_pool: bool) -> tuple[bool, str | None]:
+    """FIX 2 + FIX 9 + FIX 15 — return (blocked, ccy_or_None)."""
+    tkr_u = (ticker or "").strip().upper()
+    bucket = OPEN_CURRENCY_COUNT_4H if use_4h_pool else OPEN_CURRENCY_COUNT
+    for ccy in get_currencies(tkr_u):
+        if tkr_u in EXOTIC_PAIRS and ccy == "USD":
+            continue
+        if bucket.get(ccy, 0) >= 2:
+            return True, ccy
+    return False, None
+
+
+def _chrono_v71_phases(days_ago: int) -> list[tuple[str, list[str], float, float, bool]]:
+    """(log label, tf list, risk_mult, tp_mult, use_4h_currency_pool)."""
+    phases: list[tuple[str, list[str], float, float, bool]] = [
+        ("PHASE 1 WEEKLY SCAN", ["1w"], 1.0, 1.0, False),
+        ("PHASE 2 DAILY SCAN", ["1d"], 0.85, 0.85, False),
+        ("PHASE 3 4H SCAN", ["4h"], 0.70, 0.70, True),
+    ]
+    if days_ago <= 55:
+        phases.append(("PHASE 4 INTRADAY SCAN", ["15m", "30m"], 0.70, 0.70, True))
+    return phases
 
 OANDA_API_TOKEN = os.getenv("OANDA_API_TOKEN", "")
 OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID", "")
@@ -502,6 +689,8 @@ OANDA_INSTRUMENT_MAP: dict[str, str] = {
     "EURAUD": "EUR_AUD",
     "EURNZD": "EUR_NZD",
     "EURCAD": "EUR_CAD",
+    "EURCHF": "EUR_CHF",
+    "GBPCHF": "GBP_CHF",
     "GBPJPY": "GBP_JPY",
     "GBPNZD": "GBP_NZD",
     "GBPAUD": "GBP_AUD",
@@ -556,15 +745,11 @@ EXCLUDED_PAIRS = frozenset(
         "AUDCHF",
         "AUDNZD",
         "CADCHF",
-        "CHFJPY",
         "EURCAD",
-        "EURCHF",
         "EURJPY",
         "GBPAUD",
-        "GBPCHF",
         "NZDCHF",
         "NZDJPY",
-        "USDCHF",
         "USDCZK",
         "USDDKK",
         "USDHKD",
@@ -2009,6 +2194,36 @@ def _apply_exotic_confidence(confidence: str, is_exotic: bool) -> str:
     return c
 
 
+def _pnl_dollars_if_stop_hit(
+    entry_price: float,
+    stop_price: float,
+    direction: str,
+    position_size: float,
+) -> float:
+    """Dollar P&L if position exits at stop_price (FIX 11)."""
+    if position_size <= 0 or not math.isfinite(position_size):
+        return float("inf")
+    d = (direction or "").strip().upper()
+    if d == "LONG":
+        return (float(stop_price) - float(entry_price)) * float(position_size)
+    if d == "SHORT":
+        return (float(entry_price) - float(stop_price)) * float(position_size)
+    return float("inf")
+
+
+def _apply_trailing_dollar_floor(
+    entry_price: float,
+    current_stop: float,
+    proposed_stop: float,
+    direction: str,
+    position_size: float,
+) -> float:
+    """Do not tighten stop if locked profit would be under $25 (FIX 11 part B)."""
+    if _pnl_dollars_if_stop_hit(entry_price, proposed_stop, direction, position_size) < 25.0:
+        return current_stop
+    return proposed_stop
+
+
 def evaluate_forward_candles(
     direction: str,
     entry: float,
@@ -2018,9 +2233,13 @@ def evaluate_forward_candles(
     tp3: float,
     forward_df: pd.DataFrame,
     strategy_id: str = "",
+    *,
+    position_size: float = 0.0,
+    leverage: int = 0,
 ) -> dict[str, Any]:
-    """Trailing: +0.5R floor at TP1 (v7), +1R at TP2, 1.5R trail from close after TP3."""
+    """Trailing: +0.75R at TP1, +1.5R at TP2 (v7.1), $25 min locked profit on trail updates, 1.5R trail after TP3."""
     _ = strategy_id
+    _ = leverage
     if forward_df is None or forward_df.empty:
         return {
             "outcome": "NO_DATA",
@@ -2054,7 +2273,6 @@ def evaluate_forward_candles(
 
     d = str(direction or "").strip().upper()
     entry_price = float(entry)
-    stop_loss_f = float(stop_loss)
     tp1_raw = float(tp1)
     if d == "LONG":
         minimum_tp1 = entry_price + (2.0 * risk)
@@ -2091,22 +2309,33 @@ def evaluate_forward_candles(
             if high >= tp3 and not hit_tp3:
                 hit_tp3 = True
                 trailing_activated = True
-                current_stop = float(entry) + risk * 2.0
+                prop = float(entry_price) + risk * 2.0
+                current_stop = _apply_trailing_dollar_floor(
+                    entry_price, current_stop, prop, d, position_size,
+                )
 
             elif high >= tp2 and not hit_tp2:
                 hit_tp2 = True
                 trailing_activated = True
-                current_stop = float(entry) + risk * 1.0
+                prop = float(entry_price) + risk * 1.5
+                current_stop = _apply_trailing_dollar_floor(
+                    entry_price, current_stop, prop, d, position_size,
+                )
 
             elif high >= tp1_active and not hit_tp1:
                 hit_tp1 = True
                 trailing_activated = True
-                current_stop = float(entry_price) + 0.5 * risk
+                prop = float(entry_price) + 0.75 * risk
+                current_stop = _apply_trailing_dollar_floor(
+                    entry_price, current_stop, prop, d, position_size,
+                )
 
             if hit_tp1 and trailing_activated:
                 trail_level = close - risk * 1.5
                 if trail_level > current_stop:
-                    current_stop = trail_level
+                    current_stop = _apply_trailing_dollar_floor(
+                        entry_price, current_stop, trail_level, d, position_size,
+                    )
 
         else:
             if high >= current_stop:
@@ -2118,22 +2347,33 @@ def evaluate_forward_candles(
             if low <= tp3 and not hit_tp3:
                 hit_tp3 = True
                 trailing_activated = True
-                current_stop = float(entry) - risk * 2.0
+                prop = float(entry_price) - risk * 2.0
+                current_stop = _apply_trailing_dollar_floor(
+                    entry_price, current_stop, prop, d, position_size,
+                )
 
             elif low <= tp2 and not hit_tp2:
                 hit_tp2 = True
                 trailing_activated = True
-                current_stop = float(entry) - risk * 1.0
+                prop = float(entry_price) - risk * 1.5
+                current_stop = _apply_trailing_dollar_floor(
+                    entry_price, current_stop, prop, d, position_size,
+                )
 
             elif low <= tp1_active and not hit_tp1:
                 hit_tp1 = True
                 trailing_activated = True
-                current_stop = float(entry_price) - 0.5 * risk
+                prop = float(entry_price) - 0.75 * risk
+                current_stop = _apply_trailing_dollar_floor(
+                    entry_price, current_stop, prop, d, position_size,
+                )
 
             if hit_tp1 and trailing_activated:
                 trail_level = close + risk * 1.5
                 if trail_level < current_stop:
-                    current_stop = trail_level
+                    current_stop = _apply_trailing_dollar_floor(
+                        entry_price, current_stop, trail_level, d, position_size,
+                    )
 
     if not hit_stop and not forward_df.empty:
         try:
@@ -2293,11 +2533,13 @@ def _python_forced_layer2_trade(
     future: pd.DataFrame,
     layer2: list[tuple[str, str, int] | tuple[str, str, int, dict[str, Any] | None]],
     rsi_live: float = 50.0,
+    chrono_risk_mult: float = 1.0,
+    chrono_tp_mult: float = 1.0,
 ) -> dict[str, Any] | None:
-    """Execute highest-scoring Layer 2+ setup without Claude (v7.0)."""
+    """Execute Layer 2+ setup without Claude (v7.1)."""
     if not layer2:
         return None
-    best = max(layer2, key=lambda x: int(x[2]))
+    best = layer2[0] if len(layer2) == 1 else max(layer2, key=lambda x: int(x[2]))
     strat_id = str(best[0]).strip().upper()
     meta = best[3] if len(best) > 3 else None
     direction = str(best[1]).strip().upper()
@@ -2360,6 +2602,13 @@ def _python_forced_layer2_trade(
             is_exotic=is_exotic,
         )
 
+    _apply_chrono_risk_tp_multipliers(
+        ai,
+        price=float(price),
+        chrono_risk_mult=chrono_risk_mult,
+        chrono_tp_mult=chrono_tp_mult,
+    )
+
     entry = float(ai.get("entry", entry) or entry)
     stop = float(ai.get("stop_loss", stop) or stop)
     tp1 = float(ai.get("tp1", tp1) or tp1)
@@ -2386,6 +2635,8 @@ def _python_forced_layer2_trade(
         tp3,
         fut,
         strat_id,
+        position_size=float(ai.get("_position_size", 0) or 0),
+        leverage=LEVERAGE,
     )
     if exit_data.get("outcome") in ("NO_DATA", "INVALID"):
         return None
@@ -2487,7 +2738,16 @@ def _python_forced_layer2_trade(
     }
 
 
-def run_one_backtest(ticker: str, timeframe: str, analysis_date: str, *, chrono_yfinance: bool = False) -> dict[str, Any] | None:
+def run_one_backtest(
+    ticker: str,
+    timeframe: str,
+    analysis_date: str,
+    *,
+    chrono_yfinance: bool = False,
+    chrono_risk_mult: float = 1.0,
+    chrono_tp_mult: float = 1.0,
+    chrono_enforce_extended_cooldown: bool = False,
+) -> dict[str, Any] | None:
     try:
         sym = (ticker or "").strip().upper()
         tf_key = timeframe.lower().strip()
@@ -2734,6 +2994,52 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str, *, chrono_
         layer2_list = [s for s in qualifying_strategies if s[0] not in LAYER1_STRATEGY_IDS]
 
         if layer2_list and not layer1_list:
+            picked = _layer2_tuple_for_deterministic_pick(sym, tf_key, zone_pct, layer2_list)
+            if picked is None:
+                return _skipped_backtest_row(
+                    sym=sym,
+                    timeframe=timeframe,
+                    analysis_date=analysis_date,
+                    price=float(price),
+                    zone_pct=zone_pct,
+                    zone_label=zone_label,
+                    skip_reason="No Layer 2 strategy qualifies after v7.1 deterministic ordering",
+                    ai={
+                        "skip_trade": True,
+                        "strategy_id": "SKIP",
+                        "strategy_met": False,
+                        "skip_reason": "No Layer 2 after v7.1 ordering",
+                        "direction": "NONE",
+                        "conviction_score": 0,
+                    },
+                    tf_key=tf_key,
+                    is_exotic=is_exotic,
+                )
+            d_pick = str(picked[1]).strip().upper()
+            if d_pick == "BOTH":
+                d_pick = "LONG" if float(zone_pct) < 50.0 else "SHORT"
+            if chrono_enforce_extended_cooldown:
+                ok_e, rs_e = _chrono_extended_loss_cooldown_block(sym, timeframe, d_pick, analysis_date)
+                if not ok_e:
+                    return _skipped_backtest_row(
+                        sym=sym,
+                        timeframe=timeframe,
+                        analysis_date=analysis_date,
+                        price=float(price),
+                        zone_pct=zone_pct,
+                        zone_label=zone_label,
+                        skip_reason=rs_e,
+                        ai={
+                            "skip_trade": True,
+                            "strategy_id": "SKIP",
+                            "strategy_met": False,
+                            "skip_reason": rs_e,
+                            "direction": "NONE",
+                            "conviction_score": 0,
+                        },
+                        tf_key=tf_key,
+                        is_exotic=is_exotic,
+                    )
             forced = _python_forced_layer2_trade(
                 sym=sym,
                 timeframe=timeframe,
@@ -2744,8 +3050,10 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str, *, chrono_
                 zone_label=zone_label,
                 is_exotic=is_exotic,
                 future=future,
-                layer2=layer2_list,
+                layer2=[picked],
                 rsi_live=float(ind.get("rsi", 50) or 50),
+                chrono_risk_mult=chrono_risk_mult,
+                chrono_tp_mult=chrono_tp_mult,
             )
             return forced
 
@@ -2872,6 +3180,13 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str, *, chrono_
         if ai.get("skip_trade"):
             return _skip_out(str(ai.get("skip_reason") or "enforcement skip"), ai)
 
+        if chrono_enforce_extended_cooldown:
+            d_pre = str(ai.get("direction", "")).strip().upper()
+            if d_pre in ("LONG", "SHORT"):
+                ok_e2, rs_e2 = _chrono_extended_loss_cooldown_block(sym, timeframe, d_pre, analysis_date)
+                if not ok_e2:
+                    return _skip_out(rs_e2, ai)
+
         strategy_id_norm = str(ai.get("strategy_id", "")).strip().upper()
         if strategy_id_norm not in STRATEGIES:
             return _skip_out(f"unsupported strategy_id: {strategy_id_norm}", ai)
@@ -2918,6 +3233,16 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str, *, chrono_
         rr_tp2 = 3.0
         ai["rr_ratio"] = f"1:{rr_tp2:.2f}"
 
+        _apply_chrono_risk_tp_multipliers(
+            ai,
+            price=float(price),
+            chrono_risk_mult=chrono_risk_mult,
+            chrono_tp_mult=chrono_tp_mult,
+        )
+        tp1 = float(ai.get("tp1", tp1) or tp1)
+        tp2 = float(ai.get("tp2", tp2) or tp2)
+        tp3 = float(ai.get("tp3", tp3) or tp3)
+
         position_size = float(ai.get("_position_size", 0) or 0)
         leveraged_exposure = float(ai.get("_leveraged_exposure", 0) or 0)
         max_risk_dollars = float(ai.get("_max_risk_dollars", 0) or 0)
@@ -2938,6 +3263,8 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str, *, chrono_
             tp3,
             fut,
             strategy_id_norm,
+            position_size=position_size,
+            leverage=LEVERAGE,
         )
         del fut
         del past
@@ -4139,9 +4466,9 @@ def run_chronological_backtest(
 ) -> dict[str, Any]:
     """
     Walk forward calendar day by day from ``start_date`` to ``end_date``.
-    Each weekday scans every ticker in ``CHRONO_TICKERS`` in fixed order; timeframes
-    are ``4h``/``1d``/``1w`` plus ``15m``/``30m`` when the scan date is within 55 days
-    of today (Yahoo intraday window). Uses ``run_one_backtest`` (Layer 2+ Python-forced
+    Each weekday runs FIX 9 phased scans (weekly, then daily, then 4h, then optional
+    intraday when the scan date is within 55 days of today). Within each phase every
+    ticker is scanned in list order. Uses ``run_one_backtest`` (Layer 2+ Python-forced
     trades skip Claude; Layer 1 uses v7 prompt).
     Persists to ``chrono_results_{job_id}.json`` under ``DATA_DIR`` (resumable).
     """
@@ -4186,12 +4513,18 @@ def run_chronological_backtest(
     clear_chrono_stop_flag(job_id)
     set_active_chrono(job_id)
     try:
-        global _CHRONO_V7_STRATEGY_FIRED
-        _CHRONO_V7_STRATEGY_FIRED = set()
-        for _hist in chrono_data.get("all_trades", []) or []:
-            _hsid = str(_hist.get("strategy_id", "")).strip().upper()
-            if _hsid:
-                _CHRONO_V7_STRATEGY_FIRED.add(_hsid)
+        merge_hist: list[dict[str, Any]] = []
+        merge_hist.extend(x for x in (chrono_data.get("all_trades") or []) if isinstance(x, dict))
+        try:
+            merge_hist.extend(x for x in load_all_results() if isinstance(x, dict))
+        except Exception:  # noqa: BLE001
+            pass
+        _rebuild_strategy_trade_counts_from_rows(merge_hist)
+        _rebuild_consecutive_losses_from_rows(merge_hist)
+        # FIX 18 — restore zero-trade priority after restart (same rule as end-of-day)
+        for _z0 in ALL_STRATEGY_IDS:
+            if STRATEGY_TRADE_COUNT.get(_z0, 0) == 0:
+                ZERO_TRADE_STRATEGIES.add(_z0)
 
         for _k, _v in (
             ("daily_pnl", []),
@@ -4296,6 +4629,7 @@ def run_chronological_backtest(
             intra = chrono_data.get("chrono_intraday")
             finalize_day_only = False
             resume_idx = 0
+            v71_pi_s = v71_ti_s = v71_tj_s = 0
             day_trades: list[dict[str, Any]] = []
             day_skipped: list[dict[str, Any]] = []
             day_pnl = 0.0
@@ -4319,6 +4653,15 @@ def run_chronological_backtest(
                         capital = float(icap)
                 else:
                     resume_idx = max(0, nidx)
+                    if intra.get("v71_phase_idx") is not None:
+                        try:
+                            v71_pi_s = int(intra.get("v71_phase_idx") or 0)
+                            v71_ti_s = int(intra.get("v71_ticker_i") or 0)
+                            v71_tj_s = int(intra.get("v71_tf_j") or 0)
+                        except (TypeError, ValueError):
+                            v71_pi_s = v71_ti_s = v71_tj_s = 0
+                    else:
+                        v71_pi_s, v71_ti_s, v71_tj_s = 0, resume_idx, 0
                     dt_raw = intra.get("day_trades") or []
                     ds_raw = intra.get("day_skipped") or []
                     day_trades = [dict(x) for x in dt_raw] if isinstance(dt_raw, list) else []
@@ -4330,15 +4673,20 @@ def run_chronological_backtest(
 
             TRADED_TICKERS_TODAY.clear()
             OPEN_CURRENCY_COUNT.clear()
+            OPEN_CURRENCY_COUNT_4H.clear()
             for _row in day_trades:
                 _tk = str(_row.get("ticker", "")).strip().upper()
                 if _tk:
                     TRADED_TICKERS_TODAY.add(_tk)
+                _tf_r = str(_row.get("timeframe", "")).strip().lower()
+                _use4 = _tf_r in ("4h", "15m", "30m")
                 for _ccy in get_currencies(_tk):
-                    OPEN_CURRENCY_COUNT[_ccy] = OPEN_CURRENCY_COUNT.get(_ccy, 0) + 1
-                _dsid = str(_row.get("strategy_id", "")).strip().upper()
-                if _dsid:
-                    _CHRONO_V7_STRATEGY_FIRED.add(_dsid)
+                    if _tk in EXOTIC_PAIRS and _ccy == "USD":
+                        continue
+                    if _use4:
+                        OPEN_CURRENCY_COUNT_4H[_ccy] = OPEN_CURRENCY_COUNT_4H.get(_ccy, 0) + 1
+                    else:
+                        OPEN_CURRENCY_COUNT[_ccy] = OPEN_CURRENCY_COUNT.get(_ccy, 0) + 1
 
             CHRONO_LIVE_STATUS.update(
                 {
@@ -4358,193 +4706,355 @@ def run_chronological_backtest(
 
             chrono_abort = False
             if not finalize_day_only:
-                for ti in range(resume_idx, len(tickers)):
-                    ticker = tickers[ti]
-                    if chrono_stop_requested(job_id):
-                        chrono_abort = True
-                        break
+                scan_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+                days_ago = (date.today() - scan_date).days
+                phases = _chrono_v71_phases(days_ago)
 
-                    scan_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-                    days_ago = (date.today() - scan_date).days
-                    if days_ago <= 55:
-                        timeframes_to_scan = ["15m", "30m", "4h", "1d", "1w"]
-                    else:
-                        timeframes_to_scan = ["4h", "1d", "1w"]
+                def _v71_next_step(pi: int, ti: int, tj: int) -> tuple[int, int, int]:
+                    _label, tf_list, _rm, _tm, _u4 = phases[pi]
+                    if tj + 1 < len(tf_list):
+                        return pi, ti, tj + 1
+                    if ti + 1 < len(tickers):
+                        return pi, ti + 1, 0
+                    if pi + 1 < len(phases):
+                        return pi + 1, 0, 0
+                    return pi, ti, tj
 
-                    for timeframe in timeframes_to_scan:
-                        if chrono_stop_requested(job_id):
-                            chrono_abort = True
-                            break
-                        session = _chrono_session_for_timeframe(timeframe)
-                        tpos = CHRONO_TICKERS.index(ticker) + 1 if ticker in CHRONO_TICKERS else 0
-                        CHRONO_LIVE_STATUS.update(
-                            {
-                                "current_ticker": ticker,
-                                "current_timeframe": timeframe,
-                                "current_date": date_str,
-                                "trades_today": len(day_trades),
-                                "capital": round(capital, 2),
-                                "status": "scanning",
-                                "ticker_position": tpos,
-                                "total_tickers": len(CHRONO_TICKERS),
-                                "scan_counts": dict(CHRONO_SCAN_COUNTS),
-                            }
-                        )
-                        pos_key = f"{ticker}_{timeframe}"
-                        if pos_key in open_positions:
-                            result = {
-                                "date": date_str,
-                                "ticker": ticker,
-                                "timeframe": timeframe,
-                                "session": session,
-                                "job_id": job_id,
-                                "skipped": True,
-                                "skip_trade": True,
-                                "outcome": "SKIPPED",
-                                "pnl_dollars": 0.0,
-                                "skip_reason": f"Already in open position: {pos_key}",
-                                "verdict": "SKIP",
-                            }
-                            append_result(result)
-                            day_skipped.append(result)
-                            continue
-
-                        cd_ok, cd_reason = check_cooldown(ticker, timeframe, date_str)
-                        if not cd_ok:
-                            log(
-                                f"[COOLDOWN] {ticker} {timeframe} {date_str}: {cd_reason}",
-                                level="info",
-                            )
-                            result = {
-                                "date": date_str,
-                                "ticker": ticker,
-                                "timeframe": timeframe,
-                                "session": session,
-                                "job_id": job_id,
-                                "skipped": True,
-                                "skip_trade": True,
-                                "outcome": "SKIPPED",
-                                "pnl_dollars": 0.0,
-                                "skip_reason": cd_reason,
-                                "verdict": "COOLDOWN",
-                            }
-                            append_result(result)
-                            day_skipped.append(result)
-                            continue
-
-                        tkr_u = str(ticker).strip().upper()
-                        if tkr_u in TRADED_TICKERS_TODAY:
-                            result = {
-                                "date": date_str,
-                                "ticker": ticker,
-                                "timeframe": timeframe,
-                                "session": session,
-                                "job_id": job_id,
-                                "skipped": True,
-                                "skip_trade": True,
-                                "outcome": "SKIPPED",
-                                "pnl_dollars": 0.0,
-                                "skip_reason": "Ticker already traded today on another timeframe",
-                                "verdict": "SKIP",
-                            }
-                            append_result(result)
-                            day_skipped.append(result)
-                            continue
-
-                        cap_block_ccy: str | None = None
-                        for _ccy in get_currencies(tkr_u):
-                            if OPEN_CURRENCY_COUNT.get(_ccy, 0) >= 2:
-                                cap_block_ccy = _ccy
+                for pi in range(v71_pi_s, len(phases)):
+                    label, tf_list, risk_m, tp_m, use4h_pool = phases[pi]
+                    log(f"[Chrono {job_id}] {date_str} — {label}", level="info")
+                    t_start = v71_ti_s if pi == v71_pi_s else 0
+                    for ti in range(t_start, len(tickers)):
+                        ticker = tickers[ti]
+                        j_start = v71_tj_s if (pi == v71_pi_s and ti == v71_ti_s) else 0
+                        for tj in range(j_start, len(tf_list)):
+                            timeframe = tf_list[tj]
+                            if chrono_stop_requested(job_id):
+                                chrono_abort = True
                                 break
-                        if cap_block_ccy is not None:
-                            result = {
-                                "date": date_str,
-                                "ticker": ticker,
-                                "timeframe": timeframe,
-                                "session": session,
-                                "job_id": job_id,
-                                "skipped": True,
-                                "skip_trade": True,
-                                "outcome": "SKIPPED",
-                                "pnl_dollars": 0.0,
-                                "skip_reason": f"Currency cap: {cap_block_ccy} already has 2 open trades",
-                                "verdict": "SKIP",
-                            }
-                            append_result(result)
-                            day_skipped.append(result)
-                            continue
-
-                        try:
-                            res = run_one_backtest(ticker, timeframe, date_str, chrono_yfinance=True)
-                        except Exception as e:  # noqa: BLE001
-                            log(
-                                f"[Chrono {job_id}] Error {ticker} {timeframe} {date_str}: {e}",
-                                level="warning",
+                            session = _chrono_session_for_timeframe(timeframe)
+                            tpos = CHRONO_TICKERS.index(ticker) + 1 if ticker in CHRONO_TICKERS else 0
+                            CHRONO_LIVE_STATUS.update(
+                                {
+                                    "current_ticker": ticker,
+                                    "current_timeframe": timeframe,
+                                    "current_date": date_str,
+                                    "trades_today": len(day_trades),
+                                    "capital": round(capital, 2),
+                                    "status": "scanning",
+                                    "ticker_position": tpos,
+                                    "total_tickers": len(CHRONO_TICKERS),
+                                    "scan_counts": dict(CHRONO_SCAN_COUNTS),
+                                }
                             )
-                            continue
+                            pos_key = f"{ticker}_{timeframe}"
+                            if pos_key in open_positions:
+                                result = {
+                                    "date": date_str,
+                                    "ticker": ticker,
+                                    "timeframe": timeframe,
+                                    "session": session,
+                                    "job_id": job_id,
+                                    "skipped": True,
+                                    "skip_trade": True,
+                                    "outcome": "SKIPPED",
+                                    "pnl_dollars": 0.0,
+                                    "skip_reason": f"Already in open position: {pos_key}",
+                                    "verdict": "SKIP",
+                                }
+                                append_result(result)
+                                day_skipped.append(result)
+                                npi, nti, ntj = _v71_next_step(pi, ti, tj)
+                                chrono_data["chrono_intraday"] = {
+                                    "date": date_str,
+                                    "v71_phase_idx": npi,
+                                    "v71_ticker_i": nti,
+                                    "v71_tf_j": ntj,
+                                    "next_ticker_idx": nti,
+                                    "day_trades": day_trades,
+                                    "day_skipped": day_skipped,
+                                    "day_pnl": round(day_pnl, 2),
+                                    "capital": round(capital, 2),
+                                }
+                                chrono_data["capital"] = round(capital, 2)
+                                chrono_data["current_date"] = date_str
+                                chrono_data["status"] = "running"
+                                save_json(chrono_path, chrono_data)
+                                continue
 
-                        if res is None:
-                            continue
+                            cd_ok, cd_reason = check_cooldown(ticker, timeframe, date_str)
+                            if not cd_ok:
+                                log(
+                                    f"[COOLDOWN] {ticker} {timeframe} {date_str}: {cd_reason}",
+                                    level="info",
+                                )
+                                result = {
+                                    "date": date_str,
+                                    "ticker": ticker,
+                                    "timeframe": timeframe,
+                                    "session": session,
+                                    "job_id": job_id,
+                                    "skipped": True,
+                                    "skip_trade": True,
+                                    "outcome": "SKIPPED",
+                                    "pnl_dollars": 0.0,
+                                    "skip_reason": cd_reason,
+                                    "verdict": "COOLDOWN",
+                                }
+                                append_result(result)
+                                day_skipped.append(result)
+                                npi, nti, ntj = _v71_next_step(pi, ti, tj)
+                                chrono_data["chrono_intraday"] = {
+                                    "date": date_str,
+                                    "v71_phase_idx": npi,
+                                    "v71_ticker_i": nti,
+                                    "v71_tf_j": ntj,
+                                    "next_ticker_idx": nti,
+                                    "day_trades": day_trades,
+                                    "day_skipped": day_skipped,
+                                    "day_pnl": round(day_pnl, 2),
+                                    "capital": round(capital, 2),
+                                }
+                                chrono_data["capital"] = round(capital, 2)
+                                chrono_data["current_date"] = date_str
+                                chrono_data["status"] = "running"
+                                save_json(chrono_path, chrono_data)
+                                continue
 
-                        if res.get("skipped"):
-                            row = {
+                            tkr_u = str(ticker).strip().upper()
+                            if tkr_u in TRADED_TICKERS_TODAY:
+                                result = {
+                                    "date": date_str,
+                                    "ticker": ticker,
+                                    "timeframe": timeframe,
+                                    "session": session,
+                                    "job_id": job_id,
+                                    "skipped": True,
+                                    "skip_trade": True,
+                                    "outcome": "SKIPPED",
+                                    "pnl_dollars": 0.0,
+                                    "skip_reason": "Ticker already traded today on another timeframe",
+                                    "verdict": "SKIP",
+                                }
+                                append_result(result)
+                                day_skipped.append(result)
+                                npi, nti, ntj = _v71_next_step(pi, ti, tj)
+                                chrono_data["chrono_intraday"] = {
+                                    "date": date_str,
+                                    "v71_phase_idx": npi,
+                                    "v71_ticker_i": nti,
+                                    "v71_tf_j": ntj,
+                                    "next_ticker_idx": nti,
+                                    "day_trades": day_trades,
+                                    "day_skipped": day_skipped,
+                                    "day_pnl": round(day_pnl, 2),
+                                    "capital": round(capital, 2),
+                                }
+                                chrono_data["capital"] = round(capital, 2)
+                                chrono_data["current_date"] = date_str
+                                chrono_data["status"] = "running"
+                                save_json(chrono_path, chrono_data)
+                                continue
+
+                            cap_blocked, cap_ccy = _chrono_currency_cap_blocks(ticker, use_4h_pool=use4h_pool)
+                            if cap_blocked:
+                                result = {
+                                    "date": date_str,
+                                    "ticker": ticker,
+                                    "timeframe": timeframe,
+                                    "session": session,
+                                    "job_id": job_id,
+                                    "skipped": True,
+                                    "skip_trade": True,
+                                    "outcome": "SKIPPED",
+                                    "pnl_dollars": 0.0,
+                                    "skip_reason": f"Currency cap: {cap_ccy} already has 2 open trades",
+                                    "verdict": "SKIP",
+                                }
+                                append_result(result)
+                                day_skipped.append(result)
+                                npi, nti, ntj = _v71_next_step(pi, ti, tj)
+                                chrono_data["chrono_intraday"] = {
+                                    "date": date_str,
+                                    "v71_phase_idx": npi,
+                                    "v71_ticker_i": nti,
+                                    "v71_tf_j": ntj,
+                                    "next_ticker_idx": nti,
+                                    "day_trades": day_trades,
+                                    "day_skipped": day_skipped,
+                                    "day_pnl": round(day_pnl, 2),
+                                    "capital": round(capital, 2),
+                                }
+                                chrono_data["capital"] = round(capital, 2)
+                                chrono_data["current_date"] = date_str
+                                chrono_data["status"] = "running"
+                                save_json(chrono_path, chrono_data)
+                                continue
+
+                            try:
+                                res = run_one_backtest(
+                                    ticker,
+                                    timeframe,
+                                    date_str,
+                                    chrono_yfinance=True,
+                                    chrono_risk_mult=risk_m,
+                                    chrono_tp_mult=tp_m,
+                                    chrono_enforce_extended_cooldown=True,
+                                )
+                            except Exception as e:  # noqa: BLE001
+                                log(
+                                    f"[Chrono {job_id}] Error {ticker} {timeframe} {date_str}: {e}",
+                                    level="warning",
+                                )
+                                npi, nti, ntj = _v71_next_step(pi, ti, tj)
+                                chrono_data["chrono_intraday"] = {
+                                    "date": date_str,
+                                    "v71_phase_idx": npi,
+                                    "v71_ticker_i": nti,
+                                    "v71_tf_j": ntj,
+                                    "next_ticker_idx": nti,
+                                    "day_trades": day_trades,
+                                    "day_skipped": day_skipped,
+                                    "day_pnl": round(day_pnl, 2),
+                                    "capital": round(capital, 2),
+                                }
+                                chrono_data["capital"] = round(capital, 2)
+                                chrono_data["current_date"] = date_str
+                                chrono_data["status"] = "running"
+                                save_json(chrono_path, chrono_data)
+                                continue
+
+                            if res is None:
+                                npi, nti, ntj = _v71_next_step(pi, ti, tj)
+                                chrono_data["chrono_intraday"] = {
+                                    "date": date_str,
+                                    "v71_phase_idx": npi,
+                                    "v71_ticker_i": nti,
+                                    "v71_tf_j": ntj,
+                                    "next_ticker_idx": nti,
+                                    "day_trades": day_trades,
+                                    "day_skipped": day_skipped,
+                                    "day_pnl": round(day_pnl, 2),
+                                    "capital": round(capital, 2),
+                                }
+                                chrono_data["capital"] = round(capital, 2)
+                                chrono_data["current_date"] = date_str
+                                chrono_data["status"] = "running"
+                                save_json(chrono_path, chrono_data)
+                                continue
+
+                            if res.get("skipped"):
+                                row = {
+                                    "date": date_str,
+                                    "ticker": str(res.get("ticker", ticker)),
+                                    "timeframe": str(res.get("timeframe", timeframe)),
+                                    "session": session,
+                                    "job_id": job_id,
+                                    "skipped": True,
+                                    "outcome": "SKIPPED",
+                                    "pnl_dollars": 0.0,
+                                    "skip_reason": str(res.get("skip_reason", "") or ""),
+                                    "verdict": res.get("verdict"),
+                                }
+                                day_skipped.append(row)
+                                npi, nti, ntj = _v71_next_step(pi, ti, tj)
+                                chrono_data["chrono_intraday"] = {
+                                    "date": date_str,
+                                    "v71_phase_idx": npi,
+                                    "v71_ticker_i": nti,
+                                    "v71_tf_j": ntj,
+                                    "next_ticker_idx": nti,
+                                    "day_trades": day_trades,
+                                    "day_skipped": day_skipped,
+                                    "day_pnl": round(day_pnl, 2),
+                                    "capital": round(capital, 2),
+                                }
+                                chrono_data["capital"] = round(capital, 2)
+                                chrono_data["current_date"] = date_str
+                                chrono_data["status"] = "running"
+                                save_json(chrono_path, chrono_data)
+                                continue
+
+                            oc = str(res.get("outcome", "") or "")
+                            if oc not in ("WIN", "LOSS"):
+                                npi, nti, ntj = _v71_next_step(pi, ti, tj)
+                                chrono_data["chrono_intraday"] = {
+                                    "date": date_str,
+                                    "v71_phase_idx": npi,
+                                    "v71_ticker_i": nti,
+                                    "v71_tf_j": ntj,
+                                    "next_ticker_idx": nti,
+                                    "day_trades": day_trades,
+                                    "day_skipped": day_skipped,
+                                    "day_pnl": round(day_pnl, 2),
+                                    "capital": round(capital, 2),
+                                }
+                                chrono_data["capital"] = round(capital, 2)
+                                chrono_data["current_date"] = date_str
+                                chrono_data["status"] = "running"
+                                save_json(chrono_path, chrono_data)
+                                continue
+
+                            pnl = float(res.get("pnl_dollars", 0) or 0)
+                            row = dict(res)
+                            row["job_id"] = job_id
+                            row["session"] = session
+                            row.setdefault("date", date_str)
+                            day_trades.append(row)
+                            day_pnl += pnl
+                            capital += pnl
+
+                            open_positions[pos_key] = row
+                            if oc in ("WIN", "LOSS"):
+                                open_positions.pop(pos_key, None)
+                                record_trade(ticker, timeframe, date_str)
+                                TRADED_TICKERS_TODAY.add(tkr_u)
+                                tf_lc = str(timeframe).strip().lower()
+                                use_major = tf_lc not in ("4h", "15m", "30m")
+                                for _ccy in get_currencies(tkr_u):
+                                    if tkr_u in EXOTIC_PAIRS and _ccy == "USD":
+                                        continue
+                                    if use_major:
+                                        OPEN_CURRENCY_COUNT[_ccy] = OPEN_CURRENCY_COUNT.get(_ccy, 0) + 1
+                                    else:
+                                        OPEN_CURRENCY_COUNT_4H[_ccy] = OPEN_CURRENCY_COUNT_4H.get(_ccy, 0) + 1
+                                _rsid2 = str(row.get("strategy_id", "")).strip().upper()
+                                if _rsid2:
+                                    STRATEGY_TRADE_COUNT[_rsid2] = STRATEGY_TRADE_COUNT.get(_rsid2, 0) + 1
+                                    ZERO_TRADE_STRATEGIES.discard(_rsid2)
+                                drow = str(row.get("direction", "")).strip().upper()
+                                lk = _chrono_combo_key(ticker, timeframe, drow)
+                                if oc == "LOSS":
+                                    CONSECUTIVE_LOSSES[lk] = CONSECUTIVE_LOSSES.get(lk, 0) + 1
+                                else:
+                                    CONSECUTIVE_LOSSES[lk] = 0
+                                LAST_COMBO_TRADE_DATE[lk] = date_str
+
+                            npi, nti, ntj = _v71_next_step(pi, ti, tj)
+                            chrono_data["chrono_intraday"] = {
                                 "date": date_str,
-                                "ticker": str(res.get("ticker", ticker)),
-                                "timeframe": str(res.get("timeframe", timeframe)),
-                                "session": session,
-                                "job_id": job_id,
-                                "skipped": True,
-                                "outcome": "SKIPPED",
-                                "pnl_dollars": 0.0,
-                                "skip_reason": str(res.get("skip_reason", "") or ""),
-                                "verdict": res.get("verdict"),
+                                "v71_phase_idx": npi,
+                                "v71_ticker_i": nti,
+                                "v71_tf_j": ntj,
+                                "next_ticker_idx": nti,
+                                "day_trades": day_trades,
+                                "day_skipped": day_skipped,
+                                "day_pnl": round(day_pnl, 2),
+                                "capital": round(capital, 2),
                             }
-                            day_skipped.append(row)
-                            continue
+                            chrono_data["capital"] = round(capital, 2)
+                            chrono_data["current_date"] = date_str
+                            chrono_data["status"] = "running"
+                            save_json(chrono_path, chrono_data)
 
-                        oc = str(res.get("outcome", "") or "")
-                        if oc not in ("WIN", "LOSS"):
-                            continue
-
-                        pnl = float(res.get("pnl_dollars", 0) or 0)
-                        row = dict(res)
-                        row["job_id"] = job_id
-                        row["session"] = session
-                        row.setdefault("date", date_str)
-                        day_trades.append(row)
-                        day_pnl += pnl
-                        capital += pnl
-
-                        open_positions[pos_key] = row
-                        if oc in ("WIN", "LOSS"):
-                            open_positions.pop(pos_key, None)
-                            record_trade(ticker, timeframe, date_str)
-                            TRADED_TICKERS_TODAY.add(tkr_u)
-                            for _ccy in get_currencies(tkr_u):
-                                OPEN_CURRENCY_COUNT[_ccy] = OPEN_CURRENCY_COUNT.get(_ccy, 0) + 1
-                            _rsid2 = str(row.get("strategy_id", "")).strip().upper()
-                            if _rsid2:
-                                _CHRONO_V7_STRATEGY_FIRED.add(_rsid2)
-
+                        if chrono_abort:
+                            break
+                        CHRONO_SCAN_COUNTS[ticker] = CHRONO_SCAN_COUNTS.get(ticker, 0) + 1
+                        time.sleep(2.0)
                     if chrono_abort:
                         break
-
-                    CHRONO_SCAN_COUNTS[ticker] = CHRONO_SCAN_COUNTS.get(ticker, 0) + 1
-
-                    chrono_data["chrono_intraday"] = {
-                        "date": date_str,
-                        "next_ticker_idx": ti + 1,
-                        "day_trades": day_trades,
-                        "day_skipped": day_skipped,
-                        "day_pnl": round(day_pnl, 2),
-                        "capital": round(capital, 2),
-                    }
-                    chrono_data["capital"] = round(capital, 2)
-                    chrono_data["current_date"] = date_str
-                    chrono_data["status"] = "running"
-                    save_json(chrono_path, chrono_data)
-
-                    time.sleep(2.0)
+                if chrono_abort:
+                    break
 
             if chrono_stop_requested(job_id) or chrono_abort:
                 log(f"[Chrono {job_id}] Stop requested — exiting early", level="info")
@@ -4594,6 +5104,11 @@ def run_chronological_backtest(
                     "scan_counts": dict(CHRONO_SCAN_COUNTS),
                 }
             )
+
+            # FIX 18 — next calendar day prioritises strategies still at zero lifetime trades
+            for _zsid in ALL_STRATEGY_IDS:
+                if STRATEGY_TRADE_COUNT.get(_zsid, 0) == 0:
+                    ZERO_TRADE_STRATEGIES.add(_zsid)
 
             time.sleep(5.0)
             current += timedelta(days=1)
