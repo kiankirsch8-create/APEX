@@ -5,15 +5,15 @@ rolling stats, and periodic self-improvement. All state is simple JSON on ``DATA
 """
 from __future__ import annotations
 
-STRATEGY_VERSION = "v5.0-68-strategies"
-# 68 strategies across 8 categories (registry in strategies_v5_data.py)
-# Python pre-filter (prefilter_v5.py) + module cooldown LAST_TRADE_DATES
-# OANDA practice constants for optional live routing (OANDA_*)
+STRATEGY_VERSION = "v6.0-layer-split"
+# v6: module-level LAST_TRADE_DATES (never reset per day); Layer 2+ Python-forced trades;
+# Claude prompt hardened for Layer 1 (T01 / R01) only.
 #
 # DO NOT CHANGE (contract):
 #   evaluate_forward_candles trailing behavior
 #   RISK_BY_CONFIDENCE numeric values
 #   append_result / load_all_results implementations
+#   calculate_stats function
 #   File I/O and storage paths (DATA_DIR results)
 
 import gc
@@ -38,6 +38,18 @@ from anthropic import Anthropic
 import pandas_ta  # noqa: F401
 
 from utils import DATA_DIR, env, load_json, log, save_json, utcnow_iso
+
+# ── COOLDOWN TRACKER — module-level, NEVER inside any loop ──
+# Key: "TICKER_tf" (tf lowercased). Value: "YYYY-MM-DD" of last trade.
+LAST_TRADE_DATES: dict[str, str] = {}
+TRADE_COOLDOWN_DAYS: dict[str, int] = {
+    "1w": 7,
+    "1d": 2,
+    "4h": 1,
+    "1h": 0,
+    "30m": 0,
+    "15m": 0,
+}
 
 MODEL = "claude-sonnet-4-5-20250929"
 CLAUDE_MODEL = MODEL
@@ -240,6 +252,10 @@ _PROMPT_V3_FILE = Path(__file__).resolve().parent / "prompts" / "apex_master_v3.
 
 from strategies_v5_data import STRATEGIES
 
+LAYER1_STRATEGY_IDS: frozenset[str] = frozenset(
+    {"T01_EMA_PULLBACK", "R01_EXTREME_ZONE_REVERSION"},
+)
+
 _INTRADAY_STRATEGY_IDS: frozenset[str] = frozenset(
     sid for sid, meta in STRATEGIES.items() if str(meta.get("category", "")).strip() == "INTRADAY"
 )
@@ -273,18 +289,7 @@ MIN_STOP_PCT: dict[str, float] = {
 
 
 
-from prefilter_v5 import python_prefilter
-
-TRADE_COOLDOWN_DAYS: dict[str, int] = {
-    "1w": 7,
-    "1d": 2,
-    "4h": 1,
-    "1h": 0,
-    "30m": 0,
-    "15m": 0,
-}
-
-LAST_TRADE_DATES: dict[str, str] = {}
+from prefilter_v6 import python_prefilter
 
 MAX_CORRELATED_POSITIONS = 2
 
@@ -337,7 +342,7 @@ def check_cooldown(ticker: str, timeframe: str, date_str: str) -> tuple[bool, st
         if days_since < cooldown:
             return False, (
                 f"Cooldown: {ticker} {timeframe} traded {days_since}d ago "
-                f"(need {cooldown}d)"
+                f"(need {cooldown}d gap)"
             )
         return True, ""
     except Exception:  # noqa: BLE001
@@ -1446,10 +1451,154 @@ HARD RULES:
 """
 
 
+def _format_apex_master_v6(
+    *,
+    ticker: str,
+    tf_key: str,
+    analysis_date: str,
+    price: float,
+    zone_label: str,
+    zone_pct: float,
+    high_52w: float,
+    low_52w: float,
+    ind: dict[str, Any],
+    bb_width: float,
+    intel_text: str,
+    qualifying_str: str,
+) -> str:
+    """APEX v6.0 — Layer 1 (T01 / R01) only; hardened skip language."""
+    return f"""
+You are APEX v6.0 — institutional forex trading AI.
+
+Python pre-filter confirmed: {qualifying_str}
+These are LAYER 1 setups only (T01_EMA_PULLBACK or R01_EXTREME_ZONE_REVERSION).
+Your job: confirm or deny each setup with precise entry/stop/targets.
+
+MARKET DATA:
+Pair:    {ticker}
+TF:      {tf_key}
+Date:    {analysis_date}
+Price:   {price:.5f}
+Zone:    {zone_label} ({zone_pct:.1f}%)
+52w Lo:  {low_52w:.5f}
+52w Hi:  {high_52w:.5f}
+EMA20:   {float(ind.get("ema20", price) or price):.5f}
+EMA50:   {float(ind.get("ema50", price) or price):.5f}
+EMA200:  {float(ind.get("ema200", price) or price):.5f}
+ATR:     {float(ind.get("atr", 0) or 0):.5f}
+RSI:     {float(ind.get("rsi", 50) or 50):.1f}
+ADX:     {float(ind.get("adx", 20) or 20):.1f}
+MACD H:  {float(ind.get("macd_hist", 0) or 0):.6f}
+BB Wid:  {bb_width:.2f}%
+Swings:  H={ind.get("swing_highs", [])} L={ind.get("swing_lows", [])}
+
+{intel_text}
+
+═══ T01 EMA PULLBACK — non-negotiables ═══
+Direction LONG:  EMA20/50 both above EMA200 AND zone_pct < 60%
+Direction SHORT: EMA20/50 both below EMA200 AND zone_pct > 40%
+Entry at: price within 2.5x ATR of EMA20 or EMA50
+ADX: any value >= 12
+
+═══ R01 EXTREME ZONE — non-negotiables ═══
+LONG:  zone_pct <= 20% AND (RSI <= 40 OR ADX <= 45)
+SHORT: zone_pct >= 80% AND (RSI >= 60 OR ADX <= 45)
+BLOCKED on 4H (1D and 1W only)
+
+═══ RULES ═══
+1. Check if the qualifying strategy actually matches the data above
+2. If YES → set precise stop (structural level, not arbitrary %)
+3. If NO → SKIP with specific reason (max 15 words)
+4. Minimum R:R = 1:2. Preferred = 1:3.
+5. Confidence HIGH (2%) only if ALL non-negotiables met on 1D/1W
+6. Confidence MEDIUM (1%) if most met or on 4H
+7. DO NOT skip because of "no forensic data" — that is not a reason
+8. DO NOT skip because "Layer 2 strategy" — those are handled elsewhere
+
+═══ VALID JSON OUTPUT ONLY ═══
+
+If skipping:
+{{
+  "skip_trade": true,
+  "skip_reason": "specific reason max 15 words",
+  "strategy_id": "SKIP",
+  "strategy_name": "",
+  "strategy_met": false,
+  "verdict": "SKIP",
+  "direction": "NONE",
+  "confidence": "SKIP",
+  "conviction_score": 0,
+  "zone_pct": {zone_pct},
+  "zone_label": "{zone_label}",
+  "price_zone": "{zone_label}",
+  "zone_position_pct": {zone_pct},
+  "smc_concept": "NONE",
+  "smc_direction": "",
+  "is_exotic": false,
+  "confluence_points": 0,
+  "entry": 0, "stop_loss": 0, "tp1": 0, "tp2": 0, "tp3": 0,
+  "tp_target": "TP1", "rr_ratio": "",
+  "signals_used": [], "confluences": [], "conflicts": [],
+  "htf_bias": "", "market_structure": "",
+  "core_signals_met": [], "core_signals_failed": [],
+  "non_negotiables_met": [], "non_negotiables_failed": [],
+  "reasoning": "max 20 words"
+}}
+
+If trading:
+{{
+  "skip_trade": false,
+  "strategy_id": "T01_EMA_PULLBACK",
+  "strategy_name": "EMA Trend Pullback",
+  "strategy_met": true,
+  "core_signals_met": ["EMA_ALIGNED_BULLISH", "WITHIN_2ATR_EMA20"],
+  "core_signals_failed": [],
+  "non_negotiables_met": ["EMA_BULL", "ZONE_BELOW_60"],
+  "non_negotiables_failed": [],
+  "verdict": "BUY",
+  "direction": "LONG",
+  "confidence": "HIGH",
+  "conviction_score": 7,
+  "zone_pct": {zone_pct},
+  "zone_label": "{zone_label}",
+  "price_zone": "DISCOUNT",
+  "zone_position_pct": {zone_pct},
+  "htf_bias": "BULLISH",
+  "market_structure": "UPTREND_PULLBACK",
+  "smc_concept": "NONE",
+  "smc_direction": "",
+  "is_exotic": false,
+  "confluence_points": 3,
+  "entry": {price:.5f},
+  "entry_reasoning": "price at EMA20 in uptrend",
+  "stop_loss": 0.00000,
+  "stop_reasoning": "below most recent swing low",
+  "tp1": 0.00000,
+  "tp2": 0.00000,
+  "tp3": 0.00000,
+  "tp_target": "TP2",
+  "rr_ratio": "1:3.0",
+  "trailing_plan": "BE at TP1, +1R at TP2, trail 1.5R at TP3",
+  "signals_used": ["EMA_BULLISH", "RSI_PULLBACK"],
+  "confluences": ["ADX confirmed trend", "discount zone support"],
+  "conflicts": [],
+  "intel_summary": "max 12 words",
+  "reasoning": "max 30 words"
+}}
+
+HARD RULES:
+- direction must be LONG or SHORT (never NONE for trades)
+- strategy_id must be T01_EMA_PULLBACK or R01_EXTREME_ZONE_REVERSION
+- strategy_met: true ONLY if setup genuinely visible in the data above
+- conviction_score: integer 1-8, cap at 8
+- minimum R:R 1:2 or SKIP
+- reasoning: maximum 30 words, no filler
+""".strip()
+
+
 def enforce_rules(ai: dict[str, Any], timeframe: str, price: float, ticker: str) -> dict[str, Any]:
-    """Post-parse enforcement — v5.0 relaxed gates (cannot be overridden by model text)."""
+    """Post-parse enforcement — v6.0 Layer 1 + Python-forced Layer 2 sizing (model text cannot override)."""
     tf = (timeframe or "").strip().lower()
-    strategy_id = str(ai.get("strategy_id", "SKIP")).strip().upper()
     direction = str(ai.get("direction", "NONE")).strip().upper()
     try:
         entry = float(ai.get("entry", price) or price)
@@ -1463,63 +1612,59 @@ def enforce_rules(ai: dict[str, Any], timeframe: str, price: float, ticker: str)
         zone_pct = float(ai.get("zone_pct", 50) or 50)
     except (TypeError, ValueError):
         zone_pct = 50.0
+    strategy_id = str(ai.get("strategy_id", "SKIP")).strip().upper()
     strategy_met = bool(ai.get("strategy_met", False))
 
     if ai.get("skip_trade", False):
         return ai
 
-    # RULE 1: strategy_met must be True
     if not strategy_met:
         ai["skip_trade"] = True
-        ai["skip_reason"] = "strategy_met=False"
+        ai["skip_reason"] = "strategy_met is False"
         return ai
 
-    meta = STRATEGIES.get(strategy_id) or {}
-    allowed_tfs = [str(x).strip().lower() for x in (meta.get("timeframes") or [])]
-    if allowed_tfs and tf not in allowed_tfs:
-        ai["skip_trade"] = True
-        ai["skip_reason"] = f"{strategy_id} not valid on {tf}"
-        return ai
-
-    # RULE 2: R01 (extreme reversion) blocked on 4H and below
     if strategy_id == "R01_EXTREME_ZONE_REVERSION":
         if tf in ("4h", "1h", "30m", "15m"):
             ai["skip_trade"] = True
             ai["skip_reason"] = f"R01 blocked on {tf}"
             return ai
 
-    # RULE 3: T01 zone rules (relaxed from v4.0)
     if strategy_id == "T01_EMA_PULLBACK":
         if direction == "LONG" and zone_pct > 60:
             ai["skip_trade"] = True
-            ai["skip_reason"] = f"T01 LONG blocked: zone {zone_pct:.0f}% > 60%"
+            ai["skip_reason"] = f"T01 LONG blocked zone {zone_pct:.0f}%>60%"
             return ai
         if direction == "SHORT" and zone_pct < 40:
             ai["skip_trade"] = True
-            ai["skip_reason"] = f"T01 SHORT blocked: zone {zone_pct:.0f}% < 40%"
+            ai["skip_reason"] = f"T01 SHORT blocked zone {zone_pct:.0f}%<40%"
             return ai
 
-    # RULE 4: Intraday strategies only on 15M/30M
+    if strategy_id in _INTRADAY_STRATEGY_IDS and tf not in ("15m", "30m"):
+        ai["skip_trade"] = True
+        ai["skip_reason"] = f"{strategy_id} only on 15M/30M"
+        return ai
     if strategy_id in _INTRADAY_STRATEGY_IDS:
-        if tf not in ("15m", "30m"):
-            ai["skip_trade"] = True
-            ai["skip_reason"] = f"{strategy_id} only on 15M/30M"
-            return ai
         ai["confidence"] = "LOW"
 
-    # RULE 5: Cap conviction at 8
     try:
         ai["conviction_score"] = min(int(round(float(ai.get("conviction_score", 5)))), 8)
     except (TypeError, ValueError):
         ai["conviction_score"] = 5
 
-    # RULE 6: Enforce minimum stop distance
     if stop and entry and stop != entry:
-        stop_dist_pct = abs(entry - stop) / entry * 100
-        min_stop = float(MIN_STOP_PCT.get(tf, 0.3))
-        if stop_dist_pct < min_stop:
-            mult = 1 if direction == "LONG" else -1
-            new_stop = entry * (1 - mult * min_stop / 100)
+        stop_pct = abs(entry - stop) / entry * 100
+        mn = float(MIN_STOP_PCT.get(tf, 0.3))
+        mx = float(MAX_STOP_PCT.get(tf, 1.5))
+        mult = 1 if direction == "LONG" else -1
+        if stop_pct < mn:
+            new_stop = entry * (1 - mult * mn / 100)
+            risk = abs(entry - new_stop)
+            ai["stop_loss"] = round(new_stop, 5)
+            ai["tp1"] = round(entry + mult * risk * 2, 5)
+            ai["tp2"] = round(entry + mult * risk * 3, 5)
+            ai["tp3"] = round(entry + mult * risk * 5, 5)
+        elif stop_pct > mx:
+            new_stop = entry * (1 - mult * mx / 100)
             risk = abs(entry - new_stop)
             ai["stop_loss"] = round(new_stop, 5)
             ai["tp1"] = round(entry + mult * risk * 2, 5)
@@ -1529,20 +1674,6 @@ def enforce_rules(ai: dict[str, Any], timeframe: str, price: float, ticker: str)
     stop = float(ai.get("stop_loss", 0) or 0)
     entry = float(ai.get("entry", price) or price)
 
-    # RULE 7: Cap maximum stop distance
-    if stop and entry and stop != entry:
-        stop_dist_pct = abs(entry - stop) / entry * 100
-        max_stop = float(MAX_STOP_PCT.get(tf, 1.5))
-        if stop_dist_pct > max_stop:
-            mult = 1 if direction == "LONG" else -1
-            new_stop = entry * (1 - mult * max_stop / 100)
-            risk = abs(entry - new_stop)
-            ai["stop_loss"] = round(new_stop, 5)
-            ai["tp1"] = round(entry + mult * risk * 2, 5)
-            ai["tp2"] = round(entry + mult * risk * 3, 5)
-            ai["tp3"] = round(entry + mult * risk * 5, 5)
-
-    # RULE 8: Position sizing
     confidence = str(ai.get("confidence", "LOW")).strip().upper()
     if confidence not in RISK_BY_CONFIDENCE:
         confidence = "LOW"
@@ -1558,12 +1689,6 @@ def enforce_rules(ai: dict[str, Any], timeframe: str, price: float, ticker: str)
         ai["_leveraged_exposure"] = round(pos_size * entry, 2)
         ai["_max_risk_dollars"] = round(risk_dollars, 2)
         ai["_account_risk_pct"] = risk_pct
-
-    # RULE 9: Untested strategies default to MEDIUM max (was HIGH)
-    tested_strategies = ("T01_EMA_PULLBACK", "R01_EXTREME_ZONE_REVERSION")
-    if strategy_id not in tested_strategies:
-        if str(ai.get("confidence", "")).strip().upper() == "HIGH":
-            ai["confidence"] = "MEDIUM"
 
     return ai
 
@@ -1915,6 +2040,207 @@ def _skipped_backtest_row(
     }
 
 
+def _python_forced_layer2_trade(
+    *,
+    sym: str,
+    timeframe: str,
+    analysis_date: str,
+    tf_key: str,
+    price: float,
+    zone_pct: float,
+    zone_label: str,
+    is_exotic: bool,
+    future: pd.DataFrame,
+    layer2: list[tuple[str, str, int]],
+) -> dict[str, Any] | None:
+    """Execute highest-scoring Layer 2+ setup without Claude (v6.0)."""
+    if not layer2:
+        return None
+    best = max(layer2, key=lambda x: int(x[2]))
+    strat_id = str(best[0]).strip().upper()
+    direction = str(best[1]).strip().upper()
+    if direction == "BOTH":
+        direction = "LONG" if float(zone_pct) < 50 else "SHORT"
+    if direction not in ("LONG", "SHORT"):
+        return None
+
+    mult = 1 if direction == "LONG" else -1
+    entry = round(float(price), 5)
+    stop = round(entry * (1 - mult * 0.005), 5)
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return None
+    tp1 = round(entry + mult * risk * 2, 5)
+    tp2 = round(entry + mult * risk * 3, 5)
+    tp3 = round(entry + mult * risk * 5, 5)
+
+    ai: dict[str, Any] = {
+        "skip_trade": False,
+        "strategy_id": strat_id,
+        "strategy_name": str(STRATEGIES.get(strat_id, {}).get("name", strat_id)),
+        "strategy_met": True,
+        "direction": direction,
+        "confidence": "LOW",
+        "conviction_score": 3,
+        "entry": entry,
+        "stop_loss": stop,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "verdict": "BUY" if direction == "LONG" else "SELL",
+        "zone_pct": zone_pct,
+        "confluences": [str(x[0]) for x in layer2],
+        "signals_used": [strat_id],
+        "reasoning": f"Python-forced {strat_id}: gathering data at LOW confidence",
+        "rr_ratio": "1:2.0",
+        "tp_target": "TP1",
+        "htf_bias": "UNKNOWN",
+        "market_structure": "UNKNOWN",
+        "core_signals_met": ["PYTHON_LAYER2"],
+        "core_signals_failed": [],
+    }
+    ai = enforce_rules(ai, tf_key, float(price), sym)
+    if ai.get("skip_trade"):
+        return _skipped_backtest_row(
+            sym=sym,
+            timeframe=timeframe,
+            analysis_date=analysis_date,
+            price=float(price),
+            zone_pct=zone_pct,
+            zone_label=zone_label,
+            skip_reason=str(ai.get("skip_reason") or "enforce after Python force"),
+            ai=ai,
+            tf_key=tf_key,
+            is_exotic=is_exotic,
+        )
+
+    entry = float(ai.get("entry", entry) or entry)
+    stop = float(ai.get("stop_loss", stop) or stop)
+    tp1 = float(ai.get("tp1", tp1) or tp1)
+    tp2 = float(ai.get("tp2", tp2) or tp2)
+    tp3 = float(ai.get("tp3", tp3) or tp3)
+    strat_id = str(ai.get("strategy_id", strat_id)).strip().upper()
+
+    fwd_n = int(TF_FORWARD_CANDLES.get(tf_key, FORWARD_CANDLES))
+    fut = future.head(fwd_n)
+    if fut.empty or len(fut) < 1:
+        return None
+
+    log(
+        f"[LAYER2-FORCED] {strat_id} {direction} {sym} {tf_key} {analysis_date}",
+        level="info",
+    )
+
+    exit_data = evaluate_forward_candles(
+        direction,
+        entry,
+        stop,
+        tp1,
+        tp2,
+        tp3,
+        fut,
+        strat_id,
+    )
+    if exit_data.get("outcome") in ("NO_DATA", "INVALID"):
+        return None
+
+    position_size = float(ai.get("_position_size", 0) or 0)
+    leveraged_exposure = float(ai.get("_leveraged_exposure", 0) or 0)
+    max_risk_dollars = float(ai.get("_max_risk_dollars", 0) or 0)
+    sizing_risk_pct = float(ai.get("_account_risk_pct", 0) or 0)
+    risk_pct_of_price = abs(entry - stop) / entry if entry > 0 else 0.0
+    risk_pct_display = round(risk_pct_of_price * 100, 3)
+
+    hit_tp1 = bool(exit_data.get("hit_tp1"))
+    hit_tp2 = bool(exit_data.get("hit_tp2"))
+    hit_tp3 = bool(exit_data.get("hit_tp3"))
+    hit_stop = bool(exit_data.get("hit_stop"))
+    exit_p = float(exit_data.get("exit_price", entry))
+    exit_r = str(exit_data.get("exit_reason", ""))
+    candles_to_exit = int(exit_data.get("candles_to_exit", 0) or 0)
+    trailing_activated = bool(exit_data.get("trailing_activated", False))
+    final_stop = float(exit_data.get("final_stop", stop) or stop)
+
+    raw_pct = float(exit_data.get("pnl_pct", 0) or 0)
+    outcome = str(exit_data.get("outcome", "LOSS"))
+    if outcome not in ("WIN", "LOSS"):
+        outcome = "WIN" if raw_pct > 0 else "LOSS"
+    correct = outcome == "WIN"
+    pnl_dollars = round(leveraged_exposure * raw_pct, 2)
+    pnl_pct_display = round(raw_pct * 100, 2)
+    confidence = "LOW"
+
+    return {
+        "date": analysis_date,
+        "ticker": sym,
+        "timeframe": timeframe,
+        "verdict": ai.get("verdict"),
+        "direction": direction,
+        "confidence": confidence,
+        "htf_bias": str(ai.get("htf_bias") or "UNKNOWN"),
+        "market_structure": str(ai.get("market_structure") or "UNKNOWN"),
+        "zone_pct": zone_pct,
+        "zone_label": zone_label,
+        "zone_label_model": None,
+        "price_zone": "EQUILIBRIUM",
+        "zone_position_pct": zone_pct,
+        "smc_concept": "NONE",
+        "smc_direction": "",
+        "tp_target": str(ai.get("tp_target") or "TP1"),
+        "is_exotic": is_exotic,
+        "confluence_points": 0,
+        "zone_reasoning": "",
+        "smc_reasoning": "",
+        "exit_reasoning": "",
+        "entry_price": round(entry, 5),
+        "stop_loss": round(stop, 5),
+        "tp1": round(tp1, 5),
+        "tp2": round(tp2, 5),
+        "tp3": round(tp3, 5),
+        "exit_price": exit_p,
+        "exit_reason": exit_r,
+        "outcome": outcome,
+        "correct": correct,
+        "pnl_pct": pnl_pct_display,
+        "pnl_dollars": pnl_dollars,
+        "leverage": LEVERAGE,
+        "position_size": round(position_size, 2),
+        "leveraged_exposure": round(leveraged_exposure, 2),
+        "max_risk_dollars": max_risk_dollars,
+        "account_risk_pct": sizing_risk_pct,
+        "risk_pct_of_price": risk_pct_display,
+        "hit_tp1": hit_tp1,
+        "hit_tp2": hit_tp2,
+        "hit_tp3": hit_tp3,
+        "hit_stop": hit_stop,
+        "candles_to_exit": candles_to_exit,
+        "signals_used": [strat_id],
+        "confluences": ai.get("confluences") if isinstance(ai.get("confluences"), list) else [],
+        "conflicts": [],
+        "reasoning": str(ai.get("reasoning", "")),
+        "rr_ratio": str(ai.get("rr_ratio", "1:2.0")),
+        "conviction_score": int(ai.get("conviction_score", 3) or 3),
+        "confluence_score_python": 0,
+        "risk_mode": "PYTHON_LAYER2",
+        "weekly_bias_chart": "",
+        "intel_summary": "",
+        "strategy_id": strat_id,
+        "strategy_name": str(STRATEGIES.get(strat_id, {}).get("name", strat_id)),
+        "strategy_met": True,
+        "core_signals_met": ["PYTHON_LAYER2"],
+        "core_signals_failed": [],
+        "non_negotiables_met": ["PYTHON_LAYER2"],
+        "non_negotiables_failed": [],
+        "trailing_plan": "",
+        "timeframe_restricted": tf_key == "1h",
+        "tf_strategy_allowed": tf_key != "1h" or strat_id in ALLOWED_1H_STRATEGIES,
+        "trailing_activated": trailing_activated,
+        "final_stop": round(final_stop, 5),
+        "skipped": False,
+        "skip_trade": False,
+    }
+
+
 def run_one_backtest(ticker: str, timeframe: str, analysis_date: str, *, chrono_yfinance: bool = False) -> dict[str, Any] | None:
     try:
         sym = (ticker or "").strip().upper()
@@ -2106,12 +2432,6 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str, *, chrono_
                 is_exotic=is_exotic,
             )
 
-        qualifying_str = str([s[0] for s in qualifying_strategies])
-
-        macd_line = float(ind.get("macd_line", 0) or 0)
-        macd_signal = float(ind.get("macd_signal", 0) or 0)
-        macd_sig = macd_signal
-
         intel_text = ""
         news_sentiment = 0.0
         cot_bias = "UNKNOWN"
@@ -2164,21 +2484,50 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str, *, chrono_
         except Exception as e:
             log(f"[Intel] {e}")
 
-        _utc_hour = datetime.now(timezone.utc).hour
-        if 22 <= _utc_hour or _utc_hour < 8:
-            _session = "ASIA"
-        elif 7 <= _utc_hour < 12:
-            _session = "LONDON"
-        elif 12 <= _utc_hour < 21:
-            _session = "NEW_YORK"
-        else:
-            _session = "OFF_HOURS"
+        layer1_list = [s for s in qualifying_strategies if s[0] in LAYER1_STRATEGY_IDS]
+        layer2_list = [s for s in qualifying_strategies if s[0] not in LAYER1_STRATEGY_IDS]
 
-        tf_label = TF_DESCRIPTIONS.get(tf_key, tf_key)
-        prompt = _format_apex_master_v5(
+        if layer2_list and not layer1_list:
+            forced = _python_forced_layer2_trade(
+                sym=sym,
+                timeframe=timeframe,
+                analysis_date=analysis_date,
+                tf_key=tf_key,
+                price=float(price),
+                zone_pct=zone_pct,
+                zone_label=zone_label,
+                is_exotic=is_exotic,
+                future=future,
+                layer2=layer2_list,
+            )
+            return forced
+
+        if not layer1_list:
+            return _skipped_backtest_row(
+                sym=sym,
+                timeframe=timeframe,
+                analysis_date=analysis_date,
+                price=float(price),
+                zone_pct=zone_pct,
+                zone_label=zone_label,
+                skip_reason="No Layer 1 (T01/R01) candidates for Claude",
+                ai={
+                    "skip_trade": True,
+                    "strategy_id": "SKIP",
+                    "strategy_met": False,
+                    "skip_reason": "No Layer 1 for Claude",
+                    "direction": "NONE",
+                    "conviction_score": 0,
+                },
+                tf_key=tf_key,
+                is_exotic=is_exotic,
+            )
+
+        qualifying_str = str([s[0] for s in layer1_list])
+
+        prompt = _format_apex_master_v6(
             ticker=sym,
             tf_key=tf_key,
-            tf_label=tf_label,
             analysis_date=analysis_date,
             price=float(price),
             zone_label=zone_label,
@@ -2188,11 +2537,6 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str, *, chrono_
             ind=ind,
             bb_width=bb_width,
             intel_text=intel_text,
-            news_sentiment=news_sentiment,
-            cot_bias=cot_bias,
-            fear_greed=fear_greed,
-            vix_val=vix_val,
-            session_line=_session,
             qualifying_str=qualifying_str,
         )
         try:
@@ -2235,6 +2579,7 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str, *, chrono_
         _legacy_sid = {
             "S03_EMA_PULLBACK": "T01_EMA_PULLBACK",
             "S04_EXTREME_REVERSION": "R01_EXTREME_ZONE_REVERSION",
+            "R01_EXTREME_ZONE": "R01_EXTREME_ZONE_REVERSION",
             "S08_RANGE_BREAKOUT": "B01_RANGE_BREAKOUT",
         }
         _sid_raw = str(ai.get("strategy_id", "")).strip().upper()
@@ -2277,6 +2622,11 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str, *, chrono_
         strategy_id_norm = str(ai.get("strategy_id", "")).strip().upper()
         if strategy_id_norm not in STRATEGIES:
             return _skip_out(f"unsupported strategy_id: {strategy_id_norm}", ai)
+        if strategy_id_norm not in LAYER1_STRATEGY_IDS:
+            return _skip_out(
+                f"Layer 1 Claude path requires T01 or R01, got {strategy_id_norm}",
+                ai,
+            )
 
         direction = str(ai.get("direction", "")).strip().upper()
         if direction not in ("LONG", "SHORT"):
@@ -3538,7 +3888,8 @@ def run_chronological_backtest(
     Walk forward calendar day by day from ``start_date`` to ``end_date``.
     Each weekday scans every ticker in ``CHRONO_TICKERS`` in fixed order; timeframes
     are ``4h``/``1d``/``1w`` plus ``15m``/``30m`` when the scan date is within 55 days
-    of today (Yahoo intraday window). Uses ``run_one_backtest`` (same Claude path).
+    of today (Yahoo intraday window). Uses ``run_one_backtest`` (Layer 2+ Python-forced
+    trades skip Claude; Layer 1 uses v6 prompt).
     Persists to ``chrono_results_{job_id}.json`` under ``DATA_DIR`` (resumable).
     """
     if job_id is None:
@@ -3788,6 +4139,10 @@ def run_chronological_backtest(
 
                         cd_ok, cd_reason = check_cooldown(ticker, timeframe, date_str)
                         if not cd_ok:
+                            log(
+                                f"[COOLDOWN] {ticker} {timeframe} {date_str}: {cd_reason}",
+                                level="info",
+                            )
                             result = {
                                 "date": date_str,
                                 "ticker": ticker,
@@ -3799,7 +4154,7 @@ def run_chronological_backtest(
                                 "outcome": "SKIPPED",
                                 "pnl_dollars": 0.0,
                                 "skip_reason": cd_reason,
-                                "verdict": "SKIP",
+                                "verdict": "COOLDOWN",
                             }
                             append_result(result)
                             day_skipped.append(result)
