@@ -5,37 +5,16 @@ rolling stats, and periodic self-improvement. All state is simple JSON on ``DATA
 """
 from __future__ import annotations
 
-STRATEGY_VERSION = "v4.0-three-layer"
-# Built from forensic analysis of 2,475 real backtested trades — May 2026
+STRATEGY_VERSION = "v5.0-68-strategies"
+# 68 strategies across 8 categories (registry in strategies_v5_data.py)
+# Python pre-filter (prefilter_v5.py) + module cooldown LAST_TRADE_DATES
+# OANDA practice constants for optional live routing (OANDA_*)
 #
-# KEY FORENSIC FINDINGS:
-#   1W timeframe: +$4,267 total — all the profit
-#   4H timeframe: -$996 total — net negative with S03/S04
-#   S04 on 4H: 0-25% WR across all pairs — DELETED
-#   S03 LONG equilibrium: 28% WR — BLOCKED
-#   NZD pairs: best performers (58.8% WR on 1W S04)
-#   GBPJPY 1W S04: 11.9% WR over 42 trades — BLOCKED
-#
-# THREE LAYER ARCHITECTURE:
-#   Layer 1: S03/S04 on 1W and 1D — proven anchor
-#   Layer 2: S11/S01/S05/S02/S06/S07/S08/S12 — gathering data
-#   Layer 3: S13-S18 on 15M/30M — intraday, exit same session
-#
-# PYTHON PRE-FILTER: eliminates 90% of Claude calls
-#   Only genuine setups reach Claude — 10x cost reduction
-#
-# RULES THAT MUST NEVER BE CHANGED:
-#   S04 hard blocked on 4H/1H/30M/15M (forensic proof)
-#   S03 LONG requires zone <50% (28% WR vs 53% WR)
-#   S08 blocked on 4H (proven 25% WR)
-#   strategy_met must be True to trade
-#   MIN_STOP_PCT on 4H = 0.8% (daily noise protection)
-#   evaluate_forward_candles trailing stop logic
-#   RISK_BY_CONFIDENCE: HIGH=2%, MEDIUM=1%, LOW=0.5%
-#   Max conviction score: 8
-#
-# TO ADD NEW STRATEGIES: create S19+, add to STRATEGIES dict,
-# give them LOW confidence until 30+ trades of data exist.
+# DO NOT CHANGE (contract):
+#   evaluate_forward_candles trailing behavior
+#   RISK_BY_CONFIDENCE numeric values
+#   append_result / load_all_results implementations
+#   File I/O and storage paths (DATA_DIR results)
 
 import gc
 import json
@@ -210,9 +189,10 @@ TF_WEIGHTS: dict[str, float] = {
 
 ALLOWED_1H_STRATEGIES: frozenset[str] = frozenset(
     {
-        "S11_SR_FLIP",
-        "S02_LIQUIDITY_SWEEP",
-        "S17_LONDON_OPEN_BREAKOUT",
+        "T01_EMA_PULLBACK",
+        "SMC01_SR_FLIP",
+        "B08_KEY_LEVEL_RETEST",
+        "M01_MACD_DIVERGENCE",
     }
 )
 
@@ -258,182 +238,16 @@ FORWARD_CANDLES = TF_FORWARD_CANDLES.get("4h", 30)
 
 _PROMPT_V3_FILE = Path(__file__).resolve().parent / "prompts" / "apex_master_v3.txt"
 
-STRATEGIES: dict[str, dict[str, Any]] = {
-    # ── LAYER 1 — WEEKLY ANCHOR (proven edge, primary profit source) ──
-    "S03_EMA_PULLBACK": {
-        "name": "EMA Trend Pullback",
-        "category": "TREND_FOLLOWING",
-        "proven_wr": 57.7,
-        "layer": 1,
-        "best_tf": ["1w", "1d"],
-        "allowed_tf": ["1w", "1d", "4h"],
-        "blocked_tf": [],
-        "min_confidence": "MEDIUM",
-    },
-    "S04_EXTREME_REVERSION": {
-        "name": "Extreme Zone Reversion",
-        "category": "MEAN_REVERSION",
-        "proven_wr": 66.7,
-        "layer": 1,
-        "best_tf": ["1w", "1d"],
-        "allowed_tf": ["1w", "1d"],
-        "blocked_tf": ["4h", "1h", "30m", "15m"],
-        "min_confidence": "MEDIUM",
-    },
-    # ── LAYER 2 — DAILY MOMENTUM (gathering data, medium confidence) ──
-    "S11_SR_FLIP": {
-        "name": "Support Resistance Flip",
-        "category": "STRUCTURE",
-        "proven_wr": None,
-        "layer": 2,
-        "best_tf": ["1d", "4h"],
-        "allowed_tf": ["1w", "1d", "4h"],
-        "blocked_tf": [],
-        "min_confidence": "LOW",
-    },
-    "S01_BREAKOUT_RETEST": {
-        "name": "Breakout Retest",
-        "category": "TREND_FOLLOWING",
-        "proven_wr": None,
-        "layer": 2,
-        "best_tf": ["1d"],
-        "allowed_tf": ["1d", "4h"],
-        "blocked_tf": [],
-        "min_confidence": "LOW",
-    },
-    "S05_MACD_DIVERGENCE": {
-        "name": "MACD Divergence",
-        "category": "MOMENTUM",
-        "proven_wr": None,
-        "layer": 2,
-        "best_tf": ["1d"],
-        "allowed_tf": ["1d", "4h"],
-        "blocked_tf": [],
-        "min_confidence": "LOW",
-    },
-    "S02_LIQUIDITY_SWEEP": {
-        "name": "Liquidity Sweep Reversal",
-        "category": "SMART_MONEY",
-        "proven_wr": None,
-        "layer": 2,
-        "best_tf": ["4h", "1d"],
-        "allowed_tf": ["4h", "1d"],
-        "blocked_tf": [],
-        "min_confidence": "LOW",
-    },
-    "S06_ORDER_BLOCK": {
-        "name": "Institutional Order Block",
-        "category": "SMART_MONEY",
-        "proven_wr": None,
-        "layer": 2,
-        "best_tf": ["1d"],
-        "allowed_tf": ["1d", "4h"],
-        "blocked_tf": [],
-        "min_confidence": "LOW",
-    },
-    "S07_FAIR_VALUE_GAP": {
-        "name": "Fair Value Gap Fill",
-        "category": "SMART_MONEY",
-        "proven_wr": None,
-        "layer": 2,
-        "best_tf": ["4h", "1d"],
-        "allowed_tf": ["4h", "1d"],
-        "blocked_tf": [],
-        "min_confidence": "LOW",
-    },
-    "S08_RANGE_BREAKOUT": {
-        "name": "Range Breakout",
-        "category": "BREAKOUT",
-        "proven_wr": None,
-        "layer": 2,
-        "best_tf": ["1d"],
-        "allowed_tf": ["1d"],
-        "blocked_tf": ["4h"],
-        "min_confidence": "LOW",
-    },
-    "S12_VOLATILITY_COMPRESSION": {
-        "name": "Volatility Compression Breakout",
-        "category": "BREAKOUT",
-        "proven_wr": None,
-        "layer": 2,
-        "best_tf": ["1d"],
-        "allowed_tf": ["1d", "4h"],
-        "blocked_tf": [],
-        "min_confidence": "LOW",
-    },
-    # ── LAYER 3 — INTRADAY EVENT-DRIVEN (exit same session, no overnight) ──
-    "S13_NEWS_MOMENTUM": {
-        "name": "News Momentum",
-        "category": "NEWS_DRIVEN",
-        "proven_wr": None,
-        "layer": 3,
-        "best_tf": ["15m", "30m"],
-        "allowed_tf": ["15m", "30m"],
-        "blocked_tf": ["1h", "4h", "1d", "1w"],
-        "min_confidence": "LOW",
-        "max_hold_candles": 4,
-    },
-    "S14_OPENING_RANGE_BREAKOUT": {
-        "name": "Opening Range Breakout",
-        "category": "INTRADAY",
-        "proven_wr": None,
-        "layer": 3,
-        "best_tf": ["15m", "30m"],
-        "allowed_tf": ["15m", "30m"],
-        "blocked_tf": ["1h", "4h", "1d", "1w"],
-        "min_confidence": "LOW",
-        "max_hold_candles": 8,
-    },
-    "S15_VWAP_DEVIATION": {
-        "name": "VWAP Deviation Reversion",
-        "category": "INTRADAY",
-        "proven_wr": None,
-        "layer": 3,
-        "best_tf": ["15m", "30m"],
-        "allowed_tf": ["15m", "30m"],
-        "blocked_tf": ["1h", "4h", "1d", "1w"],
-        "min_confidence": "LOW",
-        "max_hold_candles": 6,
-    },
-    "S16_HTF_LEVEL_REJECTION": {
-        "name": "HTF Level Rejection",
-        "category": "INTRADAY",
-        "proven_wr": None,
-        "layer": 3,
-        "best_tf": ["15m", "30m"],
-        "allowed_tf": ["15m", "30m"],
-        "blocked_tf": ["1h", "4h", "1d", "1w"],
-        "min_confidence": "LOW",
-        "max_hold_candles": 8,
-    },
-    "S17_LONDON_OPEN_BREAKOUT": {
-        "name": "London Open Breakout",
-        "category": "INTRADAY",
-        "proven_wr": None,
-        "layer": 3,
-        "best_tf": ["15m", "30m"],
-        "allowed_tf": ["15m", "30m", "4h"],
-        "blocked_tf": ["1d", "1w"],
-        "min_confidence": "LOW",
-        "max_hold_candles": 12,
-    },
-    "S18_NY_OPEN_MOMENTUM": {
-        "name": "NY Open Momentum",
-        "category": "INTRADAY",
-        "proven_wr": None,
-        "layer": 3,
-        "best_tf": ["15m", "30m"],
-        "allowed_tf": ["15m", "30m"],
-        "blocked_tf": ["1h", "4h", "1d", "1w"],
-        "min_confidence": "LOW",
-        "max_hold_candles": 12,
-    },
-}
+from strategies_v5_data import STRATEGIES
+
+_INTRADAY_STRATEGY_IDS: frozenset[str] = frozenset(
+    sid for sid, meta in STRATEGIES.items() if str(meta.get("category", "")).strip() == "INTRADAY"
+)
 
 # Correlation groups — max 2 open trades per group at once
 CORRELATION_GROUPS: dict[str, list[str]] = {
     "USD_EM": ["USDMXN", "USDZAR", "USDNOK", "USDSEK"],
-    "JPY_CROSSES": ["CADJPY", "AUDJPY", "GBPJPY", "USDJPY", "NZDJPY", "EURJPY"],
+    "JPY_CROSSES": ["CADJPY", "AUDJPY", "GBPJPY", "USDJPY", "NZDJPY", "EURJPY", "CHFJPY"],
     "COMMODITY": ["AUDUSD", "NZDUSD", "USDCAD", "AUDNZD", "AUDCAD", "NZDCAD"],
     "EUR_CROSSES": ["EURUSD", "EURGBP", "EURNZD", "EURAUD", "EURCAD"],
     "GBP_CROSSES": ["GBPUSD", "GBPJPY", "GBPNZD", "GBPAUD", "GBPCAD"],
@@ -457,199 +271,85 @@ MIN_STOP_PCT: dict[str, float] = {
 }
 
 
-def _utc_hour_for_intraday_session(past: pd.DataFrame | None) -> int:
-    """Prefer last bar's hour (UTC); fall back to wall-clock UTC for live scans."""
-    if past is not None and not past.empty:
-        try:
-            ts = past.index[-1]
-            if isinstance(ts, pd.Timestamp):
-                if ts.tzinfo is not None:
-                    return int(ts.tz_convert(timezone.utc).hour)
-                return int(ts.hour)
-        except Exception:  # noqa: BLE001
-            pass
-    return datetime.now(timezone.utc).hour
 
 
-def python_prefilter(
-    ticker: str,
-    timeframe: str,
-    price: float,
-    ind: dict[str, Any],
-    zone_pct: float,
-    *,
-    analysis_date: str | None = None,
-    past: pd.DataFrame | None = None,
-) -> tuple[bool, list[tuple[str, str, int]], str]:
-    """
-    Pure Python check of all strategy conditions.
-    Returns (qualifies, strategies, reason).
-    Cost: zero. Eliminates 90%+ of Claude calls.
-    """
-    tf = timeframe.lower().strip()
-    sym_u = (ticker or "").strip().upper()
-    qualifying: list[tuple[str, str, int]] = []
+from prefilter_v5 import python_prefilter
 
-    ema20 = float(ind.get("ema20", price) or price)
-    ema50 = float(ind.get("ema50", price) or price)
-    ema200 = float(ind.get("ema200", price) or price)
-    rsi = float(ind.get("rsi", 50) or 50)
-    adx = float(ind.get("adx", 20) or 20)
-    atr = float(ind.get("atr", price * 0.01) or (price * 0.01))
-    macd_hist = float(ind.get("macd_hist", 0) or 0)
-    bb_width = float(ind.get("bb_width", 3.0) or 3.0)
-    swing_highs = ind.get("swing_highs", []) or []
-    swing_lows = ind.get("swing_lows", []) or []
+TRADE_COOLDOWN_DAYS: dict[str, int] = {
+    "1w": 7,
+    "1d": 2,
+    "4h": 1,
+    "1h": 0,
+    "30m": 0,
+    "15m": 0,
+}
 
-    today = date.today()
-    if analysis_date:
-        try:
-            scan_date = datetime.strptime(str(analysis_date)[:10], "%Y-%m-%d").date()
-        except Exception:  # noqa: BLE001
-            scan_date = today
-    else:
-        scan_date = today
+LAST_TRADE_DATES: dict[str, str] = {}
 
-    days_ago = (today - scan_date).days
+MAX_CORRELATED_POSITIONS = 2
 
-    if tf in ("15m", "30m") and days_ago > 55:
-        return False, [], "15M/30M data not available beyond 55 days"
+OANDA_API_TOKEN = os.getenv("OANDA_API_TOKEN", "")
+OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID", "")
+OANDA_BASE_URL = "https://api-fxpractice.oanda.com"
+OANDA_INSTRUMENT_MAP: dict[str, str] = {
+    "EURUSD": "EUR_USD",
+    "GBPUSD": "GBP_USD",
+    "USDJPY": "USD_JPY",
+    "AUDUSD": "AUD_USD",
+    "USDCAD": "USD_CAD",
+    "NZDUSD": "NZD_USD",
+    "USDCHF": "USD_CHF",
+    "EURGBP": "EUR_GBP",
+    "EURJPY": "EUR_JPY",
+    "EURAUD": "EUR_AUD",
+    "EURNZD": "EUR_NZD",
+    "EURCAD": "EUR_CAD",
+    "GBPJPY": "GBP_JPY",
+    "GBPNZD": "GBP_NZD",
+    "GBPAUD": "GBP_AUD",
+    "GBPCAD": "GBP_CAD",
+    "AUDJPY": "AUD_JPY",
+    "AUDCAD": "AUD_CAD",
+    "AUDNZD": "AUD_NZD",
+    "NZDCAD": "NZD_CAD",
+    "NZDJPY": "NZD_JPY",
+    "CADJPY": "CAD_JPY",
+    "CHFJPY": "CHF_JPY",
+    "USDMXN": "USD_MXN",
+    "USDZAR": "USD_ZAR",
+    "USDNOK": "USD_NOK",
+    "USDSEK": "USD_SEK",
+}
 
-    ema_bull = ema20 > ema200 and ema50 > ema200
-    ema_bear = ema20 < ema200 and ema50 < ema200
-    dist_ema20 = abs(price - ema20)
-    dist_ema50 = abs(price - ema50)
-    within_2atr = dist_ema20 <= atr * 2 or dist_ema50 <= atr * 2
-    rsi_room = 25 <= rsi <= 70
-    adx_trend = adx >= 12
 
-    # LAYER 1 — S03 EMA PULLBACK
-    if tf in ("1w", "1d", "4h"):
-        s03_signals = int(
-            sum(
-                [
-                    bool(ema_bull or ema_bear),
-                    within_2atr,
-                    rsi_room,
-                    adx_trend,
-                ]
+def check_cooldown(ticker: str, timeframe: str, date_str: str) -> tuple[bool, str]:
+    """Return (allowed, reason) for ticker+timeframe vs last trade date."""
+    pos_key = f"{(ticker or '').strip().upper()}_{(timeframe or '').strip().lower()}"
+    last_date = LAST_TRADE_DATES.get(pos_key)
+    if not last_date:
+        return True, ""
+    try:
+        last_dt = datetime.strptime(last_date, "%Y-%m-%d")
+        curr_dt = datetime.strptime(date_str, "%Y-%m-%d")
+        days_since = (curr_dt - last_dt).days
+        tf_lc = (timeframe or "").strip().lower()
+        cooldown = int(TRADE_COOLDOWN_DAYS.get(tf_lc, 1))
+        if days_since < cooldown:
+            return False, (
+                f"Cooldown: {ticker} {timeframe} traded {days_since}d ago "
+                f"(need {cooldown}d)"
             )
-        )
+        return True, ""
+    except Exception:  # noqa: BLE001
+        return True, ""
 
-        s03_long_zone = zone_pct < 25
-        s03_short_zone = zone_pct > 75
 
-        if s03_signals >= 3:
-            if ema_bull and s03_long_zone:
-                qualifying.append(("S03_EMA_PULLBACK", "LONG", s03_signals))
-            if ema_bear and s03_short_zone:
-                qualifying.append(("S03_EMA_PULLBACK", "SHORT", s03_signals))
-            if not ema_bull and zone_pct < 15 and within_2atr and rsi_room:
-                qualifying.append(("S03_EMA_PULLBACK", "LONG", s03_signals))
-            if not ema_bear and zone_pct > 85 and within_2atr and rsi_room:
-                qualifying.append(("S03_EMA_PULLBACK", "SHORT", s03_signals))
+def record_trade(ticker: str, timeframe: str, date_str: str) -> None:
+    """Record last trade date for cooldown tracking."""
+    pos_key = f"{(ticker or '').strip().upper()}_{(timeframe or '').strip().lower()}"
+    LAST_TRADE_DATES[pos_key] = date_str.strip()[:10]
 
-    # LAYER 1 — S04 EXTREME REVERSION (1D and 1W ONLY)
-    if tf in ("1w", "1d"):
-        zone_threshold_long = 10 if tf == "1d" else 15
-        zone_threshold_short = 90 if tf == "1d" else 85
 
-        zone_extreme_long = zone_pct <= zone_threshold_long
-        zone_extreme_short = zone_pct >= zone_threshold_short
-        rsi_oversold = rsi <= 35
-        rsi_overbought = rsi >= 65
-        adx_not_runaway = adx <= 45
-
-        s04_long_count = int(
-            sum([zone_extreme_long, rsi_oversold, adx_not_runaway]),
-        )
-        s04_short_count = int(
-            sum([zone_extreme_short, rsi_overbought, adx_not_runaway]),
-        )
-
-        if s04_long_count >= 2:
-            qualifying.append(("S04_EXTREME_REVERSION", "LONG", s04_long_count))
-        if s04_short_count >= 2:
-            qualifying.append(("S04_EXTREME_REVERSION", "SHORT", s04_short_count))
-
-    # LAYER 2 — S11 SR FLIP
-    if tf in ("1w", "1d", "4h"):
-        all_swings = list(swing_highs) + list(swing_lows)
-        for level in all_swings:
-            nearby = [s for s in all_swings if abs(s - level) / max(level, 0.0001) < 0.005]
-            if len(nearby) >= 2:
-                if abs(price - level) / max(level, 0.0001) < 0.003:
-                    qualifying.append(("S11_SR_FLIP", "BOTH", 2))
-                    break
-
-    # LAYER 2 — S05 MACD DIVERGENCE (1D and 4H)
-    if tf in ("1d", "4h"):
-        if zone_pct < 30 and macd_hist > 0 and rsi < 45:
-            qualifying.append(("S05_MACD_DIVERGENCE", "LONG", 2))
-        if zone_pct > 70 and macd_hist < 0 and rsi > 55:
-            qualifying.append(("S05_MACD_DIVERGENCE", "SHORT", 2))
-
-    # LAYER 2 — S01 BREAKOUT RETEST (1D and 4H)
-    if tf in ("1d", "4h"):
-        for level in list(swing_highs) + list(swing_lows):
-            if abs(price - level) / max(level, 0.0001) < 0.005:
-                if adx > 15:
-                    qualifying.append(("S01_BREAKOUT_RETEST", "BOTH", 2))
-                    break
-
-    # LAYER 2 — S08 RANGE BREAKOUT (1D ONLY)
-    if tf == "1d":
-        bb_upper = float(ind.get("bb_upper", price * 1.02) or (price * 1.02))
-        bb_lower = float(ind.get("bb_lower", price * 0.98) or (price * 0.98))
-        if bb_width < 3.0 and adx < 30:
-            if price > bb_upper or price < bb_lower:
-                qualifying.append(("S08_RANGE_BREAKOUT", "BOTH", 2))
-
-    # LAYER 2 — S12 VOLATILITY COMPRESSION (1D)
-    if tf == "1d":
-        if bb_width < 2.0 and adx < 20:
-            qualifying.append(("S12_VOLATILITY_COMPRESSION", "BOTH", 2))
-
-    utc_hour = _utc_hour_for_intraday_session(past)
-
-    # LAYER 3 — INTRADAY (15M/30M within 55 days)
-    if tf in ("15m", "30m") and days_ago <= 55:
-        bb_u = float(ind.get("bb_upper", price * 1.01) or (price * 1.01))
-        bb_l = float(ind.get("bb_lower", price * 0.99) or (price * 0.99))
-        if adx > 15 and (price > bb_u or price < bb_l):
-            qualifying.append(("S14_OPENING_RANGE_BREAKOUT", "BOTH", 2))
-
-        if rsi <= 30:
-            qualifying.append(("S15_VWAP_DEVIATION", "LONG", 2))
-        if rsi >= 70:
-            qualifying.append(("S15_VWAP_DEVIATION", "SHORT", 2))
-
-        for level in list(swing_highs) + list(swing_lows):
-            if abs(price - level) / max(level, 0.0001) < 0.002:
-                qualifying.append(("S16_HTF_LEVEL_REJECTION", "BOTH", 2))
-                break
-
-        if rsi <= 35 or rsi >= 65:
-            qualifying.append(("S13_NEWS_MOMENTUM", "BOTH", 2))
-
-    # LAYER 3 — S17 London Open (15M/30M, 07:00-10:00 UTC)
-    if tf in ("15m", "30m") and days_ago <= 55:
-        if 7 <= utc_hour < 10:
-            pairs_london = ["EURUSD", "GBPUSD", "EURGBP", "GBPJPY", "EURJPY"]
-            if sym_u in pairs_london and adx > 15:
-                qualifying.append(("S17_LONDON_OPEN_BREAKOUT", "BOTH", 2))
-
-    # LAYER 3 — S18 NY Open (15M/30M, 12:00-15:00 UTC)
-    if tf in ("15m", "30m") and days_ago <= 55:
-        if 12 <= utc_hour < 15:
-            pairs_ny = ["EURUSD", "USDJPY", "GBPUSD", "USDCAD", "USDMXN"]
-            if sym_u in pairs_ny and adx > 20:
-                qualifying.append(("S18_NY_OPEN_MOMENTUM", "BOTH", 2))
-
-    if not qualifying:
-        return False, [], "No strategy non-negotiables met"
-
-    return True, qualifying, f"{len(qualifying)} strategies qualify"
 
 
 EXCLUDED_PAIRS = frozenset(
@@ -1459,6 +1159,122 @@ OUTPUT — VALID JSON ONLY. NO PROSE. NO PREAMBLE.
     )
 
 
+def _format_apex_master_v5(
+    *,
+    ticker: str,
+    tf_key: str,
+    tf_label: str,
+    analysis_date: str,
+    price: float,
+    zone_label: str,
+    zone_pct: float,
+    high_52w: float,
+    low_52w: float,
+    ind: dict[str, Any],
+    bb_width: float,
+    intel_text: str,
+    news_sentiment: float,
+    cot_bias: str,
+    fear_greed: float,
+    vix_val: float,
+    session_line: str,
+    qualifying_str: str,
+) -> str:
+    """APEX master prompt v5.0 — 68 strategies, condensed categories."""
+    _ = (tf_label, news_sentiment, cot_bias, fear_greed, vix_val)
+    e20 = float(ind.get("ema20", price) or price)
+    e50 = float(ind.get("ema50", price) or price)
+    e200 = float(ind.get("ema200", price) or price)
+    rsi = float(ind.get("rsi", 50) or 50)
+    adx = float(ind.get("adx", 20) or 20)
+    atr = float(ind.get("atr", 0) or 0) or abs(price) * 0.01
+    macd_hist = float(ind.get("macd_hist", 0) or 0)
+    sh = ind.get("swing_highs", []) or []
+    sl = ind.get("swing_lows", []) or []
+
+    head = f"""
+You are APEX v5.0 — elite institutional forex trading AI with 68 strategies.
+
+Python pre-filter found these candidates: {qualifying_str}
+Your job: confirm the BEST setup, set precise entry/stop/targets, or SKIP.
+
+MARKET DATA:
+Asset: {ticker} | TF: {tf_key} | Date: {analysis_date} | Session: {session_line}
+Price: {price:.5f} | Zone: {zone_label} ({zone_pct:.1f}%)
+52w: {low_52w:.5f} — {high_52w:.5f}
+EMA20: {e20:.5f} | EMA50: {e50:.5f} | EMA200: {e200:.5f}
+ATR: {atr:.5f} | RSI: {rsi:.1f} | ADX: {adx:.1f}
+MACD: {macd_hist:.6f} | BB Width: {bb_width:.2f}%
+Swings H: {sh} | L: {sl}
+
+{intel_text}
+
+═══ STRATEGY CATEGORIES (68 total) ═══
+
+TREND (T01-T10): EMA pullback, crossover, HH/HL, ADX entry, supertrend,
+SAR flip, MA ribbon, Donchian, Keltner, 200 EMA bounce.
+USE WHEN: EMAs aligned, ADX>15, price pulling back in trend direction.
+
+REVERSION (R01-R10): Zone extreme, RSI divergence, BB touch, stochastic,
+CCI, Williams %R, VWAP deviation, monthly level, weekly gap, COT extreme.
+USE WHEN: Zone <20% or >80%, RSI extreme, price at structural level.
+
+BREAKOUT (B01-B10): Range, compression, London open, NY open, opening range,
+triangle, inside bar, key level retest, RSI momentum, weekly range.
+USE WHEN: BB compressed (<3%), ADX low (<25), price at range boundary.
+
+MOMENTUM (M01-M08): MACD divergence, zero cross, RSI continuation, ROC,
+stochastic cross, price acceleration, volume surge, news.
+USE WHEN: MACD confirming direction, RSI 40-60 crossing center, ADX rising.
+
+STRUCTURE (SMC01-SMC10): SR flip, order block, FVG, liquidity sweep,
+equal HL hunt, inducement, breaker, mitigation, premium/discount+MSS, CHoCH.
+USE WHEN: Price at swing level with 2+ touches, structural break visible.
+
+VOLATILITY (V01-V06): VIX spike, ATR expansion, squeeze, pre-news,
+post-news, vol mean reversion.
+USE WHEN: BB width extreme (very narrow or very wide), ATR expanding/contracting.
+
+STATISTICAL (Q01-Q06): Day of week, time of day, seasonality, carry trade,
+correlation divergence, regime detection.
+USE WHEN: Statistical edge from timing or positioning data.
+
+INTRADAY (I01-I08): VWAP scalp, HTF rejection, first hour reversal,
+power hour, gap fade, Asia fade, micro structure, session close.
+USE WHEN: 15M/30M timeframe during active session with RSI extreme.
+
+═══ DECISION RULES ═══
+
+1. CHECK each candidate from Python pre-filter list above
+2. For each one: does the chart ACTUALLY show this setup clearly?
+3. Pick the BEST one (highest conviction after visual confirmation)
+4. If NONE are genuine setups → SKIP (don't force trades)
+5. Minimum R:R = 1:2. Stop at structural invalidation level.
+
+CONFIDENCE:
+HIGH (2%): Proven strategy (T01/R01) with all conditions met on 1D/1W
+MEDIUM (1%): Strong setup on any TF, or proven strategy partially met
+LOW (0.5%): New/untested strategy, intraday, or marginal setup
+
+IMPORTANT — RELAXED RULES vs v4.0:
+- T01 (EMA pullback): needs 2 of 4 non-negotiables (was 3 of 4)
+- R01 (zone reversion): zone <20% or >80% (was <15% or >85%)
+- R01: RSI <40 or >60 (was <35 or >65)
+- New strategies start at LOW confidence, graduate to MEDIUM after 10+ trades
+- 4H trades allowed for ALL strategies except R01 reversion
+- Multiple strategies can qualify — pick the highest conviction one
+
+═══ OUTPUT — VALID JSON ONLY ═══
+"""
+
+    tail = _APEX_V5_OUTPUT_SCHEMA_FALLBACK
+    return head.strip() + "\n" + tail.format(
+        zone_pct=zone_pct,
+        zone_label=zone_label,
+        price=price,
+    )
+
+
 _APEX_V4_OUTPUT_SCHEMA_FALLBACK = """
 If skipping:
 {{
@@ -1550,8 +1366,88 @@ HARD OUTPUT RULES:
 """
 
 
+_APEX_V5_OUTPUT_SCHEMA_FALLBACK = """
+If skipping:
+{{
+  "skip_trade": true,
+  "skip_reason": "specific reason max 20 words",
+  "strategy_id": "SKIP",
+  "strategy_name": "",
+  "strategy_met": false,
+  "verdict": "SKIP",
+  "direction": "NONE",
+  "confidence": "SKIP",
+  "conviction_score": 0,
+  "zone_pct": {zone_pct},
+  "zone_label": "{zone_label}",
+  "price_zone": "{zone_label}",
+  "zone_position_pct": {zone_pct},
+  "smc_concept": "NONE",
+  "smc_direction": "",
+  "is_exotic": false,
+  "confluence_points": 0,
+  "entry": 0, "stop_loss": 0, "tp1": 0, "tp2": 0, "tp3": 0,
+  "tp_target": "TP1", "rr_ratio": "",
+  "signals_used": [], "confluences": [], "conflicts": [],
+  "htf_bias": "", "market_structure": "",
+  "core_signals_met": [], "core_signals_failed": [],
+  "non_negotiables_met": [], "non_negotiables_failed": [],
+  "reasoning": "max 30 words"
+}}
+
+If trading:
+{{
+  "skip_trade": false,
+  "strategy_id": "T01_EMA_PULLBACK",
+  "strategy_name": "EMA Trend Pullback",
+  "strategy_met": true,
+  "core_signals_met": ["EMA_ALIGNED", "PRICE_AT_EMA20"],
+  "core_signals_failed": [],
+  "non_negotiables_met": ["EMA_ALIGNED", "PRICE_AT_EMA20"],
+  "non_negotiables_failed": [],
+  "verdict": "BUY",
+  "direction": "LONG",
+  "confidence": "MEDIUM",
+  "conviction_score": 6,
+  "zone_pct": {zone_pct},
+  "zone_label": "{zone_label}",
+  "price_zone": "DISCOUNT",
+  "zone_position_pct": {zone_pct},
+  "htf_bias": "BULLISH",
+  "market_structure": "UPTREND_PULLBACK",
+  "smc_concept": "NONE",
+  "smc_direction": "",
+  "is_exotic": false,
+  "confluence_points": 3,
+  "entry": {price},
+  "entry_reasoning": "max 15 words",
+  "stop_loss": 0.00000,
+  "stop_reasoning": "max 15 words",
+  "tp1": 0.00000,
+  "tp2": 0.00000,
+  "tp3": 0.00000,
+  "tp_target": "TP2",
+  "rr_ratio": "1:3.0",
+  "trailing_plan": "BE at TP1, +1R at TP2, trail 1.5R at TP3",
+  "signals_used": ["EMA_BULLISH", "RSI_NEUTRAL"],
+  "confluences": ["ADX trend confirmed", "discount zone"],
+  "conflicts": [],
+  "intel_summary": "max 15 words",
+  "reasoning": "max 40 words"
+}}
+
+HARD RULES:
+- direction: LONG or SHORT only (never NONE for trades)
+- strategy_id: use the exact ID from the 68 strategies above
+- strategy_met: true ONLY if setup is genuinely visible on chart
+- conviction_score: integer 1-8, hard cap 8
+- minimum R:R 1:2
+- reasoning: maximum 40 words
+"""
+
+
 def enforce_rules(ai: dict[str, Any], timeframe: str, price: float, ticker: str) -> dict[str, Any]:
-    """Post-parse enforcement — cannot be overridden by model text."""
+    """Post-parse enforcement — v5.0 relaxed gates (cannot be overridden by model text)."""
     tf = (timeframe or "").strip().lower()
     strategy_id = str(ai.get("strategy_id", "SKIP")).strip().upper()
     direction = str(ai.get("direction", "NONE")).strip().upper()
@@ -1575,107 +1471,65 @@ def enforce_rules(ai: dict[str, Any], timeframe: str, price: float, ticker: str)
     # RULE 1: strategy_met must be True
     if not strategy_met:
         ai["skip_trade"] = True
-        ai["skip_reason"] = "strategy_met=False — no fallback trades"
+        ai["skip_reason"] = "strategy_met=False"
         return ai
 
-    # RULE 2: S04 BLOCKED on 4H, 1H, 30M, 15M — NO EXCEPTIONS
-    if strategy_id == "S04_EXTREME_REVERSION":
+    meta = STRATEGIES.get(strategy_id) or {}
+    allowed_tfs = [str(x).strip().lower() for x in (meta.get("timeframes") or [])]
+    if allowed_tfs and tf not in allowed_tfs:
+        ai["skip_trade"] = True
+        ai["skip_reason"] = f"{strategy_id} not valid on {tf}"
+        return ai
+
+    # RULE 2: R01 (extreme reversion) blocked on 4H and below
+    if strategy_id == "R01_EXTREME_ZONE_REVERSION":
         if tf in ("4h", "1h", "30m", "15m"):
             ai["skip_trade"] = True
-            ai["skip_reason"] = (
-                f"S04 hard blocked on {tf} — "
-                f"forensic data: 0-25% WR, net negative"
-            )
+            ai["skip_reason"] = f"R01 blocked on {tf}"
             return ai
-        if tf == "1d":
-            if not (zone_pct <= 10 or zone_pct >= 90):
-                ai["skip_trade"] = True
-                ai["skip_reason"] = (
-                    f"S04 1D: zone {zone_pct:.1f}% not extreme enough "
-                    f"— need below 10 or above 90"
-                )
-                return ai
-        if tf == "1w":
-            if not (zone_pct <= 15 or zone_pct >= 85):
-                ai["skip_trade"] = True
-                ai["skip_reason"] = (
-                    f"S04 1W: zone {zone_pct:.1f}% not extreme enough "
-                    f"— need below 15 or above 85"
-                )
-                return ai
 
-    # RULE 3: S03 zone rules — forensic finding
-    if strategy_id == "S03_EMA_PULLBACK":
-        if direction == "LONG" and zone_pct > 50:
+    # RULE 3: T01 zone rules (relaxed from v4.0)
+    if strategy_id == "T01_EMA_PULLBACK":
+        if direction == "LONG" and zone_pct > 60:
             ai["skip_trade"] = True
-            ai["skip_reason"] = (
-                f"S03 LONG blocked: zone {zone_pct:.1f}% above 50% "
-                f"— discount required (28% WR vs 53% WR)"
-            )
+            ai["skip_reason"] = f"T01 LONG blocked: zone {zone_pct:.0f}% > 60%"
             return ai
-        if direction == "SHORT" and zone_pct < 50:
+        if direction == "SHORT" and zone_pct < 40:
             ai["skip_trade"] = True
-            ai["skip_reason"] = (
-                f"S03 SHORT blocked: zone {zone_pct:.1f}% below 50% "
-                f"— premium required for short edge"
-            )
+            ai["skip_reason"] = f"T01 SHORT blocked: zone {zone_pct:.0f}% < 40%"
             return ai
 
-    # RULE 4: S08 BLOCKED on 4H
-    if strategy_id == "S08_RANGE_BREAKOUT" and tf == "4h":
-        ai["skip_trade"] = True
-        ai["skip_reason"] = "S08 blocked on 4H — proven 25% WR"
-        return ai
-
-    # RULE 5: Layer 3 intraday strategies only on 15M/30M
-    layer3_15m_only = (
-        "S13_NEWS_MOMENTUM",
-        "S14_OPENING_RANGE_BREAKOUT",
-        "S15_VWAP_DEVIATION",
-        "S16_HTF_LEVEL_REJECTION",
-        "S18_NY_OPEN_MOMENTUM",
-    )
-    if strategy_id in layer3_15m_only:
+    # RULE 4: Intraday strategies only on 15M/30M
+    if strategy_id in _INTRADAY_STRATEGY_IDS:
         if tf not in ("15m", "30m"):
             ai["skip_trade"] = True
             ai["skip_reason"] = f"{strategy_id} only on 15M/30M"
             return ai
         ai["confidence"] = "LOW"
 
-    if strategy_id == "S17_LONDON_OPEN_BREAKOUT":
-        if tf not in ("15m", "30m", "4h"):
-            ai["skip_trade"] = True
-            ai["skip_reason"] = "S17 only on 15M/30M/4H"
-            return ai
-        ai["confidence"] = "LOW"
-
-    # RULE 6: 4H on Layer 2/3 strategies — wider stop required
-    if tf == "4h" and stop and entry and stop != entry:
-        stop_dist_pct = abs(entry - stop) / entry * 100
-        min_pct = float(MIN_STOP_PCT.get("4h", 0.8))
-        if stop_dist_pct < min_pct:
-            mult = 1 if direction == "LONG" else -1
-            min_stop = entry * (1 - mult * min_pct / 100)
-            risk = abs(entry - min_stop)
-            ai["stop_loss"] = round(min_stop, 5)
-            ai["tp1"] = round(entry + mult * risk * 2, 5)
-            ai["tp2"] = round(entry + mult * risk * 3, 5)
-            ai["tp3"] = round(entry + mult * risk * 5, 5)
-            log(
-                f"[StopWidened] {ticker} 4H stop widened to {min_pct}% minimum",
-                level="info",
-            )
-
-    # RULE 7: Cap conviction at 8
+    # RULE 5: Cap conviction at 8
     try:
         ai["conviction_score"] = min(int(round(float(ai.get("conviction_score", 5)))), 8)
     except (TypeError, ValueError):
         ai["conviction_score"] = 5
 
-    entry = float(ai.get("entry", price) or price)
-    stop = float(ai.get("stop_loss", 0) or 0)
+    # RULE 6: Enforce minimum stop distance
+    if stop and entry and stop != entry:
+        stop_dist_pct = abs(entry - stop) / entry * 100
+        min_stop = float(MIN_STOP_PCT.get(tf, 0.3))
+        if stop_dist_pct < min_stop:
+            mult = 1 if direction == "LONG" else -1
+            new_stop = entry * (1 - mult * min_stop / 100)
+            risk = abs(entry - new_stop)
+            ai["stop_loss"] = round(new_stop, 5)
+            ai["tp1"] = round(entry + mult * risk * 2, 5)
+            ai["tp2"] = round(entry + mult * risk * 3, 5)
+            ai["tp3"] = round(entry + mult * risk * 5, 5)
 
-    # RULE 8: Cap maximum stop width
+    stop = float(ai.get("stop_loss", 0) or 0)
+    entry = float(ai.get("entry", price) or price)
+
+    # RULE 7: Cap maximum stop distance
     if stop and entry and stop != entry:
         stop_dist_pct = abs(entry - stop) / entry * 100
         max_stop = float(MAX_STOP_PCT.get(tf, 1.5))
@@ -1688,16 +1542,13 @@ def enforce_rules(ai: dict[str, Any], timeframe: str, price: float, ticker: str)
             ai["tp2"] = round(entry + mult * risk * 3, 5)
             ai["tp3"] = round(entry + mult * risk * 5, 5)
 
-    # RULE 9: Position sizing
+    # RULE 8: Position sizing
     confidence = str(ai.get("confidence", "LOW")).strip().upper()
     if confidence not in RISK_BY_CONFIDENCE:
         confidence = "LOW"
     risk_pct = float(RISK_BY_CONFIDENCE.get(confidence, 0.005))
     risk_dollars = STARTING_CAPITAL * risk_pct
-    entry = float(ai.get("entry", price) or price)
-    stop = float(ai.get("stop_loss", 0) or 0)
-    stop_dist = abs(entry - stop)
-
+    stop_dist = abs(entry - float(ai.get("stop_loss", entry * 0.99) or 0))
     if stop_dist > 0:
         pos_size = risk_dollars / stop_dist
         exposure = pos_size * entry
@@ -1707,6 +1558,12 @@ def enforce_rules(ai: dict[str, Any], timeframe: str, price: float, ticker: str)
         ai["_leveraged_exposure"] = round(pos_size * entry, 2)
         ai["_max_risk_dollars"] = round(risk_dollars, 2)
         ai["_account_risk_pct"] = risk_pct
+
+    # RULE 9: Untested strategies default to MEDIUM max (was HIGH)
+    tested_strategies = ("T01_EMA_PULLBACK", "R01_EXTREME_ZONE_REVERSION")
+    if strategy_id not in tested_strategies:
+        if str(ai.get("confidence", "")).strip().upper() == "HIGH":
+            ai["confidence"] = "MEDIUM"
 
     return ai
 
@@ -2309,16 +2166,16 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str, *, chrono_
 
         _utc_hour = datetime.now(timezone.utc).hour
         if 22 <= _utc_hour or _utc_hour < 8:
-            _session = "ASIA (22:00-08:00 UTC) — JPY, AUD, NZD most active"
+            _session = "ASIA"
         elif 7 <= _utc_hour < 12:
-            _session = "LONDON (07:00-12:00 UTC) — EUR, GBP most active"
+            _session = "LONDON"
         elif 12 <= _utc_hour < 21:
-            _session = "NEW YORK (12:00-21:00 UTC) — USD pairs most active"
+            _session = "NEW_YORK"
         else:
-            _session = "OFF-HOURS (21:00-22:00 UTC) — low liquidity"
+            _session = "OFF_HOURS"
 
         tf_label = TF_DESCRIPTIONS.get(tf_key, tf_key)
-        prompt = _format_apex_master_v4(
+        prompt = _format_apex_master_v5(
             ticker=sym,
             tf_key=tf_key,
             tf_label=tf_label,
@@ -2375,6 +2232,15 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str, *, chrono_
         if not ai:
             return _skip_out("empty or invalid JSON from model", {})
 
+        _legacy_sid = {
+            "S03_EMA_PULLBACK": "T01_EMA_PULLBACK",
+            "S04_EXTREME_REVERSION": "R01_EXTREME_ZONE_REVERSION",
+            "S08_RANGE_BREAKOUT": "B01_RANGE_BREAKOUT",
+        }
+        _sid_raw = str(ai.get("strategy_id", "")).strip().upper()
+        if _sid_raw in _legacy_sid:
+            ai["strategy_id"] = _legacy_sid[_sid_raw]
+
         _sanitize_signal_lists(ai)
         ai["zone_pct"] = zone_pct
 
@@ -2421,7 +2287,7 @@ def run_one_backtest(ticker: str, timeframe: str, analysis_date: str, *, chrono_
             conviction_score = int(round(float(ai.get("conviction_score", 5))))
         except (TypeError, ValueError):
             conviction_score = 5
-        conviction_score = max(0, min(10, conviction_score))
+        conviction_score = max(0, min(8, conviction_score))
 
         confidence = str(ai.get("confidence", "LOW")).strip().upper()
         if confidence not in ("HIGH", "MEDIUM", "LOW"):
@@ -3794,7 +3660,6 @@ def run_chronological_backtest(
                 except ValueError:
                     pass
 
-        last_trade_dates: dict[str, str] = {}
 
         while current <= end_dt:
             if chrono_stop_requested(job_id):
@@ -3921,33 +3786,24 @@ def run_chronological_backtest(
                             day_skipped.append(result)
                             continue
 
-                        tf_lc = timeframe.lower()
-                        if pos_key in last_trade_dates:
-                            last_date = last_trade_dates[pos_key]
-                            days_since = (
-                                datetime.strptime(date_str, "%Y-%m-%d")
-                                - datetime.strptime(last_date, "%Y-%m-%d")
-                            ).days
-                            cooldown = {"1w": 7, "1d": 2, "4h": 1}.get(tf_lc, 1)
-                            if days_since < cooldown:
-                                result = {
-                                    "date": date_str,
-                                    "ticker": ticker,
-                                    "timeframe": timeframe,
-                                    "session": session,
-                                    "job_id": job_id,
-                                    "skipped": True,
-                                    "skip_trade": True,
-                                    "outcome": "SKIPPED",
-                                    "pnl_dollars": 0.0,
-                                    "skip_reason": (
-                                        f"Cooldown: {ticker} {timeframe} traded {days_since}d ago"
-                                    ),
-                                    "verdict": "SKIP",
-                                }
-                                append_result(result)
-                                day_skipped.append(result)
-                                continue
+                        cd_ok, cd_reason = check_cooldown(ticker, timeframe, date_str)
+                        if not cd_ok:
+                            result = {
+                                "date": date_str,
+                                "ticker": ticker,
+                                "timeframe": timeframe,
+                                "session": session,
+                                "job_id": job_id,
+                                "skipped": True,
+                                "skip_trade": True,
+                                "outcome": "SKIPPED",
+                                "pnl_dollars": 0.0,
+                                "skip_reason": cd_reason,
+                                "verdict": "SKIP",
+                            }
+                            append_result(result)
+                            day_skipped.append(result)
+                            continue
 
                         try:
                             res = run_one_backtest(ticker, timeframe, date_str, chrono_yfinance=True)
@@ -3993,7 +3849,7 @@ def run_chronological_backtest(
                         open_positions[pos_key] = row
                         if oc in ("WIN", "LOSS"):
                             open_positions.pop(pos_key, None)
-                        last_trade_dates[pos_key] = date_str
+                            record_trade(ticker, timeframe, date_str)
 
                     if chrono_abort:
                         break
