@@ -31,6 +31,104 @@ PROB_CEIL = 91
 UPSIDE_CAP = 500.0  # display cap
 
 
+def _sync_conviction_tier_to_rating(r: dict[str, Any]) -> None:
+    """Map INSIDERMAX conviction_tier to legacy apex_rating when tier is present."""
+    tier = (r.get("conviction_tier") or "").strip().upper()
+    if not tier:
+        return
+    if "TIER_S1" in tier:
+        r["direction"] = "DOWN"
+        r["apex_rating"] = "STRONG SHORT"
+    elif "TIER_S2" in tier:
+        r["direction"] = "DOWN"
+        r["apex_rating"] = "SHORT"
+    elif tier.startswith("TIER_1"):
+        r["direction"] = "UP"
+        r["apex_rating"] = "STRONG BUY"
+    elif tier.startswith("TIER_2"):
+        r["direction"] = "UP"
+        r["apex_rating"] = "BUY"
+    elif tier.startswith("TIER_3"):
+        r["direction"] = "UP"
+        r["apex_rating"] = "SPECULATIVE BUY"
+    elif tier.startswith("TIER_4"):
+        r["apex_rating"] = "WATCH"
+    elif tier.startswith("TIER_5"):
+        r["apex_rating"] = "AVOID"
+
+
+def _widen_stop_fear_long(r: dict[str, Any]) -> None:
+    """FEAR_MODE: widen long stops ~50% vs prior distance (master prompt rule)."""
+    reg = (r.get("macro_regime") or "").upper()
+    if "FEAR" not in reg:
+        return
+    if (r.get("direction") or "").upper() != "UP":
+        return
+    price = float(r.get("current_price") or 0)
+    stop = float(r.get("stop_loss") or 0)
+    if price <= 0 or stop <= 0 or stop >= price:
+        return
+    risk_width = price - stop
+    new_stop = price - risk_width * 1.5
+    if new_stop > 0 and new_stop < stop:
+        r["stop_loss"] = round(new_stop, 4)
+
+
+def _enforce_risk_adjusted_gates(r: dict[str, Any]) -> None:
+    """Clamp ratings using risk_adjusted_score (fallback: composite_score)."""
+    raw = r.get("risk_adjusted_score")
+    if raw is None:
+        raw = r.get("composite_score")
+    try:
+        rs = float(raw)
+    except (TypeError, ValueError):
+        rs = 0.0
+    ar = (r.get("apex_rating") or "").upper()
+    if rs < 5.5 and ar not in {"AVOID", "WATCH", "SHORT", "STRONG SHORT"}:
+        r["apex_rating"] = "AVOID"
+    elif (
+        rs < 6.5
+        and ar in {"STRONG BUY", "BUY"}
+        and (r.get("direction") or "UP").upper() == "UP"
+    ):
+        r["apex_rating"] = "SPECULATIVE BUY"
+    elif rs < 8.0 and ar == "STRONG BUY" and (r.get("direction") or "UP").upper() == "UP":
+        r["apex_rating"] = "BUY"
+
+
+def _apply_macro_regime_position_scale(r: dict[str, Any], ps: dict[str, Any]) -> dict[str, Any]:
+    """Scale sizing for FEAR / COMPLACENCY longs per master prompt."""
+    ps = dict(ps)
+    reg = (r.get("macro_regime") or "").upper()
+    d = (r.get("direction") or "UP").upper()
+    pct = float(ps.get("recommended_invest_percentage") or 0)
+    if pct <= 0:
+        return ps
+    factor = 1.0
+    if "FEAR" in reg and d == "UP":
+        factor = 0.5
+    elif "COMPLACENCY" in reg and d == "UP":
+        factor = 0.75
+    new_pct = round(pct * factor, 2)
+    budget = float(ps.get("total_budget_usd") or r.get("_total_budget_usd") or 10_000)
+    invest = round(budget * new_pct / 100.0, 2)
+    upside = float(r.get("final_upside_percentage") or 0)
+    price = float(r.get("current_price") or 0)
+    stop = float(r.get("stop_loss") or 0)
+    risk_to_stop = abs(price - stop) / price * 100 if price > 0 and stop > 0 else 10.0
+    ps["recommended_invest_percentage"] = new_pct
+    ps["recommended_invest_amount"] = invest
+    ps["potential_return_dollars"] = round(invest * upside / 100.0, 2)
+    ps["potential_loss_dollars"] = round(invest * risk_to_stop / 100.0, 2)
+    if ps["potential_loss_dollars"] > 0:
+        ps["risk_reward_ratio"] = f"1:{round(ps['potential_return_dollars'] / ps['potential_loss_dollars'], 1)}"
+    else:
+        ps["risk_reward_ratio"] = "1:0"
+    if factor != 1.0:
+        ps["sizing_reasoning"] = (ps.get("sizing_reasoning") or "") + f" (macro ×{factor:g})"
+    return ps
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -40,6 +138,9 @@ def calculate(report: dict[str, Any]) -> dict[str, Any]:
     The function never mutates the caller's dict — it returns a copy.
     """
     r = dict(report)
+
+    _sync_conviction_tier_to_rating(r)
+    _widen_stop_fear_long(r)
 
     # ---- upside ----
     upside = _calc_upside(r)
@@ -56,13 +157,16 @@ def calculate(report: dict[str, Any]) -> dict[str, Any]:
     if not r.get("probability_percentage"):
         r["probability_percentage"] = prob
 
+    _enforce_risk_adjusted_gates(r)
+
     # ---- reasoning ----
     r["final_reasoning"] = _auto_reasoning(r)
     if not r.get("probability_reasoning"):
         r["probability_reasoning"] = r["final_reasoning"]
 
     # ---- position sizing ----
-    r["position_sizing"] = _calc_position_sizing(r)
+    ps = _calc_position_sizing(r)
+    r["position_sizing"] = _apply_macro_regime_position_scale(r, ps)
 
     return r
 
@@ -110,6 +214,13 @@ def _calc_probability(r: dict) -> int:
     pct = weighted * 10  # to %
     pct *= CONFIDENCE_MULT.get((r.get("confidence_level") or "MEDIUM").upper(), 0.85)
     pct *= SECTION_MULT.get((r.get("section") or "SMALL_CAP").upper(), 0.95)
+    sms = r.get("smart_money_score")
+    if sms is not None:
+        try:
+            smsf = max(0.0, min(10.0, float(sms)))
+            pct += (smsf - 5.0) * 1.15
+        except (TypeError, ValueError):
+            pass
     pct = max(PROB_FLOOR, min(round(pct), PROB_CEIL))
     return int(pct)
 
@@ -203,8 +314,12 @@ def _calc_position_sizing(r: dict) -> dict:
 
 def _allocation_for_rating(rating: str, section: str, prob: float) -> tuple[float, str, str]:
     """Return (percent_of_budget, risk_category, sizing_reasoning)."""
+    rating = rating.upper()
     if rating == "AVOID":
         return 0.0, "CONSERVATIVE", "AVOID rating — no allocation recommended."
+
+    if rating == "WATCH":
+        return 0.0, "CONSERVATIVE", "WATCH tier — watchlist only; no capital deployed."
 
     if rating in {"SHORT", "STRONG SHORT"}:
         # Short plays: max 3%
