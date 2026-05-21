@@ -5,7 +5,8 @@ rolling stats, and periodic self-improvement. All state is simple JSON on ``DATA
 """
 from __future__ import annotations
 
-STRATEGY_VERSION = "v7.1-session10"
+STRATEGY_VERSION = "v7.2-session16"
+# v7.2: strategy_status.json + chrono skips LOCKED strategies; UNTESTED loose EMA200/ADX paths (chrono only).
 # v7.1: chrono phase scan (1w→1d→4h→intraday), risk/tp multipliers, separate 4H currency pool,
 # deterministic Layer-2 strategy order, $25 trailing floor + 0.75R/1.5R locks, exotic USD cap exemption,
 # consecutive-loss extended cooldown, expanded universe (CHF + QQQ).
@@ -82,6 +83,7 @@ IMPROVING_FILE = DATA_DIR / "improving.json"
 IMPROVE_DEBUG_FILE = DATA_DIR / "improve_debug.json"
 SESSION_CONFIG_FILE = DATA_DIR / "session_config.json"
 ACTIVE_CHRONO_FILE = DATA_DIR / "active_chrono_job.json"
+STRATEGY_STATUS_FILE = DATA_DIR / "strategy_status.json"
 
 STARTING_CAPITAL = 10000.0
 LEVERAGE = 50
@@ -94,7 +96,7 @@ BACKTEST_CLAUDE_MAX_TOKENS = 1200
 CLAUDE_HTTP_TIMEOUT_SEC = 25.0
 
 # Chronological walk-forward backtest (API-triggered; separate from rolling loop)
-CHRONO_START_DATE = "2024-06-01"
+CHRONO_START_DATE = "2025-04-01"
 CHRONO_END_DATE = "2026-05-17"
 CHRONO_TIMEFRAMES: list[str] = ["4h", "1d", "1w"]  # 15m/30m appended in chrono loop when scan date is recent
 CHRONO_TICKERS = [
@@ -323,6 +325,230 @@ def get_currencies(ticker: str) -> list[str]:
     if len(t) == 6 and t.isalpha():
         return [t[:3], t[3:]]
     return []
+
+
+# ── v7.2 strategy status (FIX 20 / FIX 21) — chrono uses metadata; LOCKED skipped in chrono scan ──
+STRATEGY_STATUS: dict[str, Any] = {}
+LOCKED_STRATEGIES_SCAN_SKIP: frozenset[str] = frozenset()
+UNTESTED_STRATEGIES_V72: frozenset[str] = frozenset()
+
+
+def _v72_locked_ids_default() -> frozenset[str]:
+    return frozenset(
+        {
+            "T01_EMA_PULLBACK",
+            "R01_EXTREME_ZONE_REVERSION",
+            "T03_HH_HL_CONTINUATION",
+            "T07_MA_RIBBON_ALIGNMENT",
+            "T02_EMA_CROSSOVER",
+            "SMC01_SR_FLIP",
+            "SMC05_EQUAL_HL_HUNT",
+        }
+    )
+
+
+def _v72_testing_ids_default() -> frozenset[str]:
+    return frozenset(
+        {
+            "T04_ADX_TREND_ENTRY",
+            "M06_PRICE_ACCELERATION",
+            "B09_RSI_MOMENTUM_BREAK",
+            "SMC10_CHOCH",
+            "M03_RSI_MOMENTUM_CONTINUATION",
+            "T10_200EMA_BOUNCE",
+            "V02_ATR_EXPANSION_ENTRY",
+            "T09_KELTNER_TREND_RIDE",
+            "M02_MACD_ZERO_CROSS",
+            "R03_BB_EXTREME_TOUCH",
+            "R09_WEEKLY_GAP_FILL",
+            "B06_TRIANGLE_BREAKOUT",
+            "B08_KEY_LEVEL_RETEST",
+        }
+    )
+
+
+def _v72_default_status_payload() -> dict[str, Any]:
+    locked = sorted(_v72_locked_ids_default())
+    testing = sorted(_v72_testing_ids_default())
+    untested = sorted(set(ALL_STRATEGY_IDS) - set(locked) - set(testing))
+    return {
+        "locked": locked,
+        "testing": testing,
+        "untested": untested,
+        "last_updated": date.today().isoformat(),
+    }
+
+
+def _v72_load_strategy_status(*, log_startup: bool = False) -> None:
+    """Load or create ``strategy_status.json``; refresh module-level LOCKED / UNTESTED sets."""
+    global STRATEGY_STATUS, LOCKED_STRATEGIES_SCAN_SKIP, UNTESTED_STRATEGIES_V72
+    default_payload = _v72_default_status_payload()
+    raw: Any = None
+    if STRATEGY_STATUS_FILE.is_file():
+        raw = load_json(STRATEGY_STATUS_FILE, default=None)
+    if not isinstance(raw, dict) or not isinstance(raw.get("locked"), list):
+        save_json(STRATEGY_STATUS_FILE, default_payload)
+        raw = default_payload
+    else:
+        # Ensure all 68 ids are classified (append missing to untested)
+        seen: set[str] = set()
+        for k in ("locked", "testing", "untested"):
+            for x in raw.get(k) or []:
+                if isinstance(x, str):
+                    seen.add(x.strip().upper())
+        missing = [s for s in ALL_STRATEGY_IDS if s not in seen]
+        if missing:
+            ut = [str(x).strip().upper() for x in (raw.get("untested") or []) if isinstance(x, str)]
+            ut.extend(missing)
+            raw["untested"] = sorted(set(ut))
+            raw["last_updated"] = date.today().isoformat()
+            save_json(STRATEGY_STATUS_FILE, raw)
+    STRATEGY_STATUS = raw
+    LOCKED_STRATEGIES_SCAN_SKIP = frozenset(str(x).strip().upper() for x in (raw.get("locked") or []) if x)
+    UNTESTED_STRATEGIES_V72 = frozenset(str(x).strip().upper() for x in (raw.get("untested") or []) if x)
+    if log_startup:
+        log(
+            f"[v7.2] strategy_status locked={len(LOCKED_STRATEGIES_SCAN_SKIP)} "
+            f"testing={len(raw.get('testing') or [])} untested={len(UNTESTED_STRATEGIES_V72)}",
+            level="info",
+        )
+
+
+def _v72_sid_allowed_on_tf(sid: str, tf_key: str) -> bool:
+    """INTRADAY (I*) only on 4h/15m/30m per v7.2; others use STRATEGIES timeframes (empty = all)."""
+    sid_u = sid.strip().upper()
+    tf_l = (tf_key or "").strip().lower()
+    if sid_u in _INTRADAY_STRATEGY_IDS:
+        return tf_l in ("4h", "15m", "30m")
+    meta = STRATEGIES.get(sid_u) or {}
+    tfs = meta.get("timeframes") or []
+    if not tfs:
+        return True
+    allowed = {str(x).strip().lower() for x in tfs}
+    return tf_l in allowed
+
+
+def _v72_one_loose_untested_candidate(
+    sym: str,
+    tf_key: str,
+    price: float,
+    ind: dict[str, Any],
+    *,
+    chrono_yfinance: bool,
+    existing_sids: set[str],
+) -> tuple[str, str, int, dict[str, Any]] | None:
+    """Return a single FIX-21 synthetic row for the best-priority UNTESTED id, or None."""
+    if not chrono_yfinance or not UNTESTED_STRATEGIES_V72:
+        return None
+    close = float(ind.get("close", price) or price)
+    ema200 = float(ind.get("ema200", close) or close)
+    atrv = float(ind.get("atr", 0) or 0)
+    adxv = float(ind.get("adx", 0) or 0)
+    if atrv <= 0 or not math.isfinite(close) or not math.isfinite(ema200):
+        return None
+    tf_l = (tf_key or "").strip().lower()
+
+    def _loose_dir_sl_tp(sid: str) -> tuple[str, float, float, float] | None:
+        direction: str | None = None
+        sl_atr = tp1_atr = tp2_atr = 0.0
+        if tf_l == "1w":
+            if sid in _INTRADAY_STRATEGY_IDS:
+                return None
+            if close > ema200:
+                direction = "LONG"
+            elif close < ema200:
+                direction = "SHORT"
+            sl_atr, tp1_atr, tp2_atr = 1.5, 3.0, 4.5
+        elif tf_l == "1d":
+            if sid in _INTRADAY_STRATEGY_IDS:
+                return None
+            if adxv < 14.0:
+                return None
+            if close > ema200:
+                direction = "LONG"
+            elif close < ema200:
+                direction = "SHORT"
+            sl_atr, tp1_atr, tp2_atr = 1.5, 3.0, 4.5
+        elif tf_l in ("4h", "15m", "30m"):
+            if close > ema200:
+                direction = "LONG"
+            elif close < ema200:
+                direction = "SHORT"
+            sl_atr, tp1_atr, tp2_atr = (1.0, 2.0, 3.0)
+        else:
+            return None
+        if direction is None:
+            return None
+        return direction, sl_atr, tp1_atr, tp2_atr
+
+    sids_sorted = sorted(
+        UNTESTED_STRATEGIES_V72,
+        key=lambda s: (0 if s in ZERO_TRADE_STRATEGIES else 1, STRATEGY_TRADE_COUNT.get(s, 0), s),
+    )
+    for sid in sids_sorted:
+        sid_u = sid.strip().upper()
+        if sid_u in existing_sids or sid_u in LOCKED_STRATEGIES_SCAN_SKIP:
+            continue
+        if not _v72_sid_allowed_on_tf(sid_u, tf_l):
+            continue
+        pack = _loose_dir_sl_tp(sid_u)
+        if pack is None:
+            continue
+        direction, sl_atr, tp1_atr, tp2_atr = pack
+        mult = 1 if direction == "LONG" else -1
+        entry = round(close, 5)
+        sl = round(entry - mult * sl_atr * atrv, 5)
+        tp1 = round(entry + mult * tp1_atr * atrv, 5)
+        tp2 = round(entry + mult * tp2_atr * atrv, 5)
+        meta = {
+            "v7_fallback": True,
+            "v72_untested": True,
+            "reasoning": f"{sid_u}: UNTESTED — gathering first data",
+            "confidence": "LOW",
+            "risk_mode": "PYTHON_LAYER2",
+            "direction": direction,
+            "entry": entry,
+            "stop_loss": sl,
+            "tp1": tp1,
+            "tp2": tp2,
+            "tp3": tp2,
+        }
+        return (sid_u, direction, 1, meta)
+    return None
+
+
+def _v72_merge_loose_untested_into_layer2(
+    layer2_rows: list[tuple[str, str, int, dict[str, Any] | None]],
+    sym: str,
+    tf_key: str,
+    price: float,
+    ind: dict[str, Any],
+    *,
+    chrono_yfinance: bool,
+) -> list[tuple[str, str, int, dict[str, Any] | None]]:
+    """Append one FIX-21 loose UNTESTED row only when strict Layer-2 produced no candidates."""
+    if not chrono_yfinance or layer2_rows:
+        return layer2_rows
+    have = {str(r[0]).strip().upper() for r in layer2_rows}
+    one = _v72_one_loose_untested_candidate(
+        sym, tf_key, price, ind, chrono_yfinance=chrono_yfinance, existing_sids=have
+    )
+    if one is None:
+        return layer2_rows
+    merged = list(layer2_rows)
+    merged.append(one)
+    return merged
+
+
+def _v72_strip_locked_from_chrono(
+    rows: list[tuple[str, str, int, dict[str, Any] | None]],
+    *,
+    chrono_yfinance: bool,
+) -> list[tuple[str, str, int, dict[str, Any] | None]]:
+    """FIX 20 correction — graduated LOCKED strategies never run in chrono backtest."""
+    if not chrono_yfinance or not LOCKED_STRATEGIES_SCAN_SKIP:
+        return rows
+    return [r for r in rows if str(r[0]).strip().upper() not in LOCKED_STRATEGIES_SCAN_SKIP]
 
 
 # Prefilter has no rules for these ids — v7.1 uses deterministic “turn” ordering instead of random (FIX 10).
@@ -2535,6 +2761,7 @@ def _python_forced_layer2_trade(
     rsi_live: float = 50.0,
     chrono_risk_mult: float = 1.0,
     chrono_tp_mult: float = 1.0,
+    chrono_job: bool = False,
 ) -> dict[str, Any] | None:
     """Execute Layer 2+ setup without Claude (v7.1)."""
     if not layer2:
@@ -2548,42 +2775,77 @@ def _python_forced_layer2_trade(
     if direction not in ("LONG", "SHORT"):
         return None
 
-    mult = 1 if direction == "LONG" else -1
-    entry = round(float(price), 5)
-    stop = round(entry * (1 - mult * 0.005), 5)
-    risk = abs(entry - stop)
-    if risk <= 0:
-        return None
-    tp1 = round(entry + mult * risk * 2, 5)
-    tp2 = round(entry + mult * risk * 3, 5)
-    tp3 = round(entry + mult * risk * 5, 5)
+    if isinstance(meta, dict) and meta.get("v72_untested"):
+        direction = str(meta.get("direction", direction)).strip().upper()
+        if direction not in ("LONG", "SHORT"):
+            return None
+        entry = round(float(meta.get("entry", price)), 5)
+        stop = round(float(meta["stop_loss"]), 5)
+        tp1 = round(float(meta["tp1"]), 5)
+        tp2 = round(float(meta["tp2"]), 5)
+        tp3 = round(float(meta.get("tp3", tp2)), 5)
+        ai = {
+            "skip_trade": False,
+            "strategy_id": strat_id,
+            "strategy_name": str(STRATEGIES.get(strat_id, {}).get("name", strat_id)),
+            "strategy_met": True,
+            "direction": direction,
+            "confidence": "LOW",
+            "conviction_score": 3,
+            "entry": entry,
+            "stop_loss": stop,
+            "tp1": tp1,
+            "tp2": tp2,
+            "tp3": tp3,
+            "verdict": "BUY" if direction == "LONG" else "SELL",
+            "zone_pct": zone_pct,
+            "confluences": [str(x[0]) for x in layer2],
+            "signals_used": [strat_id],
+            "reasoning": str(meta.get("reasoning") or f"{strat_id}: UNTESTED — gathering first data"),
+            "rr_ratio": "1:2.0",
+            "tp_target": "TP1",
+            "htf_bias": "UNKNOWN",
+            "market_structure": "UNKNOWN",
+            "core_signals_met": ["PYTHON_LAYER2", "V72_UNTESTED_LOOSE"],
+            "core_signals_failed": [],
+        }
+    else:
+        mult = 1 if direction == "LONG" else -1
+        entry = round(float(price), 5)
+        stop = round(entry * (1 - mult * 0.005), 5)
+        risk = abs(entry - stop)
+        if risk <= 0:
+            return None
+        tp1 = round(entry + mult * risk * 2, 5)
+        tp2 = round(entry + mult * risk * 3, 5)
+        tp3 = round(entry + mult * risk * 5, 5)
 
-    ai: dict[str, Any] = {
-        "skip_trade": False,
-        "strategy_id": strat_id,
-        "strategy_name": str(STRATEGIES.get(strat_id, {}).get("name", strat_id)),
-        "strategy_met": True,
-        "direction": direction,
-        "confidence": "LOW",
-        "conviction_score": 3,
-        "entry": entry,
-        "stop_loss": stop,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
-        "verdict": "BUY" if direction == "LONG" else "SELL",
-        "zone_pct": zone_pct,
-        "confluences": [str(x[0]) for x in layer2],
-        "signals_used": [strat_id],
-        "reasoning": f"Python-forced {strat_id}: gathering data at LOW confidence",
-        "rr_ratio": "1:2.0",
-        "tp_target": "TP1",
-        "htf_bias": "UNKNOWN",
-        "market_structure": "UNKNOWN",
-        "core_signals_met": ["PYTHON_LAYER2"],
-        "core_signals_failed": [],
-    }
-    if isinstance(meta, dict) and meta.get("v7_fallback"):
+        ai = {
+            "skip_trade": False,
+            "strategy_id": strat_id,
+            "strategy_name": str(STRATEGIES.get(strat_id, {}).get("name", strat_id)),
+            "strategy_met": True,
+            "direction": direction,
+            "confidence": "LOW",
+            "conviction_score": 3,
+            "entry": entry,
+            "stop_loss": stop,
+            "tp1": tp1,
+            "tp2": tp2,
+            "tp3": tp3,
+            "verdict": "BUY" if direction == "LONG" else "SELL",
+            "zone_pct": zone_pct,
+            "confluences": [str(x[0]) for x in layer2],
+            "signals_used": [strat_id],
+            "reasoning": f"Python-forced {strat_id}: gathering data at LOW confidence",
+            "rr_ratio": "1:2.0",
+            "tp_target": "TP1",
+            "htf_bias": "UNKNOWN",
+            "market_structure": "UNKNOWN",
+            "core_signals_met": ["PYTHON_LAYER2"],
+            "core_signals_failed": [],
+        }
+    if isinstance(meta, dict) and meta.get("v7_fallback") and not meta.get("v72_untested"):
         ai["reasoning"] = str(meta.get("reasoning") or ai["reasoning"])
         ai["confidence"] = str(meta.get("confidence") or "LOW").strip().upper()
 
@@ -2620,6 +2882,12 @@ def _python_forced_layer2_trade(
     fut = future.head(fwd_n)
     if fut.empty or len(fut) < 1:
         return None
+
+    if chrono_job and strat_id in UNTESTED_STRATEGIES_V72 and STRATEGY_TRADE_COUNT.get(strat_id, 0) == 0:
+        log(
+            f"UNTESTED strategy {strat_id} firing for first time — gathering data",
+            level="info",
+        )
 
     log(
         f"[LAYER2-FORCED] {strat_id} {direction} {sym} {tf_key} {analysis_date}",
@@ -2938,6 +3206,12 @@ def run_one_backtest(
                 is_exotic=is_exotic,
             )
 
+        if chrono_yfinance:
+            qualifying_strategies = _v72_strip_locked_from_chrono(
+                list(qualifying_strategies),
+                chrono_yfinance=True,
+            )
+
         intel_text = ""
         news_sentiment = 0.0
         cot_bias = "UNKNOWN"
@@ -2992,6 +3266,15 @@ def run_one_backtest(
 
         layer1_list = [s for s in qualifying_strategies if s[0] in LAYER1_STRATEGY_IDS]
         layer2_list = [s for s in qualifying_strategies if s[0] not in LAYER1_STRATEGY_IDS]
+        if chrono_yfinance:
+            layer2_list = _v72_merge_loose_untested_into_layer2(
+                layer2_list,
+                sym,
+                tf_key,
+                float(price),
+                ind,
+                chrono_yfinance=True,
+            )
 
         if layer2_list and not layer1_list:
             picked = _layer2_tuple_for_deterministic_pick(sym, tf_key, zone_pct, layer2_list)
@@ -3054,6 +3337,7 @@ def run_one_backtest(
                 rsi_live=float(ind.get("rsi", 50) or 50),
                 chrono_risk_mult=chrono_risk_mult,
                 chrono_tp_mult=chrono_tp_mult,
+                chrono_job=chrono_yfinance,
             )
             return forced
 
@@ -4521,6 +4805,7 @@ def run_chronological_backtest(
             pass
         _rebuild_strategy_trade_counts_from_rows(merge_hist)
         _rebuild_consecutive_losses_from_rows(merge_hist)
+        _v72_load_strategy_status(log_startup=True)
         # FIX 18 — restore zero-trade priority after restart (same rule as end-of-day)
         for _z0 in ALL_STRATEGY_IDS:
             if STRATEGY_TRADE_COUNT.get(_z0, 0) == 0:
@@ -5262,3 +5547,6 @@ def get_improve_debug() -> dict[str, Any]:
     if isinstance(data, dict) and data:
         return data
     return {"message": "No debug data yet"}
+
+
+_v72_load_strategy_status(log_startup=True)
