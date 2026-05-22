@@ -23,6 +23,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from calendar_manager import check_calendar_risk
+from regime_manager import get_regime_cached
+
+CURRENT_JOB_ID = os.environ.get("APEX_JOB_ID", "live")
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -576,6 +579,23 @@ def pnl_snapshot(mt5: Any) -> tuple[float, float, float, float]:
     return eq, eq - da, eq - anchor, float(ai.balance)
 
 
+def _regime_with_ftmo_override(reg: dict[str, Any], mt5: Any) -> dict[str, Any]:
+    """Force CRISIS sizing when within $500 of FTMO soft stops (Prompt 2)."""
+    rd = dict(reg)
+    if not mt5:
+        return rd
+    _eq, daily, total, _bal = pnl_snapshot(mt5)
+    if daily < -3500.0 or total < -7500.0:
+        log_msg(
+            "[REGIME OVERRIDE] FTMO limit approaching — forced CRISIS 25% size",
+            "warning",
+        )
+        rd["regime"] = "CRISIS_FTMO"
+        rd["size_multiplier"] = 0.25
+        rd["note"] = "FTMO soft limit within $500 — forced CRISIS 25% size"
+    return rd
+
+
 def limits_ok(mt5: Any) -> tuple[bool, str]:
     eq, daily, total, _ = pnl_snapshot(mt5)
     if total <= -TOTAL_SOFT_LIMIT:
@@ -666,7 +686,7 @@ def select_layer2(sym: str, tf: str, ind: dict[str, Any], df: Any) -> tuple[str 
     return None, None
 
 
-def scan_one(mt5: Any, sym: str, tf: str, cd: CooldownState, loss: LossState) -> None:
+def scan_one(mt5: Any, sym: str, tf: str, cd: CooldownState, loss: LossState, regime: dict[str, Any]) -> None:
     today = datetime.now(timezone.utc).date()
     if cd.traded_day != today.isoformat():
         cd.traded_day = today.isoformat()
@@ -734,7 +754,7 @@ def scan_one(mt5: Any, sym: str, tf: str, cd: CooldownState, loss: LossState) ->
             continue
         conf = c_cl if c_cl in CONF_RISK_USD else "HIGH"
         risk = CONF_RISK_USD[conf] * TF_RISK_MULT.get(tf, 1.0)
-        exec_trade(mt5, sym, tf, strat, dire, sl, tp1, tp2, risk, cd, rs, conf, cal_risk)
+        exec_trade(mt5, sym, tf, strat, dire, sl, tp1, tp2, risk, cd, rs, conf, cal_risk, regime)
         return
 
     # Layer 2
@@ -755,7 +775,7 @@ def scan_one(mt5: Any, sym: str, tf: str, cd: CooldownState, loss: LossState) ->
         log_msg(f"[SKIP] {sym} {tf} {sid}: rr", "info")
         return
     risk = CONF_RISK_USD["LOW"] * TF_RISK_MULT.get(tf, 1.0)
-    exec_trade(mt5, sym, tf, sid, dire, sl, tp1, tp2, risk, cd, "layer2", "LOW", cal_risk)
+    exec_trade(mt5, sym, tf, sid, dire, sl, tp1, tp2, risk, cd, "layer2", "LOW", cal_risk, regime)
 
 
 def exec_trade(
@@ -772,6 +792,7 @@ def exec_trade(
     reasoning: str,
     conf: str,
     calendar_risk: dict[str, Any] | None = None,
+    regime_risk: dict[str, Any] | None = None,
 ) -> None:
     if not limits_ok(mt5)[0]:
         return
@@ -785,7 +806,18 @@ def exec_trade(
         "reason": "No high-impact events within 48h",
         "size_multiplier": 1.0,
     }
-    risk_eff = float(risk) * float(cr.get("size_multiplier", 1.0))
+    rg = regime_risk or {
+        "regime": "NORMAL",
+        "size_multiplier": 1.0,
+        "wr_10": 0.5,
+        "wr_20": 0.5,
+        "consecutive_losses": 0,
+    }
+    cal_m = float(cr.get("size_multiplier", 1.0) or 0.0)
+    reg_m = float(rg.get("size_multiplier", 1.0) or 0.0)
+    raw_risk = float(risk) * max(0.0, cal_m) * max(0.0, reg_m)
+    base_cap = float(CONF_RISK_USD.get(conf if conf in CONF_RISK_USD else "LOW", 300.0)) * 1.5
+    risk_eff = max(25.0, min(raw_risk, base_cap))
     meta = {
         "ticker": sym.upper(),
         "tf": tf,
@@ -798,6 +830,10 @@ def exec_trade(
         "reasoning": reasoning,
         "calendar_action": str(cr.get("action", "CLEAR")),
         "calendar_reason": str(cr.get("reason", "")),
+        "regime": str(rg.get("regime", "NORMAL")),
+        "regime_size_multiplier": reg_m,
+        "regime_wr_10": float(rg.get("wr_10", 0.5) or 0.5),
+        "regime_consecutive_losses": int(rg.get("consecutive_losses", 0) or 0),
     }
     res = order_send(mt5, bs, dire, sl, risk_eff, meta)
     if not res.get("ok"):
@@ -811,7 +847,8 @@ def exec_trade(
     save_cooldown_state(cd)
     log_msg(
         f"[TRADE] {sym} {dire} {tf} {strat} entry={res.get('entry')} SL={sl:.5f} TP1={tp1:.5f} "
-        f"lot={res.get('volume')} risk_usd={risk_eff:.2f} (base={risk:.2f}) claude={reasoning!r}",
+        f"lot={res.get('volume')} risk_usd={risk_eff:.2f} (base={risk:.2f}) claude={reasoning!r} "
+        f"regime={rg.get('regime')}",
         "info",
     )
 
@@ -983,10 +1020,17 @@ def daily_job() -> None:
             td.append(t)
             st["trading_day_dates"] = td
             save_ftmo_state(st)
+        base_reg = get_regime_cached(CURRENT_JOB_ID)
+        reg = _regime_with_ftmo_override(base_reg, mt5)
+        log_msg(
+            f"[REGIME] {reg['regime']} — WR10={reg['wr_10']:.0%} WR20={reg['wr_20']:.0%} "
+            f"Streak={reg['consecutive_losses']} losses Size={reg['size_multiplier']}x",
+            "info",
+        )
         for sym in TICKERS:
             try:
                 for tf in ("1d", "4h"):
-                    scan_one(mt5, sym, tf, cd, loss)
+                    scan_one(mt5, sym, tf, cd, loss, reg)
             except Exception as e:  # noqa: BLE001
                 log_msg(f"[scan] {sym}: {e}", "error")
     except Exception as e:  # noqa: BLE001
@@ -999,9 +1043,16 @@ def weekly_job() -> None:
         if not mt5:
             return
         cd, loss = load_cooldown_state(), load_loss_state()
+        base_reg = get_regime_cached(CURRENT_JOB_ID)
+        reg = _regime_with_ftmo_override(base_reg, mt5)
+        log_msg(
+            f"[REGIME] {reg['regime']} — WR10={reg['wr_10']:.0%} WR20={reg['wr_20']:.0%} "
+            f"Streak={reg['consecutive_losses']} losses Size={reg['size_multiplier']}x",
+            "info",
+        )
         for sym in TICKERS:
             try:
-                scan_one(mt5, sym, "1w", cd, loss)
+                scan_one(mt5, sym, "1w", cd, loss, reg)
             except Exception as e:  # noqa: BLE001
                 log_msg(f"[w] {sym}: {e}", "error")
     except Exception as e:  # noqa: BLE001
@@ -1014,6 +1065,14 @@ def hourly_job() -> None:
         if mt5:
             print_status(mt5)
             update_loss_from_deals(mt5)
+            rb = get_regime_cached(CURRENT_JOB_ID)
+            reg = _regime_with_ftmo_override(rb, mt5)
+            log_msg(
+                f"REGIME: {reg['regime']} | Size: {reg['size_multiplier']}x | "
+                f"WR(10): {reg['wr_10']:.0%} | WR(20): {reg['wr_20']:.0%} | "
+                f"Streak: {reg['consecutive_losses']} consecutive losses",
+                "info",
+            )
     except Exception as e:  # noqa: BLE001
         log_msg(f"[hourly] {e}", "error")
 
