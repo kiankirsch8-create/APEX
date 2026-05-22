@@ -5,8 +5,8 @@ rolling stats, and periodic self-improvement. All state is simple JSON on ``DATA
 """
 from __future__ import annotations
 
-STRATEGY_VERSION = "v7.3-session17"
-# v7.3: economic calendar layer (calendar_manager: live feed + historical simulated blocks).
+STRATEGY_VERSION = "v7.3-session18"
+# v7.3: economic calendar (calendar_manager) + rolling win-rate regime (regime_manager).
 # v7.2: strategy_status.json + chrono skips LOCKED strategies; UNTESTED loose EMA200/ADX paths (chrono only).
 # v7.1: chrono phase scan (1w→1d→4h→intraday), risk/tp multipliers, separate 4H currency pool,
 # deterministic Layer-2 strategy order, $25 trailing floor + 0.75R/1.5R locks, exotic USD cap exemption,
@@ -43,6 +43,7 @@ from anthropic import Anthropic
 import pandas_ta  # noqa: F401
 
 from calendar_manager import check_calendar_risk_historical
+from regime_manager import get_regime_cached
 from utils import DATA_DIR, env, load_json, log, save_json, utcnow_iso
 
 # ── COOLDOWN TRACKER — module-level, NEVER inside any loop ──
@@ -2660,6 +2661,50 @@ def _tp_target_and_smc_dashboard(trades: list[dict[str, Any]]) -> dict[str, Any]
     return {"tp_performance": tp_performance, "smc_performance": smc_performance}
 
 
+def _v73_regime_row_fields(reg: dict[str, Any] | None) -> dict[str, Any]:
+    r = reg or {}
+    return {
+        "regime": str(r.get("regime", "NORMAL")),
+        "regime_size_multiplier": float(r.get("size_multiplier", 1.0) or 1.0),
+        "regime_wr_10": float(r.get("wr_10", 0.5) or 0.5),
+        "regime_consecutive_losses": int(r.get("consecutive_losses", 0) or 0),
+    }
+
+
+def _v73_apply_calendar_regime_position_size(
+    ai: dict[str, Any],
+    *,
+    confidence: str,
+    calendar_risk: dict[str, Any] | None,
+    regime: dict[str, Any] | None,
+    entry: float,
+) -> None:
+    """Stack calendar × regime multipliers on ``_max_risk_dollars`` with $25 floor and 1.5× RISK cap."""
+    cal = calendar_risk or {"size_multiplier": 1.0}
+    reg = regime or {"size_multiplier": 1.0}
+    cm = max(0.0, float(cal.get("size_multiplier", 1.0) or 0.0))
+    rm = max(0.0, float(reg.get("size_multiplier", 1.0) or 0.0))
+    comb = cm * rm
+    ent = float(entry)
+    mrd0 = float(ai.get("_max_risk_dollars", 0) or 0)
+    st0 = float(ai.get("stop_loss", 0) or 0)
+    if mrd0 <= 0 or ent <= 0:
+        return
+    sd0 = abs(ent - st0)
+    if sd0 <= 0:
+        return
+    mrd1 = round(mrd0 * comb, 2)
+    c = str(confidence or "LOW").strip().upper()
+    if c not in RISK_BY_CONFIDENCE:
+        c = "LOW"
+    cap = float(STARTING_CAPITAL) * float(RISK_BY_CONFIDENCE[c]) * 1.5
+    mrd1 = max(25.0, min(mrd1, cap))
+    ps = mrd1 / sd0
+    ai["_max_risk_dollars"] = mrd1
+    ai["_position_size"] = round(ps, 2)
+    ai["_leveraged_exposure"] = round(ps * ent, 2)
+
+
 def _skipped_backtest_row(
     *,
     sym: str,
@@ -2749,6 +2794,14 @@ def _skipped_backtest_row(
         "calendar_reason": str(
             ai.get("calendar_reason") or "No high-impact events within 48h",
         ),
+        **_v73_regime_row_fields(
+            {
+                "regime": ai.get("regime"),
+                "size_multiplier": ai.get("regime_size_multiplier"),
+                "wr_10": ai.get("regime_wr_10"),
+                "consecutive_losses": ai.get("regime_consecutive_losses"),
+            }
+        ),
     }
 
 
@@ -2769,6 +2822,7 @@ def _python_forced_layer2_trade(
     chrono_tp_mult: float = 1.0,
     chrono_job: bool = False,
     calendar_risk: dict[str, Any] | None = None,
+    regime_ctx: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Execute Layer 2+ setup without Claude (v7.1)."""
     if not layer2:
@@ -2866,6 +2920,7 @@ def _python_forced_layer2_trade(
         ai2 = dict(ai)
         ai2["calendar_action"] = str(cal.get("action", "CLEAR"))
         ai2["calendar_reason"] = str(cal.get("reason", ""))
+        ai2.update(_v73_regime_row_fields(regime_ctx))
         return _skipped_backtest_row(
             sym=sym,
             timeframe=timeframe,
@@ -2886,17 +2941,13 @@ def _python_forced_layer2_trade(
         chrono_tp_mult=chrono_tp_mult,
     )
 
-    cmult = float(cal.get("size_multiplier", 1.0))
-    if 0 < cmult < 1.0:
-        mrd0 = float(ai.get("_max_risk_dollars", 0) or 0)
-        ent0 = float(ai.get("entry", price) or price)
-        st0 = float(ai.get("stop_loss", 0) or 0)
-        sd0 = abs(ent0 - st0)
-        if mrd0 > 0 and sd0 > 0 and ent0 > 0:
-            ai["_max_risk_dollars"] = round(mrd0 * cmult, 2)
-            ps = ai["_max_risk_dollars"] / sd0
-            ai["_position_size"] = round(ps, 2)
-            ai["_leveraged_exposure"] = round(ps * ent0, 2)
+    _v73_apply_calendar_regime_position_size(
+        ai,
+        confidence=str(ai.get("confidence", "LOW")),
+        calendar_risk=cal,
+        regime=regime_ctx,
+        entry=float(ai.get("entry", price) or price),
+    )
 
     entry = float(ai.get("entry", entry) or entry)
     stop = float(ai.get("stop_loss", stop) or stop)
@@ -3032,6 +3083,7 @@ def _python_forced_layer2_trade(
         "skip_trade": False,
         "calendar_action": str(cal.get("action", "CLEAR")),
         "calendar_reason": str(cal.get("reason", "")),
+        **_v73_regime_row_fields(regime_ctx),
     }
 
 
@@ -3044,20 +3096,29 @@ def run_one_backtest(
     chrono_risk_mult: float = 1.0,
     chrono_tp_mult: float = 1.0,
     chrono_enforce_extended_cooldown: bool = False,
+    chrono_regime: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     try:
         sym = (ticker or "").strip().upper()
         tf_key = timeframe.lower().strip()
+        try:
+            scan_d = date.fromisoformat(analysis_date.strip()[:10])
+        except (TypeError, ValueError):
+            scan_d = None
+
+        if chrono_regime is not None:
+            regime_ctx = chrono_regime
+        else:
+            regime_ctx = get_regime_cached(
+                os.environ.get("ROLLING_REGIME_JOB_ID", "rolling"),
+                as_of_date=scan_d,
+            )
+
         hist_cal: dict[str, Any] = {
             "action": "CLEAR",
             "reason": "No high-impact events within 48h",
             "size_multiplier": 1.0,
         }
-        scan_d: date | None = None
-        try:
-            scan_d = date.fromisoformat(analysis_date.strip()[:10])
-        except (TypeError, ValueError):
-            scan_d = None
         if scan_d is not None:
             hist_cal = check_calendar_risk_historical(sym, scan_d)
             if hist_cal.get("action") == "BLOCK":
@@ -3077,6 +3138,7 @@ def run_one_backtest(
                         "conviction_score": 0,
                         "calendar_action": "BLOCK",
                         "calendar_reason": str(hist_cal.get("reason") or ""),
+                        **_v73_regime_row_fields(regime_ctx),
                     },
                     tf_key=tf_key,
                     is_exotic=sym in EXOTIC_REDUCE,
@@ -3402,6 +3464,7 @@ def run_one_backtest(
                 chrono_tp_mult=chrono_tp_mult,
                 chrono_job=chrono_yfinance,
                 calendar_risk=hist_cal,
+                regime_ctx=regime_ctx,
             )
             return forced
 
@@ -3466,6 +3529,7 @@ def run_one_backtest(
             merged_ai = dict(src if src is not None else ai)
             merged_ai["calendar_action"] = str(hist_cal.get("action", "CLEAR"))
             merged_ai["calendar_reason"] = str(hist_cal.get("reason", ""))
+            merged_ai.update(_v73_regime_row_fields(regime_ctx))
             return _skipped_backtest_row(
                 sym=sym,
                 timeframe=timeframe,
@@ -3593,6 +3657,14 @@ def run_one_backtest(
         tp1 = float(ai.get("tp1", tp1) or tp1)
         tp2 = float(ai.get("tp2", tp2) or tp2)
         tp3 = float(ai.get("tp3", tp3) or tp3)
+
+        _v73_apply_calendar_regime_position_size(
+            ai,
+            confidence=confidence,
+            calendar_risk=hist_cal,
+            regime=regime_ctx,
+            entry=float(ai.get("entry", entry) or entry),
+        )
 
         position_size = float(ai.get("_position_size", 0) or 0)
         leveraged_exposure = float(ai.get("_leveraged_exposure", 0) or 0)
@@ -3788,6 +3860,7 @@ def run_one_backtest(
             "skip_trade": False,
             "calendar_action": str(hist_cal.get("action", "CLEAR")),
             "calendar_reason": str(hist_cal.get("reason", "")),
+            **_v73_regime_row_fields(regime_ctx),
         }
 
     except Exception as e:  # noqa: BLE001
@@ -5061,6 +5134,13 @@ def run_chronological_backtest(
             chrono_abort = False
             if not finalize_day_only:
                 scan_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+                day_regime = get_regime_cached(job_id, as_of_date=scan_date)
+                log(
+                    f"[REGIME] {day_regime['regime']} — WR10={day_regime['wr_10']:.0%} "
+                    f"WR20={day_regime['wr_20']:.0%} Streak={day_regime['consecutive_losses']} losses "
+                    f"Size={day_regime['size_multiplier']}x",
+                    level="info",
+                )
                 days_ago = (date.today() - scan_date).days
                 phases = _chrono_v71_phases(days_ago)
 
@@ -5254,6 +5334,7 @@ def run_chronological_backtest(
                                     chrono_risk_mult=risk_m,
                                     chrono_tp_mult=tp_m,
                                     chrono_enforce_extended_cooldown=True,
+                                    chrono_regime=day_regime,
                                 )
                             except Exception as e:  # noqa: BLE001
                                 log(
@@ -5310,6 +5391,16 @@ def run_chronological_backtest(
                                     "skip_reason": str(res.get("skip_reason", "") or ""),
                                     "verdict": res.get("verdict"),
                                 }
+                                row.update(
+                                    _v73_regime_row_fields(
+                                        {
+                                            "regime": res.get("regime"),
+                                            "size_multiplier": res.get("regime_size_multiplier"),
+                                            "wr_10": res.get("regime_wr_10"),
+                                            "consecutive_losses": res.get("regime_consecutive_losses"),
+                                        }
+                                    )
+                                )
                                 day_skipped.append(row)
                                 npi, nti, ntj = _v71_next_step(pi, ti, tj)
                                 chrono_data["chrono_intraday"] = {
