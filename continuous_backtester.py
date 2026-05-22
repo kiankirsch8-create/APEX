@@ -5,8 +5,8 @@ rolling stats, and periodic self-improvement. All state is simple JSON on ``DATA
 """
 from __future__ import annotations
 
-STRATEGY_VERSION = "v7.3-session18"
-# v7.3: economic calendar (calendar_manager) + rolling win-rate regime (regime_manager).
+STRATEGY_VERSION = "v7.3-session19"
+# v7.3: economic calendar + rolling regime + macro bias (macro_manager); Railway sets IS_BACKTEST via set_backtest_mode(True).
 # v7.2: strategy_status.json + chrono skips LOCKED strategies; UNTESTED loose EMA200/ADX paths (chrono only).
 # v7.1: chrono phase scan (1w→1d→4h→intraday), risk/tp multipliers, separate 4H currency pool,
 # deterministic Layer-2 strategy order, $25 trailing floor + 0.75R/1.5R locks, exotic USD cap exemption,
@@ -43,8 +43,17 @@ from anthropic import Anthropic
 import pandas_ta  # noqa: F401
 
 from calendar_manager import check_calendar_risk_historical
+from macro_manager import (
+    apply_macro_confidence_adjustment,
+    get_macro_bias,
+    macro_result_fields,
+    merged_macro_result_fields,
+    set_backtest_mode,
+)
 from regime_manager import get_regime_cached
 from utils import DATA_DIR, env, load_json, log, save_json, utcnow_iso
+
+set_backtest_mode(True)
 
 # ── COOLDOWN TRACKER — module-level, NEVER inside any loop ──
 # Key: "TICKER_tf" (tf lowercased). Value: "YYYY-MM-DD" of last trade.
@@ -2677,14 +2686,16 @@ def _v73_apply_calendar_regime_position_size(
     confidence: str,
     calendar_risk: dict[str, Any] | None,
     regime: dict[str, Any] | None,
+    macro: dict[str, Any] | None = None,
     entry: float,
 ) -> None:
-    """Stack calendar × regime multipliers on ``_max_risk_dollars`` with $25 floor and 1.5× RISK cap."""
+    """Stack calendar × regime × macro multipliers on ``_max_risk_dollars`` with $25 floor and 1.5× HIGH cap."""
     cal = calendar_risk or {"size_multiplier": 1.0}
     reg = regime or {"size_multiplier": 1.0}
     cm = max(0.0, float(cal.get("size_multiplier", 1.0) or 0.0))
     rm = max(0.0, float(reg.get("size_multiplier", 1.0) or 0.0))
-    comb = cm * rm
+    mm = max(0.0, float((macro or {}).get("size_multiplier", 1.0) or 0.0))
+    comb = cm * rm * mm
     ent = float(entry)
     mrd0 = float(ai.get("_max_risk_dollars", 0) or 0)
     st0 = float(ai.get("stop_loss", 0) or 0)
@@ -2697,7 +2708,7 @@ def _v73_apply_calendar_regime_position_size(
     c = str(confidence or "LOW").strip().upper()
     if c not in RISK_BY_CONFIDENCE:
         c = "LOW"
-    cap = float(STARTING_CAPITAL) * float(RISK_BY_CONFIDENCE[c]) * 1.5
+    cap = float(STARTING_CAPITAL) * float(RISK_BY_CONFIDENCE["HIGH"]) * 1.5
     mrd1 = max(25.0, min(mrd1, cap))
     ps = mrd1 / sd0
     ai["_max_risk_dollars"] = mrd1
@@ -2802,6 +2813,7 @@ def _skipped_backtest_row(
                 "consecutive_losses": ai.get("regime_consecutive_losses"),
             }
         ),
+        **merged_macro_result_fields(ai),
     }
 
 
@@ -2910,6 +2922,20 @@ def _python_forced_layer2_trade(
         ai["reasoning"] = str(meta.get("reasoning") or ai["reasoning"])
         ai["confidence"] = str(meta.get("confidence") or "LOW").strip().upper()
 
+    scan_d_macro: date | None = None
+    try:
+        scan_d_macro = date.fromisoformat(analysis_date.strip()[:10])
+    except (TypeError, ValueError):
+        scan_d_macro = None
+    macro_bt = get_macro_bias(sym, direction, as_of_date=scan_d_macro)
+    ai.update(macro_result_fields(macro_bt))
+    ai["confidence"] = apply_macro_confidence_adjustment(str(ai.get("confidence", "LOW")), macro_bt)
+    log(
+        f"[MACRO] {sym} {direction} — {macro_bt['bias']} (score {macro_bt['composite_score']:+.2f}) "
+        f"rate_diff={macro_bt['rate_differential']:+.2f}% {macro_bt['price_trend']}",
+        level="info",
+    )
+
     ai = enforce_rules(ai, tf_key, float(price), sym, rsi=float(rsi_live))
     cal = calendar_risk or {
         "action": "CLEAR",
@@ -2946,6 +2972,7 @@ def _python_forced_layer2_trade(
         confidence=str(ai.get("confidence", "LOW")),
         calendar_risk=cal,
         regime=regime_ctx,
+        macro=macro_bt,
         entry=float(ai.get("entry", price) or price),
     )
 
@@ -3011,7 +3038,7 @@ def _python_forced_layer2_trade(
     correct = outcome == "WIN"
     pnl_dollars = round(leveraged_exposure * raw_pct, 2)
     pnl_pct_display = round(raw_pct * 100, 2)
-    confidence = "LOW"
+    confidence = str(ai.get("confidence", "LOW")).strip().upper()
 
     return {
         "date": analysis_date,
@@ -3084,6 +3111,7 @@ def _python_forced_layer2_trade(
         "calendar_action": str(cal.get("action", "CLEAR")),
         "calendar_reason": str(cal.get("reason", "")),
         **_v73_regime_row_fields(regime_ctx),
+        **merged_macro_result_fields(ai),
     }
 
 
@@ -3559,6 +3587,8 @@ def run_one_backtest(
         _sanitize_signal_lists(ai)
         ai["zone_pct"] = zone_pct
 
+        macro_bt: dict[str, Any] | None = None
+
         if not bool(ai.get("skip_trade")):
             d0 = str(ai.get("direction", "")).strip().upper()
             if d0 not in ("LONG", "SHORT"):
@@ -3583,6 +3613,15 @@ def run_one_backtest(
             ai["confidence"] = _apply_exotic_confidence(c0, is_exotic)
             if sym == "GBPJPY" and str(ai.get("confidence", "")).strip().upper() == "HIGH":
                 ai["confidence"] = "MEDIUM"
+
+            macro_bt = get_macro_bias(sym, d0, as_of_date=scan_d)
+            ai.update(macro_result_fields(macro_bt))
+            ai["confidence"] = apply_macro_confidence_adjustment(str(ai.get("confidence", "LOW")), macro_bt)
+            log(
+                f"[MACRO] {sym} {d0} — {macro_bt['bias']} (score {macro_bt['composite_score']:+.2f}) "
+                f"rate_diff={macro_bt['rate_differential']:+.2f}% {macro_bt['price_trend']}",
+                level="info",
+            )
 
         ai = enforce_rules(
             ai,
@@ -3663,6 +3702,7 @@ def run_one_backtest(
             confidence=confidence,
             calendar_risk=hist_cal,
             regime=regime_ctx,
+            macro=macro_bt,
             entry=float(ai.get("entry", entry) or entry),
         )
 
@@ -3861,6 +3901,7 @@ def run_one_backtest(
             "calendar_action": str(hist_cal.get("action", "CLEAR")),
             "calendar_reason": str(hist_cal.get("reason", "")),
             **_v73_regime_row_fields(regime_ctx),
+            **merged_macro_result_fields(ai),
         }
 
     except Exception as e:  # noqa: BLE001
