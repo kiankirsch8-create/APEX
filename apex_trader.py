@@ -23,7 +23,16 @@ from pathlib import Path
 from typing import Any, Callable
 
 from calendar_manager import check_calendar_risk
+from macro_manager import (
+    apply_macro_confidence_adjustment,
+    get_macro_bias,
+    macro_result_fields,
+    set_backtest_mode,
+    weekly_macro_summary_lines,
+)
 from regime_manager import get_regime_cached
+
+set_backtest_mode(False)
 
 CURRENT_JOB_ID = os.environ.get("APEX_JOB_ID", "live")
 
@@ -753,8 +762,15 @@ def scan_one(mt5: Any, sym: str, tf: str, cd: CooldownState, loss: LossState, re
         if v != "EXECUTE":
             continue
         conf = c_cl if c_cl in CONF_RISK_USD else "HIGH"
+        macro = get_macro_bias(sym, dire)
+        log_msg(
+            f"[MACRO] {sym} {dire} — {macro['bias']} (score {macro['composite_score']:+.2f}) "
+            f"rate_diff={macro['rate_differential']:+.2f}% {macro['price_trend']}",
+            "info",
+        )
+        conf = apply_macro_confidence_adjustment(conf, macro)
         risk = CONF_RISK_USD[conf] * TF_RISK_MULT.get(tf, 1.0)
-        exec_trade(mt5, sym, tf, strat, dire, sl, tp1, tp2, risk, cd, rs, conf, cal_risk, regime)
+        exec_trade(mt5, sym, tf, strat, dire, sl, tp1, tp2, risk, cd, rs, conf, cal_risk, regime, macro)
         return
 
     # Layer 2
@@ -774,8 +790,15 @@ def scan_one(mt5: Any, sym: str, tf: str, cd: CooldownState, loss: LossState, re
     if not rr_ok(ent, sl, tp1):
         log_msg(f"[SKIP] {sym} {tf} {sid}: rr", "info")
         return
-    risk = CONF_RISK_USD["LOW"] * TF_RISK_MULT.get(tf, 1.0)
-    exec_trade(mt5, sym, tf, sid, dire, sl, tp1, tp2, risk, cd, "layer2", "LOW", cal_risk, regime)
+    macro = get_macro_bias(sym, dire)
+    log_msg(
+        f"[MACRO] {sym} {dire} — {macro['bias']} (score {macro['composite_score']:+.2f}) "
+        f"rate_diff={macro['rate_differential']:+.2f}% {macro['price_trend']}",
+        "info",
+    )
+    conf = apply_macro_confidence_adjustment("LOW", macro)
+    risk = CONF_RISK_USD[conf] * TF_RISK_MULT.get(tf, 1.0)
+    exec_trade(mt5, sym, tf, sid, dire, sl, tp1, tp2, risk, cd, "layer2", conf, cal_risk, regime, macro)
 
 
 def exec_trade(
@@ -793,6 +816,7 @@ def exec_trade(
     conf: str,
     calendar_risk: dict[str, Any] | None = None,
     regime_risk: dict[str, Any] | None = None,
+    macro_bias: dict[str, Any] | None = None,
 ) -> None:
     if not limits_ok(mt5)[0]:
         return
@@ -815,9 +839,19 @@ def exec_trade(
     }
     cal_m = float(cr.get("size_multiplier", 1.0) or 0.0)
     reg_m = float(rg.get("size_multiplier", 1.0) or 0.0)
-    raw_risk = float(risk) * max(0.0, cal_m) * max(0.0, reg_m)
-    base_cap = float(CONF_RISK_USD.get(conf if conf in CONF_RISK_USD else "LOW", 300.0)) * 1.5
-    risk_eff = max(25.0, min(raw_risk, base_cap))
+    mb = macro_bias if isinstance(macro_bias, dict) and macro_bias else {
+        "bias": "NEUTRAL",
+        "composite_score": 0.0,
+        "rate_differential": 0.0,
+        "price_trend": "RANGING",
+        "sentiment_score": 0.0,
+        "confidence_upgrade": 0,
+        "size_multiplier": 1.0,
+    }
+    mm = float(mb.get("size_multiplier", 1.0) or 0.0)
+    raw_risk = float(risk) * max(0.0, cal_m) * max(0.0, reg_m) * max(0.0, mm)
+    max_allowed = float(CONF_RISK_USD["HIGH"]) * 1.5
+    risk_eff = max(25.0, min(raw_risk, max_allowed))
     meta = {
         "ticker": sym.upper(),
         "tf": tf,
@@ -835,6 +869,7 @@ def exec_trade(
         "regime_wr_10": float(rg.get("wr_10", 0.5) or 0.5),
         "regime_consecutive_losses": int(rg.get("consecutive_losses", 0) or 0),
     }
+    meta.update(macro_result_fields(mb))
     res = order_send(mt5, bs, dire, sl, risk_eff, meta)
     if not res.get("ok"):
         log_msg(f"[FAIL] {sym} {tf} {strat}: {res}", "error")
@@ -1039,6 +1074,10 @@ def daily_job() -> None:
 
 def weekly_job() -> None:
     try:
+        if datetime.now(timezone.utc).weekday() == 0:
+            log_msg("[WEEKLY MACRO SUMMARY]", "info")
+            for ln in weekly_macro_summary_lines(TICKERS):
+                log_msg(ln, "info")
         mt5 = ensure_mt5()
         if not mt5:
             return
