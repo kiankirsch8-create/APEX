@@ -5,7 +5,8 @@ rolling stats, and periodic self-improvement. All state is simple JSON on ``DATA
 """
 from __future__ import annotations
 
-STRATEGY_VERSION = "v7.2-session16"
+STRATEGY_VERSION = "v7.3-session17"
+# v7.3: economic calendar layer (calendar_manager: live feed + historical simulated blocks).
 # v7.2: strategy_status.json + chrono skips LOCKED strategies; UNTESTED loose EMA200/ADX paths (chrono only).
 # v7.1: chrono phase scan (1w→1d→4h→intraday), risk/tp multipliers, separate 4H currency pool,
 # deterministic Layer-2 strategy order, $25 trailing floor + 0.75R/1.5R locks, exotic USD cap exemption,
@@ -41,6 +42,7 @@ from anthropic import Anthropic
 
 import pandas_ta  # noqa: F401
 
+from calendar_manager import check_calendar_risk_historical
 from utils import DATA_DIR, env, load_json, log, save_json, utcnow_iso
 
 # ── COOLDOWN TRACKER — module-level, NEVER inside any loop ──
@@ -2743,6 +2745,10 @@ def _skipped_backtest_row(
         "timeframe_restricted": tf_key == "1h",
         "tf_strategy_allowed": tf_key != "1h" or sid in ALLOWED_1H_STRATEGIES,
         "trailing_plan": str(ai.get("trailing_plan") or "")[:500],
+        "calendar_action": str(ai.get("calendar_action") or "CLEAR"),
+        "calendar_reason": str(
+            ai.get("calendar_reason") or "No high-impact events within 48h",
+        ),
     }
 
 
@@ -2762,6 +2768,7 @@ def _python_forced_layer2_trade(
     chrono_risk_mult: float = 1.0,
     chrono_tp_mult: float = 1.0,
     chrono_job: bool = False,
+    calendar_risk: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Execute Layer 2+ setup without Claude (v7.1)."""
     if not layer2:
@@ -2850,7 +2857,15 @@ def _python_forced_layer2_trade(
         ai["confidence"] = str(meta.get("confidence") or "LOW").strip().upper()
 
     ai = enforce_rules(ai, tf_key, float(price), sym, rsi=float(rsi_live))
+    cal = calendar_risk or {
+        "action": "CLEAR",
+        "reason": "No high-impact events within 48h",
+        "size_multiplier": 1.0,
+    }
     if ai.get("skip_trade"):
+        ai2 = dict(ai)
+        ai2["calendar_action"] = str(cal.get("action", "CLEAR"))
+        ai2["calendar_reason"] = str(cal.get("reason", ""))
         return _skipped_backtest_row(
             sym=sym,
             timeframe=timeframe,
@@ -2859,7 +2874,7 @@ def _python_forced_layer2_trade(
             zone_pct=zone_pct,
             zone_label=zone_label,
             skip_reason=str(ai.get("skip_reason") or "enforce after Python force"),
-            ai=ai,
+            ai=ai2,
             tf_key=tf_key,
             is_exotic=is_exotic,
         )
@@ -2870,6 +2885,18 @@ def _python_forced_layer2_trade(
         chrono_risk_mult=chrono_risk_mult,
         chrono_tp_mult=chrono_tp_mult,
     )
+
+    cmult = float(cal.get("size_multiplier", 1.0))
+    if 0 < cmult < 1.0:
+        mrd0 = float(ai.get("_max_risk_dollars", 0) or 0)
+        ent0 = float(ai.get("entry", price) or price)
+        st0 = float(ai.get("stop_loss", 0) or 0)
+        sd0 = abs(ent0 - st0)
+        if mrd0 > 0 and sd0 > 0 and ent0 > 0:
+            ai["_max_risk_dollars"] = round(mrd0 * cmult, 2)
+            ps = ai["_max_risk_dollars"] / sd0
+            ai["_position_size"] = round(ps, 2)
+            ai["_leveraged_exposure"] = round(ps * ent0, 2)
 
     entry = float(ai.get("entry", entry) or entry)
     stop = float(ai.get("stop_loss", stop) or stop)
@@ -3003,6 +3030,8 @@ def _python_forced_layer2_trade(
         "final_stop": round(final_stop, 5),
         "skipped": False,
         "skip_trade": False,
+        "calendar_action": str(cal.get("action", "CLEAR")),
+        "calendar_reason": str(cal.get("reason", "")),
     }
 
 
@@ -3019,6 +3048,40 @@ def run_one_backtest(
     try:
         sym = (ticker or "").strip().upper()
         tf_key = timeframe.lower().strip()
+        hist_cal: dict[str, Any] = {
+            "action": "CLEAR",
+            "reason": "No high-impact events within 48h",
+            "size_multiplier": 1.0,
+        }
+        scan_d: date | None = None
+        try:
+            scan_d = date.fromisoformat(analysis_date.strip()[:10])
+        except (TypeError, ValueError):
+            scan_d = None
+        if scan_d is not None:
+            hist_cal = check_calendar_risk_historical(sym, scan_d)
+            if hist_cal.get("action") == "BLOCK":
+                return _skipped_backtest_row(
+                    sym=sym,
+                    timeframe=timeframe,
+                    analysis_date=analysis_date.strip(),
+                    price=0.0,
+                    zone_pct=50.0,
+                    zone_label="EQUILIBRIUM",
+                    skip_reason=str(hist_cal.get("reason") or "Calendar block (simulated)"),
+                    ai={
+                        "strategy_id": "SKIP",
+                        "strategy_met": False,
+                        "skip_trade": True,
+                        "direction": "NONE",
+                        "conviction_score": 0,
+                        "calendar_action": "BLOCK",
+                        "calendar_reason": str(hist_cal.get("reason") or ""),
+                    },
+                    tf_key=tf_key,
+                    is_exotic=sym in EXOTIC_REDUCE,
+                )
+
         is_forex = len(sym) == 6 and sym.isalpha()
         yf_ticker = sym + "=X" if is_forex else sym
 
@@ -3338,6 +3401,7 @@ def run_one_backtest(
                 chrono_risk_mult=chrono_risk_mult,
                 chrono_tp_mult=chrono_tp_mult,
                 chrono_job=chrono_yfinance,
+                calendar_risk=hist_cal,
             )
             return forced
 
@@ -3399,6 +3463,9 @@ def run_one_backtest(
 
         def _skip_out(reason: str, src: dict[str, Any] | None = None) -> dict[str, Any]:
             log(f"[SKIP] {sym} {timeframe}: {reason}", level="info")
+            merged_ai = dict(src if src is not None else ai)
+            merged_ai["calendar_action"] = str(hist_cal.get("action", "CLEAR"))
+            merged_ai["calendar_reason"] = str(hist_cal.get("reason", ""))
             return _skipped_backtest_row(
                 sym=sym,
                 timeframe=timeframe,
@@ -3407,7 +3474,7 @@ def run_one_backtest(
                 zone_pct=zone_pct,
                 zone_label=zone_label,
                 skip_reason=reason,
-                ai=src if src is not None else ai,
+                ai=merged_ai,
                 tf_key=tf_key,
                 is_exotic=is_exotic,
             )
@@ -3719,6 +3786,8 @@ def run_one_backtest(
             "final_stop": round(final_stop, 5),
             "skipped": False,
             "skip_trade": False,
+            "calendar_action": str(hist_cal.get("action", "CLEAR")),
+            "calendar_reason": str(hist_cal.get("reason", "")),
         }
 
     except Exception as e:  # noqa: BLE001
