@@ -1182,6 +1182,58 @@ def _next_scan_hour(now: datetime) -> int:
     return SCAN_HOURS[0]
 
 
+def next_scan_datetime_utc(now: datetime | None = None) -> datetime:
+    """Earliest future UTC time at minute 0 whose hour is in ``SCAN_HOURS`` (strictly after ``now``)."""
+    t = now or datetime.now(timezone.utc)
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    cand = t.replace(minute=0, second=0, microsecond=0)
+    if cand <= t:
+        cand = cand + timedelta(hours=1)
+    for _ in range(24 * 14):
+        if cand.hour in SCAN_HOURS:
+            return cand
+        cand = cand + timedelta(hours=1)
+    return cand
+
+
+def emit_startup_diagnostics() -> None:
+    """
+    Log within a few seconds of process start (does not wait for SCAN_HOURS):
+    (1) password env present, (2) MT5 account + balance or failure, (3) next scan UTC.
+    """
+    pw = (os.environ.get("APEX_MT5_PASSWORD") or os.environ.get("MT5_PASSWORD") or "").strip()
+    pw_ok = bool(pw)
+    line1 = f"[STARTUP] APEX_MT5_PASSWORD / MT5_PASSWORD: {'set (non-empty)' if pw_ok else 'MISSING — export APEX_MT5_PASSWORD'}"
+    print(line1)
+    log_msg(line1, "info" if pw_ok else "warning")
+
+    mt5 = ensure_mt5()
+    if not mt5:
+        line2 = "[STARTUP] MT5: NOT connected (see apex_log.txt for details)"
+        print(line2)
+        log_msg(line2, "error")
+    else:
+        try:
+            ai = mt5.account_info()
+            if ai is None:
+                line2 = "[STARTUP] MT5: connected but account_info() returned None"
+            else:
+                line2 = (
+                    f"[STARTUP] MT5: OK | login={int(ai.login)} | server={getattr(ai, 'server', '')!s} "
+                    f"| balance={float(ai.balance):,.2f} {ai.currency}"
+                )
+        except Exception as e:  # noqa: BLE001
+            line2 = f"[STARTUP] MT5: connected but account_info failed: {e}"
+        print(line2)
+        log_msg(line2, "info" if "OK" in line2 else "warning")
+
+    nxt = next_scan_datetime_utc(datetime.now(timezone.utc))
+    line3 = f"[STARTUP] Next scan (UTC): {nxt.strftime('%Y-%m-%d %H:%M')} (hours {SCAN_HOURS})"
+    print(line3)
+    log_msg(line3, "info")
+
+
 def print_status_quick(mt5: Any) -> None:
     st = load_live_state()
     ai = mt5.account_info()
@@ -1198,7 +1250,7 @@ def print_status_quick(mt5: Any) -> None:
 def main_loop() -> None:
     st = load_live_state()
     last_slot = str(st.get("last_scan_slot") or "")
-    log_msg("[APEX] v7.3 live — SCAN_HOURS UTC; set APEX_MT5_PASSWORD", "info")
+    emit_startup_diagnostics()
 
     while True:
         try:
