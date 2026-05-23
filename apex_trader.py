@@ -4,7 +4,7 @@ APEX v7.3 Live — MT5 execution aligned with Railway backtest intelligence (May
 Deploy to Windows VPS as ``C:\\Apex\\apex_trader.py`` (or set ``APEX_DATA_DIR``).
 
 - Scans 8× daily at fixed UTC hours (no APScheduler tight loop).
-- Uses ``prefilter_v6.python_prefilter`` + same indicator pipeline as ``continuous_backtester``.
+- Uses ``prefilter_v6.python_prefilter`` + pandas/numpy TA columns (no ``pandas_ta`` / numba).
 - Six locked strategies only; macro + calendar + regime + trend + confluence sizing stack.
 - Simplified cooldowns vs legacy script; crash-safe main loop + MT5 reconnect.
 
@@ -25,8 +25,8 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
-import pandas_ta  # noqa: F401 — registers DataFrame ``.ta`` accessor
 import yfinance as yf
 
 from calendar_manager import check_calendar_risk
@@ -179,8 +179,72 @@ def ticket_meta_save(d: dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# OHLCV + indicators (mirrors continuous_backtester.run_one_backtest pipeline)
+# OHLCV + indicators (pandas/numpy only — no pandas_ta / numba on Windows VPS)
 # ---------------------------------------------------------------------------
+
+
+def _ema(s: pd.Series, span: int) -> pd.Series:
+    return s.ewm(span=span, adjust=False).mean()
+
+
+def _rsi_series(s: pd.Series, period: int = 14) -> pd.Series:
+    d = s.diff()
+    g = d.clip(lower=0.0)
+    lo = (-d.clip(upper=0.0))
+    ag = g.ewm(alpha=1.0 / period, adjust=False).mean()
+    al = lo.ewm(alpha=1.0 / period, adjust=False).mean()
+    rs = ag / al.replace(0.0, float("nan"))
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def _true_range(h: pd.Series, l: pd.Series, c: pd.Series) -> pd.Series:
+    prev = c.shift(1)
+    return (h - l).combine((h - prev).abs(), max).combine((l - prev).abs(), max)
+
+
+def _atr_wilder(h: pd.Series, l: pd.Series, c: pd.Series, period: int = 14) -> pd.Series:
+    tr = _true_range(h, l, c)
+    return tr.ewm(alpha=1.0 / period, adjust=False).mean()
+
+
+def _adx_wilder(h: pd.Series, l: pd.Series, c: pd.Series, period: int = 14) -> pd.Series:
+    up = h.diff()
+    dn = -l.diff()
+    pdm = ((up > dn) & (up > 0)) * up
+    mdm = ((dn > up) & (dn > 0)) * dn
+    tr = _true_range(h, l, c)
+    atr = tr.ewm(alpha=1.0 / period, adjust=False).mean()
+    pdi = 100.0 * (pdm.ewm(alpha=1.0 / period, adjust=False).mean() / atr.replace(0, np.nan))
+    mdi = 100.0 * (mdm.ewm(alpha=1.0 / period, adjust=False).mean() / atr.replace(0, np.nan))
+    dx = (100.0 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)).fillna(0.0)
+    return dx.ewm(alpha=1.0 / period, adjust=False).mean().fillna(0.0)
+
+
+def _append_indicators_numpy(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Append columns using the same names ``python_prefilter`` / backtester expect
+    (RSI_14, MACD_*, EMA_*, ATRr_14, ADX_14, BBL_/BBM_/BBU_*).
+    """
+    out = df.copy()
+    c = out["Close"].astype(float)
+    h = out["High"].astype(float)
+    l = out["Low"].astype(float)
+    out["EMA_20"] = _ema(c, 20)
+    out["EMA_50"] = _ema(c, 50)
+    out["EMA_200"] = _ema(c, 200)
+    out["RSI_14"] = _rsi_series(c, 14)
+    macd_line = _ema(c, 12) - _ema(c, 26)
+    out["MACD_12_26_9"] = macd_line
+    out["MACDs_12_26_9"] = _ema(macd_line, 9)
+    out["MACDh_12_26_9"] = out["MACD_12_26_9"] - out["MACDs_12_26_9"]
+    mid = c.rolling(20, min_periods=20).mean()
+    sd = c.rolling(20, min_periods=20).std(ddof=0)
+    out["BBM_20_2.0_2.0"] = mid
+    out["BBU_20_2.0_2.0"] = mid + 2.0 * sd
+    out["BBL_20_2.0_2.0"] = mid - 2.0 * sd
+    out["ATRr_14"] = _atr_wilder(h, l, c, 14)
+    out["ADX_14"] = _adx_wilder(h, l, c, 14)
+    return out
 
 
 def _pick_bb_cols(df: pd.DataFrame) -> tuple[str, str, str]:
@@ -205,7 +269,7 @@ def yf_ticker(sym: str) -> str:
 
 
 def fetch_past_for_prefilter(sym: str, tf_key: str) -> pd.DataFrame | None:
-    """Enough history for weekly/daily pandas_ta columns + swings."""
+    """Enough history for weekly/daily indicators + swings."""
     t = yf_ticker(sym)
     try:
         if tf_key == "1w":
@@ -233,15 +297,7 @@ def fetch_past_for_prefilter(sym: str, tf_key: str) -> pd.DataFrame | None:
 def build_prefilter_inputs(past: pd.DataFrame, sym: str) -> tuple[dict[str, Any], float, float] | None:
     """Return (ind dict, zone_pct, price) for python_prefilter."""
     try:
-        past = past.copy()
-        past.ta.rsi(length=14, append=True)
-        past.ta.macd(append=True)
-        past.ta.ema(length=20, append=True)
-        past.ta.ema(length=50, append=True)
-        past.ta.ema(length=200, append=True)
-        past.ta.bbands(length=20, append=True)
-        past.ta.atr(length=14, append=True)
-        past.ta.adx(length=14, append=True)
+        past = _append_indicators_numpy(past)
     except Exception as e:  # noqa: BLE001
         log_msg(f"[ta] {sym}: {e}", "warning")
         return None
