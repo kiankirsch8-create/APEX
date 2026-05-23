@@ -1,10 +1,14 @@
 """
-APEX live MT5 trader — FTMO-style soft limits, Layer 1 (Claude gate) + Layer 2 Python,
-v7.1-style filters, trailing, persistence.
+APEX v7.3 Live — MT5 execution aligned with Railway backtest intelligence (May 2026).
 
-Place or symlink at ``C:\\APEX\\apex_trader.py`` or set ``APEX_DATA_DIR`` to your data folder.
+Deploy to Windows VPS as ``C:\\Apex\\apex_trader.py`` (or set ``APEX_DATA_DIR``).
 
-**Never put your MT5 password in this file.** Use environment variable ``APEX_MT5_PASSWORD``.
+- Scans 8× daily at fixed UTC hours (no APScheduler tight loop).
+- Uses ``prefilter_v6.python_prefilter`` + same indicator pipeline as ``continuous_backtester``.
+- Six locked strategies only; macro + calendar + regime + trend + confluence sizing stack.
+- Simplified cooldowns vs legacy script; crash-safe main loop + MT5 reconnect.
+
+**Never store MT5 password in this file.** Use ``APEX_MT5_PASSWORD``.
 """
 
 from __future__ import annotations
@@ -13,14 +17,17 @@ import json
 import logging
 import math
 import os
-import re
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
+
+import pandas as pd
+import pandas_ta  # noqa: F401 — registers DataFrame ``.ta`` accessor
+import yfinance as yf
 
 from calendar_manager import check_calendar_risk
 from macro_manager import (
@@ -28,112 +35,87 @@ from macro_manager import (
     get_macro_bias,
     macro_result_fields,
     set_backtest_mode,
-    weekly_macro_summary_lines,
 )
+from prefilter_v6 import python_prefilter
 from regime_manager import get_regime_cached
+from trend_manager import apply_trend_filter
 
 set_backtest_mode(False)
 
-CURRENT_JOB_ID = os.environ.get("APEX_JOB_ID", "live")
-
 # ---------------------------------------------------------------------------
-# Paths
+# Paths (default Windows: C:\\Apex — case-insensitive on NTFS)
 # ---------------------------------------------------------------------------
 
 
 def _base_dir() -> Path:
     if os.name == "nt":
-        default = r"C:\APEX"
+        default = r"C:\Apex"
     else:
-        default = str(Path.home() / "APEX")
+        default = str(Path.home() / "Apex")
     return Path(os.environ.get("APEX_DATA_DIR", default)).resolve()
 
 
 BASE_DIR = _base_dir()
+LIVE_STATE_FILE = BASE_DIR / "live_state.json"
+LIVE_TRADES_LOG = BASE_DIR / "live_trades_log.txt"
 LOG_FILE = BASE_DIR / "apex_log.txt"
-COOLDOWN_FILE = BASE_DIR / "cooldowns.json"
-LOSS_FILE = BASE_DIR / "loss_tracking.json"
-STATE_FILE = BASE_DIR / "apex_trader_state.json"
 TICKET_META_FILE = BASE_DIR / "apex_trader_tickets.json"
-STRATEGY_COUNTS_FILE = BASE_DIR / "strategy_trade_counts.json"
 
 MT5_LOGIN = int(os.environ.get("APEX_MT5_LOGIN", "107356886"))
 MT5_SERVER = os.environ.get("APEX_MT5_SERVER", "MetaQuotes-Demo")
 STARTING_BALANCE = float(os.environ.get("APEX_STARTING_BALANCE", "100000"))
 
-DAILY_SOFT_LIMIT = 4000.0
-TOTAL_SOFT_LIMIT = 8000.0
-PHASE1_PROFIT = 10000.0
+SCAN_HOURS = [0, 3, 7, 9, 12, 15, 18, 21]
 
-APEX_MAGIC = 107356887
-ORDER_COMMENT = "APEX"
+TICKERS: list[str] = [
+    "AUDUSD", "AUDJPY", "CADJPY", "CHFJPY", "EURAUD", "EURCHF",
+    "EURGBP", "EURNZD", "EURUSD", "GBPAUD", "GBPCAD", "GBPCHF",
+    "GBPJPY", "GBPNZD", "GBPUSD", "NZDCAD", "NZDJPY", "NZDUSD",
+    "USDCAD", "USDCHF", "USDJPY", "USDMXN", "USDNOK", "USDSEK",
+    "USDZAR", "QQQ",
+]
 
-CONF_RISK_USD: dict[str, float] = {"HIGH": 1500.0, "MEDIUM": 1000.0, "LOW": 300.0}
-TF_RISK_MULT: dict[str, float] = {"1w": 1.0, "1d": 0.85, "4h": 0.70}
+TIMEFRAMES: tuple[str, ...] = ("1w", "1d")
 
-# FIX 27 — live MT5: only elite strategies (Railway backtests all 68).
-LIVE_ALLOWED_STRATEGIES: frozenset[str] = frozenset(
+LIVE_STRATEGIES: frozenset[str] = frozenset(
     {
         "T01_EMA_PULLBACK",
         "R01_EXTREME_ZONE_REVERSION",
         "SMC05_EQUAL_HL_HUNT",
-        "M07_VOLUME_SURGE_MOMENTUM",
-        "M03_RSI_MOMENTUM_CONTINUATION",
+        "M02_MACD_ZERO_CROSS",
         "T07_MA_RIBBON_ALIGNMENT",
-        "SMC01_SR_FLIP",
+        "M03_RSI_MOMENTUM_CONTINUATION",
     }
 )
 
+# Base risk fractions (balance %) after macro confidence upgrade — matches backtest RISK_BY_CONFIDENCE style.
+RISK_FRAC_BY_CONFIDENCE: dict[str, float] = {"LOW": 0.005, "MEDIUM": 0.010, "HIGH": 0.017}
 
-def live_elite_strategy_ok(strategy_id: str, confidence: str) -> tuple[bool, str]:
-    sid = (strategy_id or "").strip().upper()
-    conf_u = (confidence or "").strip().upper()
-    if sid not in LIVE_ALLOWED_STRATEGIES:
-        return False, f"LIVE SKIP: {sid} not in elite set"
-    if sid == "M03_RSI_MOMENTUM_CONTINUATION" and conf_u != "HIGH":
-        return False, "LIVE SKIP: M03 not HIGH confidence"
-    return True, ""
-
+APEX_MAGIC = 107356887
+ORDER_COMMENT = "APEX"
 
 EXOTIC_PAIRS = frozenset({"USDMXN", "USDZAR", "USDNOK", "USDSEK"})
-
-TICKERS: tuple[str, ...] = (
-    "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "NZDUSD", "USDCHF",
-    "EURGBP", "EURJPY", "EURAUD", "EURNZD", "EURCAD", "EURCHF",
-    "GBPJPY", "GBPNZD", "GBPAUD", "GBPCAD", "GBPCHF",
-    "AUDJPY", "AUDCAD", "AUDNZD", "NZDCAD", "NZDJPY", "CADJPY", "CHFJPY",
-    "USDMXN", "USDZAR", "USDNOK", "USDSEK", "QQQ",
-)
-
-_MIN_TRAIL_LOCK_USD = 25.0
 
 _log_lock = threading.Lock()
 _logger: logging.Logger | None = None
 
 
-def _ensure_logger() -> logging.Logger:
-    global _logger
-    if _logger is not None:
-        return _logger
-    BASE_DIR.mkdir(parents=True, exist_ok=True)
-    lg = logging.getLogger("apex_trader")
-    lg.setLevel(logging.INFO)
-    lg.handlers.clear()
-    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-    fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
-    fh.setFormatter(fmt)
-    sh = logging.StreamHandler(sys.stdout)
-    sh.setFormatter(fmt)
-    lg.addHandler(fh)
-    lg.addHandler(sh)
-    _logger = lg
-    return lg
-
-
 def log_msg(msg: str, level: str = "info") -> None:
-    lg = _ensure_logger()
+    global _logger
+    if _logger is None:
+        BASE_DIR.mkdir(parents=True, exist_ok=True)
+        _logger = logging.getLogger("apex_trader")
+        _logger.setLevel(logging.INFO)
+        _logger.handlers.clear()
+        fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+        fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+        fh.setFormatter(fmt)
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setFormatter(fmt)
+        _logger.addHandler(fh)
+        _logger.addHandler(sh)
     with _log_lock:
-        getattr(lg, level.lower(), lg.info)(msg)
+        getattr(_logger, level.lower(), _logger.info)(msg)
 
 
 def _load(path: Path, default: Any) -> Any:
@@ -157,71 +139,64 @@ def _save(path: Path, data: Any) -> None:
         log_msg(f"[state] save {path.name}: {e}", "error")
 
 
-@dataclass
-class CooldownState:
-    last_trade: dict[str, str] = field(default_factory=dict)
-    traded_day: str = ""
-    traded_tickers: list[str] = field(default_factory=list)
-
-
-@dataclass
-class LossState:
-    consec: dict[str, int] = field(default_factory=dict)
-    last_outcome_date: dict[str, str] = field(default_factory=dict)
-
-
-def load_cooldown_state() -> CooldownState:
-    raw = _load(COOLDOWN_FILE, {})
-    st = CooldownState()
-    if isinstance(raw, dict):
-        st.last_trade = {str(k): str(v) for k, v in (raw.get("last_trade") or {}).items()}
-        st.traded_day = str(raw.get("traded_day") or "")
-        st.traded_tickers = [str(x).upper() for x in (raw.get("traded_tickers") or [])]
-    return st
-
-
-def save_cooldown_state(st: CooldownState) -> None:
-    _save(
-        COOLDOWN_FILE,
-        {"last_trade": st.last_trade, "traded_day": st.traded_day, "traded_tickers": st.traded_tickers},
+def load_live_state() -> dict[str, Any]:
+    d = _load(
+        LIVE_STATE_FILE,
+        {
+            "last_scan_slot": "",
+            "last_trade_open": {},
+            "last_trade_closed": {},
+            "loss_consec": {},
+            "loss_last_date": {},
+            "day_key": "",
+            "day_anchor": None,
+            "anchor_equity": None,
+            "halted_dd": False,
+        },
     )
+    return d if isinstance(d, dict) else {}
 
 
-def load_loss_state() -> LossState:
-    raw = _load(LOSS_FILE, {})
-    st = LossState()
-    if isinstance(raw, dict):
-        st.consec = {str(k): int(v) for k, v in (raw.get("consec") or {}).items()}
-        st.last_outcome_date = {str(k): str(v) for k, v in (raw.get("last_outcome_date") or {}).items()}
-    return st
+def save_live_state(d: dict[str, Any]) -> None:
+    _save(LIVE_STATE_FILE, d)
 
 
-def save_loss_state(st: LossState) -> None:
-    _save(LOSS_FILE, {"consec": st.consec, "last_outcome_date": st.last_outcome_date})
+def append_trade_log(line: str) -> None:
+    try:
+        BASE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(LIVE_TRADES_LOG, "a", encoding="utf-8") as f:
+            f.write(line.rstrip() + "\n")
+    except OSError as e:
+        log_msg(f"[log] live_trades_log: {e}", "warning")
 
 
-def load_strategy_counts() -> dict[str, int]:
-    raw = _load(STRATEGY_COUNTS_FILE, {})
-    return {str(k): int(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
+def ticket_meta_load() -> dict[str, Any]:
+    return _load(TICKET_META_FILE, {})
 
 
-def save_strategy_counts(c: dict[str, int]) -> None:
-    _save(STRATEGY_COUNTS_FILE, c)
+def ticket_meta_save(d: dict[str, Any]) -> None:
+    _save(TICKET_META_FILE, d)
 
 
-def load_ftmo_state() -> dict[str, Any]:
-    return _load(
-        STATE_FILE,
-        {"trading_day_dates": [], "anchor_equity": None, "day_anchor": None, "day_key": ""},
-    )
+# ---------------------------------------------------------------------------
+# OHLCV + indicators (mirrors continuous_backtester.run_one_backtest pipeline)
+# ---------------------------------------------------------------------------
 
 
-def save_ftmo_state(d: dict[str, Any]) -> None:
-    _save(STATE_FILE, d)
+def _pick_bb_cols(df: pd.DataFrame) -> tuple[str, str, str]:
+    lower = mid = upper = ""
+    for c in df.columns:
+        if str(c).startswith("BBL_"):
+            lower = c
+        elif str(c).startswith("BBM_"):
+            mid = c
+        elif str(c).startswith("BBU_"):
+            upper = c
+    return lower, mid, upper
 
 
-def yahoo_ticker(sym: str) -> str:
-    s = sym.strip().upper()
+def yf_ticker(sym: str) -> str:
+    s = (sym or "").strip().upper()
     if s == "QQQ":
         return "QQQ"
     if len(s) == 6 and s.isalpha():
@@ -229,198 +204,226 @@ def yahoo_ticker(sym: str) -> str:
     return s
 
 
-def fetch_df(sym: str, interval: str, period: str) -> Any:
-    import pandas as pd
-    import yfinance as yf
-
-    df = yf.download(yahoo_ticker(sym), period=period, interval=interval, progress=False, auto_adjust=False)
-    if df is None or df.empty:
-        return pd.DataFrame()
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [str(c[0]).lower() for c in df.columns]
-    else:
-        df.columns = [str(c).lower() for c in df.columns]
-    if "adj close" in df.columns and "close" not in df.columns:
-        df.rename(columns={"adj close": "close"}, inplace=True)
-    return df.dropna(subset=["close"])
-
-
-def ema(s: Any, span: int) -> Any:
-    return s.ewm(span=span, adjust=False).mean()
-
-
-def rsi_series(s: Any, period: int = 14) -> Any:
-    d = s.diff()
-    g = d.clip(lower=0.0)
-    l = (-d.clip(upper=0.0))
-    ag = g.ewm(alpha=1.0 / period, adjust=False).mean()
-    al = l.ewm(alpha=1.0 / period, adjust=False).mean()
-    rs = ag / al.replace(0.0, float("nan"))
-    return 100.0 - (100.0 / (1.0 + rs))
-
-
-def true_range(h: Any, l: Any, c: Any) -> Any:
-    prev = c.shift(1)
-    return (h - l).combine((h - prev).abs(), max).combine((l - prev).abs(), max)
-
-
-def atr_wilder(h: Any, l: Any, c: Any, period: int = 14) -> Any:
-    return true_range(h, l, c).ewm(alpha=1.0 / period, adjust=False).mean()
-
-
-def adx_wilder(h: Any, l: Any, c: Any, period: int = 14) -> Any:
-    import numpy as np
-    import pandas as pd
-
-    up = h.diff()
-    dn = -l.diff()
-    pdm = ((up > dn) & (up > 0)) * up
-    mdm = ((dn > up) & (dn > 0)) * dn
-    tr = true_range(h, l, c)
-    atr = tr.ewm(alpha=1.0 / period, adjust=False).mean()
-    pdi = 100.0 * (pdm.ewm(alpha=1.0 / period, adjust=False).mean() / atr.replace(0, np.nan))
-    mdi = 100.0 * (mdm.ewm(alpha=1.0 / period, adjust=False).mean() / atr.replace(0, np.nan))
-    dx = (100.0 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)).fillna(0.0)
-    return dx.ewm(alpha=1.0 / period, adjust=False).mean().fillna(0.0)
-
-
-def zone_pct_52w(c: Any, h: Any, l: Any, lb: int) -> float:
-    wh = h.rolling(lb, min_periods=max(20, lb // 10)).max()
-    wl = l.rolling(lb, min_periods=max(20, lb // 10)).min()
-    hi, lo, cl = float(wh.iloc[-1]), float(wl.iloc[-1]), float(c.iloc[-1])
-    if not math.isfinite(hi) or not math.isfinite(lo) or hi <= lo:
-        return 50.0
-    return float(max(0.0, min(100.0, (cl - lo) / (hi - lo) * 100.0)))
-
-
-def build_indicators(sym: str, interval: str) -> dict[str, Any] | None:
+def fetch_past_for_prefilter(sym: str, tf_key: str) -> pd.DataFrame | None:
+    """Enough history for weekly/daily pandas_ta columns + swings."""
+    t = yf_ticker(sym)
     try:
-        period = "730d" if interval == "1wk" else "400d" if interval == "1d" else "120d"
-        df = fetch_df(sym, interval, period)
-        if df.empty or len(df) < 60:
-            return None
-        c = df["close"].astype(float)
-        h = df["high"].astype(float)
-        l = df["low"].astype(float)
-        e20, e50, e200 = ema(c, 20), ema(c, 50), ema(c, 200)
-        r = rsi_series(c, 14)
-        atrv = atr_wilder(h, l, c, 14)
-        adxv = adx_wilder(h, l, c, 14)
-        zp = zone_pct_52w(c, h, l, 260 if interval == "1wk" else 252)
-        return {
-            "close": float(c.iloc[-1]),
-            "ema20": float(e20.iloc[-1]),
-            "ema50": float(e50.iloc[-1]),
-            "ema200": float(e200.iloc[-1]),
-            "rsi": float(r.iloc[-1]),
-            "rsi_prev": float(r.iloc[-2]) if len(r) > 1 else float(r.iloc[-1]),
-            "atr": float(atrv.iloc[-1]),
-            "adx": float(adxv.iloc[-1]),
-            "zone_pct": float(zp),
-            "_df": df,
-        }
+        if tf_key == "1w":
+            df = yf.download(t, period="max", interval="1wk", progress=False, auto_adjust=False)
+        else:
+            df = yf.download(t, period="5y", interval="1d", progress=False, auto_adjust=False)
     except Exception as e:  # noqa: BLE001
-        log_msg(f"[yf] {sym} {interval}: {e}", "warning")
+        log_msg(f"[yf] {sym} {tf_key}: {e}", "warning")
+        return None
+    if df is None or df.empty:
+        return None
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.copy()
+        df.columns = df.columns.get_level_values(0)
+    df = df.rename(columns={c: str(c).title() for c in df.columns})
+    if "Adj Close" in df.columns and "Close" not in df.columns:
+        df = df.rename(columns={"Adj Close": "Close"})
+    df = df.dropna(subset=["Close"])
+    min_rows = 35 if tf_key == "1w" else 55
+    if len(df) < min_rows:
+        return None
+    return df
+
+
+def build_prefilter_inputs(past: pd.DataFrame, sym: str) -> tuple[dict[str, Any], float, float] | None:
+    """Return (ind dict, zone_pct, price) for python_prefilter."""
+    try:
+        past = past.copy()
+        past.ta.rsi(length=14, append=True)
+        past.ta.macd(append=True)
+        past.ta.ema(length=20, append=True)
+        past.ta.ema(length=50, append=True)
+        past.ta.ema(length=200, append=True)
+        past.ta.bbands(length=20, append=True)
+        past.ta.atr(length=14, append=True)
+        past.ta.adx(length=14, append=True)
+    except Exception as e:  # noqa: BLE001
+        log_msg(f"[ta] {sym}: {e}", "warning")
         return None
 
+    latest = past.iloc[-1]
+    price = round(float(latest["Close"]), 5)
+    if price <= 0:
+        return None
 
-def rr_ok(entry: float, sl: float, tp1: float) -> bool:
+    bbl, bbm, bbu = _pick_bb_cols(past)
+
+    def safe(col: str, default: float = 0.0) -> float:
+        try:
+            if col not in past.columns:
+                return default
+            v = past[col].iloc[-1]
+            if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
+                return default
+            return round(float(v), 5)
+        except Exception:  # noqa: BLE001
+            return default
+
+    ind: dict[str, Any] = {
+        "rsi": safe("RSI_14"),
+        "macd_hist": safe("MACDh_12_26_9"),
+        "ema20": safe("EMA_20", price),
+        "ema50": safe("EMA_50", price),
+        "ema200": safe("EMA_200", price),
+        "atr": safe("ATRr_14"),
+        "adx": safe("ADX_14"),
+        "bb_upper": safe(bbu, price) if bbu else price,
+        "bb_lower": safe(bbl, price) if bbl else price,
+    }
+    try:
+        if "MACD_12_26_9" in past.columns and "MACDs_12_26_9" in past.columns:
+            ind["macd_line"] = round(float(past["MACD_12_26_9"].iloc[-1]), 5)
+            ind["macd_signal"] = round(float(past["MACDs_12_26_9"].iloc[-1]), 5)
+        else:
+            ind["macd_line"] = 0.0
+            ind["macd_signal"] = 0.0
+    except Exception:  # noqa: BLE001
+        ind["macd_line"] = 0.0
+        ind["macd_signal"] = 0.0
+
+    try:
+        if bbm and bbm in past.columns:
+            ind["bb_mid"] = round(float(past[bbm].iloc[-1]), 5)
+        else:
+            ind["bb_mid"] = round((ind["bb_upper"] + ind["bb_lower"]) / 2, 5)
+    except Exception:  # noqa: BLE001
+        ind["bb_mid"] = round((ind["bb_upper"] + ind["bb_lower"]) / 2, 5)
+
+    try:
+        ind["high_52w"] = round(float(past["High"].max()), 5)
+        ind["low_52w"] = round(float(past["Low"].min()), 5)
+    except Exception:  # noqa: BLE001
+        ind["high_52w"] = ind["low_52w"] = round(float(price), 5)
+
+    swing_highs: list[float] = []
+    swing_lows: list[float] = []
+    recent = past.tail(50)
+    if len(recent) > 11:
+        for i in range(5, len(recent) - 5):
+            try:
+                hi = float(recent["High"].iloc[i])
+                if hi == float(recent["High"].iloc[i - 5 : i + 6].max()):
+                    swing_highs.append(round(hi, 5))
+                lo = float(recent["Low"].iloc[i])
+                if lo == float(recent["Low"].iloc[i - 5 : i + 6].min()):
+                    swing_lows.append(round(lo, 5))
+            except Exception:  # noqa: BLE001
+                continue
+    ind["swing_highs"] = swing_highs[-5:]
+    ind["swing_lows"] = swing_lows[-5:]
+
+    high_52w = float(ind.get("high_52w") or price * 1.1)
+    low_52w = float(ind.get("low_52w") or price * 0.9)
+    if not math.isfinite(high_52w):
+        high_52w = float(price) * 1.1
+    if not math.isfinite(low_52w):
+        low_52w = float(price) * 0.9
+    zone_pct = (
+        round((float(price) - low_52w) / (high_52w - low_52w) * 100, 1)
+        if high_52w > low_52w
+        else 50.0
+    )
+
+    bb_mid_val = float(ind.get("bb_mid", price) or price)
+    if not math.isfinite(bb_mid_val) or bb_mid_val <= 0:
+        bb_mid_val = float(price)
+    try:
+        bb_width = round(
+            (float(ind["bb_upper"]) - float(ind["bb_lower"])) / bb_mid_val * 100,
+            3,
+        )
+    except (TypeError, ValueError, ZeroDivisionError):
+        bb_width = 2.0
+    ind["bb_width"] = bb_width
+
+    return ind, zone_pct, price
+
+
+def run_python_prefilter_live(sym: str, tf_key: str) -> tuple[list[tuple[str, str, int]], float, dict[str, Any], float, str]:
+    """
+    Returns filtered live strategies:
+    ``(rows, price, ind, zone_pct, analysis_date)`` where rows are (sid, dir, score).
+    """
+    past = fetch_past_for_prefilter(sym, tf_key)
+    if past is None:
+        return [], 0.0, {}, 0.0, datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    pack = build_prefilter_inputs(past, sym)
+    if pack is None:
+        return [], 0.0, {}, 0.0, datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    ind, zone_pct, price = pack
+    analysis_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    ok, rows, _reason = python_prefilter(
+        sym,
+        tf_key,
+        float(price),
+        ind,
+        float(zone_pct),
+        analysis_date=analysis_date,
+        past=past,
+    )
+    if not ok:
+        return [], float(price), ind, float(zone_pct), analysis_date
+    out: list[tuple[str, str, int]] = []
+    for sid, dr, sc in rows:
+        su = str(sid).strip().upper()
+        if su in LIVE_STRATEGIES:
+            out.append((su, str(dr).strip().upper(), int(sc)))
+    return out, float(price), ind, float(zone_pct), analysis_date
+
+
+# ---------------------------------------------------------------------------
+# Stops / targets (2R / 3R / 5R off entry–stop risk, same as backtest forward sim)
+# ---------------------------------------------------------------------------
+
+
+def stop_tp_bundle(strategy_id: str, direction: str, entry: float, atr: float) -> tuple[float, float, float, float]:
+    """Return (sl, tp1, tp2, tp3). T01/R01 use legacy live multipliers; others 1.5 ATR stop."""
+    d = direction.strip().upper()
+    mult = 1.0 if d == "LONG" else -1.0
+    sid = strategy_id.strip().upper()
+    if sid == "T01_EMA_PULLBACK":
+        sl = entry - mult * 1.5 * atr
+        tp1 = entry + mult * 3.0 * atr
+        tp2 = entry + mult * 4.5 * atr
+    elif sid == "R01_EXTREME_ZONE_REVERSION":
+        sl = entry - mult * 2.0 * atr
+        tp1 = entry + mult * 4.0 * atr
+        tp2 = entry + mult * 6.0 * atr
+    else:
+        sl = entry - mult * 1.5 * atr
+        tp1 = entry + mult * 3.5 * atr
+        tp2 = entry + mult * 5.5 * atr
+    r = abs(entry - sl)
+    if r <= 0:
+        r = abs(entry) * 0.005
+    tp3 = entry + mult * 5.0 * r
+    return round(sl, 5), round(tp1, 5), round(tp2, 5), round(tp3, 5)
+
+
+def rr_ok(entry: float, sl: float, tp1: float, direction: str) -> bool:
     risk = abs(entry - sl)
-    return risk > 0 and abs(tp1 - entry) / risk >= 2.0 - 1e-9
+    if risk <= 0:
+        return False
+    rew = abs(tp1 - entry)
+    return rew / risk >= 2.0 - 1e-9
 
 
-def layer1_t01(d: str, ind: dict[str, Any], zp: float) -> bool:
-    e20, e50, e200 = ind["ema20"], ind["ema50"], ind["ema200"]
-    cl, atrv = ind["close"], ind["atr"]
-    dist = abs(cl - e20)
-    if d == "LONG":
-        return e20 > e50 > e200 and zp < 60 and dist <= 2.5 * atrv
-    return e20 < e50 < e200 and zp > 40 and dist <= 2.5 * atrv
+# ---------------------------------------------------------------------------
+# Risk helpers
+# ---------------------------------------------------------------------------
 
 
-def layer1_t01_sl_tp(d: str, entry: float, atrv: float) -> tuple[float, float, float]:
-    if d == "LONG":
-        return entry - 1.5 * atrv, entry + 3.0 * atrv, entry + 4.5 * atrv
-    return entry + 1.5 * atrv, entry - 3.0 * atrv, entry - 4.5 * atrv
-
-
-def layer1_r01(d: str, zp: float, rsi_v: float, adx_v: float) -> bool:
-    if d == "LONG":
-        return zp <= 20 and rsi_v <= 40 and adx_v <= 45
-    return zp >= 80 and rsi_v >= 60 and adx_v <= 45
-
-
-def layer1_r01_sl_tp(d: str, entry: float, atrv: float) -> tuple[float, float, float]:
-    if d == "LONG":
-        return entry - 2.0 * atrv, entry + 4.0 * atrv, entry + 6.0 * atrv
-    return entry + 2.0 * atrv, entry - 4.0 * atrv, entry - 6.0 * atrv
-
-
-def layer2_t02(df: Any) -> str | None:
-    if len(df) < 4:
-        return None
-    e20 = ema(df["close"].astype(float), 20)
-    e50 = ema(df["close"].astype(float), 50)
-    for k in (-1, -2, -3):
-        if float(e20.iloc[k - 1]) <= float(e50.iloc[k - 1]) and float(e20.iloc[k]) > float(e50.iloc[k]):
-            return "LONG"
-        if float(e20.iloc[k - 1]) >= float(e50.iloc[k - 1]) and float(e20.iloc[k]) < float(e50.iloc[k]):
-            return "SHORT"
-    return None
-
-
-def layer2_t04(ind: dict[str, Any]) -> str | None:
-    if ind["adx"] <= 25:
-        return None
-    c, e20, e50, e200 = ind["close"], ind["ema20"], ind["ema50"], ind["ema200"]
-    if c > e200 and e20 > e50:
-        return "LONG"
-    if c < e200 and e20 < e50:
-        return "SHORT"
-    return None
-
-
-def layer2_m03(ind: dict[str, Any]) -> str | None:
-    r0, r1 = ind["rsi"], ind["rsi_prev"]
-    if r0 > 60 and r0 > r1:
-        return "LONG"
-    if r0 < 40 and r0 < r1:
-        return "SHORT"
-    return None
-
-
-def layer2_smc01(df: Any) -> str | None:
-    if len(df) < 25:
-        return None
-    low = df["low"].astype(float)
-    high = df["high"].astype(float)
-    close = df["close"].astype(float)
-    wl = low.iloc[-20:-3].min()
-    wh = high.iloc[-20:-3].max()
-    if low.iloc[-4] <= wl * 0.9995 and close.iloc[-1] > wl * 1.001:
-        return "LONG"
-    if high.iloc[-4] >= wh * 1.0005 and close.iloc[-1] < wh * 0.999:
-        return "SHORT"
-    return None
-
-
-def layer2_sl_tp(entry: float, atrv: float, d: str) -> tuple[float, float, float]:
-    if d == "LONG":
-        return entry - 1.5 * atrv, entry + 3.5 * atrv, entry + 5.5 * atrv
-    return entry + 1.5 * atrv, entry - 3.5 * atrv, entry - 5.5 * atrv
-
-
-def ema200_ok(d: str, ind: dict[str, Any]) -> bool:
-    c, e200 = ind["close"], ind["ema200"]
-    return (c >= e200) if d == "LONG" else (c <= e200)
-
-
-def gbpusd_short_block(sym: str, tf: str, d: str, zp: float) -> bool:
-    return sym == "GBPUSD" and tf == "1d" and d == "SHORT" and zp < 80
-
-
-def nzdusd_w1_short_block(sym: str, tf: str, d: str, zp: float) -> bool:
-    return sym == "NZDUSD" and tf == "1w" and d == "SHORT" and zp < 35
+def confluence_multiplier(n: int) -> float:
+    if n >= 3:
+        return 1.5
+    if n == 2:
+        return 1.25
+    return 1.0
 
 
 def get_currencies(ticker: str) -> list[str]:
@@ -428,105 +431,154 @@ def get_currencies(ticker: str) -> list[str]:
     return [t[:3], t[3:]] if len(t) == 6 and t.isalpha() else []
 
 
-def cooldown_ok(
-    cd: CooldownState, loss: LossState, sym: str, tf: str, d: str, today: date
-) -> tuple[bool, str]:
-    su = sym.upper()
-    if cd.traded_day == today.isoformat() and su in cd.traded_tickers:
-        return False, "same_day_dedup"
-    key = f"{su}_{tf.lower()}"
-    last = cd.last_trade.get(key)
-    if last:
-        try:
-            d0 = datetime.strptime(last[:10], "%Y-%m-%d").date()
-            if tf == "1w" and (today - d0).days < 7:
-                return False, "weekly_cooldown_7d"
-            if tf == "1d" and (today - d0).days < 2:
-                return False, "daily_cooldown_2d"
-        except ValueError:
-            pass
-    lk = f"{su}_{tf.lower()}_{d.upper()}"
-    if loss.consec.get(lk, 0) >= 3:
-        ld = loss.last_outcome_date.get(lk)
-        if ld:
-            try:
-                d0 = datetime.strptime(ld[:10], "%Y-%m-%d").date()
-                if (today - d0).days < 21:
-                    return False, "extended_loss_21d"
-            except ValueError:
-                pass
-    return True, ""
-
-
-def currency_cap_ok(sym: str, counts: dict[str, int]) -> tuple[bool, str]:
-    su = sym.upper()
-    for ccy in get_currencies(su):
-        if su in EXOTIC_PAIRS and ccy == "USD":
-            continue
-        if counts.get(ccy, 0) >= 2:
-            return False, f"currency_cap_{ccy}"
-    return True, ""
-
-
-def open_ccy_counts(mt5: Any) -> dict[str, int]:
-    out: dict[str, int] = {}
+def open_position_currency_maps(mt5: Any) -> tuple[set[str], set[str]]:
+    """Currencies with net long / net short exposure from open APEX positions."""
+    long_c: set[str] = set()
+    short_c: set[str] = set()
     for p in mt5.positions_get() or []:
         if int(getattr(p, "magic", 0) or 0) != APEX_MAGIC:
             continue
         raw = str(p.symbol).replace(".", "").upper()
         base = raw[:6] if len(raw) >= 6 and raw[:6].isalpha() else raw
-        for ccy in get_currencies(base):
-            if base[:6] in EXOTIC_PAIRS and ccy == "USD":
-                continue
-            out[ccy] = out.get(ccy, 0) + 1
-    return out
+        ccys = get_currencies(base)
+        if len(ccys) != 2:
+            continue
+        a, b = ccys[0], ccys[1]
+        typ = int(getattr(p, "type", 0) or 0)
+        # MT5: POSITION_TYPE_BUY = 0
+        if typ == 0:
+            long_c.add(a)
+            short_c.add(b)
+        else:
+            short_c.add(a)
+            long_c.add(b)
+    return long_c, short_c
 
 
-def claude_gate(sym: str, tf: str, d: str, ind: dict[str, Any], zp: float) -> tuple[str, str, str]:
-    import json as _json
+def currency_direction_conflict(sym: str, direction: str, mt5: Any) -> tuple[bool, str]:
+    """Block if new trade leg fights an open currency leg (live spec)."""
+    long_c, short_c = open_position_currency_maps(mt5)
+    d = direction.strip().upper()
+    cc = get_currencies(sym)
+    if len(cc) != 2:
+        return False, ""
+    a, b = cc[0], cc[1]
+    if d == "LONG":
+        if a in short_c:
+            return True, f"conflict: {a} short from open exposure"
+        if b in long_c:
+            return True, f"conflict: {b} long from open exposure"
+    else:
+        if a in long_c:
+            return True, f"conflict: {a} long from open exposure"
+        if b in short_c:
+            return True, f"conflict: {b} short from open exposure"
+    return False, ""
 
-    key = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
-    if not key:
-        return "EXECUTE", "HIGH", "no_api_key_fallback"
-    prompt = f"""You are APEX, an expert forex trader. Evaluate this trade setup:
-Ticker: {sym}
-Timeframe: {tf}
-Direction: {d}
-Current price: {ind['close']:.5f}
-EMA20: {ind['ema20']:.5f} EMA50: {ind['ema50']:.5f} EMA200: {ind['ema200']:.5f}
-Zone position: {zp:.1f}% (0=52-week low, 100=52-week high)
-RSI: {ind['rsi']:.2f}
-ATR: {ind['atr']:.6f}
-Respond in JSON only:
-{{
-"verdict": "EXECUTE" or "SKIP",
-"confidence": "HIGH" or "MEDIUM" or "LOW",
-"reasoning": "one sentence"
-}}"""
+
+def is_first_friday_nfp(d: date) -> bool:
+    return d.weekday() == 4 and d.day <= 7
+
+
+def nfp_blocks_symbol(sym: str, today: date) -> bool:
+    if not is_first_friday_nfp(today):
+        return False
+    s = sym.strip().upper()
+    if "USD" in s:
+        return True
+    return False
+
+
+def loss_streak_block(st: dict[str, Any], sym: str, tf: str, direction: str, today: date) -> tuple[bool, str]:
+    lk = f"{sym.strip().upper()}_{tf.lower()}_{direction.strip().upper()}"
+    consec = int((st.get("loss_consec") or {}).get(lk, 0) or 0)
+    if consec < 3:
+        return False, ""
+    ld = str((st.get("loss_last_date") or {}).get(lk, "") or "")[:10]
+    if not ld:
+        return False, ""
     try:
-        import anthropic
+        d0 = date.fromisoformat(ld)
+    except ValueError:
+        return False, ""
+    if (today - d0).days < 21:
+        return True, "extended_loss_21d"
+    return False, ""
 
-        model = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5")
-        client = anthropic.Anthropic(api_key=key)
-        resp = client.messages.create(
-            model=model, max_tokens=200, messages=[{"role": "user", "content": prompt}]
-        )
-        text = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
-        m = re.search(r"\{[^{}]*\}", text, re.DOTALL)
-        if not m:
-            return "EXECUTE", "HIGH", "parse_fail_fallback"
-        data = _json.loads(m.group(0))
-        v = str(data.get("verdict", "SKIP")).upper()
-        c = str(data.get("confidence", "MEDIUM")).upper()
-        r = str(data.get("reasoning", "")).strip()
-        if v not in ("EXECUTE", "SKIP"):
-            v = "EXECUTE"
-        if c not in ("HIGH", "MEDIUM", "LOW"):
-            c = "HIGH"
-        return v, c, r
+
+def closed_cooldown_block(st: dict[str, Any], sym: str, tf: str, today: date) -> tuple[bool, str]:
+    """2-day cooldown after last *close* on this ticker+timeframe."""
+    key = f"{sym.strip().upper()}_{tf.lower()}"
+    last = str((st.get("last_trade_closed") or {}).get(key, "") or "")[:10]
+    if not last:
+        return False, ""
+    try:
+        d0 = date.fromisoformat(last)
+    except ValueError:
+        return False, ""
+    if (today - d0).days < 2:
+        return True, "sym_tf_2d_cooldown"
+    return False, ""
+
+
+def finalize_closed_positions(mt5: Any, st: dict[str, Any]) -> dict[str, Any]:
+    """When a ticket leaves ``positions_get``, apply loss streak + ``last_trade_closed`` once."""
+    try:
+        import MetaTrader5 as mt5m
+
+        open_ids = {int(p.ticket) for p in (mt5.positions_get() or []) if int(getattr(p, "magic", 0) or 0) == APEX_MAGIC}
+        meta = ticket_meta_load()
+        changed = False
+        lc = dict(st.get("loss_consec") or {})
+        ll = dict(st.get("loss_last_date") or {})
+        ltc = dict(st.get("last_trade_closed") or {})
+        today_s = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        t0 = datetime.now(timezone.utc) - timedelta(days=14)
+
+        for k, m in list(meta.items()):
+            if not isinstance(m, dict):
+                continue
+            try:
+                tid = int(k)
+            except ValueError:
+                continue
+            if tid in open_ids:
+                continue
+            prof = 0.0
+            deals = mt5.history_deals_get(t0.replace(tzinfo=None), datetime.utcnow(), position=tid) or []
+            for d in deals:
+                if int(getattr(d, "magic", 0) or 0) != APEX_MAGIC:
+                    continue
+                if d.entry == mt5m.DEAL_ENTRY_OUT:
+                    prof += float(d.profit)
+            sym = str(m.get("ticker", "")).upper()
+            tf = str(m.get("tf", "")).lower()
+            dr = str(m.get("direction", "")).upper()
+            lk = f"{sym}_{tf}_{dr}"
+            lc[lk] = lc.get(lk, 0) + 1 if prof < 0 else 0
+            ll[lk] = today_s
+            ltc[f"{sym}_{tf}"] = today_s
+            del meta[k]
+            changed = True
+
+        if changed:
+            st["loss_consec"] = lc
+            st["loss_last_date"] = ll
+            st["last_trade_closed"] = ltc
+            ticket_meta_save(meta)
     except Exception as e:  # noqa: BLE001
-        log_msg(f"[Claude] {e} — fallback", "warning")
-        return "EXECUTE", "HIGH", f"api_error:{e}"
+        log_msg(f"[finalize] {e}", "warning")
+    return st
+
+
+def update_closed_trades_and_losses(mt5: Any, st: dict[str, Any]) -> dict[str, Any]:
+    """Backward-compatible name — delegates to ``finalize_closed_positions``."""
+    return finalize_closed_positions(mt5, st)
+
+
+# ---------------------------------------------------------------------------
+# MT5 (preserved structure from prior apex_trader)
+# ---------------------------------------------------------------------------
 
 
 def mt5_connect() -> Any | None:
@@ -553,6 +605,27 @@ def mt5_connect() -> Any | None:
     return mt5
 
 
+_mt5_holder: dict[str, Any] = {"m": None}
+
+
+def ensure_mt5() -> Any | None:
+    m = _mt5_holder.get("m")
+    if m is not None:
+        try:
+            if m.terminal_info():
+                return m
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            m.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+    time.sleep(1)
+    nm = mt5_connect()
+    _mt5_holder["m"] = nm
+    return nm
+
+
 def resolve_sym(mt5: Any, s: str) -> str | None:
     u = s.strip().upper()
     if mt5.symbol_select(u, True):
@@ -575,14 +648,15 @@ def fill_mode(mt5: Any, sym: str) -> int:
     return mt5.ORDER_FILLING_RETURN
 
 
-def mpl_sl(mt5: Any, sym: str, entry: float, sl: float) -> float | None:
+def mpl_sl(mt5: Any, sym: str, entry: float, sl: float, d: str) -> float | None:
     info = mt5.symbol_info(sym)
     if info is None:
         return None
     ts, tv = float(info.trade_tick_size or info.point or 0), float(info.trade_tick_value or 0)
     if ts <= 0 or tv <= 0:
         return None
-    return abs(entry - sl) / ts * tv
+    ticks = (sl - entry) / ts if d == "LONG" else (entry - sl) / ts
+    return abs(float(ticks) * tv)
 
 
 def norm_vol(mt5: Any, sym: str, v: float) -> float:
@@ -596,68 +670,57 @@ def norm_vol(mt5: Any, sym: str, v: float) -> float:
     return round(v2, int(max(0, -math.floor(math.log10(step)))))
 
 
-def pnl_snapshot(mt5: Any) -> tuple[float, float, float, float]:
-    st = load_ftmo_state()
-    ai = mt5.account_info()
-    if ai is None:
-        return 0.0, 0.0, 0.0, 0.0
-    eq = float(ai.equity)
-    anchor = float(st["anchor_equity"]) if st.get("anchor_equity") is not None else STARTING_BALANCE
-    dk = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if st.get("day_key") != dk or st.get("day_anchor") is None:
-        st["day_key"] = dk
-        st["day_anchor"] = eq
-        save_ftmo_state(st)
-    da = float(st.get("day_anchor", eq))
-    return eq, eq - da, eq - anchor, float(ai.balance)
+def open_apex_positions(mt5: Any) -> list[Any]:
+    out: list[Any] = []
+    for p in mt5.positions_get() or []:
+        if int(getattr(p, "magic", 0) or 0) != APEX_MAGIC:
+            continue
+        if (p.comment or "").strip() != ORDER_COMMENT:
+            continue
+        out.append(p)
+    return out
 
 
-def _regime_with_ftmo_override(reg: dict[str, Any], mt5: Any) -> dict[str, Any]:
-    """Force CRISIS sizing when within $500 of FTMO soft stops (Prompt 2)."""
-    rd = dict(reg)
-    if not mt5:
-        return rd
-    _eq, daily, total, _bal = pnl_snapshot(mt5)
-    if daily < -3500.0 or total < -7500.0:
-        log_msg(
-            "[REGIME OVERRIDE] FTMO limit approaching — forced CRISIS 25% size",
-            "warning",
-        )
-        rd["regime"] = "CRISIS_FTMO"
-        rd["size_multiplier"] = 0.25
-        rd["note"] = "FTMO soft limit within $500 — forced CRISIS 25% size"
-    return rd
+def close_all_apex(mt5: Any) -> None:
+    import MetaTrader5 as mt5
+
+    for p in open_apex_positions(mt5):
+        tick = mt5.symbol_info_tick(p.symbol)
+        if tick is None:
+            continue
+        typ = mt5.ORDER_TYPE_SELL if int(p.type) == 0 else mt5.ORDER_TYPE_BUY
+        price = float(tick.bid if typ == mt5.ORDER_TYPE_SELL else tick.ask)
+        req = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": p.symbol,
+            "volume": float(p.volume),
+            "type": typ,
+            "position": int(p.ticket),
+            "price": price,
+            "deviation": 25,
+            "magic": APEX_MAGIC,
+            "comment": ORDER_COMMENT,
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": fill_mode(mt5, p.symbol),
+        }
+        r = mt5.order_send(req)
+        if r is None or r.retcode != mt5.TRADE_RETCODE_DONE:
+            log_msg(f"[close_all] fail ticket={p.ticket} {r}", "error")
 
 
-def limits_ok(mt5: Any) -> tuple[bool, str]:
-    eq, daily, total, _ = pnl_snapshot(mt5)
-    if total <= -TOTAL_SOFT_LIMIT:
-        return False, "total_loss_gate"
-    if daily <= -DAILY_SOFT_LIMIT:
-        return False, "daily_loss_gate"
-    if total >= PHASE1_PROFIT:
-        msg = f"Phase 1 complete — total PnL {total:.2f} >= ${PHASE1_PROFIT:,.0f}"
-        print(msg)
-        log_msg(msg, "info")
-    return True, ""
-
-
-def ticket_meta_load() -> dict[str, Any]:
-    return _load(TICKET_META_FILE, {})
-
-
-def ticket_meta_save(d: dict[str, Any]) -> None:
-    _save(TICKET_META_FILE, d)
-
-
-def order_send(
-    mt5: Any, sym: str, d: str, sl: float, risk_usd: float, meta: dict[str, Any]
+def order_send_live(
+    mt5: Any,
+    sym: str,
+    d: str,
+    sl: float,
+    risk_usd: float,
+    meta: dict[str, Any],
 ) -> dict[str, Any]:
     tick = mt5.symbol_info_tick(sym)
     if tick is None:
         return {"ok": False, "error": "no_tick"}
     entry = float(tick.ask if d == "LONG" else tick.bid)
-    mpl = mpl_sl(mt5, sym, entry, sl)
+    mpl = mpl_sl(mt5, sym, entry, sl, d)
     if mpl is None or mpl <= 0:
         return {"ok": False, "error": "mpl"}
     vol = norm_vol(mt5, sym, risk_usd / mpl)
@@ -680,7 +743,7 @@ def order_send(
     res = mt5.order_send(req)
     if res is None or res.retcode != mt5.TRADE_RETCODE_DONE:
         return {"ok": False, "error": getattr(res, "comment", str(res))}
-    time.sleep(0.2)
+    time.sleep(0.25)
     ticket = None
     for p in mt5.positions_get(symbol=sym) or []:
         if int(getattr(p, "magic", 0) or 0) == APEX_MAGIC:
@@ -690,292 +753,24 @@ def order_send(
     meta["ticket"] = ticket
     meta["entry_fill"] = entry
     meta["r"] = abs(entry - float(sl))
+    meta["tp1"] = float(meta.get("tp1", 0) or 0)
+    meta["tp2"] = float(meta.get("tp2", 0) or 0)
+    meta["tp3"] = float(meta.get("tp3", 0) or 0)
     tm = ticket_meta_load()
     if ticket:
-        tm[str(ticket)] = {k: v for k, v in meta.items()}
+        tm[str(ticket)] = {k: (float(v) if isinstance(v, (float, int)) else v) for k, v in meta.items()}
         ticket_meta_save(tm)
     return {"ok": True, "ticket": ticket, "volume": vol, "entry": entry}
 
 
-def select_layer2(sym: str, tf: str, ind: dict[str, Any], df: Any) -> tuple[str | None, str | None]:
-    counts = load_strategy_counts()
-    cands: list[tuple[str, Callable[[], str | None]]] = [
-        ("T02_EMA_CROSSOVER", lambda: layer2_t02(df)),
-        ("T04_ADX_TREND_ENTRY", lambda: layer2_t04(ind)),
-        ("M03_RSI_MOMENTUM_CONTINUATION", lambda: layer2_m03(ind)),
-        ("SMC01_SR_FLIP", lambda: layer2_smc01(df)),
-    ]
-
-    def sk(it: tuple[str, Callable[[], str | None]]) -> tuple[int, int, str]:
-        sid = it[0]
-        return (0 if counts.get(sid, 0) == 0 else 1, counts.get(sid, 0), sid)
-
-    for sid, fn in sorted(cands, key=sk):
-        if tf == "1w" and sid == "T04_ADX_TREND_ENTRY":
-            continue
-        dr = fn()
-        if dr and ema200_ok(dr, ind):
-            return sid, dr
-    return None, None
+# ---------------------------------------------------------------------------
+# Trailing (Part 7): TP1 BE, TP2 lock at TP1, TP3 partial 50% + trail remainder
+# ---------------------------------------------------------------------------
 
 
-def scan_one(mt5: Any, sym: str, tf: str, cd: CooldownState, loss: LossState, regime: dict[str, Any]) -> None:
-    today = datetime.now(timezone.utc).date()
-    if cd.traded_day != today.isoformat():
-        cd.traded_day = today.isoformat()
-        cd.traded_tickers = []
-        save_cooldown_state(cd)
+def manage_trailing_live(mt5: Any) -> None:
+    import MetaTrader5 as mt5
 
-    interval = {"1w": "1wk", "1d": "1d", "4h": "4h"}[tf]
-    ind = build_indicators(sym, interval)
-    if ind is None:
-        log_msg(f"[SKIP] {sym} {tf}: yfinance", "info")
-        return
-    df = ind.pop("_df")
-    zp = float(ind["zone_pct"])
-
-    if cd.traded_day == today.isoformat() and sym.upper() in cd.traded_tickers:
-        log_msg(f"[SKIP] {sym} {tf}: same_day_dedup", "info")
-        return
-
-    if not limits_ok(mt5)[0]:
-        log_msg(f"[SKIP] {sym} {tf}: {limits_ok(mt5)[1]}", "warning")
-        return
-
-    cc = open_ccy_counts(mt5)
-    if not currency_cap_ok(sym, cc)[0]:
-        log_msg(f"[SKIP] {sym} {tf}: {currency_cap_ok(sym, cc)[1]}", "info")
-        return
-
-    now_utc = datetime.now(timezone.utc)
-    cal_risk = check_calendar_risk(sym, now_utc)
-    if cal_risk.get("action") == "BLOCK":
-        log_msg(f"[CALENDAR BLOCK] {sym} — {cal_risk.get('reason', '')}", "info")
-        return
-    if cal_risk.get("action") in ("REDUCE", "WATCH"):
-        log_msg(f"[CALENDAR {cal_risk.get('action')}] {sym} — {cal_risk.get('reason', '')}", "info")
-
-    # Layer 1
-    for strat, dire in (
-        ("T01_EMA_PULLBACK", "LONG"),
-        ("T01_EMA_PULLBACK", "SHORT"),
-        ("R01_EXTREME_ZONE_REVERSION", "LONG"),
-        ("R01_EXTREME_ZONE_REVERSION", "SHORT"),
-    ):
-        if strat.startswith("T01") and not layer1_t01(dire, ind, zp):
-            continue
-        if strat.startswith("R01") and not layer1_r01(dire, zp, ind["rsi"], ind["adx"]):
-            continue
-        if nzdusd_w1_short_block(sym, tf, dire, zp) or gbpusd_short_block(sym, tf, dire, zp):
-            log_msg(f"[SKIP] {sym} {tf} {strat} {dire}: zone_rule", "info")
-            continue
-        ok2, r2 = cooldown_ok(cd, loss, sym, tf, dire, today)
-        if not ok2:
-            log_msg(f"[SKIP] {sym} {tf} {dire}: {r2}", "info")
-            continue
-        if strat.startswith("T01"):
-            sl, tp1, tp2 = layer1_t01_sl_tp(dire, ind["close"], ind["atr"])
-        else:
-            sl, tp1, tp2 = layer1_r01_sl_tp(dire, ind["close"], ind["atr"])
-        ent = float(ind["close"])
-        if not rr_ok(ent, sl, tp1):
-            log_msg(f"[SKIP] {sym} {tf} {strat}: rr", "info")
-            continue
-        v, c_cl, rs = claude_gate(sym, tf, dire, ind, zp)
-        log_msg(f"[Claude] {sym} {tf} {strat} {dire} {v} {c_cl} {rs}")
-        if v != "EXECUTE":
-            continue
-        conf = c_cl if c_cl in CONF_RISK_USD else "HIGH"
-        macro = get_macro_bias(sym, dire)
-        log_msg(
-            f"[MACRO] {sym} {dire} — {macro['bias']} (score {macro['composite_score']:+.2f}) "
-            f"rate_diff={macro['rate_differential']:+.2f}% {macro['price_trend']}",
-            "info",
-        )
-        conf_pre = conf
-        conf = apply_macro_confidence_adjustment(conf, macro)
-        ok_elite, elite_rs = live_elite_strategy_ok(strat, conf)
-        if not ok_elite:
-            log_msg(elite_rs, "info")
-            continue
-        risk = CONF_RISK_USD[conf] * TF_RISK_MULT.get(tf, 1.0)
-        cpu = conf_pre if conf_pre != conf and conf_pre in ("HIGH", "MEDIUM", "LOW") else None
-        exec_trade(
-            mt5,
-            sym,
-            tf,
-            strat,
-            dire,
-            sl,
-            tp1,
-            tp2,
-            risk,
-            cd,
-            rs,
-            conf,
-            cal_risk,
-            regime,
-            macro,
-            confidence_pre_upgrade=cpu,
-        )
-        return
-
-    # Layer 2
-    sid, dire = select_layer2(sym, tf, ind, df)
-    if not sid:
-        log_msg(f"[SKIP] {sym} {tf}: no_layer2", "info")
-        return
-    if not ema200_ok(dire, ind) or gbpusd_short_block(sym, tf, dire, zp) or nzdusd_w1_short_block(sym, tf, dire, zp):
-        log_msg(f"[SKIP] {sym} {tf} {sid}: filter", "info")
-        return
-    ok3, r3 = cooldown_ok(cd, loss, sym, tf, dire, today)
-    if not ok3:
-        log_msg(f"[SKIP] {sym} {tf} {sid}: {r3}", "info")
-        return
-    sl, tp1, tp2 = layer2_sl_tp(float(ind["close"]), ind["atr"], dire)
-    ent = float(ind["close"])
-    if not rr_ok(ent, sl, tp1):
-        log_msg(f"[SKIP] {sym} {tf} {sid}: rr", "info")
-        return
-    macro = get_macro_bias(sym, dire)
-    log_msg(
-        f"[MACRO] {sym} {dire} — {macro['bias']} (score {macro['composite_score']:+.2f}) "
-        f"rate_diff={macro['rate_differential']:+.2f}% {macro['price_trend']}",
-        "info",
-    )
-    conf_pre = "LOW"
-    conf = apply_macro_confidence_adjustment(conf_pre, macro)
-    ok_elite, elite_rs = live_elite_strategy_ok(sid, conf)
-    if not ok_elite:
-        log_msg(elite_rs, "info")
-        return
-    risk = CONF_RISK_USD[conf] * TF_RISK_MULT.get(tf, 1.0)
-    cpu = conf_pre if conf_pre != conf else None
-    exec_trade(
-        mt5,
-        sym,
-        tf,
-        sid,
-        dire,
-        sl,
-        tp1,
-        tp2,
-        risk,
-        cd,
-        "layer2",
-        conf,
-        cal_risk,
-        regime,
-        macro,
-        confidence_pre_upgrade=cpu,
-    )
-
-
-def exec_trade(
-    mt5: Any,
-    sym: str,
-    tf: str,
-    strat: str,
-    dire: str,
-    sl: float,
-    tp1: float,
-    tp2: float,
-    risk: float,
-    cd: CooldownState,
-    reasoning: str,
-    conf: str,
-    calendar_risk: dict[str, Any] | None = None,
-    regime_risk: dict[str, Any] | None = None,
-    macro_bias: dict[str, Any] | None = None,
-    confidence_pre_upgrade: str | None = None,
-) -> None:
-    if not limits_ok(mt5)[0]:
-        return
-    if not currency_cap_ok(sym, open_ccy_counts(mt5))[0]:
-        return
-    bs = resolve_sym(mt5, sym)
-    if not bs:
-        return
-    cr = calendar_risk or {
-        "action": "CLEAR",
-        "reason": "No high-impact events within 48h",
-        "size_multiplier": 1.0,
-    }
-    rg = regime_risk or {
-        "regime": "NORMAL",
-        "size_multiplier": 1.0,
-        "wr_10": 0.5,
-        "wr_20": 0.5,
-        "consecutive_losses": 0,
-    }
-    cal_m = float(cr.get("size_multiplier", 1.0) or 0.0)
-    reg_m = float(rg.get("size_multiplier", 1.0) or 0.0)
-    mb = macro_bias if isinstance(macro_bias, dict) and macro_bias else {
-        "bias": "NEUTRAL",
-        "composite_score": 0.0,
-        "rate_differential": 0.0,
-        "price_trend": "RANGING",
-        "sentiment_score": 0.0,
-        "confidence_upgrade": 0,
-        "size_multiplier": 1.0,
-    }
-    mm = float(mb.get("size_multiplier", 1.0) or 0.0)
-    raw_risk = float(risk) * max(0.0, cal_m) * max(0.0, reg_m) * max(0.0, mm)
-    max_allowed = float(CONF_RISK_USD["HIGH"]) * 1.5
-    risk_eff = max(25.0, min(raw_risk, max_allowed))
-    meta = {
-        "ticker": sym.upper(),
-        "tf": tf,
-        "strategy": strat,
-        "direction": dire,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "confidence": conf,
-        "reasoning": reasoning,
-        "calendar_action": str(cr.get("action", "CLEAR")),
-        "calendar_reason": str(cr.get("reason", "")),
-        "regime": str(rg.get("regime", "NORMAL")),
-        "regime_size_multiplier": reg_m,
-        "regime_wr_10": float(rg.get("wr_10", 0.5) or 0.5),
-        "regime_consecutive_losses": int(rg.get("consecutive_losses", 0) or 0),
-    }
-    meta.update(macro_result_fields(mb))
-    if confidence_pre_upgrade is not None:
-        pre_u = str(confidence_pre_upgrade).strip().upper()
-        if pre_u in ("HIGH", "MEDIUM", "LOW") and pre_u != str(conf).strip().upper():
-            meta["confidence_pre_upgrade"] = pre_u
-    res = order_send(mt5, bs, dire, sl, risk_eff, meta)
-    if not res.get("ok"):
-        log_msg(f"[FAIL] {sym} {tf} {strat}: {res}", "error")
-        return
-    cnt = load_strategy_counts()
-    cnt[strat] = cnt.get(strat, 0) + 1
-    save_strategy_counts(cnt)
-    cd.traded_tickers.append(sym.upper())
-    cd.last_trade[f"{sym.upper()}_{tf.lower()}"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    save_cooldown_state(cd)
-    log_msg(
-        f"[TRADE] {sym} {dire} {tf} {strat} entry={res.get('entry')} SL={sl:.5f} TP1={tp1:.5f} "
-        f"lot={res.get('volume')} risk_usd={risk_eff:.2f} (base={risk:.2f}) claude={reasoning!r} "
-        f"regime={rg.get('regime')}",
-        "info",
-    )
-
-
-def pnl_at_sl(entry: float, nsl: float, d: str, vol: float, mt5: Any, sym: str) -> float:
-    info = mt5.symbol_info(sym)
-    if info is None:
-        return 0.0
-    ts, tv = float(info.trade_tick_size or info.point or 0), float(info.trade_tick_value or 0)
-    if ts <= 0 or tv <= 0:
-        return 0.0
-    ticks = (nsl - entry) / ts if d == "LONG" else (entry - nsl) / ts
-    return ticks * tv * vol
-
-
-def manage_trailing(mt5: Any) -> None:
-    """TP1 @ entry±1.0R → SL at entry±0.75R; TP2 @ entry±1.5R → SL at entry±1.5R; $25 min locked P&L."""
     if not mt5.terminal_info():
         return
     meta = ticket_meta_load()
@@ -986,251 +781,397 @@ def manage_trailing(mt5: Any) -> None:
         m = meta.get(k)
         if not isinstance(m, dict):
             continue
-        d = str(m["direction"]).upper()
+        d = str(m.get("direction", "")).upper()
         entry = float(m.get("entry_fill", pos.price_open))
-        r = float(m.get("r") or abs(entry - float(pos.sl or entry)))
-        if r <= 0:
-            continue
+        tp1 = float(m.get("tp1", 0) or 0)
+        tp2 = float(m.get("tp2", 0) or 0)
+        tp3 = float(m.get("tp3", 0) or 0)
         tick = mt5.symbol_info_tick(pos.symbol)
         if tick is None:
             continue
-        bid, ask, vol = float(tick.bid), float(tick.ask), float(pos.volume)
+        bid, ask = float(tick.bid), float(tick.ask)
         cur_sl = float(pos.sl or 0.0)
+        vol = float(pos.volume)
+
         hit1 = bool(m.get("hit_tp1"))
         hit2 = bool(m.get("hit_tp2"))
+        hit3p = bool(m.get("hit_tp3_partial"))
         nsl: float | None = None
-        tag = ""
 
         if d == "LONG":
-            if not hit1 and bid >= entry + 1.0 * r:
-                cand = entry + 0.75 * r
-                if pnl_at_sl(entry, cand, d, vol, mt5, pos.symbol) >= _MIN_TRAIL_LOCK_USD and cand > cur_sl:
-                    nsl, tag, m["hit_tp1"] = cand, "tp1_lock_0.75R", True
-            elif hit1 and not hit2 and bid >= entry + 1.5 * r:
-                cand = entry + 1.5 * r
-                if pnl_at_sl(entry, cand, d, vol, mt5, pos.symbol) >= _MIN_TRAIL_LOCK_USD and cand > cur_sl:
-                    nsl, tag, m["hit_tp2"] = cand, "tp2_lock_1.5R", True
+            px = bid
+            if not hit1 and tp1 > 0 and px >= tp1:
+                nsl = entry  # breakeven
+                m["hit_tp1"] = True
+            elif hit1 and not hit2 and tp2 > 0 and px >= tp2:
+                nsl = tp1
+                m["hit_tp2"] = True
+            elif hit2 and not hit3p and tp3 > 0 and px >= tp3:
+                half = norm_vol(mt5, pos.symbol, vol / 2.0)
+                if half > 0 and half < vol:
+                    creq = {
+                        "action": mt5.TRADE_ACTION_DEAL,
+                        "symbol": pos.symbol,
+                        "volume": half,
+                        "type": mt5.ORDER_TYPE_SELL,
+                        "position": int(pos.ticket),
+                        "price": bid,
+                        "deviation": 25,
+                        "magic": APEX_MAGIC,
+                        "comment": ORDER_COMMENT,
+                        "type_time": mt5.ORDER_TIME_GTC,
+                        "type_filling": fill_mode(mt5, pos.symbol),
+                    }
+                    cr = mt5.order_send(creq)
+                    if cr and cr.retcode == mt5.TRADE_RETCODE_DONE:
+                        m["hit_tp3_partial"] = True
+                        log_msg(f"[PARTIAL] ticket={pos.ticket} closed 50% @TP3", "info")
+                trail = tp2 if tp2 > 0 else entry
+                nsl = max(cur_sl, trail)
         else:
-            if not hit1 and ask <= entry - 1.0 * r:
-                cand = entry - 0.75 * r
-                if pnl_at_sl(entry, cand, d, vol, mt5, pos.symbol) >= _MIN_TRAIL_LOCK_USD and (cur_sl <= 0 or cand < cur_sl):
-                    nsl, tag, m["hit_tp1"] = cand, "tp1_lock_0.75R", True
-            elif hit1 and not hit2 and ask <= entry - 1.5 * r:
-                cand = entry - 1.5 * r
-                if pnl_at_sl(entry, cand, d, vol, mt5, pos.symbol) >= _MIN_TRAIL_LOCK_USD and (cur_sl <= 0 or cand < cur_sl):
-                    nsl, tag, m["hit_tp2"] = cand, "tp2_lock_1.5R", True
+            px = ask
+            if not hit1 and tp1 > 0 and px <= tp1:
+                nsl = entry
+                m["hit_tp1"] = True
+            elif hit1 and not hit2 and tp2 > 0 and px <= tp2:
+                nsl = tp1
+                m["hit_tp2"] = True
+            elif hit2 and not hit3p and tp3 > 0 and px <= tp3:
+                half = norm_vol(mt5, pos.symbol, vol / 2.0)
+                if half > 0 and half < vol:
+                    creq = {
+                        "action": mt5.TRADE_ACTION_DEAL,
+                        "symbol": pos.symbol,
+                        "volume": half,
+                        "type": mt5.ORDER_TYPE_BUY,
+                        "position": int(pos.ticket),
+                        "price": ask,
+                        "deviation": 25,
+                        "magic": APEX_MAGIC,
+                        "comment": ORDER_COMMENT,
+                        "type_time": mt5.ORDER_TIME_GTC,
+                        "type_filling": fill_mode(mt5, pos.symbol),
+                    }
+                    cr = mt5.order_send(creq)
+                    if cr and cr.retcode == mt5.TRADE_RETCODE_DONE:
+                        m["hit_tp3_partial"] = True
+                        log_msg(f"[PARTIAL] ticket={pos.ticket} closed 50% @TP3", "info")
+                trail = tp2 if tp2 > 0 else entry
+                nsl = min(cur_sl, trail) if cur_sl > 0 else trail
 
-        if nsl is None:
-            meta[k] = m
-            continue
-        res = mt5.order_send(
-            {
-                "action": mt5.TRADE_ACTION_SLTP,
-                "symbol": pos.symbol,
-                "position": int(pos.ticket),
-                "sl": float(nsl),
-                "tp": float(pos.tp or 0.0),
-            }
-        )
-        if res and res.retcode == mt5.TRADE_RETCODE_DONE:
-            log_msg(f"[TRAIL] ticket={pos.ticket} {tag} new_sl={nsl:.5f}", "info")
+        if nsl is not None:
+            res = mt5.order_send(
+                {
+                    "action": mt5.TRADE_ACTION_SLTP,
+                    "symbol": pos.symbol,
+                    "position": int(pos.ticket),
+                    "sl": float(nsl),
+                    "tp": float(pos.tp or 0.0),
+                }
+            )
+            if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+                log_msg(f"[TRAIL] ticket={pos.ticket} new_sl={nsl:.5f}", "info")
         meta[k] = m
     ticket_meta_save(meta)
 
 
-def update_loss_from_deals(mt5: Any) -> None:
-    try:
-        import MetaTrader5 as mt5m
-        from collections import defaultdict
-
-        t0 = datetime.now(timezone.utc) - timedelta(days=60)
-        deals = mt5.history_deals_get(t0.replace(tzinfo=None), datetime.utcnow())
-        if not deals:
-            return
-        profit_by_pos: dict[int, float] = defaultdict(float)
-        for d in deals:
-            if int(getattr(d, "magic", 0) or 0) != APEX_MAGIC:
-                continue
-            pid = int(getattr(d, "position_id", 0) or 0)
-            if pid and d.entry == mt5m.DEAL_ENTRY_OUT:
-                profit_by_pos[pid] += float(d.profit)
-        if not profit_by_pos:
-            return
-        loss = load_loss_state()
-        meta = ticket_meta_load()
-        ch = False
-        for pid, prof in profit_by_pos.items():
-            m = meta.pop(str(pid), None)
-            if not isinstance(m, dict):
-                continue
-            sym = str(m.get("ticker", "")).upper()
-            tf = str(m.get("tf", "")).lower()
-            dr = str(m.get("direction", "")).upper()
-            lk = f"{sym}_{tf}_{dr}"
-            ds = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            loss.consec[lk] = loss.consec.get(lk, 0) + 1 if prof < 0 else 0
-            loss.last_outcome_date[lk] = ds
-            ch = True
-        if ch:
-            save_loss_state(loss)
-            ticket_meta_save(meta)
-    except Exception as e:  # noqa: BLE001
-        log_msg(f"[loss] {e}", "warning")
+# ---------------------------------------------------------------------------
+# Sizing stack (Part 5)
+# ---------------------------------------------------------------------------
 
 
-def print_status(mt5: Any) -> None:
-    eq, daily, total, bal = pnl_snapshot(mt5)
-    print(
-        f"[STATUS] balance={bal:.2f} equity={eq:.2f} daily_pnl={daily:.2f} total_pnl={total:.2f}\n"
-        f"  headroom daily_soft: {DAILY_SOFT_LIMIT + daily:.2f}  total_soft: {TOTAL_SOFT_LIMIT + total:.2f}\n"
-        f"  to profit target: {PHASE1_PROFIT - total:.2f}\n"
-    )
-    st = load_ftmo_state()
-    days = len(st.get("trading_day_dates") or [])
-    print(f"  trading_days_logged: {days}")
-    log_msg(f"[STATUS] bal={bal} eq={eq} daily={daily} total={total} days={days}", "info")
-    for p in mt5.positions_get() or []:
-        if int(getattr(p, "magic", 0) or 0) != APEX_MAGIC:
-            continue
-        tk = mt5.symbol_info_tick(p.symbol)
-        px = float(tk.bid) if tk else float(p.price_current)
-        print(f"  OPEN {p.symbol} ticket={p.ticket} open={p.price_open:.5f} now={px:.5f} pnl={p.profit:.2f} sl={p.sl}")
+def pick_signal_for_sym_tf(rows: list[tuple[str, str, int]]) -> tuple[str, str, int] | None:
+    if not rows:
+        return None
+    prio = {
+        "T01_EMA_PULLBACK": 0,
+        "R01_EXTREME_ZONE_REVERSION": 1,
+        "SMC05_EQUAL_HL_HUNT": 2,
+        "T07_MA_RIBBON_ALIGNMENT": 3,
+        "M02_MACD_ZERO_CROSS": 4,
+        "M03_RSI_MOMENTUM_CONTINUATION": 5,
+    }
+    return sorted(rows, key=lambda x: (-int(x[2]), prio.get(x[0], 99), x[0]))[0]
 
 
-_mt5: dict[str, Any] = {"m": None}
+def run_full_scan() -> None:
+    import MetaTrader5 as mt5
 
-
-def ensure_mt5() -> Any | None:
-    m = _mt5.get("m")
-    if m is not None and m.terminal_info():
-        return m
-    try:
-        if m is not None:
-            m.shutdown()
-    except Exception:  # noqa: BLE001
-        pass
-    time.sleep(1)
-    nm = mt5_connect()
-    _mt5["m"] = nm
-    return nm
-
-
-def daily_job() -> None:
-    if datetime.now(timezone.utc).weekday() >= 5:
+    st = load_live_state()
+    if st.get("halted_dd"):
+        log_msg("[SCAN] halted — total drawdown pause active", "warning")
         return
-    try:
-        mt5 = ensure_mt5()
-        if not mt5:
-            return
-        cd, loss = load_cooldown_state(), load_loss_state()
-        st = load_ftmo_state()
-        t = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        td = list(st.get("trading_day_dates") or [])
-        if t not in td:
-            td.append(t)
-            st["trading_day_dates"] = td
-            save_ftmo_state(st)
-        base_reg = get_regime_cached(CURRENT_JOB_ID)
-        reg = _regime_with_ftmo_override(base_reg, mt5)
-        log_msg(
-            f"[REGIME] {reg['regime']} — WR10={reg['wr_10']:.0%} WR20={reg['wr_20']:.0%} "
-            f"Streak={reg['consecutive_losses']} losses Size={reg['size_multiplier']}x",
-            "info",
+
+    m = ensure_mt5()
+    if not m:
+        log_msg("[SCAN] MT5 unavailable", "error")
+        return
+
+    ai = m.account_info()
+    if ai is None:
+        log_msg("[SCAN] no account_info", "error")
+        return
+    balance = float(ai.balance)
+    equity = float(ai.equity)
+    if st.get("anchor_equity") is None:
+        st["anchor_equity"] = equity
+    anchor = float(st.get("anchor_equity") or equity)
+
+    now = datetime.now(timezone.utc)
+    today = now.date()
+    dk = now.strftime("%Y-%m-%d")
+    if st.get("day_key") != dk:
+        st["day_key"] = dk
+        st["day_anchor"] = equity
+        save_live_state(st)
+    day_anchor = float(st.get("day_anchor") or equity)
+    daily_pnl = equity - day_anchor
+    dd_frac = (anchor - equity) / anchor if anchor > 0 else 0.0
+
+    daily_limit = max(5000.0, balance * 0.05)
+    if daily_pnl <= -daily_limit:
+        log_msg(f"[RISK] daily loss limit hit ({daily_pnl:.2f} <= -{daily_limit:.2f})", "warning")
+        return
+    if dd_frac >= 0.20:
+        log_msg("[RISK] -20% drawdown — closing all and halting new trades", "critical")
+        close_all_apex(m)
+        st["halted_dd"] = True
+        save_live_state(st)
+        return
+
+    st = update_closed_trades_and_losses(m, st)
+    save_live_state(st)
+
+    if len(open_apex_positions(m)) >= 15:
+        log_msg("[SCAN] max 15 open positions", "warning")
+        return
+
+    job_id = os.environ.get("APEX_JOB_ID", "live")
+    regime = get_regime_cached(job_id)
+    reg_m = float(regime.get("size_multiplier", 1.0) or 1.0)
+
+    # Pass 1 — confluence: distinct LIVE strategies per (sym, direction) this scan
+    agree: dict[tuple[str, str], set[str]] = defaultdict(set)
+    scan_cells: list[tuple[str, str, list[tuple[str, str, int]], float, dict[str, Any], float, str]] = []
+    for sym in TICKERS:
+        for tf in TIMEFRAMES:
+            rows, price, ind, zone_pct, ad = run_python_prefilter_live(sym, tf)
+            if not rows:
+                continue
+            scan_cells.append((sym, tf, rows, price, ind, zone_pct, ad))
+            for sid, dr, _sc in rows:
+                if dr == "BOTH":
+                    agree[(sym.upper(), "LONG")].add(sid)
+                    agree[(sym.upper(), "SHORT")].add(sid)
+                elif dr in ("LONG", "SHORT"):
+                    agree[(sym.upper(), dr)].add(sid)
+
+    placed = 0
+    skipped = 0
+    lines_out: list[str] = []
+
+    for sym, tf, rows, price, ind, zone_pct, ad in scan_cells:
+        sig = pick_signal_for_sym_tf(rows)
+        if sig is None:
+            continue
+        sid, direction, _score = sig
+        if direction not in ("LONG", "SHORT"):
+            skipped += 1
+            continue
+
+        if nfp_blocks_symbol(sym, today):
+            msg = f"SKIP: {sym} {tf} {direction} — NFP first Friday (USD)"
+            lines_out.append(msg)
+            skipped += 1
+            continue
+
+        ok_ls, rs_ls = loss_streak_block(st, sym, tf, direction, today)
+        if ok_ls:
+            lines_out.append(f"SKIP: {sym} {tf} {direction} — {rs_ls}")
+            skipped += 1
+            continue
+
+        ok_c, rs_c = closed_cooldown_block(st, sym, tf, today)
+        if ok_c:
+            lines_out.append(f"SKIP: {sym} {tf} {direction} — {rs_c}")
+            skipped += 1
+            continue
+
+        ok_cc, rs_cc = currency_direction_conflict(sym, direction, m)
+        if ok_cc:
+            lines_out.append(f"SKIP: {sym} {tf} {direction} — {rs_cc}")
+            skipped += 1
+            continue
+
+        now_utc = datetime.now(timezone.utc)
+        cal = check_calendar_risk(sym, now_utc)
+        if str(cal.get("action", "")).upper() == "BLOCK":
+            lines_out.append(f"SKIP: {sym} {tf} {direction} — calendar BLOCK")
+            skipped += 1
+            continue
+        cal_pen = 0.5 if str(cal.get("action", "")).upper() == "REDUCE" else 1.0
+
+        macro = get_macro_bias(sym, direction)
+        conf0 = "MEDIUM"
+        conf = apply_macro_confidence_adjustment(conf0, macro)
+        cpu = conf0 if conf0 != conf else None
+
+        if sid == "M03_RSI_MOMENTUM_CONTINUATION" and conf != "HIGH":
+            lines_out.append(f"SKIP: {sym} {tf} M03 — need HIGH after macro ({conf})")
+            skipped += 1
+            continue
+
+        tr = apply_trend_filter(sym, direction, sid, as_of_date=ad)
+        if tr.get("action") == "BLOCK":
+            lines_out.append(f"SKIP: {sym} {tf} {direction} — {tr.get('reason', 'trend')}")
+            skipped += 1
+            continue
+        trend_m = float(tr.get("size_multiplier", 1.0) or 1.0)
+
+        n_agree = len(agree.get((sym.upper(), direction), set()))
+        cf_m = confluence_multiplier(n_agree)
+
+        base_risk = balance * float(RISK_FRAC_BY_CONFIDENCE.get(conf, 0.01))
+        macro_m = float(macro.get("size_multiplier", 1.0) or 1.0)
+        raw = base_risk * cal_pen * macro_m * trend_m * cf_m * reg_m
+        cap_hi = balance * RISK_FRAC_BY_CONFIDENCE["HIGH"] * 1.5
+        final_risk = max(25.0, min(raw, cap_hi))
+
+        atrv = float(ind.get("atr", price * 0.01) or (price * 0.01))
+        sl, tp1, tp2, tp3 = stop_tp_bundle(sid, direction, float(price), atrv)
+        entry = float(price)
+        if not rr_ok(entry, sl, tp1, direction):
+            lines_out.append(f"SKIP: {sym} {tf} {sid} — R/R")
+            skipped += 1
+            continue
+
+        bs = resolve_sym(m, sym)
+        if not bs:
+            lines_out.append(f"SKIP: {sym} — symbol resolve")
+            skipped += 1
+            continue
+
+        meta = {
+            "ticker": sym.upper(),
+            "tf": tf,
+            "strategy": sid,
+            "direction": direction,
+            "sl": sl,
+            "tp1": tp1,
+            "tp2": tp2,
+            "tp3": tp3,
+            "confidence": conf,
+            "reasoning": "python_prefilter_v6",
+            "calendar_action": str(cal.get("action", "CLEAR")),
+            "calendar_reason": str(cal.get("reason", "")),
+            "regime": str(regime.get("regime", "NORMAL")),
+            "regime_size_multiplier": reg_m,
+            "regime_wr_10": float(regime.get("wr_10", 0.5) or 0.5),
+            "regime_consecutive_losses": int(regime.get("consecutive_losses", 0) or 0),
+            "base_risk_usd": round(base_risk, 2),
+            "final_risk_usd": round(final_risk, 2),
+            "macro_mult": macro_m,
+            "trend_mult": trend_m,
+            "confluence_mult": cf_m,
+            "confluence_count": n_agree,
+        }
+        meta.update(macro_result_fields(macro))
+        if cpu:
+            meta["confidence_pre_upgrade"] = cpu
+
+        sig_line = (
+            f"SIGNAL: {sym} {tf} {direction} | {sid} | {conf} | {macro_m:.2f}x macro | "
+            f"{trend_m:.2f}x trend | {cf_m:.2f}x confluence | risk ${final_risk:.0f}"
         )
-        for sym in TICKERS:
-            try:
-                for tf in ("1d", "4h"):
-                    scan_one(mt5, sym, tf, cd, loss, reg)
-            except Exception as e:  # noqa: BLE001
-                log_msg(f"[scan] {sym}: {e}", "error")
-    except Exception as e:  # noqa: BLE001
-        log_msg(f"[daily_job] {e}", "error")
+        lines_out.append(sig_line)
 
+        res = order_send_live(m, bs, direction, sl, final_risk, meta)
+        if not res.get("ok"):
+            lines_out.append(f"FAIL: {sym} {tf} {sid} — {res.get('error')}")
+            skipped += 1
+            continue
 
-def weekly_job() -> None:
-    try:
-        if datetime.now(timezone.utc).weekday() == 0:
-            log_msg("[WEEKLY MACRO SUMMARY]", "info")
-            for ln in weekly_macro_summary_lines(TICKERS):
-                log_msg(ln, "info")
-        mt5 = ensure_mt5()
-        if not mt5:
-            return
-        cd, loss = load_cooldown_state(), load_loss_state()
-        base_reg = get_regime_cached(CURRENT_JOB_ID)
-        reg = _regime_with_ftmo_override(base_reg, mt5)
-        log_msg(
-            f"[REGIME] {reg['regime']} — WR10={reg['wr_10']:.0%} WR20={reg['wr_20']:.0%} "
-            f"Streak={reg['consecutive_losses']} losses Size={reg['size_multiplier']}x",
-            "info",
+        placed += 1
+        otk = st.setdefault("last_trade_open", {})
+        otk[f"{sym.upper()}_{tf.lower()}"] = now.strftime("%Y-%m-%d %H:%M:%S")
+        save_live_state(st)
+        lines_out.append(
+            f"PLACED: ticket#{res.get('ticket')} entry:{res.get('entry'):.5f} sl:{sl:.5f} tp1:{tp1:.5f} "
+            f"lots:{res.get('volume')}"
         )
-        for sym in TICKERS:
-            try:
-                scan_one(mt5, sym, "1w", cd, loss, reg)
-            except Exception as e:  # noqa: BLE001
-                log_msg(f"[w] {sym}: {e}", "error")
-    except Exception as e:  # noqa: BLE001
-        log_msg(f"[weekly_job] {e}", "error")
+        append_trade_log(f"{now.isoformat()} | {sig_line} | PLACED ticket={res.get('ticket')}")
+
+    manage_trailing_live(m)
+
+    # Status banner (Part 9)
+    next_h = _next_scan_hour(now)
+    print("═" * 46)
+    print(f"APEX v7.3 LIVE — {now.strftime('%Y-%m-%d %H:%M')} UTC")
+    print(f"Balance:     ${balance:,.2f}")
+    print(f"Daily P&L:   {daily_pnl:+,.2f}  (limit -${daily_limit:,.0f})")
+    print(f"Open trades: {len(open_apex_positions(m))}")
+    print(f"Next scan:   {next_h:02d}:00 UTC")
+    print("═" * 46)
+    for ln in lines_out:
+        print(ln)
+    print(f"Scan complete. {placed} placed, {skipped} skipped. Next: {next_h:02d}:00 UTC")
+    save_live_state(st)
 
 
-def hourly_job() -> None:
-    try:
-        mt5 = ensure_mt5()
-        if mt5:
-            print_status(mt5)
-            update_loss_from_deals(mt5)
-            rb = get_regime_cached(CURRENT_JOB_ID)
-            reg = _regime_with_ftmo_override(rb, mt5)
-            log_msg(
-                f"REGIME: {reg['regime']} | Size: {reg['size_multiplier']}x | "
-                f"WR(10): {reg['wr_10']:.0%} | WR(20): {reg['wr_20']:.0%} | "
-                f"Streak: {reg['consecutive_losses']} consecutive losses",
-                "info",
-            )
-    except Exception as e:  # noqa: BLE001
-        log_msg(f"[hourly] {e}", "error")
+def _next_scan_hour(now: datetime) -> int:
+    h = now.hour
+    for x in SCAN_HOURS:
+        if x > h:
+            return x
+    return SCAN_HOURS[0]
 
 
-def trail_job() -> None:
-    try:
-        mt5 = ensure_mt5()
-        if mt5:
-            manage_trailing(mt5)
-    except Exception as e:  # noqa: BLE001
-        log_msg(f"[trail] {e}", "error")
+def print_status_quick(mt5: Any) -> None:
+    st = load_live_state()
+    ai = mt5.account_info()
+    if ai is None:
+        return
+    eq = float(ai.equity)
+    if st.get("day_anchor") is not None:
+        dp = eq - float(st["day_anchor"])
+    else:
+        dp = 0.0
+    log_msg(f"[STATUS] eq={eq:.2f} daily_pnl={dp:.2f} halted={st.get('halted_dd')}", "info")
 
 
-def reconnect_job() -> None:
-    ensure_mt5()
+def main_loop() -> None:
+    st = load_live_state()
+    last_slot = str(st.get("last_scan_slot") or "")
+    log_msg("[APEX] v7.3 live — SCAN_HOURS UTC; set APEX_MT5_PASSWORD", "info")
 
+    while True:
+        try:
+            mt5 = ensure_mt5()
+            if not mt5:
+                log_msg("[MT5] reconnect in 30s…", "warning")
+                time.sleep(30)
+                continue
 
-def main() -> None:
-    log_msg("[APEX] apex_trader — set APEX_MT5_PASSWORD and ANTHROPIC_API_KEY", "info")
-    mt5 = ensure_mt5()
-    if mt5:
-        ai = mt5.account_info()
-        st = load_ftmo_state()
-        if ai and st.get("anchor_equity") is None:
-            st["anchor_equity"] = float(ai.equity)
-            save_ftmo_state(st)
+            now = datetime.now(timezone.utc)
+            if now.minute == 0 and now.hour in SCAN_HOURS:
+                slot = f"{now:%Y-%m-%d}-{now.hour:02d}"
+                if slot != last_slot:
+                    last_slot = slot
+                    st = load_live_state()
+                    st["last_scan_slot"] = slot
+                    save_live_state(st)
+                    run_full_scan()
+                    print_status_quick(mt5)
 
-    from apscheduler.schedulers.blocking import BlockingScheduler
-    from apscheduler.triggers.cron import CronTrigger
-
-    sch = BlockingScheduler(timezone="UTC")
-    sch.add_job(hourly_job, CronTrigger(minute=0), id="hourly")
-    sch.add_job(trail_job, CronTrigger(minute="*/15"), id="trail")
-    sch.add_job(reconnect_job, CronTrigger(minute="*/1"), id="ping")
-    sch.add_job(daily_job, CronTrigger(day_of_week="mon-fri", hour=13, minute=0), id="daily")
-    sch.add_job(weekly_job, CronTrigger(day_of_week="mon", hour=0, minute=0), id="weekly")
-    threading.Timer(3.0, hourly_job).start()
-    sch.start()
+            time.sleep(60)
+        except KeyboardInterrupt:
+            print("Stopped by user")
+            break
+        except Exception as e:  # noqa: BLE001
+            print(f"ERROR: {e} — restarting in 60 seconds")
+            log_msg(f"[recover] {e}", "critical")
+            time.sleep(60)
 
 
 if __name__ == "__main__":
-    while True:
-        try:
-            main()
-        except Exception as e:  # noqa: BLE001
-            log_msg(f"[recover] {e}", "critical")
-            time.sleep(60)
+    main_loop()
