@@ -5,8 +5,9 @@ rolling stats, and periodic self-improvement. All state is simple JSON on ``DATA
 """
 from __future__ import annotations
 
-STRATEGY_VERSION = "v7.3-session19"
-# v7.3: economic calendar + rolling regime + macro bias (macro_manager); Railway sets IS_BACKTEST via set_backtest_mode(True).
+STRATEGY_VERSION = "v7.3-session21"
+# v7.3 session21: FIX 23–30 (macro confidence post-enforce, B02 stops + blocked, trend_manager,
+# chrono strategy confluence, strategy_status). Calendar + regime + macro from prior prompts.
 # v7.2: strategy_status.json + chrono skips LOCKED strategies; UNTESTED loose EMA200/ADX paths (chrono only).
 # v7.1: chrono phase scan (1w→1d→4h→intraday), risk/tp multipliers, separate 4H currency pool,
 # deterministic Layer-2 strategy order, $25 trailing floor + 0.75R/1.5R locks, exotic USD cap exemption,
@@ -25,6 +26,7 @@ import gc
 import json
 import math
 import os
+from collections import defaultdict
 import random
 import re
 import threading
@@ -51,6 +53,7 @@ from macro_manager import (
     set_backtest_mode,
 )
 from regime_manager import get_regime_cached
+from trend_manager import apply_trend_filter
 from utils import DATA_DIR, env, load_json, log, save_json, utcnow_iso
 
 set_backtest_mode(True)
@@ -60,6 +63,8 @@ set_backtest_mode(True)
 LAST_TRADE_DATES: dict[str, str] = {}
 # v7.0 chrono: one trade per ticker per calendar scan day (dedupe across timeframes).
 TRADED_TICKERS_TODAY: set[str] = set()
+# FIX 29 — distinct strategy ids per (ticker, direction) accumulated during chrono calendar day.
+CHRONO_DAY_PREFILTER_SIDS: defaultdict[tuple[str, str], set[str]] = defaultdict(set)
 # v7.0 chrono: completed trades per currency per scan day (sequential sim; caps clustering).
 OPEN_CURRENCY_COUNT: dict[str, int] = {}
 # v7.1 chrono: 4h + intraday share a separate per-day currency pool from 1w/1d.
@@ -343,6 +348,7 @@ def get_currencies(ticker: str) -> list[str]:
 STRATEGY_STATUS: dict[str, Any] = {}
 LOCKED_STRATEGIES_SCAN_SKIP: frozenset[str] = frozenset()
 UNTESTED_STRATEGIES_V72: frozenset[str] = frozenset()
+BLOCKED_STRATEGIES: frozenset[str] = frozenset()
 
 
 def _v72_locked_ids_default() -> frozenset[str]:
@@ -350,11 +356,13 @@ def _v72_locked_ids_default() -> frozenset[str]:
         {
             "T01_EMA_PULLBACK",
             "R01_EXTREME_ZONE_REVERSION",
+            "SMC05_EQUAL_HL_HUNT",
             "T03_HH_HL_CONTINUATION",
             "T07_MA_RIBBON_ALIGNMENT",
             "T02_EMA_CROSSOVER",
             "SMC01_SR_FLIP",
-            "SMC05_EQUAL_HL_HUNT",
+            "M07_VOLUME_SURGE_MOMENTUM",
+            "M03_RSI_MOMENTUM_CONTINUATION",
         }
     )
 
@@ -363,10 +371,10 @@ def _v72_testing_ids_default() -> frozenset[str]:
     return frozenset(
         {
             "T04_ADX_TREND_ENTRY",
-            "M06_PRICE_ACCELERATION",
+            "B01_RANGE_BREAKOUT",
             "B09_RSI_MOMENTUM_BREAK",
+            "M06_PRICE_ACCELERATION",
             "SMC10_CHOCH",
-            "M03_RSI_MOMENTUM_CONTINUATION",
             "T10_200EMA_BOUNCE",
             "V02_ATR_EXPANSION_ENTRY",
             "T09_KELTNER_TREND_RIDE",
@@ -379,21 +387,27 @@ def _v72_testing_ids_default() -> frozenset[str]:
     )
 
 
+def _v72_blocked_ids_default() -> frozenset[str]:
+    return frozenset({"B02_VOLATILITY_COMPRESSION"})
+
+
 def _v72_default_status_payload() -> dict[str, Any]:
     locked = sorted(_v72_locked_ids_default())
     testing = sorted(_v72_testing_ids_default())
-    untested = sorted(set(ALL_STRATEGY_IDS) - set(locked) - set(testing))
+    blocked = sorted(_v72_blocked_ids_default())
+    untested = sorted(set(ALL_STRATEGY_IDS) - set(locked) - set(testing) - set(blocked))
     return {
         "locked": locked,
         "testing": testing,
+        "blocked": blocked,
         "untested": untested,
-        "last_updated": date.today().isoformat(),
+        "last_updated": "2026-05-23",
     }
 
 
 def _v72_load_strategy_status(*, log_startup: bool = False) -> None:
-    """Load or create ``strategy_status.json``; refresh module-level LOCKED / UNTESTED sets."""
-    global STRATEGY_STATUS, LOCKED_STRATEGIES_SCAN_SKIP, UNTESTED_STRATEGIES_V72
+    """Load or create ``strategy_status.json``; refresh module-level LOCKED / UNTESTED / BLOCKED sets."""
+    global STRATEGY_STATUS, LOCKED_STRATEGIES_SCAN_SKIP, UNTESTED_STRATEGIES_V72, BLOCKED_STRATEGIES
     default_payload = _v72_default_status_payload()
     raw: Any = None
     if STRATEGY_STATUS_FILE.is_file():
@@ -404,7 +418,7 @@ def _v72_load_strategy_status(*, log_startup: bool = False) -> None:
     else:
         # Ensure all 68 ids are classified (append missing to untested)
         seen: set[str] = set()
-        for k in ("locked", "testing", "untested"):
+        for k in ("locked", "testing", "untested", "blocked"):
             for x in raw.get(k) or []:
                 if isinstance(x, str):
                     seen.add(x.strip().upper())
@@ -418,10 +432,17 @@ def _v72_load_strategy_status(*, log_startup: bool = False) -> None:
     STRATEGY_STATUS = raw
     LOCKED_STRATEGIES_SCAN_SKIP = frozenset(str(x).strip().upper() for x in (raw.get("locked") or []) if x)
     UNTESTED_STRATEGIES_V72 = frozenset(str(x).strip().upper() for x in (raw.get("untested") or []) if x)
+    blk = raw.get("blocked")
+    if not isinstance(blk, list):
+        blk = list(_v72_blocked_ids_default())
+        raw["blocked"] = blk
+        save_json(STRATEGY_STATUS_FILE, raw)
+    BLOCKED_STRATEGIES = frozenset(str(x).strip().upper() for x in blk if x)
     if log_startup:
         log(
             f"[v7.2] strategy_status locked={len(LOCKED_STRATEGIES_SCAN_SKIP)} "
-            f"testing={len(raw.get('testing') or [])} untested={len(UNTESTED_STRATEGIES_V72)}",
+            f"testing={len(raw.get('testing') or [])} untested={len(UNTESTED_STRATEGIES_V72)} "
+            f"blocked={len(BLOCKED_STRATEGIES)}",
             level="info",
         )
 
@@ -675,6 +696,40 @@ def _v7_filter_layer2_qualifiers(
                     )
                     continue
 
+        if sid_u == "B02_VOLATILITY_COMPRESSION":
+            try:
+                e20 = float(ind.get("ema20", price) or price)
+                e50 = float(ind.get("ema50", price) or price)
+                e200f = float(ind.get("ema200", price) or price)
+            except (TypeError, ValueError):
+                e20 = e50 = e200f = float(price)
+            if d_eff == "SHORT" and e20 > e50 > e200f:
+                log(
+                    f"[PreFilterV7] {sym} {tf_key}: skip B02 SHORT — bullish EMA stack",
+                    level="info",
+                )
+                continue
+            if d_eff == "LONG" and e20 < e50 < e200f:
+                log(
+                    f"[PreFilterV7] {sym} {tf_key}: skip B02 LONG — bearish EMA stack",
+                    level="info",
+                )
+                continue
+            try:
+                atr14 = float(ind.get("atr", 0) or 0)
+            except (TypeError, ValueError):
+                atr14 = 0.0
+            entry_hint = float(price)
+            mult = 1 if d_eff == "LONG" else -1
+            sl_b02 = round(entry_hint - mult * 1.5 * atr14, 5) if atr14 > 0 else None
+            meta_b02: dict[str, Any] | None = (
+                {"b02_atr14": atr14, "b02_entry": entry_hint, "b02_sl": sl_b02}
+                if atr14 > 0 and sl_b02 is not None
+                else None
+            )
+            out.append((sid, direction, score, meta_b02))
+            continue
+
         out.append((sid, direction, score, None))
     return out
 
@@ -708,6 +763,7 @@ def _v7_python_prefilter_bundle(
         ind=ind,
         price=float(price),
     )
+    filtered = [r for r in filtered if str(r[0]).strip().upper() not in BLOCKED_STRATEGIES]
     post_ids = [str(x[0]) for x in filtered]
     log(
         f"[PreFilterAudit] {sym} {tf_key} {analysis_date or ''}: raw={raw_ids} post_v7={post_ids}",
@@ -2344,6 +2400,124 @@ def enforce_rules(
     return ai
 
 
+def _v73_refresh_risk_fields_from_ai_confidence(
+    ai: dict[str, Any],
+    timeframe: str,
+    price: float,
+    ticker: str,
+) -> None:
+    """FIX 23 — recompute dollar risk from ``ai['confidence']`` after macro upgrade."""
+    if ai.get("skip_trade"):
+        return
+    tf = (timeframe or "").strip().lower()
+    try:
+        entry = float(ai.get("entry", price) or price)
+    except (TypeError, ValueError):
+        entry = float(price)
+    direction = str(ai.get("direction", "NONE")).strip().upper()
+    stop = float(ai.get("stop_loss", 0) or 0)
+    if stop and entry and stop != entry:
+        stop_pct = abs(entry - stop) / entry * 100
+        mn = float(MIN_STOP_PCT.get(tf, 0.3))
+        mx = float(MAX_STOP_PCT.get(tf, 1.5))
+        mult = 1 if direction == "LONG" else -1
+        if stop_pct < mn:
+            new_stop = entry * (1 - mult * mn / 100)
+            risk = abs(entry - new_stop)
+            ai["stop_loss"] = round(new_stop, 5)
+            ai["tp1"] = round(entry + mult * risk * 2, 5)
+            ai["tp2"] = round(entry + mult * risk * 3, 5)
+            ai["tp3"] = round(entry + mult * risk * 5, 5)
+        elif stop_pct > mx:
+            new_stop = entry * (1 - mult * mx / 100)
+            risk = abs(entry - new_stop)
+            ai["stop_loss"] = round(new_stop, 5)
+            ai["tp1"] = round(entry + mult * risk * 2, 5)
+            ai["tp2"] = round(entry + mult * risk * 3, 5)
+            ai["tp3"] = round(entry + mult * risk * 5, 5)
+
+    entry = float(ai.get("entry", price) or price)
+    confidence = str(ai.get("confidence", "LOW")).strip().upper()
+    if confidence not in RISK_BY_CONFIDENCE:
+        confidence = "LOW"
+    risk_pct = float(RISK_BY_CONFIDENCE.get(confidence, 0.005))
+    risk_dollars = STARTING_CAPITAL * risk_pct
+    stop_dist = abs(entry - float(ai.get("stop_loss", entry * 0.99) or 0))
+    if stop_dist > 0:
+        pos_size = risk_dollars / stop_dist
+        exposure = pos_size * entry
+        if exposure < 1500:
+            pos_size = 1500 / entry
+        ai["_position_size"] = round(pos_size, 2)
+        ai["_leveraged_exposure"] = round(pos_size * entry, 2)
+        ai["_max_risk_dollars"] = round(risk_dollars, 2)
+        ai["_account_risk_pct"] = risk_pct
+
+
+def _v73_post_enforce_macro_confidence(
+    ai: dict[str, Any],
+    macro_bt: dict[str, Any] | None,
+    *,
+    tf_key: str,
+    price: float,
+    sym: str,
+) -> None:
+    """FIX 23 — apply macro confidence upgrade/downgrade after ``enforce_rules``."""
+    if not macro_bt or ai.get("skip_trade"):
+        return
+    pre = str(ai.get("confidence", "LOW")).strip().upper()
+    if pre not in ("HIGH", "MEDIUM", "LOW"):
+        pre = "LOW"
+    new_c = apply_macro_confidence_adjustment(pre, macro_bt)
+    if new_c != pre:
+        ai["confidence_pre_upgrade"] = pre
+        ai["confidence"] = new_c
+        log(
+            f"Macro upgrade: {sym} {pre} -> {new_c} confidence "
+            f"(macro_confidence_upgrade={int(macro_bt.get('confidence_upgrade', 0) or 0)})",
+            level="info",
+        )
+        _v73_refresh_risk_fields_from_ai_confidence(ai, tf_key, float(price), sym)
+
+
+def _strategy_confluence_multiplier(strategy_count: int) -> float:
+    """FIX 29 — independent strategy agreement on same ticker + direction."""
+    if strategy_count >= 3:
+        return 1.5
+    if strategy_count == 2:
+        return 1.25
+    return 1.0
+
+
+def _chrono_accumulate_prefilter_signals(sym: str, rows: list[Any]) -> None:
+    """FIX 29 — record qualifying strategy ids per (ticker, direction) for the chrono day."""
+    su = (sym or "").strip().upper()
+    for row in rows:
+        if not row or len(row) < 3:
+            continue
+        sid = str(row[0]).strip().upper()
+        dr = str(row[1]).strip().upper()
+        if dr == "BOTH":
+            CHRONO_DAY_PREFILTER_SIDS[(su, "LONG")].add(sid)
+            CHRONO_DAY_PREFILTER_SIDS[(su, "SHORT")].add(sid)
+        elif dr in ("LONG", "SHORT"):
+            CHRONO_DAY_PREFILTER_SIDS[(su, dr)].add(sid)
+
+
+def _local_prefilter_confluence_count(sym: str, direction: str, rows: list[Any]) -> int:
+    """Distinct strategy ids from prefilter agreeing with ``direction`` (non-chrono)."""
+    d = (direction or "").strip().upper()
+    s: set[str] = set()
+    for row in rows or []:
+        if not row or len(row) < 2:
+            continue
+        sid = str(row[0]).strip().upper()
+        dr = str(row[1]).strip().upper()
+        if dr == "BOTH" or dr == d:
+            s.add(sid)
+    return len(s)
+
+
 def _sanitize_signal_lists(ai: dict[str, Any]) -> None:
     """Strip toxic signal tokens from model output (Section 1A)."""
     banned = frozenset({"ADX_TRENDING", "RSI_NEUTRAL_ROOM"})
@@ -2687,15 +2861,19 @@ def _v73_apply_calendar_regime_position_size(
     calendar_risk: dict[str, Any] | None,
     regime: dict[str, Any] | None,
     macro: dict[str, Any] | None = None,
+    trend_mult: float = 1.0,
+    confluence_mult: float = 1.0,
     entry: float,
 ) -> None:
-    """Stack calendar × regime × macro multipliers on ``_max_risk_dollars`` with $25 floor and 1.5× HIGH cap."""
+    """Stack calendar × regime × macro × trend × strategy-confluence on ``_max_risk_dollars`` (FIX 28–29)."""
     cal = calendar_risk or {"size_multiplier": 1.0}
     reg = regime or {"size_multiplier": 1.0}
     cm = max(0.0, float(cal.get("size_multiplier", 1.0) or 0.0))
     rm = max(0.0, float(reg.get("size_multiplier", 1.0) or 0.0))
     mm = max(0.0, float((macro or {}).get("size_multiplier", 1.0) or 0.0))
-    comb = cm * rm * mm
+    tm = max(0.0, float(trend_mult or 0.0))
+    cf = max(0.0, float(confluence_mult or 0.0))
+    comb = cm * rm * mm * tm * cf
     ent = float(entry)
     mrd0 = float(ai.get("_max_risk_dollars", 0) or 0)
     st0 = float(ai.get("stop_loss", 0) or 0)
@@ -2814,6 +2992,17 @@ def _skipped_backtest_row(
             }
         ),
         **merged_macro_result_fields(ai),
+        "confidence_pre_upgrade": ai.get("confidence_pre_upgrade"),
+        "trend": str(ai.get("trend") or "RANGING"),
+        "trend_strength": float(ai.get("trend_strength", 0) or 0),
+        "trend_bias": str(ai.get("trend_bias") or "NEUTRAL"),
+        "trend_size_mult": float(ai.get("trend_size_mult", 1.0) or 1.0),
+        "trend_block": bool(ai.get("trend_block", False)),
+        "strategy_confluence_count": int(ai.get("strategy_confluence_count", 0) or 0),
+        "strategy_confluence_mult": float(ai.get("strategy_confluence_mult", 1.0) or 1.0),
+        "strategies_agreed": ai.get("strategies_agreed")
+        if isinstance(ai.get("strategies_agreed"), list)
+        else [],
     }
 
 
@@ -2885,7 +3074,10 @@ def _python_forced_layer2_trade(
     else:
         mult = 1 if direction == "LONG" else -1
         entry = round(float(price), 5)
-        stop = round(entry * (1 - mult * 0.005), 5)
+        if isinstance(meta, dict) and meta.get("b02_sl") is not None and float(meta.get("b02_atr14", 0) or 0) > 0:
+            stop = round(float(meta["b02_sl"]), 5)
+        else:
+            stop = round(entry * (1 - mult * 0.005), 5)
         risk = abs(entry - stop)
         if risk <= 0:
             return None
@@ -2929,7 +3121,6 @@ def _python_forced_layer2_trade(
         scan_d_macro = None
     macro_bt = get_macro_bias(sym, direction, as_of_date=scan_d_macro)
     ai.update(macro_result_fields(macro_bt))
-    ai["confidence"] = apply_macro_confidence_adjustment(str(ai.get("confidence", "LOW")), macro_bt)
     log(
         f"[MACRO] {sym} {direction} — {macro_bt['bias']} (score {macro_bt['composite_score']:+.2f}) "
         f"rate_diff={macro_bt['rate_differential']:+.2f}% {macro_bt['price_trend']}",
@@ -2937,6 +3128,7 @@ def _python_forced_layer2_trade(
     )
 
     ai = enforce_rules(ai, tf_key, float(price), sym, rsi=float(rsi_live))
+    _v73_post_enforce_macro_confidence(ai, macro_bt, tf_key=tf_key, price=float(price), sym=sym)
     cal = calendar_risk or {
         "action": "CLEAR",
         "reason": "No high-impact events within 48h",
@@ -2960,6 +3152,49 @@ def _python_forced_layer2_trade(
             is_exotic=is_exotic,
         )
 
+    strat_id = str(ai.get("strategy_id", strat_id)).strip().upper()
+    trend_result = apply_trend_filter(
+        sym,
+        str(ai.get("direction", direction)).strip().upper(),
+        strat_id,
+        as_of_date=analysis_date.strip()[:10],
+    )
+    if trend_result.get("action") == "BLOCK":
+        log(f"[TREND BLOCK] {sym} {direction} — {trend_result.get('reason', '')}", level="info")
+        ai2 = dict(ai)
+        ai2["calendar_action"] = str(cal.get("action", "CLEAR"))
+        ai2["calendar_reason"] = str(cal.get("reason", ""))
+        ai2.update(_v73_regime_row_fields(regime_ctx))
+        ai2["skip_reason"] = str(trend_result.get("reason") or "trend block")
+        return _skipped_backtest_row(
+            sym=sym,
+            timeframe=timeframe,
+            analysis_date=analysis_date,
+            price=float(price),
+            zone_pct=zone_pct,
+            zone_label=zone_label,
+            skip_reason=str(trend_result.get("reason") or "trend block"),
+            ai=ai2,
+            tf_key=tf_key,
+            is_exotic=is_exotic,
+        )
+    trend_mult = float(trend_result.get("size_multiplier", 1.0) or 1.0)
+
+    if chrono_job:
+        scount = len(CHRONO_DAY_PREFILTER_SIDS.get((sym.upper(), str(ai.get("direction", direction)).strip().upper()), set()))
+    else:
+        scount = len(
+            {
+                str(x[0]).strip().upper()
+                for x in layer2
+                if len(x) >= 2
+                and (str(x[1]).strip().upper() in ("BOTH", str(ai.get("direction", direction)).strip().upper()))
+            }
+        )
+    cf_mult = _strategy_confluence_multiplier(scount)
+    if scount >= 3 and str(ai.get("tp_target") or "TP1").strip().upper() == "TP2":
+        ai["tp_target"] = "TP3"
+
     _apply_chrono_risk_tp_multipliers(
         ai,
         price=float(price),
@@ -2973,6 +3208,8 @@ def _python_forced_layer2_trade(
         calendar_risk=cal,
         regime=regime_ctx,
         macro=macro_bt,
+        trend_mult=trend_mult,
+        confluence_mult=cf_mult,
         entry=float(ai.get("entry", price) or price),
     )
 
@@ -3039,6 +3276,19 @@ def _python_forced_layer2_trade(
     pnl_dollars = round(leveraged_exposure * raw_pct, 2)
     pnl_pct_display = round(raw_pct * 100, 2)
     confidence = str(ai.get("confidence", "LOW")).strip().upper()
+    td = trend_result.get("trend") or {}
+    if not isinstance(td, dict):
+        td = {}
+    if chrono_job:
+        agreed_list = sorted(CHRONO_DAY_PREFILTER_SIDS.get((sym.upper(), direction), set()))
+    else:
+        agreed_list = sorted(
+            {
+                str(x[0]).strip().upper()
+                for x in layer2
+                if len(x) >= 2 and str(x[1]).strip().upper() in ("BOTH", direction)
+            }
+        )
 
     return {
         "date": analysis_date,
@@ -3047,6 +3297,7 @@ def _python_forced_layer2_trade(
         "verdict": ai.get("verdict"),
         "direction": direction,
         "confidence": confidence,
+        "confidence_pre_upgrade": ai.get("confidence_pre_upgrade"),
         "htf_bias": str(ai.get("htf_bias") or "UNKNOWN"),
         "market_structure": str(ai.get("market_structure") or "UNKNOWN"),
         "zone_pct": zone_pct,
@@ -3112,6 +3363,14 @@ def _python_forced_layer2_trade(
         "calendar_reason": str(cal.get("reason", "")),
         **_v73_regime_row_fields(regime_ctx),
         **merged_macro_result_fields(ai),
+        "trend": str(td.get("trend", "RANGING")),
+        "trend_strength": float(td.get("strength", 0) or 0),
+        "trend_bias": str(td.get("direction_bias", "NEUTRAL")),
+        "trend_size_mult": float(trend_mult),
+        "trend_block": False,
+        "strategy_confluence_count": int(scount),
+        "strategy_confluence_mult": float(cf_mult),
+        "strategies_agreed": agreed_list,
     }
 
 
@@ -3336,6 +3595,8 @@ def run_one_backtest(
             analysis_date=analysis_date,
             past=past,
         )
+        if chrono_yfinance and qualifies:
+            _chrono_accumulate_prefilter_signals(sym, qualifying_strategies)
         if not qualifies:
             pr = f"Python pre-filter: {filter_reason}"
             log(f"[PreFilter] {sym} {timeframe} {analysis_date}: {pr}", level="info")
@@ -3616,7 +3877,6 @@ def run_one_backtest(
 
             macro_bt = get_macro_bias(sym, d0, as_of_date=scan_d)
             ai.update(macro_result_fields(macro_bt))
-            ai["confidence"] = apply_macro_confidence_adjustment(str(ai.get("confidence", "LOW")), macro_bt)
             log(
                 f"[MACRO] {sym} {d0} — {macro_bt['bias']} (score {macro_bt['composite_score']:+.2f}) "
                 f"rate_diff={macro_bt['rate_differential']:+.2f}% {macro_bt['price_trend']}",
@@ -3633,6 +3893,9 @@ def run_one_backtest(
 
         if ai.get("skip_trade"):
             return _skip_out(str(ai.get("skip_reason") or "enforcement skip"), ai)
+
+        if macro_bt is not None:
+            _v73_post_enforce_macro_confidence(ai, macro_bt, tf_key=tf_key, price=float(price), sym=sym)
 
         if chrono_enforce_extended_cooldown:
             d_pre = str(ai.get("direction", "")).strip().upper()
@@ -3653,6 +3916,23 @@ def run_one_backtest(
         direction = str(ai.get("direction", "")).strip().upper()
         if direction not in ("LONG", "SHORT"):
             return _skip_out("no valid LONG/SHORT after enforcement", ai)
+
+        trend_result = apply_trend_filter(
+            sym,
+            direction,
+            strategy_id_norm,
+            as_of_date=analysis_date.strip()[:10],
+        )
+        if trend_result.get("action") == "BLOCK":
+            log(f"[TREND BLOCK] {sym} {direction} — {trend_result.get('reason', '')}", level="info")
+            return _skip_out(str(trend_result.get("reason") or "trend block"), ai)
+        trend_mult = float(trend_result.get("size_multiplier", 1.0) or 1.0)
+
+        if chrono_yfinance:
+            scount = len(CHRONO_DAY_PREFILTER_SIDS.get((sym.upper(), direction), set()))
+        else:
+            scount = _local_prefilter_confluence_count(sym, direction, qualifying_strategies)
+        cf_mult = _strategy_confluence_multiplier(scount)
 
         strategy_met = bool(ai.get("strategy_met", False))
         try:
@@ -3680,6 +3960,9 @@ def run_one_backtest(
         if risk <= 0 or not math.isfinite(risk):
             return _skip_out("invalid risk", ai)
 
+        if scount >= 3 and str(ai.get("tp_target") or "TP1").strip().upper() == "TP2":
+            ai["tp_target"] = "TP3"
+
         tp1 = round(entry + mult * risk * 2.0, 5)
         tp2 = round(entry + mult * risk * 3.0, 5)
         tp3 = round(entry + mult * risk * 5.0, 5)
@@ -3699,10 +3982,12 @@ def run_one_backtest(
 
         _v73_apply_calendar_regime_position_size(
             ai,
-            confidence=confidence,
+            confidence=str(ai.get("confidence", "LOW")),
             calendar_risk=hist_cal,
             regime=regime_ctx,
             macro=macro_bt,
+            trend_mult=trend_mult,
+            confluence_mult=cf_mult,
             entry=float(ai.get("entry", entry) or entry),
         )
 
@@ -3818,13 +4103,26 @@ def run_one_backtest(
             STRATEGIES.get(strategy_id_norm, {}).get("name", "Best Available")
         )
 
+        if chrono_yfinance:
+            agreed_list = sorted(CHRONO_DAY_PREFILTER_SIDS.get((sym.upper(), direction), set()))
+        else:
+            agreed_list = sorted(
+                str(x[0]).strip().upper()
+                for x in qualifying_strategies
+                if len(x) >= 2 and str(x[1]).strip().upper() in ("BOTH", direction)
+            )
+        td = trend_result.get("trend") or {}
+        if not isinstance(td, dict):
+            td = {}
+
         return {
             "date": analysis_date,
             "ticker": sym,
             "timeframe": timeframe,
             "verdict": ai.get("verdict"),
             "direction": direction,
-            "confidence": confidence,
+            "confidence": str(ai.get("confidence", confidence)),
+            "confidence_pre_upgrade": ai.get("confidence_pre_upgrade"),
             "htf_bias": str(ai.get("htf_bias") or ""),
             "market_structure": str(ai.get("market_structure") or ""),
             "zone_pct": zone_pct,
@@ -3902,6 +4200,14 @@ def run_one_backtest(
             "calendar_reason": str(hist_cal.get("reason", "")),
             **_v73_regime_row_fields(regime_ctx),
             **merged_macro_result_fields(ai),
+            "trend": str(td.get("trend", "RANGING")),
+            "trend_strength": float(td.get("strength", 0) or 0),
+            "trend_bias": str(td.get("direction_bias", "NEUTRAL")),
+            "trend_size_mult": float(trend_mult),
+            "trend_block": False,
+            "strategy_confluence_count": int(scount),
+            "strategy_confluence_mult": float(cf_mult),
+            "strategies_agreed": agreed_list,
         }
 
     except Exception as e:  # noqa: BLE001
@@ -5140,6 +5446,7 @@ def run_chronological_backtest(
                         capital = float(icap)
 
             TRADED_TICKERS_TODAY.clear()
+            CHRONO_DAY_PREFILTER_SIDS.clear()
             OPEN_CURRENCY_COUNT.clear()
             OPEN_CURRENCY_COUNT_4H.clear()
             for _row in day_trades:

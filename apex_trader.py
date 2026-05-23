@@ -71,6 +71,30 @@ ORDER_COMMENT = "APEX"
 CONF_RISK_USD: dict[str, float] = {"HIGH": 1500.0, "MEDIUM": 1000.0, "LOW": 300.0}
 TF_RISK_MULT: dict[str, float] = {"1w": 1.0, "1d": 0.85, "4h": 0.70}
 
+# FIX 27 — live MT5: only elite strategies (Railway backtests all 68).
+LIVE_ALLOWED_STRATEGIES: frozenset[str] = frozenset(
+    {
+        "T01_EMA_PULLBACK",
+        "R01_EXTREME_ZONE_REVERSION",
+        "SMC05_EQUAL_HL_HUNT",
+        "M07_VOLUME_SURGE_MOMENTUM",
+        "M03_RSI_MOMENTUM_CONTINUATION",
+        "T07_MA_RIBBON_ALIGNMENT",
+        "SMC01_SR_FLIP",
+    }
+)
+
+
+def live_elite_strategy_ok(strategy_id: str, confidence: str) -> tuple[bool, str]:
+    sid = (strategy_id or "").strip().upper()
+    conf_u = (confidence or "").strip().upper()
+    if sid not in LIVE_ALLOWED_STRATEGIES:
+        return False, f"LIVE SKIP: {sid} not in elite set"
+    if sid == "M03_RSI_MOMENTUM_CONTINUATION" and conf_u != "HIGH":
+        return False, "LIVE SKIP: M03 not HIGH confidence"
+    return True, ""
+
+
 EXOTIC_PAIRS = frozenset({"USDMXN", "USDZAR", "USDNOK", "USDSEK"})
 
 TICKERS: tuple[str, ...] = (
@@ -768,9 +792,32 @@ def scan_one(mt5: Any, sym: str, tf: str, cd: CooldownState, loss: LossState, re
             f"rate_diff={macro['rate_differential']:+.2f}% {macro['price_trend']}",
             "info",
         )
+        conf_pre = conf
         conf = apply_macro_confidence_adjustment(conf, macro)
+        ok_elite, elite_rs = live_elite_strategy_ok(strat, conf)
+        if not ok_elite:
+            log_msg(elite_rs, "info")
+            continue
         risk = CONF_RISK_USD[conf] * TF_RISK_MULT.get(tf, 1.0)
-        exec_trade(mt5, sym, tf, strat, dire, sl, tp1, tp2, risk, cd, rs, conf, cal_risk, regime, macro)
+        cpu = conf_pre if conf_pre != conf and conf_pre in ("HIGH", "MEDIUM", "LOW") else None
+        exec_trade(
+            mt5,
+            sym,
+            tf,
+            strat,
+            dire,
+            sl,
+            tp1,
+            tp2,
+            risk,
+            cd,
+            rs,
+            conf,
+            cal_risk,
+            regime,
+            macro,
+            confidence_pre_upgrade=cpu,
+        )
         return
 
     # Layer 2
@@ -796,9 +843,32 @@ def scan_one(mt5: Any, sym: str, tf: str, cd: CooldownState, loss: LossState, re
         f"rate_diff={macro['rate_differential']:+.2f}% {macro['price_trend']}",
         "info",
     )
-    conf = apply_macro_confidence_adjustment("LOW", macro)
+    conf_pre = "LOW"
+    conf = apply_macro_confidence_adjustment(conf_pre, macro)
+    ok_elite, elite_rs = live_elite_strategy_ok(sid, conf)
+    if not ok_elite:
+        log_msg(elite_rs, "info")
+        return
     risk = CONF_RISK_USD[conf] * TF_RISK_MULT.get(tf, 1.0)
-    exec_trade(mt5, sym, tf, sid, dire, sl, tp1, tp2, risk, cd, "layer2", conf, cal_risk, regime, macro)
+    cpu = conf_pre if conf_pre != conf else None
+    exec_trade(
+        mt5,
+        sym,
+        tf,
+        sid,
+        dire,
+        sl,
+        tp1,
+        tp2,
+        risk,
+        cd,
+        "layer2",
+        conf,
+        cal_risk,
+        regime,
+        macro,
+        confidence_pre_upgrade=cpu,
+    )
 
 
 def exec_trade(
@@ -817,6 +887,7 @@ def exec_trade(
     calendar_risk: dict[str, Any] | None = None,
     regime_risk: dict[str, Any] | None = None,
     macro_bias: dict[str, Any] | None = None,
+    confidence_pre_upgrade: str | None = None,
 ) -> None:
     if not limits_ok(mt5)[0]:
         return
@@ -870,6 +941,10 @@ def exec_trade(
         "regime_consecutive_losses": int(rg.get("consecutive_losses", 0) or 0),
     }
     meta.update(macro_result_fields(mb))
+    if confidence_pre_upgrade is not None:
+        pre_u = str(confidence_pre_upgrade).strip().upper()
+        if pre_u in ("HIGH", "MEDIUM", "LOW") and pre_u != str(conf).strip().upper():
+            meta["confidence_pre_upgrade"] = pre_u
     res = order_send(mt5, bs, dire, sl, risk_eff, meta)
     if not res.get("ok"):
         log_msg(f"[FAIL] {sym} {tf} {strat}: {res}", "error")

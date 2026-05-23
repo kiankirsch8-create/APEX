@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import threading
-import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
+import numpy as np
 import requests
 
 logger = logging.getLogger(__name__)
@@ -46,52 +47,38 @@ _sent_cache: dict[str, tuple[float, datetime]] = {}
 _sent_lock = threading.Lock()
 _SENT_TTL = timedelta(hours=2)
 
-_BULLISH_KW = (
-    "rate hike",
-    "hawkish",
-    "strong",
-    "surges",
-    "beats",
-    "above expectations",
-    "growth",
-    "rally",
+_POS_KW = (
     "rise",
-    "positive",
-    "upbeat",
+    "gain",
+    "surge",
+    "rally",
+    "strong",
+    "bullish",
+    "hawkish",
+    "hike",
+    "rate increase",
+    "beat",
+    "growth",
     "recovery",
-    "gains",
+    "upside",
+    "advance",
 )
-_BEARISH_KW = (
-    "rate cut",
-    "dovish",
-    "weak",
-    "falls",
-    "misses",
-    "below expectations",
-    "recession",
-    "decline",
+_NEG_KW = (
+    "fall",
     "drop",
-    "negative",
-    "crisis",
+    "decline",
+    "weak",
+    "bearish",
+    "dovish",
+    "cut",
+    "miss",
+    "recession",
+    "downside",
     "slowdown",
-    "concerns",
-    "risk",
+    "weaken",
+    "tumble",
+    "concern",
 )
-
-_YAHOO_RSS_PAIR: dict[str, str] = {
-    "EUR": "EURUSD=X",
-    "GBP": "GBPUSD=X",
-    "AUD": "AUDUSD=X",
-    "NZD": "NZDUSD=X",
-    "CAD": "USDCAD=X",
-    "CHF": "USDCHF=X",
-    "JPY": "USDJPY=X",
-    "NOK": "USDNOK=X",
-    "SEK": "USDSEK=X",
-    "MXN": "USDMXN=X",
-    "ZAR": "USDZAR=X",
-    "USD": "EURUSD=X",
-}
 
 
 def set_backtest_mode(active: bool) -> None:
@@ -238,108 +225,124 @@ def get_price_trend(
     return trend
 
 
-def _score_headline(text: str) -> float:
-    tl = (text or "").lower()
-    sc = 0.0
-    n_b = n_br = 0
-    for kw in _BULLISH_KW:
-        if n_b >= 3:
-            break
-        if kw in tl:
-            sc += 0.2
-            n_b += 1
-    for kw in _BEARISH_KW:
-        if n_br >= 3:
-            break
-        if kw in tl:
-            sc -= 0.2
-            n_br += 1
-    return sc
+def _score_articles(
+    articles: Any,
+    base: str,
+    quote: str,
+    headline_key: str,
+    body_key: str,
+) -> float | None:
+    """Score article list toward base currency vs quote (FIX 30)."""
+    b = (base or "").strip().upper()[:3]
+    q = (quote or "").strip().upper()[:3]
+    if not b or not q:
+        return None
+    keywords = (
+        b,
+        q,
+        f"{b}/{q}",
+        f"{b}{q}",
+        f"{b} {q}",
+    )
+    scores: list[float] = []
+    for a in articles or []:
+        if not isinstance(a, dict):
+            continue
+        text = (
+            str(a.get(headline_key, "") or "") + " " + str(a.get(body_key, "") or "")
+        ).lower()
+        if not any(k.lower() in text for k in keywords):
+            continue
+        p = sum(1 for w in _POS_KW if w in text)
+        n = sum(1 for w in _NEG_KW if w in text)
+        if p + n > 0:
+            scores.append((p - n) / float(p + n))
+    if not scores:
+        return None
+    return round(float(np.mean(scores)), 3)
 
 
-def _finnhub_forex_news() -> list[dict[str, Any]]:
-    import os
-
-    key = (os.environ.get("FINNHUB_API_KEY") or "").strip()
-    if not key:
-        return []
-    url = f"https://finnhub.io/api/v1/news?category=forex&token={key}"
-    try:
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        return data if isinstance(data, list) else []
-    except (requests.RequestException, json.JSONDecodeError, ValueError) as e:
-        logger.warning("Finnhub news: %s", e)
-        return []
-
-
-def _yahoo_headlines(symbol: str) -> list[str]:
-    try:
-        url = (
-            "https://feeds.finance.yahoo.com/rss/2.0/headline"
-            f"?s={requests.utils.quote(symbol, safe='')}&region=US&lang=en-US"
-        )
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        root = ET.fromstring(r.content)
-        out: list[str] = []
-        for title in root.findall(".//title"):
-            if title.text:
-                out.append(title.text)
-        return out[1:]  # skip channel title
-    except (requests.RequestException, ET.ParseError) as e:
-        logger.debug("Yahoo RSS %s: %s", symbol, e)
-        return []
-
-
-def get_news_sentiment(currency: str) -> float:
+def get_news_sentiment(base: str, quote: str) -> float:
+    """
+    Sentiment -1..+1 for base vs quote from Finnhub + NewsAPI + Benzinga (FIX 30).
+    Returns 0.0 in backtest or when no usable scores.
+    """
     if IS_BACKTEST:
         return 0.0
-    ccy = (currency or "").strip().upper()[:3]
-    if not ccy:
+    b = (base or "").strip().upper()[:3]
+    q = (quote or "").strip().upper()[:3]
+    if not b or not q:
         return 0.0
+    cache_key = f"{b}/{q}"
     now = datetime.now(timezone.utc)
     with _sent_lock:
-        hit = _sent_cache.get(ccy)
+        hit = _sent_cache.get(cache_key)
         if hit is not None and (now - hit[1]) < _SENT_TTL:
             return float(hit[0])
 
-    headlines: list[str] = []
-    cutoff = now - timedelta(hours=6)
-    for art in _finnhub_forex_news()[:40]:
-        if not isinstance(art, dict):
-            continue
-        head = str(art.get("headline") or art.get("title") or "")
-        if ccy not in head.upper() and ccy not in str(art.get("related", "")).upper():
-            continue
-        try:
-            ts = int(art.get("datetime", 0) or 0)
-            if ts:
-                dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-                if dt < cutoff:
-                    continue
-        except (TypeError, ValueError, OSError):
-            pass
-        if head:
-            headlines.append(head)
+    scores: list[float] = []
 
-    if len(headlines) < 3:
-        sym = _YAHOO_RSS_PAIR.get(ccy)
-        if sym:
-            headlines.extend(_yahoo_headlines(sym)[:15])
+    # Finnhub (forex category)
+    try:
+        fh_key = (os.environ.get("FINNHUB_API_KEY") or "").strip()
+        if fh_key:
+            r = requests.get(
+                "https://finnhub.io/api/v1/news",
+                params={"category": "forex", "token": fh_key},
+                timeout=5,
+            )
+            if r.status_code == 200:
+                s = _score_articles(r.json()[:20], b, q, "headline", "summary")
+                if s is not None:
+                    scores.append(float(s))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Finnhub sentiment: %s", e)
 
-    if len(headlines) < 3:
-        with _sent_lock:
-            _sent_cache[ccy] = (0.0, now)
-        return 0.0
+    # NewsAPI
+    try:
+        na_key = (os.environ.get("NEWSAPI_KEY") or "").strip()
+        if na_key:
+            r = requests.get(
+                "https://newsapi.org/v2/everything",
+                params={
+                    "q": f"{b} OR {q} forex",
+                    "language": "en",
+                    "sortBy": "publishedAt",
+                    "pageSize": 20,
+                    "apiKey": na_key,
+                },
+                timeout=5,
+            )
+            if r.status_code == 200:
+                s = _score_articles(r.json().get("articles", []), b, q, "title", "description")
+                if s is not None:
+                    scores.append(float(s))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("NewsAPI sentiment: %s", e)
 
-    scores = [_score_headline(h) for h in headlines[:25]]
-    avg = sum(scores) / float(len(scores)) if scores else 0.0
-    avg = max(-1.0, min(1.0, avg))
+    # Benzinga
+    try:
+        bz_key = (os.environ.get("BENZINGA_API_KEY") or "").strip()
+        if bz_key:
+            r = requests.get(
+                "https://api.benzinga.com/api/v2/news",
+                params={"token": bz_key, "topics": "forex", "pageSize": 20},
+                timeout=5,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                arts = data if isinstance(data, list) else []
+                s = _score_articles(arts, b, q, "title", "body")
+                if s is not None:
+                    scores.append(float(s))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Benzinga sentiment: %s", e)
+
+    out = round(float(np.mean(scores)), 3) if scores else 0.0
+    out = max(-1.0, min(1.0, out))
     with _sent_lock:
-        _sent_cache[ccy] = (avg, now)
-    return avg
+        _sent_cache[cache_key] = (out, now)
+    return out
 
 
 def get_macro_bias(
@@ -370,12 +373,11 @@ def get_macro_bias(
     else:
         trend_score = 1.0 if trend == "DOWNTREND" else (-0.5 if trend == "UPTREND" else 0.0)
 
-    base_sent = get_news_sentiment(base)
-    quote_sent = get_news_sentiment(quote)
+    pair_sent = get_news_sentiment(base, quote)
     if dire == "LONG":
-        sentiment_score = base_sent - quote_sent
+        sentiment_score = pair_sent
     else:
-        sentiment_score = quote_sent - base_sent
+        sentiment_score = -pair_sent
     sentiment_score = max(-1.0, min(1.0, sentiment_score))
 
     if IS_BACKTEST:
