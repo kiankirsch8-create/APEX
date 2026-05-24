@@ -5,7 +5,9 @@ rolling stats, and periodic self-improvement. All state is simple JSON on ``DATA
 """
 from __future__ import annotations
 
-STRATEGY_VERSION = "v7.3-session21"
+STRATEGY_VERSION = "v7.4-macro-trail-storm-4h"
+# v7.4: macro-aware forward trailing (TRENDING vs CHOPPY), perfect-storm M03 JPY sizing,
+# chrono 4h filters + cross-TF confluence 1.75x, compact chrono export API.
 # v7.3 session21: FIX 23–30 (macro confidence post-enforce, B02 stops + blocked, trend_manager,
 # chrono strategy confluence, strategy_status). Calendar + regime + macro from prior prompts.
 # v7.2: strategy_status.json + chrono skips LOCKED strategies; UNTESTED loose EMA200/ADX paths (chrono only).
@@ -16,8 +18,7 @@ STRATEGY_VERSION = "v7.3-session21"
 # v6 baseline: LAST_TRADE_DATES (never reset per day); Layer 2+ Python-forced; Layer 1 prompt.
 #
 # DO NOT CHANGE (contract):
-#   evaluate_forward_candles trailing behavior
-#   RISK_BY_CONFIDENCE numeric values
+#   RISK_BY_CONFIDENCE numeric dict entries (v7.4 only adds optional M03 JPY perfect-storm override)
 #   append_result / load_all_results implementations
 #   calculate_stats function
 #   File I/O and storage paths (DATA_DIR results)
@@ -65,6 +66,25 @@ LAST_TRADE_DATES: dict[str, str] = {}
 TRADED_TICKERS_TODAY: set[str] = set()
 # FIX 29 — distinct strategy ids per (ticker, direction) accumulated during chrono calendar day.
 CHRONO_DAY_PREFILTER_SIDS: defaultdict[tuple[str, str], set[str]] = defaultdict(set)
+# v7.4 — cross-timeframe confluence (1w+1d+4h same sym+direction same calendar day)
+CHRONO_SYMDIR_TFS: defaultdict[tuple[str, str], set[str]] = defaultdict(set)
+# v7.4 — perfect storm JPY snapshot (sym -> last macro/trend/conf for that chrono day)
+CHRONO_JPY_STORM_SNAPSHOT: dict[str, dict[str, Any]] = {}
+CHRONO_JPY_RISK_DAY: float = 0.0
+# v7.4 — JPY storm pairs that produced at least one qualifying prefilter row today (chrono)
+CHRONO_JPY_PAIRS_SIGNALLED: set[str] = set()
+
+JPY_STORM_PAIRS: frozenset[str] = frozenset(
+    {"USDJPY", "CADJPY", "AUDJPY", "GBPJPY", "NZDJPY", "CHFJPY"},
+)
+V74_ALLOWED_4H_STRATEGIES: frozenset[str] = frozenset(
+    {
+        "T01_EMA_PULLBACK",
+        "M02_MACD_ZERO_CROSS",
+        "T07_MA_RIBBON_ALIGNMENT",
+        "R01_EXTREME_ZONE_REVERSION",
+    },
+)
 # v7.0 chrono: completed trades per currency per scan day (sequential sim; caps clustering).
 OPEN_CURRENCY_COUNT: dict[str, int] = {}
 # v7.1 chrono: 4h + intraday share a separate per-day currency pool from 1w/1d.
@@ -620,6 +640,13 @@ def _v7_filter_layer2_qualifiers(
         sid_u = str(sid).strip().upper()
         if sid_u in LAYER1_STRATEGY_IDS:
             out.append((sid, direction, score, None))
+            continue
+
+        if tf_l == "4h" and sid_u not in V74_ALLOWED_4H_STRATEGIES:
+            log(
+                f"[PreFilterV7] {sym} {tf_key}: skip {sid_u} — 4h allowlist excludes this strategy (v7.4)",
+                level="info",
+            )
             continue
 
         d_raw = str(direction or "").strip().upper()
@@ -2441,7 +2468,20 @@ def _v73_refresh_risk_fields_from_ai_confidence(
     if confidence not in RISK_BY_CONFIDENCE:
         confidence = "LOW"
     risk_pct = float(RISK_BY_CONFIDENCE.get(confidence, 0.005))
-    risk_dollars = STARTING_CAPITAL * risk_pct
+    if tf == "4h":
+        risk_pct *= 0.6
+    if ai.get("_v74_perfect_storm_m03_jpy") and confidence == "HIGH":
+        risk_pct = 0.028
+    balance = float(ai.get("_balance_for_sizing") or STARTING_CAPITAL)
+    risk_dollars = balance * risk_pct
+    risk_dollars = min(risk_dollars, balance * 0.055)
+    if ai.get("_jpy_risk_headroom") is not None:
+        try:
+            hr = float(ai.get("_jpy_risk_headroom"))
+            if hr >= 0:
+                risk_dollars = min(risk_dollars, hr)
+        except (TypeError, ValueError):
+            pass
     stop_dist = abs(entry - float(ai.get("stop_loss", entry * 0.99) or 0))
     if stop_dist > 0:
         pos_size = risk_dollars / stop_dist
@@ -2480,8 +2520,10 @@ def _v73_post_enforce_macro_confidence(
         _v73_refresh_risk_fields_from_ai_confidence(ai, tf_key, float(price), sym)
 
 
-def _strategy_confluence_multiplier(strategy_count: int) -> float:
-    """FIX 29 — independent strategy agreement on same ticker + direction."""
+def _strategy_confluence_multiplier(strategy_count: int, *, triple_tf_agreement: bool = False) -> float:
+    """FIX 29 + v7.4 — 1.75x when 1w+1d+4h same sym+direction fire the same calendar day (chrono)."""
+    if triple_tf_agreement and strategy_count >= 3:
+        return 1.75
     if strategy_count >= 3:
         return 1.5
     if strategy_count == 2:
@@ -2489,9 +2531,10 @@ def _strategy_confluence_multiplier(strategy_count: int) -> float:
     return 1.0
 
 
-def _chrono_accumulate_prefilter_signals(sym: str, rows: list[Any]) -> None:
+def _chrono_accumulate_prefilter_signals(sym: str, rows: list[Any], tf_key: str) -> None:
     """FIX 29 — record qualifying strategy ids per (ticker, direction) for the chrono day."""
     su = (sym or "").strip().upper()
+    tft = (tf_key or "").strip().lower()
     for row in rows:
         if not row or len(row) < 3:
             continue
@@ -2500,8 +2543,16 @@ def _chrono_accumulate_prefilter_signals(sym: str, rows: list[Any]) -> None:
         if dr == "BOTH":
             CHRONO_DAY_PREFILTER_SIDS[(su, "LONG")].add(sid)
             CHRONO_DAY_PREFILTER_SIDS[(su, "SHORT")].add(sid)
+            CHRONO_SYMDIR_TFS[(su, "LONG")].add(tft)
+            CHRONO_SYMDIR_TFS[(su, "SHORT")].add(tft)
         elif dr in ("LONG", "SHORT"):
             CHRONO_DAY_PREFILTER_SIDS[(su, dr)].add(sid)
+            CHRONO_SYMDIR_TFS[(su, dr)].add(tft)
+    if su in JPY_STORM_PAIRS:
+        for row in rows or []:
+            if row and len(row) >= 2 and str(row[1]).strip().upper() in ("LONG", "SHORT", "BOTH"):
+                CHRONO_JPY_PAIRS_SIGNALLED.add(su)
+                break
 
 
 def _local_prefilter_confluence_count(sym: str, direction: str, rows: list[Any]) -> int:
@@ -2636,6 +2687,52 @@ def _apply_trailing_dollar_floor(
     return proposed_stop
 
 
+def detect_market_regime(macro_bias: str, trend_strength: float, rate_diff: float) -> str:
+    """v7.4 — TRENDING only under strong macro + trend + carry differential (else CHOPPY)."""
+    mb = str(macro_bias or "").strip().upper()
+    try:
+        ts = float(trend_strength)
+    except (TypeError, ValueError):
+        ts = 0.0
+    try:
+        rd = float(rate_diff)
+    except (TypeError, ValueError):
+        rd = 0.0
+    if mb == "STRONG_TAILWIND" and ts > 0.70 and rd > 2.0:
+        return "TRENDING"
+    return "CHOPPY"
+
+
+def detect_perfect_storm() -> tuple[bool, int]:
+    """
+    v7.4 — ≥3 listed JPY pairs signalled today, all STRONG_TAILWIND + HIGH conf + trend>0.65
+    + same weekly direction_bias + rate differential > 2.5%.
+    """
+    firing = sorted(s for s in JPY_STORM_PAIRS if s in CHRONO_JPY_PAIRS_SIGNALLED)
+    if len(firing) < 3:
+        return False, len(firing)
+    snaps: list[dict[str, Any]] = []
+    for s in firing:
+        sn = CHRONO_JPY_STORM_SNAPSHOT.get(s)
+        if isinstance(sn, dict):
+            snaps.append(sn)
+    if len(snaps) < 3:
+        return False, len(snaps)
+    biases = {str(x.get("trend_bias", "NEUTRAL")).strip().upper() for x in snaps}
+    if biases != {"LONG"} and biases != {"SHORT"}:
+        return False, len(snaps)
+    for x in snaps:
+        if str(x.get("macro_bias", "")).strip().upper() != "STRONG_TAILWIND":
+            return False, len(snaps)
+        if str(x.get("confidence", "")).strip().upper() != "HIGH":
+            return False, len(snaps)
+        if float(x.get("trend_strength", 0) or 0) <= 0.65:
+            return False, len(snaps)
+        if float(x.get("rate_differential", 0) or 0) <= 2.5:
+            return False, len(snaps)
+    return True, len(snaps)
+
+
 def evaluate_forward_candles(
     direction: str,
     entry: float,
@@ -2648,10 +2745,18 @@ def evaluate_forward_candles(
     *,
     position_size: float = 0.0,
     leverage: int = 0,
+    timeframe: str = "",
+    macro_bias: str = "",
+    trend_strength: float = 0.0,
+    rate_differential: float = 0.0,
+    atr: float = 0.0,
 ) -> dict[str, Any]:
-    """Trailing: +0.75R at TP1, +1.5R at TP2 (v7.1), $25 min locked profit on trail updates, 1.5R trail after TP3."""
+    """v7.4 — regime-based TP ladders and trailing (TRENDING vs CHOPPY); 4h always CHOPPY."""
     _ = strategy_id
     _ = leverage
+    _ = tp1
+    _ = tp2
+    _ = tp3
     if forward_df is None or forward_df.empty:
         return {
             "outcome": "NO_DATA",
@@ -2665,6 +2770,7 @@ def evaluate_forward_candles(
             "candles_to_exit": 0,
             "trailing_activated": False,
             "final_stop": stop_loss,
+            "trail_market_regime": "CHOPPY",
         }
 
     risk = abs(float(entry) - float(stop_loss))
@@ -2681,122 +2787,236 @@ def evaluate_forward_candles(
             "candles_to_exit": 0,
             "trailing_activated": False,
             "final_stop": stop_loss,
+            "trail_market_regime": "CHOPPY",
         }
 
     d = str(direction or "").strip().upper()
-    entry_price = float(entry)
-    tp1_raw = float(tp1)
-    if d == "LONG":
-        minimum_tp1 = entry_price + (2.0 * risk)
-        tp1_active = max(tp1_raw, minimum_tp1)
-    elif d == "SHORT":
-        minimum_tp1 = entry_price - (2.0 * risk)
-        tp1_active = min(tp1_raw, minimum_tp1)
-    else:
-        tp1_active = tp1_raw
+    if d not in ("LONG", "SHORT"):
+        return {
+            "outcome": "INVALID",
+            "exit_price": float(entry),
+            "exit_reason": "Invalid direction",
+            "pnl_pct": 0,
+            "hit_tp1": False,
+            "hit_tp2": False,
+            "hit_tp3": False,
+            "hit_stop": False,
+            "candles_to_exit": 0,
+            "trailing_activated": False,
+            "final_stop": float(stop_loss),
+            "trail_market_regime": "CHOPPY",
+        }
 
+    entry_price = float(entry)
+    tf_lc = (timeframe or "").strip().lower()
+    regime = "CHOPPY" if tf_lc == "4h" else detect_market_regime(macro_bias, trend_strength, rate_differential)
+    mult1, mult2, mult3 = (2.0, 4.0, 7.0) if regime == "TRENDING" else (1.5, 3.0, 5.0)
+    sign = 1.0 if d == "LONG" else -1.0
+    tp1p = entry_price + sign * risk * mult1
+    tp2p = entry_price + sign * risk * mult2
+    tp3p = entry_price + sign * risk * mult3
+
+    atr_use = float(atr or 0) or risk
+    if atr_use <= 0:
+        atr_use = abs(entry_price) * 0.001
+
+    ps = float(position_size or 0.0)
+    rem = 1.0
+    realized = 0.0
     current_stop = float(stop_loss)
     hit_tp1 = hit_tp2 = hit_tp3 = hit_stop = False
     trailing_activated = False
-    exit_price = float(entry)
+    exit_price = float(entry_price)
     exit_reason = "Window ended"
     candle_count = 0
+    choppy_tb_done = False
+    peak_hi = float("-inf")
+    peak_lo = float("inf")
 
-    for _, candle in forward_df.iterrows():
+    def _px_move(px: float) -> float:
+        if d == "LONG":
+            return px - entry_price
+        return entry_price - px
+
+    def _close_frac(frac: float, px: float) -> None:
+        nonlocal rem, realized
+        if frac <= 0 or rem <= 0 or ps <= 0:
+            return
+        q = ps * rem * min(1.0, frac)
+        realized += q * _px_move(px)
+        rem = max(0.0, rem * (1.0 - min(1.0, frac)))
+
+    rows = list(forward_df.iterrows())
+    for i, (_, candle) in enumerate(rows):
         candle_count += 1
         try:
-            high = float(candle.get("High", entry))
-            low = float(candle.get("Low", entry))
-            close = float(candle.get("Close", entry))
+            high = float(candle.get("High", entry_price))
+            low = float(candle.get("Low", entry_price))
+            close = float(candle.get("Close", entry_price))
         except (TypeError, ValueError):
             continue
 
+        prev_row = rows[i - 1][1] if i > 0 else None
+        try:
+            prev_low = float(prev_row.get("Low", close)) if prev_row is not None else low
+            prev_high = float(prev_row.get("High", close)) if prev_row is not None else high
+        except (TypeError, ValueError):
+            prev_low = low
+            prev_high = high
+
+        if regime == "CHOPPY" and hit_tp1 and not hit_tp3 and prev_row is not None:
+            if d == "LONG":
+                prop = prev_low - 0.5 * atr_use
+                if prop > current_stop:
+                    ns = _apply_trailing_dollar_floor(entry_price, current_stop, prop, d, ps * rem)
+                    if ns > current_stop:
+                        trailing_activated = True
+                    current_stop = ns
+            else:
+                prop = prev_high + 0.5 * atr_use
+                if prop < current_stop:
+                    ns = _apply_trailing_dollar_floor(entry_price, current_stop, prop, d, ps * rem)
+                    if ns < current_stop:
+                        trailing_activated = True
+                    current_stop = ns
+
         if d == "LONG":
-            if low <= current_stop:
+            if low <= current_stop and rem > 0:
                 hit_stop = True
+                q = ps * rem
+                realized += q * (current_stop - entry_price)
+                rem = 0.0
                 exit_price = current_stop
-                exit_reason = "Trailing stop" if trailing_activated else "Stop loss"
+                exit_reason = "Trailing stop" if trailing_activated or hit_tp1 else "Stop loss"
                 break
 
-            if high >= tp3 and not hit_tp3:
-                hit_tp3 = True
-                trailing_activated = True
-                prop = float(entry_price) + risk * 2.0
-                current_stop = _apply_trailing_dollar_floor(
-                    entry_price, current_stop, prop, d, position_size,
-                )
-
-            elif high >= tp2 and not hit_tp2:
-                hit_tp2 = True
-                trailing_activated = True
-                prop = float(entry_price) + risk * 1.5
-                current_stop = _apply_trailing_dollar_floor(
-                    entry_price, current_stop, prop, d, position_size,
-                )
-
-            elif high >= tp1_active and not hit_tp1:
+            if high >= tp1p and not hit_tp1:
                 hit_tp1 = True
                 trailing_activated = True
-                prop = float(entry_price) + 0.75 * risk
                 current_stop = _apply_trailing_dollar_floor(
-                    entry_price, current_stop, prop, d, position_size,
+                    entry_price, current_stop, entry_price, d, ps * rem,
+                )
+                if regime == "CHOPPY":
+                    _close_frac(0.25, tp1p)
+
+            if high >= tp2p and not hit_tp2 and hit_tp1:
+                hit_tp2 = True
+                trailing_activated = True
+                if regime == "TRENDING":
+                    _close_frac(0.20, tp2p)
+                    current_stop = _apply_trailing_dollar_floor(
+                        entry_price, current_stop, tp1p, d, ps * rem,
+                    )
+                else:
+                    _close_frac(0.40, tp2p)
+                    current_stop = _apply_trailing_dollar_floor(
+                        entry_price, current_stop, tp1p, d, ps * rem,
+                    )
+
+            if high >= tp3p and not hit_tp3 and hit_tp2:
+                hit_tp3 = True
+                trailing_activated = True
+                if regime == "CHOPPY":
+                    _close_frac(1.0, tp3p)
+                    exit_price = tp3p
+                    exit_reason = "Take profit TP3 (choppy full exit)"
+                    break
+                _close_frac(0.30, tp3p)
+                peak_hi = max(peak_hi, high, close, tp3p)
+                prop = peak_hi - 2.0 * atr_use
+                current_stop = _apply_trailing_dollar_floor(
+                    entry_price, current_stop, max(current_stop, prop), d, ps * rem,
                 )
 
-            if hit_tp1 and trailing_activated:
-                trail_level = close - risk * 1.5
-                if trail_level > current_stop:
+            if regime == "TRENDING" and hit_tp3 and rem > 0:
+                peak_hi = max(peak_hi, high, close)
+                prop = peak_hi - 2.0 * atr_use
+                if prop > current_stop:
                     current_stop = _apply_trailing_dollar_floor(
-                        entry_price, current_stop, trail_level, d, position_size,
+                        entry_price, current_stop, prop, d, ps * rem,
                     )
 
         else:
-            if high >= current_stop:
+            if high >= current_stop and rem > 0:
                 hit_stop = True
+                q = ps * rem
+                realized += q * (entry_price - current_stop)
+                rem = 0.0
                 exit_price = current_stop
-                exit_reason = "Trailing stop" if trailing_activated else "Stop loss"
+                exit_reason = "Trailing stop" if trailing_activated or hit_tp1 else "Stop loss"
                 break
 
-            if low <= tp3 and not hit_tp3:
-                hit_tp3 = True
-                trailing_activated = True
-                prop = float(entry_price) - risk * 2.0
-                current_stop = _apply_trailing_dollar_floor(
-                    entry_price, current_stop, prop, d, position_size,
-                )
-
-            elif low <= tp2 and not hit_tp2:
-                hit_tp2 = True
-                trailing_activated = True
-                prop = float(entry_price) - risk * 1.5
-                current_stop = _apply_trailing_dollar_floor(
-                    entry_price, current_stop, prop, d, position_size,
-                )
-
-            elif low <= tp1_active and not hit_tp1:
+            if low <= tp1p and not hit_tp1:
                 hit_tp1 = True
                 trailing_activated = True
-                prop = float(entry_price) - 0.75 * risk
                 current_stop = _apply_trailing_dollar_floor(
-                    entry_price, current_stop, prop, d, position_size,
+                    entry_price, current_stop, entry_price, d, ps * rem,
                 )
+                if regime == "CHOPPY":
+                    _close_frac(0.25, tp1p)
 
-            if hit_tp1 and trailing_activated:
-                trail_level = close + risk * 1.5
-                if trail_level < current_stop:
+            if low <= tp2p and not hit_tp2 and hit_tp1:
+                hit_tp2 = True
+                trailing_activated = True
+                if regime == "TRENDING":
+                    _close_frac(0.20, tp2p)
                     current_stop = _apply_trailing_dollar_floor(
-                        entry_price, current_stop, trail_level, d, position_size,
+                        entry_price, current_stop, tp1p, d, ps * rem,
+                    )
+                else:
+                    _close_frac(0.40, tp2p)
+                    current_stop = _apply_trailing_dollar_floor(
+                        entry_price, current_stop, tp1p, d, ps * rem,
                     )
 
-    if not hit_stop and not forward_df.empty:
+            if low <= tp3p and not hit_tp3 and hit_tp2:
+                hit_tp3 = True
+                trailing_activated = True
+                if regime == "CHOPPY":
+                    _close_frac(1.0, tp3p)
+                    exit_price = tp3p
+                    exit_reason = "Take profit TP3 (choppy full exit)"
+                    break
+                _close_frac(0.30, tp3p)
+                peak_lo = min(peak_lo, low, close, tp3p)
+                prop = peak_lo + 2.0 * atr_use
+                current_stop = _apply_trailing_dollar_floor(
+                    entry_price, current_stop, min(current_stop, prop), d, ps * rem,
+                )
+
+            if regime == "TRENDING" and hit_tp3 and rem > 0:
+                peak_lo = min(peak_lo, low, close)
+                prop = peak_lo + 2.0 * atr_use
+                if prop < current_stop:
+                    current_stop = _apply_trailing_dollar_floor(
+                        entry_price, current_stop, prop, d, ps * rem,
+                    )
+
+        if regime == "CHOPPY" and hit_tp1 and not hit_tp2 and candle_count >= 4 and not choppy_tb_done:
+            half_tp2 = abs(tp2p - entry_price) * 0.5
+            if half_tp2 > 0:
+                prog = abs(close - entry_price) if d == "LONG" else abs(entry_price - close)
+                if prog < half_tp2:
+                    _close_frac(0.5, close)
+                    choppy_tb_done = True
+                    trailing_activated = True
+                    if rem <= 1e-12:
+                        hit_stop = True
+                        exit_price = close
+                        exit_reason = "Time-based partial (choppy)"
+                        break
+
+    if not hit_stop and rem > 0 and not forward_df.empty:
         try:
             exit_price = float(forward_df["Close"].iloc[-1])
         except (TypeError, ValueError, KeyError, IndexError):
-            exit_price = float(entry)
+            exit_price = float(entry_price)
+        if ps > 0:
+            realized += ps * rem * _px_move(exit_price)
+        rem = 0.0
 
-    if d == "LONG":
-        pnl_pct = (exit_price - float(entry)) / float(entry) if entry else 0.0
-    else:
-        pnl_pct = (float(entry) - exit_price) / float(entry) if entry else 0.0
+    denom = ps * entry_price if ps > 0 and entry_price > 0 else 0.0
+    pnl_pct = (realized / denom) if denom > 0 else 0.0
 
     return {
         "outcome": "WIN" if pnl_pct > 0 else "LOSS",
@@ -2810,6 +3030,7 @@ def evaluate_forward_candles(
         "candles_to_exit": candle_count,
         "trailing_activated": trailing_activated,
         "final_stop": round(current_stop, 5),
+        "trail_market_regime": regime,
     }
 
 
@@ -2886,7 +3107,8 @@ def _v73_apply_calendar_regime_position_size(
     c = str(confidence or "LOW").strip().upper()
     if c not in RISK_BY_CONFIDENCE:
         c = "LOW"
-    cap = float(STARTING_CAPITAL) * float(RISK_BY_CONFIDENCE["HIGH"]) * 1.5
+    bal_sz = float(ai.get("_balance_for_sizing") or STARTING_CAPITAL)
+    cap = bal_sz * float(RISK_BY_CONFIDENCE["HIGH"]) * 1.5
     mrd1 = max(25.0, min(mrd1, cap))
     ps = mrd1 / sd0
     ai["_max_risk_dollars"] = mrd1
@@ -3024,6 +3246,9 @@ def _python_forced_layer2_trade(
     chrono_job: bool = False,
     calendar_risk: dict[str, Any] | None = None,
     regime_ctx: dict[str, Any] | None = None,
+    chrono_balance: float | None = None,
+    chrono_day_pnl: float = 0.0,
+    atr_ref: float | None = None,
 ) -> dict[str, Any] | None:
     """Execute Layer 2+ setup without Claude (v7.1)."""
     if not layer2:
@@ -3128,6 +3353,8 @@ def _python_forced_layer2_trade(
     )
 
     ai = enforce_rules(ai, tf_key, float(price), sym, rsi=float(rsi_live))
+    if chrono_job:
+        ai["_balance_for_sizing"] = float(chrono_balance or STARTING_CAPITAL)
     _v73_post_enforce_macro_confidence(ai, macro_bt, tf_key=tf_key, price=float(price), sym=sym)
     cal = calendar_risk or {
         "action": "CLEAR",
@@ -3180,20 +3407,61 @@ def _python_forced_layer2_trade(
         )
     trend_mult = float(trend_result.get("size_multiplier", 1.0) or 1.0)
 
+    sym_u = sym.upper()
+    dir_u = str(ai.get("direction", direction)).strip().upper()
+    if chrono_job and sym_u in JPY_STORM_PAIRS:
+        tr_snap = trend_result.get("trend") or {}
+        if not isinstance(tr_snap, dict):
+            tr_snap = {}
+        CHRONO_JPY_STORM_SNAPSHOT[sym_u] = {
+            "macro_bias": str((macro_bt or {}).get("bias", "")),
+            "confidence": str(ai.get("confidence", "LOW")).strip().upper(),
+            "trend_strength": float(tr_snap.get("strength", 0) or 0),
+            "trend_bias": str(tr_snap.get("direction_bias", "NEUTRAL")).strip().upper(),
+            "rate_differential": float((macro_bt or {}).get("rate_differential", 0) or 0),
+        }
+
     if chrono_job:
-        scount = len(CHRONO_DAY_PREFILTER_SIDS.get((sym.upper(), str(ai.get("direction", direction)).strip().upper()), set()))
+        scount = len(CHRONO_DAY_PREFILTER_SIDS.get((sym_u, dir_u), set()))
+        triple = {"1w", "1d", "4h"}.issubset(CHRONO_SYMDIR_TFS.get((sym_u, dir_u), set()))
     else:
         scount = len(
             {
                 str(x[0]).strip().upper()
                 for x in layer2
                 if len(x) >= 2
-                and (str(x[1]).strip().upper() in ("BOTH", str(ai.get("direction", direction)).strip().upper()))
+                and (str(x[1]).strip().upper() in ("BOTH", dir_u))
             }
         )
-    cf_mult = _strategy_confluence_multiplier(scount)
+        triple = False
+    cf_mult = _strategy_confluence_multiplier(scount, triple_tf_agreement=triple)
     if scount >= 3 and str(ai.get("tp_target") or "TP1").strip().upper() == "TP2":
         ai["tp_target"] = "TP3"
+
+    ai["_v74_perfect_storm_m03_jpy"] = False
+    ai.pop("_jpy_risk_headroom", None)
+    if chrono_job:
+        bal = float(chrono_balance or STARTING_CAPITAL)
+        lim = max(5000.0, bal * 0.05)
+        ps_ok, nj = detect_perfect_storm()
+        daily_ok = float(chrono_day_pnl) > -lim
+        if (
+            ps_ok
+            and daily_ok
+            and strat_id == "M03_RSI_MOMENTUM_CONTINUATION"
+            and sym_u in JPY_STORM_PAIRS
+            and str(ai.get("confidence", "")).strip().upper() == "HIGH"
+        ):
+            ai["_v74_perfect_storm_m03_jpy"] = True
+            log(
+                f"[PERFECT STORM] {nj} JPY pairs aligned — M03 sizing: 2.8% base risk",
+                level="info",
+            )
+        if sym_u.endswith("JPY"):
+            hr = bal * 0.20 - float(CHRONO_JPY_RISK_DAY)
+            ai["_jpy_risk_headroom"] = max(0.0, hr)
+
+    _v73_refresh_risk_fields_from_ai_confidence(ai, tf_key, float(price), sym)
 
     _apply_chrono_risk_tp_multipliers(
         ai,
@@ -3236,6 +3504,11 @@ def _python_forced_layer2_trade(
         level="info",
     )
 
+    tr_ev = trend_result.get("trend") or {}
+    if not isinstance(tr_ev, dict):
+        tr_ev = {}
+    ts_ev = float(tr_ev.get("strength", 0) or 0)
+
     exit_data = evaluate_forward_candles(
         direction,
         entry,
@@ -3247,6 +3520,11 @@ def _python_forced_layer2_trade(
         strat_id,
         position_size=float(ai.get("_position_size", 0) or 0),
         leverage=LEVERAGE,
+        timeframe=tf_key,
+        macro_bias=str(ai.get("macro_bias", "") or ""),
+        trend_strength=ts_ev,
+        rate_differential=float(ai.get("macro_rate_diff", 0) or 0),
+        atr=float(atr_ref or 0),
     )
     if exit_data.get("outcome") in ("NO_DATA", "INVALID"):
         return None
@@ -3357,6 +3635,8 @@ def _python_forced_layer2_trade(
         "tf_strategy_allowed": tf_key != "1h" or strat_id in ALLOWED_1H_STRATEGIES,
         "trailing_activated": trailing_activated,
         "final_stop": round(final_stop, 5),
+        "trail_market_regime": str(exit_data.get("trail_market_regime") or "CHOPPY"),
+        "v74_perfect_storm": bool(ai.get("_v74_perfect_storm_m03_jpy")),
         "skipped": False,
         "skip_trade": False,
         "calendar_action": str(cal.get("action", "CLEAR")),
@@ -3384,6 +3664,8 @@ def run_one_backtest(
     chrono_tp_mult: float = 1.0,
     chrono_enforce_extended_cooldown: bool = False,
     chrono_regime: dict[str, Any] | None = None,
+    chrono_balance: float | None = None,
+    chrono_day_pnl: float = 0.0,
 ) -> dict[str, Any] | None:
     try:
         sym = (ticker or "").strip().upper()
@@ -3596,7 +3878,7 @@ def run_one_backtest(
             past=past,
         )
         if chrono_yfinance and qualifies:
-            _chrono_accumulate_prefilter_signals(sym, qualifying_strategies)
+            _chrono_accumulate_prefilter_signals(sym, qualifying_strategies, tf_key)
         if not qualifies:
             pr = f"Python pre-filter: {filter_reason}"
             log(f"[PreFilter] {sym} {timeframe} {analysis_date}: {pr}", level="info")
@@ -3754,6 +4036,9 @@ def run_one_backtest(
                 chrono_job=chrono_yfinance,
                 calendar_risk=hist_cal,
                 regime_ctx=regime_ctx,
+                chrono_balance=chrono_balance,
+                chrono_day_pnl=chrono_day_pnl,
+                atr_ref=float(ind.get("atr", 0) or 0) or None,
             )
             return forced
 
@@ -3897,6 +4182,10 @@ def run_one_backtest(
         if macro_bt is not None:
             _v73_post_enforce_macro_confidence(ai, macro_bt, tf_key=tf_key, price=float(price), sym=sym)
 
+        if chrono_yfinance:
+            ai["_balance_for_sizing"] = float(chrono_balance or STARTING_CAPITAL)
+            _v73_refresh_risk_fields_from_ai_confidence(ai, tf_key, float(price), sym)
+
         if chrono_enforce_extended_cooldown:
             d_pre = str(ai.get("direction", "")).strip().upper()
             if d_pre in ("LONG", "SHORT"):
@@ -3928,11 +4217,25 @@ def run_one_backtest(
             return _skip_out(str(trend_result.get("reason") or "trend block"), ai)
         trend_mult = float(trend_result.get("size_multiplier", 1.0) or 1.0)
 
+        if chrono_yfinance and sym.upper() in JPY_STORM_PAIRS and macro_bt is not None:
+            tr_snap = trend_result.get("trend") or {}
+            if not isinstance(tr_snap, dict):
+                tr_snap = {}
+            CHRONO_JPY_STORM_SNAPSHOT[sym.upper()] = {
+                "macro_bias": str(macro_bt.get("bias", "")),
+                "confidence": str(ai.get("confidence", "LOW")).strip().upper(),
+                "trend_strength": float(tr_snap.get("strength", 0) or 0),
+                "trend_bias": str(tr_snap.get("direction_bias", "NEUTRAL")).strip().upper(),
+                "rate_differential": float(macro_bt.get("rate_differential", 0) or 0),
+            }
+
         if chrono_yfinance:
             scount = len(CHRONO_DAY_PREFILTER_SIDS.get((sym.upper(), direction), set()))
+            triple = {"1w", "1d", "4h"}.issubset(CHRONO_SYMDIR_TFS.get((sym.upper(), direction), set()))
         else:
             scount = _local_prefilter_confluence_count(sym, direction, qualifying_strategies)
-        cf_mult = _strategy_confluence_multiplier(scount)
+            triple = False
+        cf_mult = _strategy_confluence_multiplier(scount, triple_tf_agreement=triple)
 
         strategy_met = bool(ai.get("strategy_met", False))
         try:
@@ -4002,6 +4305,11 @@ def run_one_backtest(
         if fut.empty or len(fut) == 0:
             return None
 
+        tr_ev2 = trend_result.get("trend") or {}
+        if not isinstance(tr_ev2, dict):
+            tr_ev2 = {}
+        ts_cl = float(tr_ev2.get("strength", 0) or 0)
+
         exit_data = evaluate_forward_candles(
             direction,
             entry,
@@ -4013,6 +4321,11 @@ def run_one_backtest(
             strategy_id_norm,
             position_size=position_size,
             leverage=LEVERAGE,
+            timeframe=tf_key,
+            macro_bias=str(ai.get("macro_bias", "") or ""),
+            trend_strength=ts_cl,
+            rate_differential=float(ai.get("macro_rate_diff", 0) or 0),
+            atr=float(ind.get("atr", 0) or 0),
         )
         del fut
         del past
@@ -4194,6 +4507,8 @@ def run_one_backtest(
             "tf_strategy_allowed": tf_key != "1h" or strategy_id_norm in ALLOWED_1H_STRATEGIES,
             "trailing_activated": trailing_activated,
             "final_stop": round(final_stop, 5),
+            "trail_market_regime": str(exit_data.get("trail_market_regime") or "CHOPPY"),
+            "v74_perfect_storm": bool(ai.get("_v74_perfect_storm_m03_jpy")),
             "skipped": False,
             "skip_trade": False,
             "calendar_action": str(hist_cal.get("action", "CLEAR")),
@@ -5232,6 +5547,153 @@ def _calc_tf_performance(trades: list[dict[str, Any]]) -> dict[str, Any]:
     return tfs
 
 
+def _v74_chrono_trade_metrics(trades: list[dict[str, Any]]) -> dict[str, Any]:
+    """v7.4 — compact 4h vs 1w/1d stats for chrono JSON (also used by export header)."""
+    done = [t for t in trades if isinstance(t, dict) and t.get("outcome") in ("WIN", "LOSS")]
+
+    def _sub(tf: str) -> dict[str, Any]:
+        s = [t for t in done if str(t.get("timeframe", "")).strip().lower() == tf]
+        pnl = sum(float(x.get("pnl_dollars", 0) or 0) for x in s)
+        w = sum(1 for x in s if x.get("outcome") == "WIN")
+        cavg = sum(int(x.get("candles_to_exit", 0) or 0) for x in s) / max(1, len(s))
+        return {
+            "count": len(s),
+            "wins": w,
+            "pnl": round(pnl, 2),
+            "win_rate_pct": round(100 * w / max(1, len(s)), 1),
+            "avg_candles": round(cavg, 2),
+        }
+
+    return {
+        "by_tf": {"1w": _sub("1w"), "1d": _sub("1d"), "4h": _sub("4h")},
+        "perfect_storm_trades": sum(1 for t in done if t.get("v74_perfect_storm")),
+        "trending_trail_trades": sum(1 for t in done if str(t.get("trail_market_regime", "")).upper() == "TRENDING"),
+        "choppy_trail_trades": sum(1 for t in done if str(t.get("trail_market_regime", "")).upper() == "CHOPPY"),
+    }
+
+
+def _v74_strategy_short(strategy_id: str) -> str:
+    s = (strategy_id or "").strip().upper()
+    if "_" in s:
+        return s.split("_", 1)[0]
+    return s[:3] if len(s) >= 3 else s
+
+
+def build_chrono_job_export_text(job_id: str) -> str | None:
+    """Plain-text compact export of completed WIN/LOSS trades for a chrono job (v7.4)."""
+    jid = (job_id or "").strip()
+    if not jid:
+        return None
+    path = chrono_results_path(jid)
+    if not path.is_file():
+        return None
+    data = load_json(path, default=None) or {}
+    trades = [
+        t
+        for t in (data.get("all_trades") or [])
+        if isinstance(t, dict) and not t.get("skipped") and t.get("outcome") in ("WIN", "LOSS")
+    ]
+    wins = [t for t in trades if t.get("outcome") == "WIN"]
+    losses = [t for t in trades if t.get("outcome") == "LOSS"]
+    wr = round(100 * len(wins) / max(1, len(trades)), 1) if trades else 0.0
+    pnl_total = round(sum(float(t.get("pnl_dollars", 0) or 0) for t in trades), 2)
+    cap0 = float(STARTING_CAPITAL)
+    sc = data.get("start_capital")
+    if sc is not None:
+        try:
+            cap0 = float(sc)
+        except (TypeError, ValueError):
+            cap0 = float(STARTING_CAPITAL)
+    cap1 = float(data.get("final_capital", data.get("capital", cap0)) or cap0)
+    d0 = str(data.get("start_date", "") or "")
+    d1 = str(data.get("end_date", "") or "")
+    strat_lines: dict[str, int] = {}
+    for t in trades:
+        sid = str(t.get("strategy_id", "UNK") or "UNK")
+        strat_lines[sid] = strat_lines.get(sid, 0) + 1
+    strat_txt = " | ".join(f"{k}: {v}" for k, v in sorted(strat_lines.items(), key=lambda kv: (-kv[1], kv[0])))
+
+    pstorm_days: set[str] = set()
+    trend_days: set[str] = set()
+    chop_days: set[str] = set()
+    for t in trades:
+        ds = str(t.get("date", ""))[:10]
+        if not ds:
+            continue
+        if t.get("v74_perfect_storm"):
+            pstorm_days.add(ds)
+        rg = str(t.get("trail_market_regime", "CHOPPY")).upper()
+        if rg == "TRENDING":
+            trend_days.add(ds)
+        else:
+            chop_days.add(ds)
+    for ds in pstorm_days:
+        trend_days.discard(ds)
+        chop_days.discard(ds)
+    for ds in trend_days:
+        chop_days.discard(ds)
+
+    lines: list[str] = []
+    lines.append(
+        f"JOB: {jid} | ${cap0:.0f} → ${cap1:.0f} | {d0} - {d1}",
+    )
+    lines.append(
+        f"TRADES: {len(trades)} actual | {len(wins)}W/{len(losses)}L | {wr}% WR | P&L: ${pnl_total:+,.0f}",
+    )
+    lines.append(f"STRATEGIES: {strat_txt or 'none'}")
+    lines.append(
+        f"REGIME: PERFECT_STORM days: {len(pstorm_days)} | TRENDING days: {len(trend_days)} | CHOPPY days: {len(chop_days)}",
+    )
+    lines.append("")
+    for t in sorted(trades, key=lambda x: str(x.get("date", ""))[:10]):
+        ds = str(t.get("date", ""))[:10]
+        tk = str(t.get("ticker", "")).upper()
+        tf = str(t.get("timeframe", "")).lower()
+        dr = str(t.get("direction", "")).upper()
+        sid = str(t.get("strategy_id", "")).upper()
+        pre = str(t.get("confidence_pre_upgrade", "") or "").upper() or "?"
+        post = str(t.get("confidence", "") or "").upper()
+        mb = str(t.get("macro_bias", "")).upper()
+        mm = float(t.get("macro_size_multiplier", 1.0) or 1.0)
+        trn = str(t.get("trend", "")).upper()
+        tm = float(t.get("trend_size_mult", 1.0) or 1.0)
+        cn = int(t.get("strategy_confluence_count", 0) or 0)
+        cm = float(t.get("strategy_confluence_mult", 1.0) or 1.0)
+        rsk = float(t.get("max_risk_dollars", 0) or 0)
+        oc = str(t.get("outcome", "")).upper()
+        pnl = float(t.get("pnl_dollars", 0) or 0)
+        exr = str(t.get("exit_reason", "") or "").replace("|", "/")
+        nc = int(t.get("candles_to_exit", 0) or 0)
+        rg = str(t.get("trail_market_regime", "CHOPPY")).upper()
+        lines.append(
+            f"{ds} | {tk} {tf} | {dr} | {_v74_strategy_short(sid)} | {pre}→{post} | {mb} {mm}x | "
+            f"trend:{trn} {tm}x | conf:{cn} {cm}x | risk:${rsk:.0f} | {oc} ${pnl:+.0f} | {exr} | {nc}c | regime:{rg}",
+        )
+    lines.append("")
+    lines.append("DATE       | P&L      | TRADES | W  | L  | CAPITAL    | REGIME")
+    daily = data.get("daily_pnl") or []
+    cap_run = float(cap0)
+    for row in daily:
+        if not isinstance(row, dict):
+            continue
+        dsd = str(row.get("date", ""))[:10]
+        pnl_d = float(row.get("pnl", 0) or 0)
+        tw = int(row.get("wins", 0) or 0)
+        tl = int(row.get("losses", 0) or 0)
+        tc = int(row.get("trades", 0) or 0)
+        cap_run = float(row.get("capital", cap_run + pnl_d) or (cap_run + pnl_d))
+        if dsd in pstorm_days:
+            rgl = "PERFECT_STORM"
+        elif dsd in trend_days:
+            rgl = "TRENDING"
+        else:
+            rgl = "CHOPPY"
+        lines.append(
+            f"{dsd} | {pnl_d:+.0f}$   | {tc:<6} | {tw:<2} | {tl:<2} | ${cap_run:,.0f}   | {rgl}",
+        )
+    return "\n".join(lines) + "\n"
+
+
 def run_chronological_backtest(
     start_date: str = CHRONO_START_DATE,
     end_date: str = CHRONO_END_DATE,
@@ -5245,6 +5707,8 @@ def run_chronological_backtest(
     trades skip Claude; Layer 1 uses v7 prompt).
     Persists to ``chrono_results_{job_id}.json`` under ``DATA_DIR`` (resumable).
     """
+    global CHRONO_JPY_RISK_DAY
+
     if job_id is None:
         job_id = str(uuid.uuid4())[:8]
 
@@ -5447,6 +5911,10 @@ def run_chronological_backtest(
 
             TRADED_TICKERS_TODAY.clear()
             CHRONO_DAY_PREFILTER_SIDS.clear()
+            CHRONO_SYMDIR_TFS.clear()
+            CHRONO_JPY_STORM_SNAPSHOT.clear()
+            CHRONO_JPY_PAIRS_SIGNALLED.clear()
+            CHRONO_JPY_RISK_DAY = 0.0
             OPEN_CURRENCY_COUNT.clear()
             OPEN_CURRENCY_COUNT_4H.clear()
             for _row in day_trades:
@@ -5683,6 +6151,8 @@ def run_chronological_backtest(
                                     chrono_tp_mult=tp_m,
                                     chrono_enforce_extended_cooldown=True,
                                     chrono_regime=day_regime,
+                                    chrono_balance=capital,
+                                    chrono_day_pnl=day_pnl,
                                 )
                             except Exception as e:  # noqa: BLE001
                                 log(
@@ -5796,6 +6266,9 @@ def run_chronological_backtest(
                             day_trades.append(row)
                             day_pnl += pnl
                             capital += pnl
+
+                            if tkr_u.endswith("JPY"):
+                                CHRONO_JPY_RISK_DAY += float(row.get("max_risk_dollars", 0) or 0)
 
                             open_positions[pos_key] = row
                             if oc in ("WIN", "LOSS"):
@@ -5933,6 +6406,7 @@ def run_chronological_backtest(
             "strategy_performance": _calc_strategy_performance(all_trades),
             "timeframe_performance": _calc_tf_performance(all_trades),
         }
+        chrono_data["v74_metrics"] = _v74_chrono_trade_metrics(all_trades)
         save_json(chrono_path, chrono_data)
         log(
             f"[Chrono {job_id}] Complete. Capital: {capital:.2f}, P&L: {capital - STARTING_CAPITAL:+.2f}",

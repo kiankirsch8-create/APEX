@@ -18,6 +18,7 @@ import yfinance as yf
 
 from fastapi import BackgroundTasks, Body, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field, model_validator
 
 import analyzer
@@ -1138,6 +1139,16 @@ async def get_chrono_trades(
         "current_date": data.get("current_date"),
         "capital": data.get("capital"),
     }
+
+
+@app.get("/api/chrono/{job_id}/export")
+async def get_chrono_export(job_id: str) -> PlainTextResponse:
+    """Compact plain-text export of executed WIN/LOSS trades for review (v7.4)."""
+    jid = job_id.strip()
+    txt = continuous_backtester.build_chrono_job_export_text(jid)
+    if txt is None:
+        raise HTTPException(status_code=404, detail="Job not found or no export available")
+    return PlainTextResponse(txt, media_type="text/plain; charset=utf-8")
 
 
 @app.get("/api/chrono/{job_id}")
