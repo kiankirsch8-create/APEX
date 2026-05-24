@@ -436,6 +436,61 @@ def run_python_prefilter_live(sym: str, tf_key: str) -> tuple[list[tuple[str, st
 # Stops / targets (2R / 3R / 5R off entry–stop risk, same as backtest forward sim)
 # ---------------------------------------------------------------------------
 
+JPY_STORM_PAIRS: frozenset[str] = frozenset(
+    {"USDJPY", "CADJPY", "AUDJPY", "GBPJPY", "NZDJPY", "CHFJPY"},
+)
+
+
+def detect_market_regime(macro_bias: str, trend_strength: float, rate_diff: float) -> str:
+    mb = str(macro_bias or "").strip().upper()
+    try:
+        ts = float(trend_strength)
+    except (TypeError, ValueError):
+        ts = 0.0
+    try:
+        rd = float(rate_diff)
+    except (TypeError, ValueError):
+        rd = 0.0
+    if mb == "STRONG_TAILWIND" and ts > 0.70 and rd > 2.0:
+        return "TRENDING"
+    return "CHOPPY"
+
+
+def detect_perfect_storm_live(snaps: dict[str, dict[str, Any]]) -> tuple[bool, int]:
+    firing = sorted(s for s in JPY_STORM_PAIRS if s in snaps)
+    if len(firing) < 3:
+        return False, len(firing)
+    rows = [snaps[s] for s in firing if isinstance(snaps.get(s), dict)]
+    if len(rows) < 3:
+        return False, len(rows)
+    biases = {str(x.get("trend_bias", "NEUTRAL")).strip().upper() for x in rows}
+    if biases != {"LONG"} and biases != {"SHORT"}:
+        return False, len(rows)
+    for x in rows:
+        if str(x.get("macro_bias", "")).strip().upper() != "STRONG_TAILWIND":
+            return False, len(rows)
+        if str(x.get("confidence", "")).strip().upper() != "HIGH":
+            return False, len(rows)
+        if float(x.get("trend_strength", 0) or 0) <= 0.65:
+            return False, len(rows)
+        if float(x.get("rate_differential", 0) or 0) <= 2.5:
+            return False, len(rows)
+    return True, len(rows)
+
+
+def regime_tp_prices(direction: str, entry: float, sl: float, regime: str) -> tuple[float, float, float]:
+    d = direction.strip().upper()
+    risk = abs(float(entry) - float(sl))
+    if risk <= 0:
+        risk = abs(float(entry)) * 0.005
+    mult1, mult2, mult3 = (2.0, 4.0, 7.0) if regime == "TRENDING" else (1.5, 3.0, 5.0)
+    m = 1.0 if d == "LONG" else -1.0
+    return (
+        round(entry + m * risk * mult1, 5),
+        round(entry + m * risk * mult2, 5),
+        round(entry + m * risk * mult3, 5),
+    )
+
 
 def stop_tp_bundle(strategy_id: str, direction: str, entry: float, atr: float) -> tuple[float, float, float, float]:
     """Return (sl, tp1, tp2, tp3). T01/R01 use legacy live multipliers; others 1.5 ATR stop."""
@@ -852,68 +907,115 @@ def manage_trailing_live(mt5: Any) -> None:
         hit1 = bool(m.get("hit_tp1"))
         hit2 = bool(m.get("hit_tp2"))
         hit3p = bool(m.get("hit_tp3_partial"))
+        hit3full = bool(m.get("hit_tp3_full"))
+        treg = str(m.get("trail_regime", "CHOPPY")).upper()
+        atru = float(m.get("atr_live", 0) or 0) or abs(entry) * 0.001
         nsl: float | None = None
+
+        def _partial_close(vol_close: float, otyp: int, px: float, label: str) -> bool:
+            v = norm_vol(mt5, pos.symbol, vol_close)
+            if v <= 0 or v >= vol:
+                return False
+            cr = mt5.order_send(
+                {
+                    "action": mt5.TRADE_ACTION_DEAL,
+                    "symbol": pos.symbol,
+                    "volume": v,
+                    "type": otyp,
+                    "position": int(pos.ticket),
+                    "price": px,
+                    "deviation": 25,
+                    "magic": APEX_MAGIC,
+                    "comment": ORDER_COMMENT,
+                    "type_time": mt5.ORDER_TIME_GTC,
+                    "type_filling": fill_mode(mt5, pos.symbol),
+                }
+            )
+            if cr and cr.retcode == mt5.TRADE_RETCODE_DONE:
+                log_msg(f"[PARTIAL] ticket={pos.ticket} {label} vol={v}", "info")
+                return True
+            return False
 
         if d == "LONG":
             px = bid
             if not hit1 and tp1 > 0 and px >= tp1:
-                nsl = entry  # breakeven
+                nsl = entry
                 m["hit_tp1"] = True
+                if treg == "CHOPPY":
+                    _partial_close(vol * 0.25, mt5.ORDER_TYPE_SELL, bid, "CHOPPY 25% @TP1")
             elif hit1 and not hit2 and tp2 > 0 and px >= tp2:
-                nsl = tp1
                 m["hit_tp2"] = True
-            elif hit2 and not hit3p and tp3 > 0 and px >= tp3:
-                half = norm_vol(mt5, pos.symbol, vol / 2.0)
-                if half > 0 and half < vol:
-                    creq = {
-                        "action": mt5.TRADE_ACTION_DEAL,
-                        "symbol": pos.symbol,
-                        "volume": half,
-                        "type": mt5.ORDER_TYPE_SELL,
-                        "position": int(pos.ticket),
-                        "price": bid,
-                        "deviation": 25,
-                        "magic": APEX_MAGIC,
-                        "comment": ORDER_COMMENT,
-                        "type_time": mt5.ORDER_TIME_GTC,
-                        "type_filling": fill_mode(mt5, pos.symbol),
-                    }
-                    cr = mt5.order_send(creq)
-                    if cr and cr.retcode == mt5.TRADE_RETCODE_DONE:
-                        m["hit_tp3_partial"] = True
-                        log_msg(f"[PARTIAL] ticket={pos.ticket} closed 50% @TP3", "info")
-                trail = tp2 if tp2 > 0 else entry
-                nsl = max(cur_sl, trail)
+                nsl = tp1
+                if treg == "TRENDING":
+                    _partial_close(vol * 0.20, mt5.ORDER_TYPE_SELL, bid, "TREND 20% @TP2")
+                elif treg == "CHOPPY":
+                    _partial_close(vol * 0.40, mt5.ORDER_TYPE_SELL, bid, "CHOP 40% @TP2")
+            elif hit2 and treg == "CHOPPY" and not hit3full and tp3 > 0 and px >= tp3:
+                if _partial_close(vol * 1.0, mt5.ORDER_TYPE_SELL, bid, "CHOPPY 100% @TP3"):
+                    m["hit_tp3_full"] = True
+            elif hit2 and treg == "TRENDING" and not hit3p and tp3 > 0 and px >= tp3:
+                if _partial_close(vol * 0.30, mt5.ORDER_TYPE_SELL, bid, "TREND 30% @TP3"):
+                    m["hit_tp3_partial"] = True
+                    m["peak_hi"] = max(float(m.get("peak_hi", entry)), px)
+                ph = float(m.get("peak_hi", px))
+                ph = max(ph, px)
+                m["peak_hi"] = ph
+                trail = ph - 2.0 * atru
+                nsl = max(cur_sl, trail) if cur_sl > 0 else trail
+            elif hit2 and treg == "TRENDING" and hit3p and tp3 > 0:
+                ph = max(float(m.get("peak_hi", px)), px)
+                m["peak_hi"] = ph
+                trail = ph - 2.0 * atru
+                if trail > cur_sl:
+                    nsl = trail
+            if treg == "CHOPPY" and hit1 and not hit3full and (rates := mt5.copy_rates_from_pos(pos.symbol, mt5.TIMEFRAME_H4, 0, 4)) is not None:
+                if len(rates) >= 2:
+                    prev_low = float(rates[-2]["low"])
+                    prop = prev_low - 0.5 * atru
+                    if prop > cur_sl and (not hit2 or hit2):
+                        nsl2 = max(cur_sl, prop)
+                        if nsl is None or nsl2 > (nsl or cur_sl):
+                            nsl = nsl2
         else:
             px = ask
             if not hit1 and tp1 > 0 and px <= tp1:
                 nsl = entry
                 m["hit_tp1"] = True
+                if treg == "CHOPPY":
+                    _partial_close(vol * 0.25, mt5.ORDER_TYPE_BUY, ask, "CHOPPY 25% @TP1")
             elif hit1 and not hit2 and tp2 > 0 and px <= tp2:
-                nsl = tp1
                 m["hit_tp2"] = True
-            elif hit2 and not hit3p and tp3 > 0 and px <= tp3:
-                half = norm_vol(mt5, pos.symbol, vol / 2.0)
-                if half > 0 and half < vol:
-                    creq = {
-                        "action": mt5.TRADE_ACTION_DEAL,
-                        "symbol": pos.symbol,
-                        "volume": half,
-                        "type": mt5.ORDER_TYPE_BUY,
-                        "position": int(pos.ticket),
-                        "price": ask,
-                        "deviation": 25,
-                        "magic": APEX_MAGIC,
-                        "comment": ORDER_COMMENT,
-                        "type_time": mt5.ORDER_TIME_GTC,
-                        "type_filling": fill_mode(mt5, pos.symbol),
-                    }
-                    cr = mt5.order_send(creq)
-                    if cr and cr.retcode == mt5.TRADE_RETCODE_DONE:
-                        m["hit_tp3_partial"] = True
-                        log_msg(f"[PARTIAL] ticket={pos.ticket} closed 50% @TP3", "info")
-                trail = tp2 if tp2 > 0 else entry
+                nsl = tp1
+                if treg == "TRENDING":
+                    _partial_close(vol * 0.20, mt5.ORDER_TYPE_BUY, ask, "TREND 20% @TP2")
+                elif treg == "CHOPPY":
+                    _partial_close(vol * 0.40, mt5.ORDER_TYPE_BUY, ask, "CHOP 40% @TP2")
+            elif hit2 and treg == "CHOPPY" and not hit3full and tp3 > 0 and px <= tp3:
+                if _partial_close(vol * 1.0, mt5.ORDER_TYPE_BUY, ask, "CHOPPY 100% @TP3"):
+                    m["hit_tp3_full"] = True
+            elif hit2 and treg == "TRENDING" and not hit3p and tp3 > 0 and px <= tp3:
+                if _partial_close(vol * 0.30, mt5.ORDER_TYPE_BUY, ask, "TREND 30% @TP3"):
+                    m["hit_tp3_partial"] = True
+                    m["peak_lo"] = min(float(m.get("peak_lo", entry)), px)
+                pl = float(m.get("peak_lo", px))
+                pl = min(pl, px)
+                m["peak_lo"] = pl
+                trail = pl + 2.0 * atru
                 nsl = min(cur_sl, trail) if cur_sl > 0 else trail
+            elif hit2 and treg == "TRENDING" and hit3p and tp3 > 0:
+                pl = min(float(m.get("peak_lo", px)), px)
+                m["peak_lo"] = pl
+                trail = pl + 2.0 * atru
+                if cur_sl <= 0 or trail < cur_sl:
+                    nsl = trail
+            if treg == "CHOPPY" and hit1 and not hit3full and (rates := mt5.copy_rates_from_pos(pos.symbol, mt5.TIMEFRAME_H4, 0, 4)) is not None:
+                if len(rates) >= 2:
+                    prev_high = float(rates[-2]["high"])
+                    prop = prev_high + 0.5 * atru
+                    if cur_sl <= 0 or prop < cur_sl:
+                        nsl2 = min(cur_sl, prop) if cur_sl > 0 else prop
+                        if nsl is None or nsl2 < (nsl if nsl is not None else prop + 1):
+                            nsl = nsl2
 
         if nsl is not None:
             res = mt5.order_send(
@@ -979,6 +1081,7 @@ def run_full_scan() -> None:
     if st.get("day_key") != dk:
         st["day_key"] = dk
         st["day_anchor"] = equity
+        st["jpy_risk_usd_day"] = 0.0
         save_live_state(st)
     day_anchor = float(st.get("day_anchor") or equity)
     daily_pnl = equity - day_anchor
@@ -1021,6 +1124,32 @@ def run_full_scan() -> None:
                     agree[(sym.upper(), "SHORT")].add(sid)
                 elif dr in ("LONG", "SHORT"):
                     agree[(sym.upper(), dr)].add(sid)
+
+    storm_snap: dict[str, dict[str, Any]] = {}
+    for sym, tf, rows, price, ind, zone_pct, ad in scan_cells:
+        su = sym.upper()
+        if su not in JPY_STORM_PAIRS:
+            continue
+        sig2 = pick_signal_for_sym_tf(rows)
+        if sig2 is None:
+            continue
+        sid2, dr2, _sc2 = sig2
+        if dr2 not in ("LONG", "SHORT"):
+            continue
+        macro2 = get_macro_bias(sym, dr2)
+        conf2 = apply_macro_confidence_adjustment("MEDIUM", macro2)
+        tr2 = apply_trend_filter(sym, dr2, sid2, as_of_date=ad)
+        td2 = tr2.get("trend") or {}
+        if not isinstance(td2, dict):
+            td2 = {}
+        storm_snap[su] = {
+            "macro_bias": str(macro2.get("bias", "")),
+            "confidence": str(conf2).strip().upper(),
+            "trend_strength": float(td2.get("strength", 0) or 0),
+            "trend_bias": str(td2.get("direction_bias", "NEUTRAL")).strip().upper(),
+            "rate_differential": float(macro2.get("rate_differential", 0) or 0),
+        }
+    perfect_ok, storm_ct = detect_perfect_storm_live(storm_snap)
 
     placed = 0
     skipped = 0
@@ -1088,14 +1217,36 @@ def run_full_scan() -> None:
         cf_m = confluence_multiplier(n_agree)
 
         base_risk = balance * float(RISK_FRAC_BY_CONFIDENCE.get(conf, 0.01))
+        if (
+            perfect_ok
+            and daily_pnl > -daily_limit
+            and sid == "M03_RSI_MOMENTUM_CONTINUATION"
+            and sym.upper() in JPY_STORM_PAIRS
+            and conf == "HIGH"
+        ):
+            base_risk = balance * 0.028
+            log_msg(f"[PERFECT STORM] {storm_ct} JPY pairs aligned — M03 sizing: 2.8% base risk", "info")
         macro_m = float(macro.get("size_multiplier", 1.0) or 1.0)
         raw = base_risk * cal_pen * macro_m * trend_m * cf_m * reg_m
         cap_hi = balance * RISK_FRAC_BY_CONFIDENCE["HIGH"] * 1.5
         final_risk = max(25.0, min(raw, cap_hi))
+        final_risk = min(final_risk, balance * 0.055)
+        jpy_used = float(st.get("jpy_risk_usd_day", 0) or 0)
+        if sym.upper().endswith("JPY"):
+            headroom = max(0.0, balance * 0.20 - jpy_used)
+            final_risk = min(final_risk, headroom)
 
         atrv = float(ind.get("atr", price * 0.01) or (price * 0.01))
-        sl, tp1, tp2, tp3 = stop_tp_bundle(sid, direction, float(price), atrv)
+        sl, _t1, _t2, _t3 = stop_tp_bundle(sid, direction, float(price), atrv)
         entry = float(price)
+        td0 = tr.get("trend") or {}
+        if not isinstance(td0, dict):
+            td0 = {}
+        ts0 = float(td0.get("strength", 0) or 0)
+        mb0 = str(macro.get("bias", ""))
+        rd0 = float(macro.get("rate_differential", 0) or 0)
+        trail_reg = detect_market_regime(mb0, ts0, rd0)
+        tp1, tp2, tp3 = regime_tp_prices(direction, entry, sl, trail_reg)
         if not rr_ok(entry, sl, tp1, direction):
             lines_out.append(f"SKIP: {sym} {tf} {sid} — R/R")
             skipped += 1
@@ -1130,6 +1281,11 @@ def run_full_scan() -> None:
             "trend_mult": trend_m,
             "confluence_mult": cf_m,
             "confluence_count": n_agree,
+            "trail_regime": trail_reg,
+            "atr_live": atrv,
+            "macro_bias": mb0,
+            "trend_strength": ts0,
+            "macro_rate_diff": rd0,
         }
         meta.update(macro_result_fields(macro))
         if cpu:
@@ -1148,6 +1304,8 @@ def run_full_scan() -> None:
             continue
 
         placed += 1
+        if sym.upper().endswith("JPY"):
+            st["jpy_risk_usd_day"] = float(st.get("jpy_risk_usd_day", 0) or 0) + float(final_risk)
         otk = st.setdefault("last_trade_open", {})
         otk[f"{sym.upper()}_{tf.lower()}"] = now.strftime("%Y-%m-%d %H:%M:%S")
         save_live_state(st)
