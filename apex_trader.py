@@ -31,6 +31,7 @@ import yfinance as yf
 
 from calendar_manager import check_calendar_risk
 from macro_manager import (
+    align_macro_bias_with_price,
     apply_macro_confidence_adjustment,
     get_macro_bias,
     macro_result_fields,
@@ -440,6 +441,49 @@ JPY_STORM_PAIRS: frozenset[str] = frozenset(
     {"USDJPY", "CADJPY", "AUDJPY", "GBPJPY", "NZDJPY", "CHFJPY"},
 )
 
+CONFLUENCE_COUNTING_LIVE: frozenset[str] = frozenset(
+    {
+        "T01_EMA_PULLBACK",
+        "R01_EXTREME_ZONE_REVERSION",
+        "SMC05_EQUAL_HL_HUNT",
+        "M02_MACD_ZERO_CROSS",
+        "T07_MA_RIBBON_ALIGNMENT",
+        "M03_RSI_MOMENTUM_CONTINUATION",
+        "B09_RSI_MOMENTUM_BREAK",
+        "T10_200EMA_BOUNCE",
+    },
+)
+
+M03_ALLOWED_TICKERS_LIVE: frozenset[str] = frozenset(
+    {
+        "AUDJPY",
+        "CADJPY",
+        "CHFJPY",
+        "NZDJPY",
+        "USDJPY",
+        "USDSEK",
+        "USDNOK",
+        "USDMXN",
+        "EURCHF",
+        "EURAUD",
+        "AUDUSD",
+        "USDCAD",
+        "USDCHF",
+        "USDZAR",
+    },
+)
+
+NEUTRAL_MACRO_BLOCKED_LIVE: frozenset[str] = frozenset(
+    {
+        "M03_RSI_MOMENTUM_CONTINUATION",
+        "T08_DONCHIAN_BREAKOUT",
+        "T04_ADX_TREND_ENTRY",
+        "V02_ATR_EXPANSION_ENTRY",
+        "M06_PRICE_ACCELERATION",
+        "B10_WEEKLY_RANGE_BREAK",
+    },
+)
+
 
 def detect_market_regime(macro_bias: str, trend_strength: float, rate_diff: float) -> str:
     mb = str(macro_bias or "").strip().upper()
@@ -452,6 +496,21 @@ def detect_market_regime(macro_bias: str, trend_strength: float, rate_diff: floa
     except (TypeError, ValueError):
         rd = 0.0
     if mb == "STRONG_TAILWIND" and ts > 0.70 and rd > 2.0:
+        return "TRENDING"
+    return "CHOPPY"
+
+
+def detect_trailing_regime(macro_bias_adjusted: str, trend_strength: float, macro_rate_diff: float) -> str:
+    mb = str(macro_bias_adjusted or "").strip().upper()
+    try:
+        ts = float(trend_strength)
+    except (TypeError, ValueError):
+        ts = 0.0
+    try:
+        rd = float(macro_rate_diff)
+    except (TypeError, ValueError):
+        rd = 0.0
+    if mb in ("STRONG_TAILWIND", "TAILWIND") and ts > 0.65 and rd > 1.5:
         return "TRENDING"
     return "CHOPPY"
 
@@ -1137,6 +1196,13 @@ def run_full_scan() -> None:
         if dr2 not in ("LONG", "SHORT"):
             continue
         macro2 = get_macro_bias(sym, dr2)
+        try:
+            ad_st = date.fromisoformat(str(ad)[:10])
+        except (TypeError, ValueError):
+            ad_st = today
+        macro2 = align_macro_bias_with_price(
+            sym, dr2, macro2, as_of_date=ad_st, price_df=None, log_fn=log_msg
+        )
         conf2 = apply_macro_confidence_adjustment("MEDIUM", macro2)
         tr2 = apply_trend_filter(sym, dr2, sid2, as_of_date=ad)
         td2 = tr2.get("trend") or {}
@@ -1196,10 +1262,29 @@ def run_full_scan() -> None:
             continue
         cal_pen = 0.5 if str(cal.get("action", "")).upper() == "REDUCE" else 1.0
 
+        try:
+            ad_live = date.fromisoformat(str(ad)[:10])
+        except (TypeError, ValueError):
+            ad_live = today
         macro = get_macro_bias(sym, direction)
+        macro = align_macro_bias_with_price(
+            sym, direction, macro, as_of_date=ad_live, price_df=None, log_fn=log_msg
+        )
         conf0 = "MEDIUM"
         conf = apply_macro_confidence_adjustment(conf0, macro)
         cpu = conf0 if conf0 != conf else None
+
+        if sid == "M03_RSI_MOMENTUM_CONTINUATION" and sym.upper() not in M03_ALLOWED_TICKERS_LIVE:
+            lines_out.append(f"SKIP: {sym} {tf} M03 — [M03 BLOCKED] {sym.upper()} not in allowed ticker list")
+            skipped += 1
+            continue
+
+        if str(macro.get("bias", "")).strip().upper() == "NEUTRAL" and sid in NEUTRAL_MACRO_BLOCKED_LIVE:
+            lines_out.append(
+                f"SKIP: {sym} {tf} {sid} — [NEUTRAL BLOCK] momentum strategy not allowed in NEUTRAL macro"
+            )
+            skipped += 1
+            continue
 
         if sid == "M03_RSI_MOMENTUM_CONTINUATION" and conf != "HIGH":
             lines_out.append(f"SKIP: {sym} {tf} M03 — need HIGH after macro ({conf})")
@@ -1213,7 +1298,24 @@ def run_full_scan() -> None:
             continue
         trend_m = float(tr.get("size_multiplier", 1.0) or 1.0)
 
-        n_agree = len(agree.get((sym.upper(), direction), set()))
+        td_w = tr.get("trend") or {}
+        if not isinstance(td_w, dict):
+            td_w = {}
+        ts_wd = float(td_w.get("strength", 0) or 0)
+        try:
+            wd_scan = date.fromisoformat(str(ad)[:10]).weekday()
+        except (TypeError, ValueError):
+            wd_scan = today.weekday()
+        if tf.strip().lower() == "1w" and wd_scan in (2, 3, 4) and ts_wd <= 0.75:
+            lines_out.append(
+                f"SKIP: {sym} {tf} {direction} — [1W TIMING] mid-week requires trend_strength > 0.75 "
+                f"(current {ts_wd:.2f})"
+            )
+            skipped += 1
+            continue
+
+        raw_agree = agree.get((sym.upper(), direction), set())
+        n_agree = len(raw_agree & CONFLUENCE_COUNTING_LIVE)
         cf_m = confluence_multiplier(n_agree)
 
         base_risk = balance * float(RISK_FRAC_BY_CONFIDENCE.get(conf, 0.01))
@@ -1236,6 +1338,33 @@ def run_full_scan() -> None:
             headroom = max(0.0, balance * 0.20 - jpy_used)
             final_risk = min(final_risk, headroom)
 
+        mb_adj = str(macro.get("bias", "")).strip().upper()
+        if tf.strip().lower() == "1w" and ad_live.weekday() == 0 and mb_adj in ("STRONG_TAILWIND", "TAILWIND"):
+            final_risk = min(final_risk * 1.25, cap_hi)
+            log_msg(
+                f"[MONDAY BOOST] {sym.upper()} {tf.upper()} {direction}: 1.25x Monday multiplier applied",
+                "info",
+            )
+        rec_sid = {
+            "M03_RSI_MOMENTUM_CONTINUATION",
+            "B09_RSI_MOMENTUM_BREAK",
+            "T01_EMA_PULLBACK",
+        }
+        if (
+            sym.upper() in ("AUDJPY", "USDMXN")
+            and mb_adj == "STRONG_TAILWIND"
+            and conf == "MEDIUM"
+            and 2 <= n_agree <= 4
+            and sid in rec_sid
+        ):
+            cap5 = balance * 0.05
+            final_risk = min(final_risk * 1.5, cap5, cap_hi)
+            log_msg(
+                f"[RECIPE BOOST] {sym.upper()} {sid} STRONG_TAILWIND MEDIUM conf:{n_agree} — 1.5x boost",
+                "info",
+            )
+        final_risk = max(25.0, min(final_risk, cap_hi))
+
         atrv = float(ind.get("atr", price * 0.01) or (price * 0.01))
         sl, _t1, _t2, _t3 = stop_tp_bundle(sid, direction, float(price), atrv)
         entry = float(price)
@@ -1245,7 +1374,7 @@ def run_full_scan() -> None:
         ts0 = float(td0.get("strength", 0) or 0)
         mb0 = str(macro.get("bias", ""))
         rd0 = float(macro.get("rate_differential", 0) or 0)
-        trail_reg = detect_market_regime(mb0, ts0, rd0)
+        trail_reg = detect_trailing_regime(mb0, ts0, rd0)
         tp1, tp2, tp3 = regime_tp_prices(direction, entry, sl, trail_reg)
         if not rr_ok(entry, sl, tp1, direction):
             lines_out.append(f"SKIP: {sym} {tf} {sid} — R/R")
