@@ -5,9 +5,10 @@ rolling stats, and periodic self-improvement. All state is simple JSON on ``DATA
 """
 from __future__ import annotations
 
-STRATEGY_VERSION = "v7.4-macro-trail-storm-4h"
-# v7.4: macro-aware forward trailing (TRENDING vs CHOPPY), perfect-storm M03 JPY sizing,
-# chrono 4h filters + cross-TF confluence 1.75x, compact chrono export API.
+STRATEGY_VERSION = "v7.4-master-prompt"
+# v7.4 master: macro 7d price alignment, locked confluence count, NEUTRAL momentum block,
+# M03 tickers / M02 off 4h, 1w mid-week + Monday sizing, trailing regime + recipe boost,
+# condition profiling (chrono) + /api/strategy_conditions/{id}.
 # v7.3 session21: FIX 23–30 (macro confidence post-enforce, B02 stops + blocked, trend_manager,
 # chrono strategy confluence, strategy_status). Calendar + regime + macro from prior prompts.
 # v7.2: strategy_status.json + chrono skips LOCKED strategies; UNTESTED loose EMA200/ADX paths (chrono only).
@@ -47,6 +48,7 @@ import pandas_ta  # noqa: F401
 
 from calendar_manager import check_calendar_risk_historical
 from macro_manager import (
+    align_macro_bias_with_price,
     apply_macro_confidence_adjustment,
     get_macro_bias,
     macro_result_fields,
@@ -80,9 +82,51 @@ JPY_STORM_PAIRS: frozenset[str] = frozenset(
 V74_ALLOWED_4H_STRATEGIES: frozenset[str] = frozenset(
     {
         "T01_EMA_PULLBACK",
-        "M02_MACD_ZERO_CROSS",
         "T07_MA_RIBBON_ALIGNMENT",
         "R01_EXTREME_ZONE_REVERSION",
+    },
+)
+
+CONFLUENCE_COUNTING_STRATEGIES: frozenset[str] = frozenset(
+    {
+        "T01_EMA_PULLBACK",
+        "R01_EXTREME_ZONE_REVERSION",
+        "SMC05_EQUAL_HL_HUNT",
+        "M02_MACD_ZERO_CROSS",
+        "T07_MA_RIBBON_ALIGNMENT",
+        "M03_RSI_MOMENTUM_CONTINUATION",
+        "B09_RSI_MOMENTUM_BREAK",
+        "T10_200EMA_BOUNCE",
+    },
+)
+
+M03_ALLOWED_TICKERS: frozenset[str] = frozenset(
+    {
+        "AUDJPY",
+        "CADJPY",
+        "CHFJPY",
+        "NZDJPY",
+        "USDJPY",
+        "USDSEK",
+        "USDNOK",
+        "USDMXN",
+        "EURCHF",
+        "EURAUD",
+        "AUDUSD",
+        "USDCAD",
+        "USDCHF",
+        "USDZAR",
+    },
+)
+
+NEUTRAL_MACRO_BLOCKED: frozenset[str] = frozenset(
+    {
+        "M03_RSI_MOMENTUM_CONTINUATION",
+        "T08_DONCHIAN_BREAKOUT",
+        "T04_ADX_TREND_ENTRY",
+        "V02_ATR_EXPANSION_ENTRY",
+        "M06_PRICE_ACCELERATION",
+        "B10_WEEKLY_RANGE_BREAK",
     },
 )
 # v7.0 chrono: completed trades per currency per scan day (sequential sim; caps clustering).
@@ -133,9 +177,9 @@ BACKTEST_CLAUDE_MAX_TOKENS = 1200
 CLAUDE_HTTP_TIMEOUT_SEC = 25.0
 
 # Chronological walk-forward backtest (API-triggered; separate from rolling loop)
-CHRONO_START_DATE = "2025-04-01"
+CHRONO_START_DATE = "2024-01-01"
 CHRONO_END_DATE = "2026-05-17"
-CHRONO_TIMEFRAMES: list[str] = ["4h", "1d", "1w"]  # 15m/30m appended in chrono loop when scan date is recent
+CHRONO_TIMEFRAMES: list[str] = ["4h", "1d", "1w", "1h"]  # 15m/30m appended in chrono loop when scan date is recent
 CHRONO_TICKERS = [
     # Majors (USD)
     "EURUSD",
@@ -264,9 +308,8 @@ TF_WEIGHTS: dict[str, float] = {
 ALLOWED_1H_STRATEGIES: frozenset[str] = frozenset(
     {
         "T01_EMA_PULLBACK",
-        "SMC01_SR_FLIP",
-        "B08_KEY_LEVEL_RETEST",
-        "M01_MACD_DIVERGENCE",
+        "R01_EXTREME_ZONE_REVERSION",
+        "T07_MA_RIBBON_ALIGNMENT",
     }
 )
 
@@ -390,17 +433,14 @@ def _v72_locked_ids_default() -> frozenset[str]:
 def _v72_testing_ids_default() -> frozenset[str]:
     return frozenset(
         {
-            "T04_ADX_TREND_ENTRY",
             "B01_RANGE_BREAKOUT",
             "B09_RSI_MOMENTUM_BREAK",
             "M06_PRICE_ACCELERATION",
             "SMC10_CHOCH",
             "T10_200EMA_BOUNCE",
-            "V02_ATR_EXPANSION_ENTRY",
             "T09_KELTNER_TREND_RIDE",
             "M02_MACD_ZERO_CROSS",
             "R03_BB_EXTREME_TOUCH",
-            "R09_WEEKLY_GAP_FILL",
             "B06_TRIANGLE_BREAKOUT",
             "B08_KEY_LEVEL_RETEST",
         }
@@ -408,7 +448,14 @@ def _v72_testing_ids_default() -> frozenset[str]:
 
 
 def _v72_blocked_ids_default() -> frozenset[str]:
-    return frozenset({"B02_VOLATILITY_COMPRESSION"})
+    return frozenset(
+        {
+            "B02_VOLATILITY_COMPRESSION",
+            "V02_ATR_EXPANSION_ENTRY",
+            "R09_WEEKLY_GAP_FILL",
+            "T04_ADX_TREND_ENTRY",
+        }
+    )
 
 
 def _v72_default_status_payload() -> dict[str, Any]:
@@ -421,7 +468,10 @@ def _v72_default_status_payload() -> dict[str, Any]:
         "testing": testing,
         "blocked": blocked,
         "untested": untested,
-        "last_updated": "2026-05-23",
+        "solid": ["T10_200EMA_BOUNCE", "B09_RSI_MOMENTUM_BREAK"],
+        "watch": ["SMC10_CHOCH"],
+        "restricted": ["M03_RSI_MOMENTUM_CONTINUATION", "M02_MACD_ZERO_CROSS"],
+        "last_updated": "2026-05-25",
     }
 
 
@@ -450,6 +500,15 @@ def _v72_load_strategy_status(*, log_startup: bool = False) -> None:
             raw["last_updated"] = date.today().isoformat()
             save_json(STRATEGY_STATUS_FILE, raw)
     STRATEGY_STATUS = raw
+    for tag_k, default_vals in (
+        ("solid", ["T10_200EMA_BOUNCE", "B09_RSI_MOMENTUM_BREAK"]),
+        ("watch", ["SMC10_CHOCH"]),
+        ("restricted", ["M03_RSI_MOMENTUM_CONTINUATION", "M02_MACD_ZERO_CROSS"]),
+    ):
+        if not isinstance(raw.get(tag_k), list):
+            raw[tag_k] = list(default_vals)
+            raw["last_updated"] = date.today().isoformat()
+            save_json(STRATEGY_STATUS_FILE, raw)
     LOCKED_STRATEGIES_SCAN_SKIP = frozenset(str(x).strip().upper() for x in (raw.get("locked") or []) if x)
     UNTESTED_STRATEGIES_V72 = frozenset(str(x).strip().upper() for x in (raw.get("untested") or []) if x)
     blk = raw.get("blocked")
@@ -988,6 +1047,7 @@ def _chrono_v71_phases(days_ago: int) -> list[tuple[str, list[str], float, float
     phases: list[tuple[str, list[str], float, float, bool]] = [
         ("PHASE 1 WEEKLY SCAN", ["1w"], 1.0, 1.0, False),
         ("PHASE 2 DAILY SCAN", ["1d"], 0.85, 0.85, False),
+        ("PHASE 2B 1H STRUCTURE", ["1h"], 0.85, 0.85, True),
         ("PHASE 3 4H SCAN", ["4h"], 0.70, 0.70, True),
     ]
     if days_ago <= 55:
@@ -1451,6 +1511,133 @@ def append_result(result: dict[str, Any]) -> int:
         log(f"[IO] append_result error: {e}", level="error")
         log(traceback.format_exc(), level="error")
         return 0
+
+
+def _atr_series_wilder(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Wilder ATR on OHLC (same spirit as live trader)."""
+    try:
+        h = pd.to_numeric(df["High"], errors="coerce").astype(float)
+        l = pd.to_numeric(df["Low"], errors="coerce").astype(float)
+        c = pd.to_numeric(df["Close"], errors="coerce").astype(float)
+    except Exception:  # noqa: BLE001
+        return pd.Series(dtype=float)
+    prev = c.shift(1)
+    tr = (h - l).combine((h - prev).abs(), max).combine((l - prev).abs(), max)
+    return tr.ewm(alpha=1.0 / period, adjust=False).mean()
+
+
+def _trade_condition_snapshot_fields(
+    analysis_date: str,
+    past: pd.DataFrame | None,
+    ind: dict[str, Any],
+) -> dict[str, Any]:
+    """v7.4 [BACKTEST] — volatility / structure labels for condition profiling (no new network I/O)."""
+    out: dict[str, Any] = {
+        "volatility_regime": "UNKNOWN",
+        "market_phase": "UNKNOWN",
+        "session_day": "",
+        "weekly_candle_age": -1,
+    }
+    try:
+        d0 = date.fromisoformat((analysis_date or "")[:10])
+    except (TypeError, ValueError):
+        return out
+    day_names = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+    out["session_day"] = day_names[d0.weekday()] if 0 <= d0.weekday() < 7 else ""
+    out["weekly_candle_age"] = int(d0.weekday()) if d0.weekday() <= 4 else 4
+
+    if past is None or past.empty or "Close" not in past.columns:
+        return out
+    try:
+        c = pd.to_numeric(past["Close"], errors="coerce").dropna()
+        if len(c) < 25:
+            return out
+        atr_s = _atr_series_wilder(past, 14)
+        if atr_s.empty or len(atr_s) < 21:
+            return out
+        cur_atr = float(atr_s.iloc[-1])
+        avg_atr = float(atr_s.iloc[-20:].mean())
+        if not math.isfinite(cur_atr) or not math.isfinite(avg_atr) or avg_atr <= 0:
+            return out
+        ratio = cur_atr / avg_atr
+        if ratio < 0.8:
+            out["volatility_regime"] = "LOW_VOL"
+        elif ratio < 1.2:
+            out["volatility_regime"] = "NORMAL_VOL"
+        elif ratio < 2.0:
+            out["volatility_regime"] = "HIGH_VOL"
+        else:
+            out["volatility_regime"] = "EXTREME_VOL"
+
+        ema20 = c.ewm(span=20, adjust=False).mean()
+        e_now = float(ema20.iloc[-1])
+        e_prev = float(ema20.iloc[-4]) if len(ema20) >= 4 else e_now
+        slope = e_now - e_prev
+        px = float(c.iloc[-1])
+        cross_recent = False
+        if len(c) >= 4 and len(ema20) >= 4:
+            for j in range(1, 4):
+                i = -(j + 1)
+                a = float(c.iloc[i]) - float(ema20.iloc[i])
+                b = float(c.iloc[i + 1]) - float(ema20.iloc[i + 1])
+                if a == 0 or b == 0:
+                    continue
+                if (a > 0) != (b > 0):
+                    cross_recent = True
+                    break
+        if cross_recent:
+            out["market_phase"] = "BREAKOUT"
+        elif px > e_now and slope > 0:
+            out["market_phase"] = "TRENDING_UP"
+        elif px < e_now and slope < 0:
+            out["market_phase"] = "TRENDING_DOWN"
+        else:
+            out["market_phase"] = "RANGING"
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def build_strategy_conditions_report(strategy_id: str) -> dict[str, Any]:
+    """
+    GET /api/strategy_conditions/{strategy_id} — WR and P&L by
+    volatility_regime × market_phase × macro_bias (completed trades only).
+    """
+    sid = (strategy_id or "").strip().upper()
+    rows = load_all_results()
+    buckets: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        if not isinstance(r, dict) or r.get("skipped"):
+            continue
+        if str(r.get("strategy_id", "")).strip().upper() != sid:
+            continue
+        if r.get("outcome") not in ("WIN", "LOSS"):
+            continue
+        vr = str(r.get("volatility_regime", "UNKNOWN") or "UNKNOWN")
+        mp = str(r.get("market_phase", "UNKNOWN") or "UNKNOWN")
+        mb = str(r.get("macro_bias", "UNKNOWN") or "UNKNOWN").strip().upper()
+        key = f"{vr}|{mp}|{mb}"
+        b = buckets.setdefault(key, {"count": 0, "wins": 0, "pnl": 0.0})
+        b["count"] += 1
+        if r.get("outcome") == "WIN":
+            b["wins"] += 1
+        b["pnl"] += float(r.get("pnl_dollars", 0) or 0)
+    breakdown: list[dict[str, Any]] = []
+    for key, b in sorted(buckets.items()):
+        n = int(b["count"])
+        wr = (100.0 * float(b["wins"]) / n) if n else 0.0
+        parts = key.split("|", 2)
+        breakdown.append(
+            {
+                "volatility_regime": parts[0] if len(parts) > 0 else "",
+                "market_phase": parts[1] if len(parts) > 1 else "",
+                "macro_bias": parts[2] if len(parts) > 2 else "",
+                "trades": n,
+                "win_rate_pct": round(wr, 2),
+                "pnl_dollars": round(float(b["pnl"]), 2),
+            }
+        )
+    return {"strategy_id": sid, "buckets": breakdown, "bucket_count": len(breakdown)}
 
 
 def safe_yf_fetch(
@@ -2521,9 +2708,8 @@ def _v73_post_enforce_macro_confidence(
 
 
 def _strategy_confluence_multiplier(strategy_count: int, *, triple_tf_agreement: bool = False) -> float:
-    """FIX 29 + v7.4 — 1.75x when 1w+1d+4h same sym+direction fire the same calendar day (chrono)."""
-    if triple_tf_agreement and strategy_count >= 3:
-        return 1.75
+    """v7.4 — multiplier from locked-strategy confluence count only (1 / 1.25 / 1.50 cap)."""
+    _ = triple_tf_agreement
     if strategy_count >= 3:
         return 1.5
     if strategy_count == 2:
@@ -2556,13 +2742,15 @@ def _chrono_accumulate_prefilter_signals(sym: str, rows: list[Any], tf_key: str)
 
 
 def _local_prefilter_confluence_count(sym: str, direction: str, rows: list[Any]) -> int:
-    """Distinct strategy ids from prefilter agreeing with ``direction`` (non-chrono)."""
+    """Distinct *locked-list* strategy ids from prefilter agreeing with ``direction`` (non-chrono)."""
     d = (direction or "").strip().upper()
     s: set[str] = set()
     for row in rows or []:
         if not row or len(row) < 2:
             continue
         sid = str(row[0]).strip().upper()
+        if sid not in CONFLUENCE_COUNTING_STRATEGIES:
+            continue
         dr = str(row[1]).strip().upper()
         if dr == "BOTH" or dr == d:
             s.add(sid)
@@ -2688,7 +2876,7 @@ def _apply_trailing_dollar_floor(
 
 
 def detect_market_regime(macro_bias: str, trend_strength: float, rate_diff: float) -> str:
-    """v7.4 — TRENDING only under strong macro + trend + carry differential (else CHOPPY)."""
+    """Legacy helper — forward sim uses ``detect_trailing_regime`` (v7.4 master thresholds)."""
     mb = str(macro_bias or "").strip().upper()
     try:
         ts = float(trend_strength)
@@ -2699,6 +2887,22 @@ def detect_market_regime(macro_bias: str, trend_strength: float, rate_diff: floa
     except (TypeError, ValueError):
         rd = 0.0
     if mb == "STRONG_TAILWIND" and ts > 0.70 and rd > 2.0:
+        return "TRENDING"
+    return "CHOPPY"
+
+
+def detect_trailing_regime(macro_bias_adjusted: str, trend_strength: float, macro_rate_diff: float) -> str:
+    """v7.4 master — TRENDING trail mode when macro tailwind + trend + carry diff > 150bp."""
+    mb = str(macro_bias_adjusted or "").strip().upper()
+    try:
+        ts = float(trend_strength)
+    except (TypeError, ValueError):
+        ts = 0.0
+    try:
+        rd = float(macro_rate_diff)
+    except (TypeError, ValueError):
+        rd = 0.0
+    if mb in ("STRONG_TAILWIND", "TAILWIND") and ts > 0.65 and rd > 1.5:
         return "TRENDING"
     return "CHOPPY"
 
@@ -2809,7 +3013,11 @@ def evaluate_forward_candles(
 
     entry_price = float(entry)
     tf_lc = (timeframe or "").strip().lower()
-    regime = "CHOPPY" if tf_lc == "4h" else detect_market_regime(macro_bias, trend_strength, rate_differential)
+    regime = (
+        "CHOPPY"
+        if tf_lc == "4h"
+        else detect_trailing_regime(macro_bias, trend_strength, rate_differential)
+    )
     mult1, mult2, mult3 = (2.0, 4.0, 7.0) if regime == "TRENDING" else (1.5, 3.0, 5.0)
     sign = 1.0 if d == "LONG" else -1.0
     tp1p = entry_price + sign * risk * mult1
@@ -3075,6 +3283,73 @@ def _v73_regime_row_fields(reg: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
+def _v74_apply_recipe_and_monday_boosts(
+    ai: dict[str, Any],
+    *,
+    sym: str,
+    strat_id: str,
+    locked_confluence: int,
+    tf_key: str,
+    analysis_date: str,
+) -> None:
+    """v7.4 master — Monday 1w boost (tailwind macro) + AUDJPY/USDMXN recipe sizing (after base stack)."""
+    bal = float(ai.get("_balance_for_sizing") or STARTING_CAPITAL)
+    try:
+        ent = float(ai.get("entry", 0) or 0)
+        stp = float(ai.get("stop_loss", 0) or 0)
+    except (TypeError, ValueError):
+        return
+    sd = abs(ent - stp)
+    if sd <= 0 or not math.isfinite(sd):
+        return
+    mrd = float(ai.get("_max_risk_dollars", 0) or 0)
+    if mrd <= 0:
+        return
+    cap_hi = bal * float(RISK_BY_CONFIDENCE["HIGH"]) * 1.5
+    sym_u = sym.strip().upper()
+    mb = str(ai.get("macro_bias", "")).strip().upper()
+    conf = str(ai.get("confidence", "")).strip().upper()
+    d0: date | None = None
+    try:
+        d0 = date.fromisoformat(analysis_date.strip()[:10])
+    except (TypeError, ValueError):
+        pass
+    if (
+        tf_key.strip().lower() == "1w"
+        and d0 is not None
+        and d0.weekday() == 0
+        and mb in ("STRONG_TAILWIND", "TAILWIND")
+    ):
+        mrd = min(mrd * 1.25, cap_hi)
+        log(
+            f"[MONDAY BOOST] {sym_u} {tf_key.upper()} "
+            f"{str(ai.get('direction', '')).strip().upper()}: 1.25x Monday multiplier applied",
+            level="info",
+        )
+    rec_sid = {
+        "M03_RSI_MOMENTUM_CONTINUATION",
+        "B09_RSI_MOMENTUM_BREAK",
+        "T01_EMA_PULLBACK",
+    }
+    if (
+        sym_u in ("AUDJPY", "USDMXN")
+        and mb == "STRONG_TAILWIND"
+        and conf == "MEDIUM"
+        and 2 <= int(locked_confluence) <= 4
+        and strat_id in rec_sid
+    ):
+        cap5 = bal * 0.05
+        mrd = min(mrd * 1.5, cap5, cap_hi)
+        log(
+            f"[RECIPE BOOST] {sym_u} {strat_id} STRONG_TAILWIND MEDIUM conf:{locked_confluence} — 1.5x boost",
+            level="info",
+        )
+    mrd = max(25.0, min(mrd, cap_hi))
+    ai["_max_risk_dollars"] = round(mrd, 2)
+    ai["_position_size"] = round(mrd / sd, 2)
+    ai["_leveraged_exposure"] = round((mrd / sd) * ent, 2)
+
+
 def _v73_apply_calendar_regime_position_size(
     ai: dict[str, Any],
     *,
@@ -3249,6 +3524,8 @@ def _python_forced_layer2_trade(
     chrono_balance: float | None = None,
     chrono_day_pnl: float = 0.0,
     atr_ref: float | None = None,
+    past: pd.DataFrame | None = None,
+    ind: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Execute Layer 2+ setup without Claude (v7.1)."""
     if not layer2:
@@ -3345,6 +3622,14 @@ def _python_forced_layer2_trade(
     except (TypeError, ValueError):
         scan_d_macro = None
     macro_bt = get_macro_bias(sym, direction, as_of_date=scan_d_macro)
+    macro_bt = align_macro_bias_with_price(
+        sym,
+        direction,
+        macro_bt,
+        as_of_date=scan_d_macro,
+        price_df=past if past is not None and not getattr(past, "empty", True) else None,
+        log_fn=log,
+    )
     ai.update(macro_result_fields(macro_bt))
     log(
         f"[MACRO] {sym} {direction} — {macro_bt['bias']} (score {macro_bt['composite_score']:+.2f}) "
@@ -3380,6 +3665,47 @@ def _python_forced_layer2_trade(
         )
 
     strat_id = str(ai.get("strategy_id", strat_id)).strip().upper()
+    sym_xu = sym.strip().upper()
+    if strat_id == "M03_RSI_MOMENTUM_CONTINUATION" and sym_xu not in M03_ALLOWED_TICKERS:
+        log(f"[M03 BLOCKED] {sym_xu} not in allowed ticker list", level="info")
+        ai2 = dict(ai)
+        ai2["calendar_action"] = str(cal.get("action", "CLEAR"))
+        ai2["calendar_reason"] = str(cal.get("reason", ""))
+        ai2.update(_v73_regime_row_fields(regime_ctx))
+        return _skipped_backtest_row(
+            sym=sym,
+            timeframe=timeframe,
+            analysis_date=analysis_date,
+            price=float(price),
+            zone_pct=zone_pct,
+            zone_label=zone_label,
+            skip_reason=f"[M03 BLOCKED] {sym_xu} not in allowed ticker list",
+            ai=ai2,
+            tf_key=tf_key,
+            is_exotic=is_exotic,
+        )
+    if str(ai.get("macro_bias", "")).strip().upper() == "NEUTRAL" and strat_id in NEUTRAL_MACRO_BLOCKED:
+        log(
+            f"[NEUTRAL BLOCK] {strat_id} skipped — momentum strategy not allowed in NEUTRAL macro",
+            level="info",
+        )
+        ai2 = dict(ai)
+        ai2["calendar_action"] = str(cal.get("action", "CLEAR"))
+        ai2["calendar_reason"] = str(cal.get("reason", ""))
+        ai2.update(_v73_regime_row_fields(regime_ctx))
+        return _skipped_backtest_row(
+            sym=sym,
+            timeframe=timeframe,
+            analysis_date=analysis_date,
+            price=float(price),
+            zone_pct=zone_pct,
+            zone_label=zone_label,
+            skip_reason=f"[NEUTRAL BLOCK] {strat_id} skipped — momentum strategy not allowed in NEUTRAL macro",
+            ai=ai2,
+            tf_key=tf_key,
+            is_exotic=is_exotic,
+        )
+
     trend_result = apply_trend_filter(
         sym,
         str(ai.get("direction", direction)).strip().upper(),
@@ -3407,6 +3733,41 @@ def _python_forced_layer2_trade(
         )
     trend_mult = float(trend_result.get("size_multiplier", 1.0) or 1.0)
 
+    tr_pre = trend_result.get("trend") or {}
+    if not isinstance(tr_pre, dict):
+        tr_pre = {}
+    ts_pre = float(tr_pre.get("strength", 0) or 0)
+    if (
+        tf_key.strip().lower() == "1w"
+        and scan_d_macro is not None
+        and scan_d_macro.weekday() in (2, 3, 4)
+        and ts_pre <= 0.75
+    ):
+        log(
+            f"[1W TIMING] Skipped {sym} 1w — mid-week entry requires trend_strength > 0.75, "
+            f"current: {ts_pre:.2f}",
+            level="info",
+        )
+        ai2 = dict(ai)
+        ai2["calendar_action"] = str(cal.get("action", "CLEAR"))
+        ai2["calendar_reason"] = str(cal.get("reason", ""))
+        ai2.update(_v73_regime_row_fields(regime_ctx))
+        return _skipped_backtest_row(
+            sym=sym,
+            timeframe=timeframe,
+            analysis_date=analysis_date,
+            price=float(price),
+            zone_pct=zone_pct,
+            zone_label=zone_label,
+            skip_reason=(
+                f"[1W TIMING] Skipped {sym} 1w — mid-week entry requires trend_strength > 0.75, "
+                f"current: {ts_pre:.2f}"
+            ),
+            ai=ai2,
+            tf_key=tf_key,
+            is_exotic=is_exotic,
+        )
+
     sym_u = sym.upper()
     dir_u = str(ai.get("direction", direction)).strip().upper()
     if chrono_job and sym_u in JPY_STORM_PAIRS:
@@ -3422,17 +3783,16 @@ def _python_forced_layer2_trade(
         }
 
     if chrono_job:
-        scount = len(CHRONO_DAY_PREFILTER_SIDS.get((sym_u, dir_u), set()))
+        raw_sids = CHRONO_DAY_PREFILTER_SIDS.get((sym_u, dir_u), set())
+        scount = len({s for s in raw_sids if s in CONFLUENCE_COUNTING_STRATEGIES})
         triple = {"1w", "1d", "4h"}.issubset(CHRONO_SYMDIR_TFS.get((sym_u, dir_u), set()))
     else:
-        scount = len(
-            {
-                str(x[0]).strip().upper()
-                for x in layer2
-                if len(x) >= 2
-                and (str(x[1]).strip().upper() in ("BOTH", dir_u))
-            }
-        )
+        layer_sids = {
+            str(x[0]).strip().upper()
+            for x in layer2
+            if len(x) >= 2 and (str(x[1]).strip().upper() in ("BOTH", dir_u))
+        }
+        scount = len({s for s in layer_sids if s in CONFLUENCE_COUNTING_STRATEGIES})
         triple = False
     cf_mult = _strategy_confluence_multiplier(scount, triple_tf_agreement=triple)
     if scount >= 3 and str(ai.get("tp_target") or "TP1").strip().upper() == "TP2":
@@ -3479,6 +3839,15 @@ def _python_forced_layer2_trade(
         trend_mult=trend_mult,
         confluence_mult=cf_mult,
         entry=float(ai.get("entry", price) or price),
+    )
+
+    _v74_apply_recipe_and_monday_boosts(
+        ai,
+        sym=sym,
+        strat_id=str(ai.get("strategy_id", strat_id)).strip().upper(),
+        locked_confluence=int(scount),
+        tf_key=tf_key,
+        analysis_date=analysis_date,
     )
 
     entry = float(ai.get("entry", entry) or entry)
@@ -3651,6 +4020,11 @@ def _python_forced_layer2_trade(
         "strategy_confluence_count": int(scount),
         "strategy_confluence_mult": float(cf_mult),
         "strategies_agreed": agreed_list,
+        **(
+            _trade_condition_snapshot_fields(analysis_date, past, ind or {})
+            if chrono_job
+            else {}
+        ),
     }
 
 
@@ -4039,6 +4413,8 @@ def run_one_backtest(
                 chrono_balance=chrono_balance,
                 chrono_day_pnl=chrono_day_pnl,
                 atr_ref=float(ind.get("atr", 0) or 0) or None,
+                past=past,
+                ind=ind,
             )
             return forced
 
@@ -4161,6 +4537,14 @@ def run_one_backtest(
                 ai["confidence"] = "MEDIUM"
 
             macro_bt = get_macro_bias(sym, d0, as_of_date=scan_d)
+            macro_bt = align_macro_bias_with_price(
+                sym,
+                d0,
+                macro_bt,
+                as_of_date=scan_d,
+                price_df=past if past is not None and not getattr(past, "empty", True) else None,
+                log_fn=log,
+            )
             ai.update(macro_result_fields(macro_bt))
             log(
                 f"[MACRO] {sym} {d0} — {macro_bt['bias']} (score {macro_bt['composite_score']:+.2f}) "
@@ -4206,6 +4590,19 @@ def run_one_backtest(
         if direction not in ("LONG", "SHORT"):
             return _skip_out("no valid LONG/SHORT after enforcement", ai)
 
+        if strategy_id_norm == "M03_RSI_MOMENTUM_CONTINUATION" and sym.strip().upper() not in M03_ALLOWED_TICKERS:
+            log(f"[M03 BLOCKED] {sym.strip().upper()} not in allowed ticker list", level="info")
+            return _skip_out(f"[M03 BLOCKED] {sym.strip().upper()} not in allowed ticker list", ai)
+        if str(ai.get("macro_bias", "")).strip().upper() == "NEUTRAL" and strategy_id_norm in NEUTRAL_MACRO_BLOCKED:
+            log(
+                f"[NEUTRAL BLOCK] {strategy_id_norm} skipped — momentum strategy not allowed in NEUTRAL macro",
+                level="info",
+            )
+            return _skip_out(
+                f"[NEUTRAL BLOCK] {strategy_id_norm} skipped — momentum strategy not allowed in NEUTRAL macro",
+                ai,
+            )
+
         trend_result = apply_trend_filter(
             sym,
             direction,
@@ -4216,6 +4613,28 @@ def run_one_backtest(
             log(f"[TREND BLOCK] {sym} {direction} — {trend_result.get('reason', '')}", level="info")
             return _skip_out(str(trend_result.get("reason") or "trend block"), ai)
         trend_mult = float(trend_result.get("size_multiplier", 1.0) or 1.0)
+
+        tr_w = trend_result.get("trend") or {}
+        if not isinstance(tr_w, dict):
+            tr_w = {}
+        ts_w = float(tr_w.get("strength", 0) or 0)
+        if (
+            chrono_yfinance
+            and tf_key == "1w"
+            and scan_d is not None
+            and scan_d.weekday() in (2, 3, 4)
+            and ts_w <= 0.75
+        ):
+            log(
+                f"[1W TIMING] Skipped {sym} 1w — mid-week entry requires trend_strength > 0.75, "
+                f"current: {ts_w:.2f}",
+                level="info",
+            )
+            return _skip_out(
+                f"[1W TIMING] Skipped {sym} 1w — mid-week entry requires trend_strength > 0.75, "
+                f"current: {ts_w:.2f}",
+                ai,
+            )
 
         if chrono_yfinance and sym.upper() in JPY_STORM_PAIRS and macro_bt is not None:
             tr_snap = trend_result.get("trend") or {}
@@ -4230,7 +4649,8 @@ def run_one_backtest(
             }
 
         if chrono_yfinance:
-            scount = len(CHRONO_DAY_PREFILTER_SIDS.get((sym.upper(), direction), set()))
+            raw_s = CHRONO_DAY_PREFILTER_SIDS.get((sym.upper(), direction), set())
+            scount = len({s for s in raw_s if s in CONFLUENCE_COUNTING_STRATEGIES})
             triple = {"1w", "1d", "4h"}.issubset(CHRONO_SYMDIR_TFS.get((sym.upper(), direction), set()))
         else:
             scount = _local_prefilter_confluence_count(sym, direction, qualifying_strategies)
@@ -4292,6 +4712,15 @@ def run_one_backtest(
             trend_mult=trend_mult,
             confluence_mult=cf_mult,
             entry=float(ai.get("entry", entry) or entry),
+        )
+
+        _v74_apply_recipe_and_monday_boosts(
+            ai,
+            sym=sym,
+            strat_id=strategy_id_norm,
+            locked_confluence=int(scount),
+            tf_key=tf_key,
+            analysis_date=analysis_date,
         )
 
         position_size = float(ai.get("_position_size", 0) or 0)
@@ -4523,6 +4952,11 @@ def run_one_backtest(
             "strategy_confluence_count": int(scount),
             "strategy_confluence_mult": float(cf_mult),
             "strategies_agreed": agreed_list,
+            **(
+                _trade_condition_snapshot_fields(analysis_date, past, ind)
+                if chrono_yfinance
+                else {}
+            ),
         }
 
     except Exception as e:  # noqa: BLE001

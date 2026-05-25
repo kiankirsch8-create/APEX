@@ -899,6 +899,12 @@ async def backtest_results(limit: int = Query(50, ge=1, le=5000)) -> dict[str, A
         return {"limit": limit, "total": 0, "results": [], "error": str(e)}
 
 
+@app.get("/api/strategy_conditions/{strategy_id}")
+async def strategy_conditions(strategy_id: str) -> dict[str, Any]:
+    """v7.4 — WR% and P&L by volatility_regime × market_phase × macro_bias for one strategy."""
+    return continuous_backtester.build_strategy_conditions_report(strategy_id)
+
+
 @app.get("/api/backtest/state")
 async def backtest_state() -> dict[str, Any]:
     """Daemon state: current ticker/date, status, counters (``backtest_state.json``)."""

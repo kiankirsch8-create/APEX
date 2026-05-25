@@ -8,6 +8,7 @@ Central bank policy rates + price trend + optional news sentiment.
 from __future__ import annotations
 
 import json
+import math
 import logging
 import os
 import re
@@ -16,6 +17,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import numpy as np
+import pandas as pd
 import requests
 
 logger = logging.getLogger(__name__)
@@ -446,6 +448,164 @@ def get_macro_bias(
             f"sentiment {sentiment_score:+.2f}"
         ),
     }
+
+
+def _macro_tier_economics(bias: str) -> tuple[float, int]:
+    """(size_multiplier, confidence_upgrade) for a macro bias label after price-alignment downgrade."""
+    b = str(bias or "").strip().upper()
+    if b == "STRONG_TAILWIND":
+        return 1.20, 1
+    if b == "TAILWIND":
+        return 1.10, 0
+    if b == "NEUTRAL":
+        return 1.0, 0
+    if b == "HEADWIND":
+        return 0.85, 0
+    if b == "STRONG_HEADWIND":
+        return 0.70, -1
+    return 1.0, 0
+
+
+def check_macro_price_alignment(
+    ticker: str,
+    direction: str,
+    macro_bias: str,
+    price_data: pd.DataFrame | None,
+    *,
+    as_of_date: date | None = None,
+) -> tuple[str, float | None, str]:
+    """
+    v7.4 — 7-day spot momentum vs macro direction. Does not recompute rate/sentiment composites.
+    Returns (adjusted_bias, momentum_pct_or_None, reason_tag).
+    """
+    tku = (ticker or "").strip().upper()
+    dire = (direction or "").strip().upper()
+    mb0 = str(macro_bias or "").strip().upper()
+    if dire not in ("LONG", "SHORT") or not (len(tku) == 6 and tku.isalpha()):
+        return mb0, None, "skip_non_fx"
+    if mb0 not in ("STRONG_TAILWIND", "TAILWIND", "NEUTRAL", "HEADWIND", "STRONG_HEADWIND"):
+        return mb0, None, "skip_bias_tier"
+
+    df = price_data
+    if df is None or getattr(df, "empty", True) or "Close" not in df.columns:
+        try:
+            from continuous_backtester import safe_yf_fetch
+
+            end_d = as_of_date or date.today()
+            start_d = end_d - timedelta(days=20)
+            yf_sym = _yf_symbol(tku)
+            df = safe_yf_fetch(yf_sym, start_d.isoformat(), (end_d + timedelta(days=1)).isoformat(), "1d")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("check_macro_price_alignment fetch %s: %s", tku, e)
+            df = None
+    if df is None or getattr(df, "empty", True) or "Close" not in df.columns:
+        return mb0, None, "no_price_data"
+
+    closes = pd.to_numeric(df["Close"], errors="coerce").dropna()
+    if len(closes) < 8:
+        return mb0, None, "short_history"
+    c_now = float(closes.iloc[-1])
+    c_7 = float(closes.iloc[-8])
+    if not math.isfinite(c_now) or not math.isfinite(c_7) or c_7 == 0:
+        return mb0, None, "bad_closes"
+    momentum = (c_now - c_7) / abs(c_7) * 100.0
+
+    agree_hi = 0.3
+    agree_lo = -0.3
+    if dire == "LONG":
+        if momentum > agree_hi:
+            return mb0, momentum, "price_agrees"
+        if agree_lo <= momentum <= agree_hi:
+            return _downgrade_macro_bias_one_level(mb0), momentum, "neutral_momentum_band"
+        return _downgrade_macro_bias_two_levels(mb0), momentum, "price_contradicts"
+    # SHORT
+    if momentum < agree_lo:
+        return mb0, momentum, "price_agrees"
+    if agree_lo <= momentum <= agree_hi:
+        return _downgrade_macro_bias_one_level_short(mb0), momentum, "neutral_momentum_band"
+    return _downgrade_macro_bias_two_levels_short(mb0), momentum, "price_contradicts"
+
+
+def _downgrade_macro_bias_one_level(bias: str) -> str:
+    """LONG book: softer macro when 7d drift is flat (momentum band)."""
+    b = str(bias or "").strip().upper()
+    if b == "STRONG_TAILWIND":
+        return "TAILWIND"
+    if b == "TAILWIND":
+        return "NEUTRAL"
+    if b == "HEADWIND":
+        return "STRONG_HEADWIND"
+    return b
+
+
+def _downgrade_macro_bias_two_levels(bias: str) -> str:
+    b = str(bias or "").strip().upper()
+    if b == "STRONG_TAILWIND":
+        return "NEUTRAL"
+    if b == "TAILWIND":
+        return "HEADWIND"
+    if b == "NEUTRAL":
+        return "HEADWIND"
+    if b == "HEADWIND":
+        return "STRONG_HEADWIND"
+    return b
+
+
+def _downgrade_macro_bias_one_level_short(bias: str) -> str:
+    """SHORT book: symmetric tier moves when momentum is flat."""
+    return _downgrade_macro_bias_one_level(bias)
+
+
+def _downgrade_macro_bias_two_levels_short(bias: str) -> str:
+    return _downgrade_macro_bias_two_levels(bias)
+
+
+def align_macro_bias_with_price(
+    ticker: str,
+    direction: str,
+    macro: dict[str, Any],
+    *,
+    as_of_date: date | None = None,
+    price_df: pd.DataFrame | None = None,
+    log_fn: Any | None = None,
+) -> dict[str, Any]:
+    """
+    Apply v7.4 7d price alignment on top of ``get_macro_bias`` output.
+    ``log_fn`` optional callable(str) e.g. continuous_backtester.log.
+    """
+    out = dict(macro)
+    mb0 = str(out.get("bias", "NEUTRAL")).strip().upper()
+    adj, mom, tag = check_macro_price_alignment(
+        ticker,
+        direction,
+        mb0,
+        price_df,
+        as_of_date=as_of_date,
+    )
+    if adj != mb0 and mom is not None:
+        sm, cu = _macro_tier_economics(adj)
+        out["bias"] = adj
+        out["size_multiplier"] = sm
+        out["confidence_upgrade"] = cu
+        msg = (
+            f"[MACRO TRANSITION] {ticker.upper()}: {mb0}→{adj} "
+            f"(7d momentum: {mom:+.1f}%, price contradicting macro direction)"
+            if "contradict" in tag
+            else (
+                f"[MACRO TRANSITION] {ticker.upper()}: {mb0}→{adj} "
+                f"(7d momentum: {mom:+.1f}%, neutral price action)"
+                if "neutral_momentum" in tag
+                else f"[MACRO TRANSITION] {ticker.upper()}: {mb0}→{adj} (7d momentum: {mom:+.1f}%, {tag})"
+            )
+        )
+        if log_fn:
+            try:
+                log_fn(msg, level="info")
+            except TypeError:
+                log_fn(msg)
+        else:
+            logger.info(msg)
+    return out
 
 
 def weekly_macro_summary_lines(tickers: tuple[str, ...]) -> list[str]:
