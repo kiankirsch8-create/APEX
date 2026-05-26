@@ -1048,7 +1048,7 @@ def _chrono_currency_cap_blocks(ticker: str, *, use_4h_pool: bool) -> tuple[bool
     return False, None
 
 
-def _chrono_v71_phases(days_ago: int) -> list[tuple[str, list[str], float, float, bool]]:
+def _chrono_v71_phases(days_ago: int, *, scan_date: date) -> list[tuple[str, list[str], float, float, bool]]:
     """(log label, tf list, risk_mult, tp_mult, use_4h_currency_pool)."""
     phases: list[tuple[str, list[str], float, float, bool]] = [
         ("PHASE 1 WEEKLY SCAN", ["1w"], 1.0, 1.0, False),
@@ -1056,6 +1056,18 @@ def _chrono_v71_phases(days_ago: int) -> list[tuple[str, list[str], float, float
         ("PHASE 2B 1H STRUCTURE", ["1h"], 0.85, 0.85, True),
         ("PHASE 3 4H SCAN", ["4h"], 0.70, 0.70, True),
     ]
+    if not scan_date_has_yf_chrono_hourly_data(scan_date):
+        before = len(phases)
+        phases = [p for p in phases if p[1] != ["1h"] and p[1] != ["4h"]]
+        if len(phases) < before:
+            dsk = scan_date.isoformat()
+            if dsk not in _yf_hourly_skip_logged_dates:
+                _yf_hourly_skip_logged_dates.add(dsk)
+                log(
+                    f"[SKIP] 1h/4h data not available for dates before "
+                    f"{yf_chrono_hourly_earliest_scan_date().isoformat()}",
+                    level="info",
+                )
     if days_ago <= 55:
         phases.append(("PHASE 4 INTRADAY SCAN", ["15m", "30m"], 0.70, 0.70, True))
     return phases
@@ -1297,6 +1309,21 @@ _results_lock = threading.Lock()
 _loop_counters_lock = threading.Lock()
 CHRONO_RUNNING = False
 _yf_lock = threading.Semaphore(1)
+
+# Yahoo intraday history for chrono is only reliable within ~730 days; older scans skip 1h/4h.
+YF_CHRONO_HOURLY_MAX_DAYS = 730
+_chrono_ohlc_cache: dict[tuple[str, str, str], tuple[Any, Any]] = {}
+_chrono_ohlc_cache_lock = threading.Lock()
+_chrono_ohlc_prefetch_done: set[tuple[str, int, int]] = set()
+_yf_hourly_skip_logged_dates: set[str] = set()
+
+
+def yf_chrono_hourly_earliest_scan_date() -> date:
+    return datetime.now(timezone.utc).date() - timedelta(days=YF_CHRONO_HOURLY_MAX_DAYS)
+
+
+def scan_date_has_yf_chrono_hourly_data(scan_d: date) -> bool:
+    return scan_d >= yf_chrono_hourly_earliest_scan_date()
 
 
 def log_learned_startup_preview() -> None:
@@ -1690,17 +1717,24 @@ def safe_yf_download(
     return safe_yf_fetch(ticker, start, end, interval, retries)
 
 
-def get_ohlcv(
+def _get_ohlcv_download_impl(
     yf_ticker: str,
     timeframe: str,
     analysis_date: str,
     *,
     chrono_yfinance: bool = False,
 ) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
-    """Fetch OHLCV for backtest window; resample 1h→4h when needed."""
+    """Download + split past/future OHLCV (no chrono batch cache or 730-day log)."""
     if not chrono_yfinance and CHRONO_RUNNING:
         return None, None
     tf_key = timeframe.lower().strip()
+    if chrono_yfinance and tf_key in ("1h", "4h"):
+        try:
+            ad = datetime.strptime(analysis_date.strip()[:10], "%Y-%m-%d").date()
+        except ValueError:
+            ad = None
+        if ad is not None and not scan_date_has_yf_chrono_hourly_data(ad):
+            return None, None
     tf_cfg: dict[str, dict[str, Any]] = {
         "15m": {"interval": "15m", "days_back": 60, "days_fwd": 7},
         "30m": {"interval": "30m", "days_back": 120, "days_fwd": 14},
@@ -1755,6 +1789,85 @@ def get_ohlcv(
     past = df[df.index <= day_end].copy()
     future = df[df.index > day_end].copy()
     return past, future
+
+
+def get_ohlcv(
+    yf_ticker: str,
+    timeframe: str,
+    analysis_date: str,
+    *,
+    chrono_yfinance: bool = False,
+) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
+    """Fetch OHLCV for backtest window; resample 1h→4h when needed."""
+    if not chrono_yfinance and CHRONO_RUNNING:
+        return None, None
+    tf_key = timeframe.lower().strip()
+    ds = analysis_date.strip()[:10]
+    if chrono_yfinance and tf_key in ("1h", "4h"):
+        try:
+            ad = datetime.strptime(ds, "%Y-%m-%d").date()
+        except ValueError:
+            ad = None
+        if ad is not None and not scan_date_has_yf_chrono_hourly_data(ad):
+            if ds not in _yf_hourly_skip_logged_dates:
+                _yf_hourly_skip_logged_dates.add(ds)
+                log(
+                    f"[SKIP] 1h/4h data not available for dates before "
+                    f"{yf_chrono_hourly_earliest_scan_date().isoformat()}",
+                    level="info",
+                )
+            return None, None
+    if chrono_yfinance:
+        ck = (yf_ticker.strip().upper(), tf_key, ds)
+        with _chrono_ohlc_cache_lock:
+            if ck in _chrono_ohlc_cache:
+                return _chrono_ohlc_cache.pop(ck)
+    return _get_ohlcv_download_impl(yf_ticker, timeframe, analysis_date, chrono_yfinance=chrono_yfinance)
+
+
+def _chrono_prefetch_ohlc_for_phase_matrix(
+    date_str: str,
+    phases: list[tuple[str, list[str], float, float, bool]],
+    tickers: list[str],
+    v71_pi_s: int,
+    v71_tj_s: int,
+) -> None:
+    """Warm Yahoo OHLC for each (phase × timeframe) slice in parallel (chrono only)."""
+    workers = max(1, int(os.environ.get("APEX_PARALLEL_WORKERS", "8")))
+    for pi_pf in range(v71_pi_s, len(phases)):
+        _label_pf, tf_list_pf, _, _, _ = phases[pi_pf]
+        tj0_pf = v71_tj_s if pi_pf == v71_pi_s else 0
+        for tj_pf in range(tj0_pf, len(tf_list_pf)):
+            tf_raw = tf_list_pf[tj_pf]
+            tf_key_pf = str(tf_raw).lower().strip()
+            pf_key = (date_str, pi_pf, tj_pf)
+            with _chrono_ohlc_cache_lock:
+                if pf_key in _chrono_ohlc_prefetch_done:
+                    continue
+                _chrono_ohlc_prefetch_done.add(pf_key)
+            log(
+                f"[CHRONO] Parallel OHLC prefetch: {len(tickers)} tickers {tf_key_pf} "
+                f"(workers={workers})",
+                level="info",
+            )
+
+            def _warm_one(sym: str) -> None:
+                s = (sym or "").strip().upper()
+                is_fx = len(s) == 6 and s.isalpha()
+                yf_t = s + "=X" if is_fx else s
+                ck = (yf_t.strip().upper(), tf_key_pf, date_str.strip()[:10])
+                try:
+                    past_f, fut_f = _get_ohlcv_download_impl(
+                        yf_t, str(tf_raw), date_str, chrono_yfinance=True
+                    )
+                except Exception as e_w:  # noqa: BLE001
+                    log(f"[ChronoPrefetch] {s} {tf_key_pf}: {e_w}", level="warning")
+                    past_f, fut_f = None, None
+                with _chrono_ohlc_cache_lock:
+                    _chrono_ohlc_cache[ck] = (past_f, fut_f)
+
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                list(ex.map(_warm_one, tickers))
 
 
 def validate_rr(plan: dict[str, Any]) -> dict[str, Any]:
@@ -6301,6 +6414,9 @@ def run_chronological_backtest(
                 continue
 
             log(f"[Chrono {job_id}] Processing {date_str}", level="info")
+            with _chrono_ohlc_cache_lock:
+                _chrono_ohlc_cache.clear()
+                _chrono_ohlc_prefetch_done.clear()
 
             cin = chrono_data.get("chrono_intraday")
             if isinstance(cin, dict) and str(cin.get("date", "")) and str(cin.get("date", "")) < date_str:
@@ -6399,8 +6515,10 @@ def run_chronological_backtest(
                     f"Size={day_regime['size_multiplier']}x",
                     level="info",
                 )
-                days_ago = (date.today() - scan_date).days
-                phases = _chrono_v71_phases(days_ago)
+                _utc_today = datetime.now(timezone.utc).date()
+                days_ago = (_utc_today - scan_date).days
+                phases = _chrono_v71_phases(days_ago, scan_date=scan_date)
+                _chrono_prefetch_ohlc_for_phase_matrix(date_str, phases, tickers, v71_pi_s, v71_tj_s)
 
                 def _v71_next_step(pi: int, ti: int, tj: int) -> tuple[int, int, int]:
                     _label, tf_list, _rm, _tm, _u4 = phases[pi]
