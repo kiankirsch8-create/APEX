@@ -46,17 +46,21 @@ from anthropic import Anthropic
 
 import pandas_ta  # noqa: F401
 
-from calendar_manager import check_calendar_risk_historical
+from intelligence_fetch_cached import (
+    cached_apply_trend_filter,
+    cached_calendar_historical,
+    cached_claude_master_text,
+    cached_complete_briefing,
+    cached_macro_bias,
+    cached_regime,
+)
 from macro_manager import (
     align_macro_bias_with_price,
     apply_macro_confidence_adjustment,
-    get_macro_bias,
     macro_result_fields,
     merged_macro_result_fields,
     set_backtest_mode,
 )
-from regime_manager import get_regime_cached
-from trend_manager import apply_trend_filter
 from utils import DATA_DIR, env, load_json, log, save_json, utcnow_iso
 
 set_backtest_mode(True)
@@ -170,8 +174,10 @@ STARTING_CAPITAL = 10000.0
 LEVERAGE = 50
 IMPROVE_EVERY = 100
 
-# Parallel backtest loop (speed)
-MAX_WORKERS = 3
+# Parallel rolling batch (I/O-bound jobs). Chrono stays sequential: same-day capital,
+# TRADED_TICKERS_TODAY, and currency caps mutate between scans — parallel chrono would
+# change which trades pass gates and is intentionally not used here.
+MAX_WORKERS = int(os.environ.get("APEX_PARALLEL_WORKERS", "8"))
 BATCH_SIZE = 10
 BACKTEST_CLAUDE_MAX_TOKENS = 1200
 CLAUDE_HTTP_TIMEOUT_SEC = 25.0
@@ -3621,7 +3627,7 @@ def _python_forced_layer2_trade(
         scan_d_macro = date.fromisoformat(analysis_date.strip()[:10])
     except (TypeError, ValueError):
         scan_d_macro = None
-    macro_bt = get_macro_bias(sym, direction, as_of_date=scan_d_macro)
+    macro_bt = cached_macro_bias(sym, direction, scan_d_macro)
     macro_bt = align_macro_bias_with_price(
         sym,
         direction,
@@ -3706,7 +3712,7 @@ def _python_forced_layer2_trade(
             is_exotic=is_exotic,
         )
 
-    trend_result = apply_trend_filter(
+    trend_result = cached_apply_trend_filter(
         sym,
         str(ai.get("direction", direction)).strip().upper(),
         strat_id,
@@ -4052,9 +4058,9 @@ def run_one_backtest(
         if chrono_regime is not None:
             regime_ctx = chrono_regime
         else:
-            regime_ctx = get_regime_cached(
+            regime_ctx = cached_regime(
                 os.environ.get("ROLLING_REGIME_JOB_ID", "rolling"),
-                as_of_date=scan_d,
+                scan_d,
             )
 
         hist_cal: dict[str, Any] = {
@@ -4063,7 +4069,7 @@ def run_one_backtest(
             "size_multiplier": 1.0,
         }
         if scan_d is not None:
-            hist_cal = check_calendar_risk_historical(sym, scan_d)
+            hist_cal = cached_calendar_historical(sym, scan_d)
             if hist_cal.get("action") == "BLOCK":
                 return _skipped_backtest_row(
                     sym=sym,
@@ -4290,11 +4296,10 @@ def run_one_backtest(
         try:
             from market_intelligence import (
                 format_for_prompt,
-                get_complete_briefing,
                 is_news_blackout,
             )
 
-            briefing = get_complete_briefing(sym, analysis_date.strip(), past)
+            briefing = cached_complete_briefing(sym, analysis_date.strip())
             intel_text = format_for_prompt(briefing)
             news_sentiment = float(briefing.get("news", {}).get("net_sentiment", 0) or 0)
             cot_bias = str(briefing.get("cot_base", {}).get("bias", "UNKNOWN"))
@@ -4457,10 +4462,14 @@ def run_one_backtest(
         )
         try:
             client = _client()
-            resp = client.messages.create(
+            raw = cached_claude_master_text(
+                client,
                 model=CLAUDE_MODEL,
                 max_tokens=BACKTEST_CLAUDE_MAX_TOKENS,
-                messages=[{"role": "user", "content": prompt}],
+                prompt=prompt,
+                ticker=sym,
+                analysis_date=analysis_date.strip(),
+                scan_d=scan_d,
             )
         except Exception as e:  # noqa: BLE001
             et = type(e).__name__
@@ -4470,7 +4479,6 @@ def run_one_backtest(
                 return None
             log(f"[Backtest] Claude API error {sym} {timeframe}: {e}", level="warning")
             return None
-        raw = _message_text(resp)
         parsed = _parse_json_response(raw)
         ai: dict[str, Any] = parsed if isinstance(parsed, dict) else {}
 
@@ -4536,7 +4544,7 @@ def run_one_backtest(
             if sym == "GBPJPY" and str(ai.get("confidence", "")).strip().upper() == "HIGH":
                 ai["confidence"] = "MEDIUM"
 
-            macro_bt = get_macro_bias(sym, d0, as_of_date=scan_d)
+            macro_bt = cached_macro_bias(sym, d0, scan_d)
             macro_bt = align_macro_bias_with_price(
                 sym,
                 d0,
@@ -4603,7 +4611,7 @@ def run_one_backtest(
                 ai,
             )
 
-        trend_result = apply_trend_filter(
+        trend_result = cached_apply_trend_filter(
             sym,
             direction,
             strategy_id_norm,
@@ -6384,7 +6392,7 @@ def run_chronological_backtest(
             chrono_abort = False
             if not finalize_day_only:
                 scan_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-                day_regime = get_regime_cached(job_id, as_of_date=scan_date)
+                day_regime = cached_regime(job_id, scan_date)
                 log(
                     f"[REGIME] {day_regime['regime']} — WR10={day_regime['wr_10']:.0%} "
                     f"WR20={day_regime['wr_20']:.0%} Streak={day_regime['consecutive_losses']} losses "
