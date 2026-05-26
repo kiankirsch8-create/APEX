@@ -27,6 +27,8 @@ import chart_analyzer_v2
 import chart_vision
 import continuous_backtester
 import funded_simulator
+import intelligence_cache
+import prefetch_intelligence
 import intraday_backtester
 import news_stream
 import portfolio_advisor
@@ -87,6 +89,11 @@ async def on_startup_resume_backtester() -> None:
         # else:
         #     log("[Startup] Backtester is disabled")
         log("[Startup] Continuous random backtester not auto-started")
+        log(
+            f"[Startup] Rolling batch parallel workers: {continuous_backtester.MAX_WORKERS} "
+            f"(APEX_PARALLEL_WORKERS)",
+            level="info",
+        )
         if os.getenv("BENZINGA_API_KEY"):
             try:
                 news_stream.start_news_stream_thread()
@@ -185,6 +192,21 @@ class IntradayToggleIn(BaseModel):
     """Enable or disable the intraday backtest daemon loop."""
 
     enabled: bool
+
+
+class CachePrefetchIn(BaseModel):
+    """Background intelligence cache warm for a historical date range."""
+
+    start_date: str = Field(..., description="YYYY-MM-DD")
+    end_date: str = Field(..., description="YYYY-MM-DD")
+    tickers: list[str] | None = Field(
+        default=None,
+        description="If omitted, uses CHRONO_TICKERS from continuous_backtester",
+    )
+    regime_job_id: str | None = Field(
+        default=None,
+        description="Optional chrono job_id — when set, also warms regime cache keys for that job",
+    )
 
 
 class AnalyzeDataIn(BaseModel):
@@ -1016,6 +1038,38 @@ async def backtest_improving() -> dict[str, Any]:
     return continuous_backtester.get_improving_state()
 
 
+def _run_prefetch_background(
+    task_id: str,
+    start_date: str,
+    end_date: str,
+    tickers: list[str] | None,
+    regime_job_id: str | None,
+) -> None:
+    try:
+        prefetch_intelligence.prefetch_date_range(
+            start_date,
+            end_date,
+            tickers=tickers,
+            regime_job_id=regime_job_id,
+            task_id=task_id,
+        )
+    except Exception as e:  # noqa: BLE001
+        log(f"[Prefetch] background task {task_id} failed: {e}")
+        p = prefetch_intelligence.prefetch_task_path(task_id)
+        try:
+            save_json(
+                p,
+                {
+                    "task_id": task_id,
+                    "status": "failed",
+                    "error": str(e),
+                    "finished_at": datetime.now().isoformat(),
+                },
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _spawn_chronological_backtest(start_date: str, end_date: str, job_id: str) -> None:
     """Fire-and-forget worker so the HTTP handler returns immediately."""
     threading.Thread(
@@ -1066,6 +1120,73 @@ async def start_chrono_backtest(
 async def get_chrono_live() -> dict[str, Any]:
     """Current scan cursor for the chrono engine (poll ~3s in UIs)."""
     return continuous_backtester.CHRONO_LIVE_STATUS.copy()
+
+
+@app.get("/api/cache/stats")
+async def get_intelligence_cache_stats() -> dict[str, Any]:
+    """SQLite intelligence cache: entry count, size, and same-process hit counters."""
+    return intelligence_cache.cache_stats()
+
+
+@app.delete("/api/cache/clear")
+async def clear_intelligence_cache(confirm: str = Query(..., description="Must be yes")) -> dict[str, Any]:
+    """Wipe historical intelligence cache (use after intelligence logic changes)."""
+    if str(confirm).strip().lower() != "yes":
+        raise HTTPException(status_code=400, detail='Set query confirm=yes (e.g. /api/cache/clear?confirm=yes)')
+    n = intelligence_cache.clear_all_cache(confirm=True)
+    return {"cleared_rows": n, "status": "ok"}
+
+
+@app.post("/api/cache/prefetch")
+async def start_cache_prefetch(
+    background_tasks: BackgroundTasks,
+    body: CachePrefetchIn,
+) -> dict[str, Any]:
+    """Warm intelligence_cache.db for a date range in the background."""
+    try:
+        sd = datetime.strptime(body.start_date.strip(), "%Y-%m-%d").date()
+        ed = datetime.strptime(body.end_date.strip(), "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format; use YYYY-MM-DD")
+    if sd > ed:
+        raise HTTPException(status_code=400, detail="start_date must be on or before end_date")
+    task_id = f"prefetch_{uuid.uuid4().hex[:10]}"
+    tickers = body.tickers
+    if not tickers:
+        tickers = list(continuous_backtester.CHRONO_TICKERS)
+    est = prefetch_intelligence.estimated_minutes_for_prefetch(
+        body.start_date.strip(),
+        body.end_date.strip(),
+        len(tickers),
+    )
+    background_tasks.add_task(
+        _run_prefetch_background,
+        task_id,
+        body.start_date.strip(),
+        body.end_date.strip(),
+        tickers,
+        (body.regime_job_id.strip() if body.regime_job_id and str(body.regime_job_id).strip() else None),
+    )
+    return {
+        "task_id": task_id,
+        "status": "started",
+        "estimated_minutes": round(float(est), 1),
+    }
+
+
+@app.get("/api/cache/prefetch/{task_id}")
+async def get_cache_prefetch_status(task_id: str) -> dict[str, Any]:
+    st = prefetch_intelligence.get_prefetch_progress(task_id.strip())
+    if not st:
+        raise HTTPException(status_code=404, detail="Unknown prefetch task_id")
+    tot = max(1, int(st.get("total") or 1))
+    done = int(st.get("completed") or 0)
+    return {
+        "completed": done,
+        "total": tot,
+        "pct": round(100.0 * done / tot, 1),
+        "status": st.get("status"),
+    }
 
 
 @app.post("/api/chrono/{job_id}/stop")
