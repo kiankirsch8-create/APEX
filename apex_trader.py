@@ -601,21 +601,27 @@ def get_currencies(ticker: str) -> list[str]:
     return [t[:3], t[3:]] if len(t) == 6 and t.isalpha() else []
 
 
+def position_forex_base6(symbol: str) -> str | None:
+    """Normalize MT5 symbol to 6-letter forex base (e.g. NZDCAD, NZDCADm → NZDCAD)."""
+    raw = str(symbol or "").replace(".", "").replace("-", "").upper()
+    if len(raw) >= 6 and raw[:6].isalpha():
+        return raw[:6]
+    return None
+
+
 def open_position_currency_maps(mt5: Any) -> tuple[set[str], set[str]]:
-    """Currencies with net long / net short exposure from open APEX positions."""
+    """Currencies with net long / net short exposure from **all** open positions (any magic/EA)."""
     long_c: set[str] = set()
     short_c: set[str] = set()
     for p in mt5.positions_get() or []:
-        if int(getattr(p, "magic", 0) or 0) != APEX_MAGIC:
+        base = position_forex_base6(str(p.symbol))
+        if not base:
             continue
-        raw = str(p.symbol).replace(".", "").upper()
-        base = raw[:6] if len(raw) >= 6 and raw[:6].isalpha() else raw
         ccys = get_currencies(base)
         if len(ccys) != 2:
             continue
         a, b = ccys[0], ccys[1]
         typ = int(getattr(p, "type", 0) or 0)
-        # MT5: POSITION_TYPE_BUY = 0
         if typ == 0:
             long_c.add(a)
             short_c.add(b)
@@ -644,6 +650,112 @@ def currency_direction_conflict(sym: str, direction: str, mt5: Any) -> tuple[boo
         if b in short_c:
             return True, f"conflict: {b} short from open exposure"
     return False, ""
+
+
+def account_symbol_direction_conflict(mt5: Any, resolved_sym: str, direction: str) -> tuple[bool, str]:
+    """
+    Block if **any** open position (any magic) on the same 6-letter forex pair is the opposite direction.
+    Catches hedges like NZDCAD BUY + NZDCAD SELL that currency-level maps can miss once both legs exist.
+    """
+    base = position_forex_base6(resolved_sym)
+    if not base:
+        return False, ""
+    d = direction.strip().upper()
+    if d not in ("LONG", "SHORT"):
+        return False, ""
+    want_typ = 0 if d == "LONG" else 1
+    for p in mt5.positions_get() or []:
+        pb = position_forex_base6(str(p.symbol))
+        if pb != base:
+            continue
+        typ = int(getattr(p, "type", 0) or 0)
+        if typ != want_typ:
+            mg = int(getattr(p, "magic", 0) or 0)
+            return True, (
+                f"opposite exposure on {base}: open ticket={int(p.ticket)} type={'BUY' if typ == 0 else 'SELL'} "
+                f"magic={mg} sym={p.symbol}"
+            )
+    return False, ""
+
+
+def close_position_at_market(mt5: Any, p: Any) -> bool:
+    """Market-close one position; drop APEX ticket meta if present."""
+    tick = mt5.symbol_info_tick(p.symbol)
+    if tick is None:
+        log_msg(f"[close] no tick for {p.symbol} ticket={p.ticket}", "error")
+        return False
+    typ = mt5.ORDER_TYPE_SELL if int(getattr(p, "type", 0) or 0) == 0 else mt5.ORDER_TYPE_BUY
+    price = float(tick.bid if typ == mt5.ORDER_TYPE_SELL else tick.ask)
+    req = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": p.symbol,
+        "volume": float(p.volume),
+        "type": typ,
+        "position": int(p.ticket),
+        "price": price,
+        "deviation": 25,
+        "magic": int(getattr(p, "magic", 0) or 0),
+        "comment": (p.comment or "")[:31] or ORDER_COMMENT,
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": fill_mode(mt5, p.symbol),
+    }
+    r = mt5.order_send(req)
+    if r is None or r.retcode != mt5.TRADE_RETCODE_DONE:
+        log_msg(f"[close] fail ticket={p.ticket} {r}", "error")
+        return False
+    tid = str(int(p.ticket))
+    meta = ticket_meta_load()
+    if tid in meta:
+        del meta[tid]
+        ticket_meta_save(meta)
+    log_msg(f"[close] closed ticket={p.ticket} {p.symbol} vol={p.volume}", "info")
+    return True
+
+
+def resolve_apex_hedged_same_pair(mt5: Any) -> None:
+    """
+    If APEX has BUY and SELL open on the same forex pair, close the side with lower total P/L (plus swap).
+    Ties favor closing LONG so net bias matches typical continuation of the winning SELL leg.
+    """
+    by_base: dict[str, dict[str, list[Any]]] = defaultdict(lambda: {"LONG": [], "SHORT": []})
+    for p in mt5.positions_get() or []:
+        if int(getattr(p, "magic", 0) or 0) != APEX_MAGIC:
+            continue
+        if (p.comment or "").strip() != ORDER_COMMENT:
+            continue
+        base = position_forex_base6(str(p.symbol))
+        if not base:
+            continue
+        typ = int(getattr(p, "type", 0) or 0)
+        side = "LONG" if typ == 0 else "SHORT"
+        by_base[base][side].append(p)
+
+    for base, sides in by_base.items():
+        longs = sides["LONG"]
+        shorts = sides["SHORT"]
+        if not longs or not shorts:
+            continue
+
+        def leg_pl(rows: list[Any]) -> float:
+            return sum(
+                float(getattr(x, "profit", 0) or 0) + float(getattr(x, "swap", 0) or 0) for x in rows
+            )
+
+        pl_long = leg_pl(longs)
+        pl_short = leg_pl(shorts)
+        if pl_long < pl_short:
+            to_close, keep = longs, "SHORT"
+        elif pl_short < pl_long:
+            to_close, keep = shorts, "LONG"
+        else:
+            to_close, keep = longs, "SHORT"
+        log_msg(
+            f"[HEDGE] {base}: BUY+SELL APEX — P/L long={pl_long:.2f} short={pl_short:.2f} "
+            f"closing {len(to_close)} leg(s), keeping {keep}",
+            "warning",
+        )
+        for pos in list(to_close):
+            close_position_at_market(mt5, pos)
 
 
 def is_first_friday_nfp(d: date) -> bool:
@@ -921,6 +1033,17 @@ def order_send_live(
     tick = mt5.symbol_info_tick(sym)
     if tick is None:
         return {"ok": False, "error": "no_tick"}
+    d = (d or "").strip().upper()
+    base_sym = position_forex_base6(sym) or ""
+    if len(get_currencies(base_sym)) == 2:
+        ok_cc, rs_cc = currency_direction_conflict(base_sym, d, mt5)
+        if ok_cc:
+            log_msg(f"[ORDER] blocked — {rs_cc}", "warning")
+            return {"ok": False, "error": f"currency_conflict:{rs_cc}"}
+    ok_opp, rs_opp = account_symbol_direction_conflict(mt5, sym, d)
+    if ok_opp:
+        log_msg(f"[ORDER] blocked — {rs_opp}", "warning")
+        return {"ok": False, "error": f"symbol_conflict:{rs_opp}"}
     entry = float(tick.ask if d == "LONG" else tick.bid)
     mpl = mpl_sl(mt5, sym, entry, sl, d)
     if mpl is None or mpl <= 0:
@@ -986,6 +1109,7 @@ def manage_trailing_live(mt5: Any) -> None:
 
     if not mt5.terminal_info():
         return
+    resolve_apex_hedged_same_pair(mt5)
     meta = ticket_meta_load()
     raw = mt5.positions_get() or []
     managed: list[Any] = []
@@ -1280,6 +1404,8 @@ def run_full_scan() -> None:
     st = update_closed_trades_and_losses(m, st)
     save_live_state(st)
 
+    resolve_apex_hedged_same_pair(m)
+
     if len(open_apex_positions(m)) >= 15:
         log_msg("[SCAN] max 15 open positions", "warning")
         return
@@ -1504,6 +1630,12 @@ def run_full_scan() -> None:
         bs = resolve_sym(m, sym)
         if not bs:
             lines_out.append(f"SKIP: {sym} — symbol resolve")
+            skipped += 1
+            continue
+
+        ok_pair, rs_pair = account_symbol_direction_conflict(m, bs, direction)
+        if ok_pair:
+            lines_out.append(f"SKIP: {sym} {tf} {direction} — {rs_pair}")
             skipped += 1
             continue
 
