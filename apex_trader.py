@@ -840,6 +840,38 @@ def norm_vol(mt5: Any, sym: str, v: float) -> float:
     return round(v2, int(max(0, -math.floor(math.log10(step)))))
 
 
+def mt5_round_price(mt5: Any, sym: str, price: float) -> float:
+    info = mt5.symbol_info(sym)
+    if info is None:
+        return round(float(price), 5)
+    dg = int(getattr(info, "digits", 5) or 5)
+    return round(float(price), dg)
+
+
+def clamp_sl_buy_live(mt5: Any, sym: str, bid: float, want_sl: float) -> float:
+    """BUY: stop must stay strictly below bid (freeze / stops level)."""
+    info = mt5.symbol_info(sym)
+    if info is None:
+        return want_sl
+    pt = float(info.point or 1e-5)
+    lvl = int(getattr(info, "trade_stops_level", 0) or 0)
+    dist = (lvl + 1) * pt
+    max_sl = bid - dist
+    return min(float(want_sl), max_sl)
+
+
+def clamp_sl_sell_live(mt5: Any, sym: str, ask: float, want_sl: float) -> float:
+    """SELL: stop must stay strictly above ask."""
+    info = mt5.symbol_info(sym)
+    if info is None:
+        return want_sl
+    pt = float(info.point or 1e-5)
+    lvl = int(getattr(info, "trade_stops_level", 0) or 0)
+    dist = (lvl + 1) * pt
+    min_sl = ask + dist
+    return max(float(want_sl), min_sl)
+
+
 def open_apex_positions(mt5: Any) -> list[Any]:
     out: list[Any] = []
     for p in mt5.positions_get() or []:
@@ -915,10 +947,21 @@ def order_send_live(
         return {"ok": False, "error": getattr(res, "comment", str(res))}
     time.sleep(0.25)
     ticket = None
+    candidates: list[Any] = []
     for p in mt5.positions_get(symbol=sym) or []:
-        if int(getattr(p, "magic", 0) or 0) == APEX_MAGIC:
-            ticket = int(p.ticket)
-            break
+        if int(getattr(p, "magic", 0) or 0) != APEX_MAGIC:
+            continue
+        pc = (p.comment or "").strip()
+        if pc and pc != ORDER_COMMENT:
+            continue
+        candidates.append(p)
+    if candidates:
+        ticket = int(
+            max(candidates, key=lambda pp: (int(getattr(pp, "time", 0) or 0), int(pp.ticket))).ticket
+        )
+    if ticket is None:
+        log_msg(f"[ORDER] filled but no APEX position row for {sym} (check magic/comment)", "error")
+        return {"ok": False, "error": "ticket_resolve"}
     meta = dict(meta)
     meta["ticket"] = ticket
     meta["entry_fill"] = entry
@@ -944,13 +987,21 @@ def manage_trailing_live(mt5: Any) -> None:
     if not mt5.terminal_info():
         return
     meta = ticket_meta_load()
-    for pos in mt5.positions_get() or []:
-        if int(getattr(pos, "magic", 0) or 0) != APEX_MAGIC or (pos.comment or "").strip() != ORDER_COMMENT:
+    raw = mt5.positions_get() or []
+    managed: list[Any] = []
+    for pos in raw:
+        if int(getattr(pos, "magic", 0) or 0) != APEX_MAGIC:
             continue
         k = str(int(pos.ticket))
-        m = meta.get(k)
-        if not isinstance(m, dict):
+        if not isinstance(meta.get(k), dict):
             continue
+        managed.append(pos)
+
+    log_msg(f"[TRAIL CHECK] Running trailing stop update for {len(managed)} open positions", "info")
+
+    for pos in managed:
+        k = str(int(pos.ticket))
+        m = meta[k]
         d = str(m.get("direction", "")).upper()
         entry = float(m.get("entry_fill", pos.price_open))
         tp1 = float(m.get("tp1", 0) or 0)
@@ -958,10 +1009,12 @@ def manage_trailing_live(mt5: Any) -> None:
         tp3 = float(m.get("tp3", 0) or 0)
         tick = mt5.symbol_info_tick(pos.symbol)
         if tick is None:
+            log_msg(f"[TRAIL] {pos.symbol} ticket#{pos.ticket} no tick — skip", "warning")
             continue
         bid, ask = float(tick.bid), float(tick.ask)
         cur_sl = float(pos.sl or 0.0)
         vol = float(pos.volume)
+        px = bid if d == "LONG" else ask
 
         hit1 = bool(m.get("hit_tp1"))
         hit2 = bool(m.get("hit_tp2"))
@@ -970,8 +1023,20 @@ def manage_trailing_live(mt5: Any) -> None:
         treg = str(m.get("trail_regime", "CHOPPY")).upper()
         atru = float(m.get("atr_live", 0) or 0) or abs(entry) * 0.001
         nsl: float | None = None
+        advance_hit1 = False
+        advance_hit2 = False
 
-        def _partial_close(vol_close: float, otyp: int, px: float, label: str) -> bool:
+        tp1_reached = (d == "LONG" and tp1 > 0 and bid >= tp1) or (d == "SHORT" and tp1 > 0 and ask <= tp1)
+        tp1_hit_label = "YES" if (hit1 or tp1_reached) else "NO"
+
+        cm = (pos.comment or "").strip()
+        log_msg(
+            f"[TRAIL] {pos.symbol} ticket#{pos.ticket} entry={entry:.5f} TP1={tp1:.5f} current={px:.5f} "
+            f"TP1_hit={tp1_hit_label} comment={cm!r}",
+            "info",
+        )
+
+        def _partial_close(vol_close: float, otyp: int, px2: float, label: str) -> bool:
             v = norm_vol(mt5, pos.symbol, vol_close)
             if v <= 0 or v >= vol:
                 return False
@@ -982,7 +1047,7 @@ def manage_trailing_live(mt5: Any) -> None:
                     "volume": v,
                     "type": otyp,
                     "position": int(pos.ticket),
-                    "price": px,
+                    "price": px2,
                     "deviation": 25,
                     "magic": APEX_MAGIC,
                     "comment": ORDER_COMMENT,
@@ -993,22 +1058,31 @@ def manage_trailing_live(mt5: Any) -> None:
             if cr and cr.retcode == mt5.TRADE_RETCODE_DONE:
                 log_msg(f"[PARTIAL] ticket={pos.ticket} {label} vol={v}", "info")
                 return True
+            rc = getattr(cr, "retcode", None) if cr else None
+            log_msg(
+                f"[PARTIAL MT5] ticket={pos.ticket} {label} retcode={rc} "
+                f"comment={getattr(cr, 'comment', '')!r}",
+                "warning",
+            )
             return False
 
         if d == "LONG":
             px = bid
             if not hit1 and tp1 > 0 and px >= tp1:
                 nsl = entry
-                m["hit_tp1"] = True
-                if treg == "CHOPPY":
-                    _partial_close(vol * 0.25, mt5.ORDER_TYPE_SELL, bid, "CHOPPY 25% @TP1")
+                advance_hit1 = True
+                if treg == "CHOPPY" and not m.get("tp1_partial_done"):
+                    if _partial_close(vol * 0.25, mt5.ORDER_TYPE_SELL, bid, "CHOPPY 25% @TP1"):
+                        m["tp1_partial_done"] = True
             elif hit1 and not hit2 and tp2 > 0 and px >= tp2:
-                m["hit_tp2"] = True
                 nsl = tp1
-                if treg == "TRENDING":
-                    _partial_close(vol * 0.20, mt5.ORDER_TYPE_SELL, bid, "TREND 20% @TP2")
-                elif treg == "CHOPPY":
-                    _partial_close(vol * 0.40, mt5.ORDER_TYPE_SELL, bid, "CHOP 40% @TP2")
+                advance_hit2 = True
+                if not m.get("tp2_touch_logged"):
+                    m["tp2_touch_logged"] = True
+                    if treg == "TRENDING":
+                        _partial_close(vol * 0.20, mt5.ORDER_TYPE_SELL, bid, "TREND 20% @TP2")
+                    elif treg == "CHOPPY":
+                        _partial_close(vol * 0.40, mt5.ORDER_TYPE_SELL, bid, "CHOP 40% @TP2")
             elif hit2 and treg == "CHOPPY" and not hit3full and tp3 > 0 and px >= tp3:
                 if _partial_close(vol * 1.0, mt5.ORDER_TYPE_SELL, bid, "CHOPPY 100% @TP3"):
                     m["hit_tp3_full"] = True
@@ -1039,16 +1113,19 @@ def manage_trailing_live(mt5: Any) -> None:
             px = ask
             if not hit1 and tp1 > 0 and px <= tp1:
                 nsl = entry
-                m["hit_tp1"] = True
-                if treg == "CHOPPY":
-                    _partial_close(vol * 0.25, mt5.ORDER_TYPE_BUY, ask, "CHOPPY 25% @TP1")
+                advance_hit1 = True
+                if treg == "CHOPPY" and not m.get("tp1_partial_done"):
+                    if _partial_close(vol * 0.25, mt5.ORDER_TYPE_BUY, ask, "CHOPPY 25% @TP1"):
+                        m["tp1_partial_done"] = True
             elif hit1 and not hit2 and tp2 > 0 and px <= tp2:
-                m["hit_tp2"] = True
                 nsl = tp1
-                if treg == "TRENDING":
-                    _partial_close(vol * 0.20, mt5.ORDER_TYPE_BUY, ask, "TREND 20% @TP2")
-                elif treg == "CHOPPY":
-                    _partial_close(vol * 0.40, mt5.ORDER_TYPE_BUY, ask, "CHOP 40% @TP2")
+                advance_hit2 = True
+                if not m.get("tp2_touch_logged"):
+                    m["tp2_touch_logged"] = True
+                    if treg == "TRENDING":
+                        _partial_close(vol * 0.20, mt5.ORDER_TYPE_BUY, ask, "TREND 20% @TP2")
+                    elif treg == "CHOPPY":
+                        _partial_close(vol * 0.40, mt5.ORDER_TYPE_BUY, ask, "CHOP 40% @TP2")
             elif hit2 and treg == "CHOPPY" and not hit3full and tp3 > 0 and px <= tp3:
                 if _partial_close(vol * 1.0, mt5.ORDER_TYPE_BUY, ask, "CHOPPY 100% @TP3"):
                     m["hit_tp3_full"] = True
@@ -1077,6 +1154,35 @@ def manage_trailing_live(mt5: Any) -> None:
                             nsl = nsl2
 
         if nsl is not None:
+            if d == "LONG":
+                nsl = clamp_sl_buy_live(mt5, pos.symbol, bid, float(nsl))
+            else:
+                nsl = clamp_sl_sell_live(mt5, pos.symbol, ask, float(nsl))
+            nsl = mt5_round_price(mt5, pos.symbol, float(nsl))
+            if d == "LONG" and nsl >= bid:
+                log_msg(
+                    f"[TRAIL] {pos.symbol} ticket#{pos.ticket} clamped SL {nsl:.5f} still >= bid {bid:.5f} — skip modify",
+                    "warning",
+                )
+                meta[k] = m
+                continue
+            if d == "SHORT" and nsl <= ask:
+                log_msg(
+                    f"[TRAIL] {pos.symbol} ticket#{pos.ticket} clamped SL {nsl:.5f} still <= ask {ask:.5f} — skip modify",
+                    "warning",
+                )
+                meta[k] = m
+                continue
+            si = mt5.symbol_info(pos.symbol)
+            pt = float(si.point or 1e-5) if si is not None else 1e-5
+            if abs(nsl - cur_sl) < pt * 0.5 and cur_sl > 0:
+                log_msg(
+                    f"[TRAIL] {pos.symbol} ticket#{pos.ticket} SL unchanged (within point) cur={cur_sl:.5f}",
+                    "info",
+                )
+                meta[k] = m
+                continue
+
             res = mt5.order_send(
                 {
                     "action": mt5.TRADE_ACTION_SLTP,
@@ -1086,8 +1192,22 @@ def manage_trailing_live(mt5: Any) -> None:
                     "tp": float(pos.tp or 0.0),
                 }
             )
-            if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+            rc = getattr(res, "retcode", None) if res else None
+            cc = getattr(res, "comment", "") if res else ""
+            deal = getattr(res, "deal", 0) if res else 0
+            ord_ = getattr(res, "order", 0) if res else 0
+            lvl = "info" if res and rc == mt5.TRADE_RETCODE_DONE else "warning"
+            log_msg(
+                f"[TRAIL MT5] {pos.symbol} ticket#{pos.ticket} SLTP retcode={rc} comment={cc!r} "
+                f"deal={deal} order={ord_} request_sl={nsl:.5f} cur_sl={cur_sl:.5f}",
+                lvl,
+            )
+            if res and rc == mt5.TRADE_RETCODE_DONE:
                 log_msg(f"[TRAIL] ticket={pos.ticket} new_sl={nsl:.5f}", "info")
+                if advance_hit1:
+                    m["hit_tp1"] = True
+                if advance_hit2:
+                    m["hit_tp2"] = True
         meta[k] = m
     ticket_meta_save(meta)
 
@@ -1548,6 +1668,7 @@ def main_loop() -> None:
                 continue
 
             now = datetime.now(timezone.utc)
+            ran_scan = False
             if now.minute == 0 and now.hour in SCAN_HOURS:
                 slot = f"{now:%Y-%m-%d}-{now.hour:02d}"
                 if slot != last_slot:
@@ -1557,6 +1678,12 @@ def main_loop() -> None:
                     save_live_state(st)
                     run_full_scan()
                     print_status_quick(mt5)
+                    ran_scan = True
+            if not ran_scan:
+                try:
+                    manage_trailing_live(mt5)
+                except Exception as te:  # noqa: BLE001
+                    log_msg(f"[TRAIL] manage_trailing_live: {te}", "warning")
 
             time.sleep(60)
         except KeyboardInterrupt:
