@@ -5,7 +5,9 @@ rolling stats, and periodic self-improvement. All state is simple JSON on ``DATA
 """
 from __future__ import annotations
 
-STRATEGY_VERSION = "v7.4-master-prompt"
+STRATEGY_VERSION = "v7.5-forensic-adjustments"
+# v7.5: T04/SMC10/T08/M06 status, recipe JPY pairs, drop 1w mid-week filter, V02 backtest regime,
+# 1-candle loss buffer + low-ATR/body entry guards (backtest only).
 # v7.4 master: macro 7d price alignment, locked confluence count, NEUTRAL momentum block,
 # M03 tickers / M02 off 4h, 1w mid-week + Monday sizing, trailing regime + recipe boost,
 # condition profiling (chrono) + /api/strategy_conditions/{id}.
@@ -101,6 +103,18 @@ CONFLUENCE_COUNTING_STRATEGIES: frozenset[str] = frozenset(
         "M03_RSI_MOMENTUM_CONTINUATION",
         "B09_RSI_MOMENTUM_BREAK",
         "T10_200EMA_BOUNCE",
+        "SMC10_CHOCH",
+        "T08_DONCHIAN_BREAKOUT",
+        "M06_PRICE_ACCELERATION",
+    },
+)
+
+# Next apex_trader.py LIVE_STRATEGIES update (v7.5 — do not import on VPS until live deploy):
+V75_LIVE_STRATEGIES_ADDITIONS: frozenset[str] = frozenset(
+    {
+        "SMC10_CHOCH",
+        "T08_DONCHIAN_BREAKOUT",
+        "M06_PRICE_ACCELERATION",
     },
 )
 
@@ -432,6 +446,9 @@ def _v72_locked_ids_default() -> frozenset[str]:
             "SMC01_SR_FLIP",
             "M07_VOLUME_SURGE_MOMENTUM",
             "M03_RSI_MOMENTUM_CONTINUATION",
+            "SMC10_CHOCH",
+            "T08_DONCHIAN_BREAKOUT",
+            "M06_PRICE_ACCELERATION",
         }
     )
 
@@ -441,8 +458,7 @@ def _v72_testing_ids_default() -> frozenset[str]:
         {
             "B01_RANGE_BREAKOUT",
             "B09_RSI_MOMENTUM_BREAK",
-            "M06_PRICE_ACCELERATION",
-            "SMC10_CHOCH",
+            "T04_ADX_TREND_ENTRY",
             "T10_200EMA_BOUNCE",
             "T09_KELTNER_TREND_RIDE",
             "M02_MACD_ZERO_CROSS",
@@ -459,7 +475,6 @@ def _v72_blocked_ids_default() -> frozenset[str]:
             "B02_VOLATILITY_COMPRESSION",
             "V02_ATR_EXPANSION_ENTRY",
             "R09_WEEKLY_GAP_FILL",
-            "T04_ADX_TREND_ENTRY",
         }
     )
 
@@ -475,10 +490,50 @@ def _v72_default_status_payload() -> dict[str, Any]:
         "blocked": blocked,
         "untested": untested,
         "solid": ["T10_200EMA_BOUNCE", "B09_RSI_MOMENTUM_BREAK"],
-        "watch": ["SMC10_CHOCH"],
+        "watch": [],
         "restricted": ["M03_RSI_MOMENTUM_CONTINUATION", "M02_MACD_ZERO_CROSS"],
-        "last_updated": "2026-05-25",
+        "last_updated": "2026-05-28",
     }
+
+
+def _v75_migrate_strategy_status(raw: dict[str, Any]) -> bool:
+    """Apply v7.5 forensic promotions (idempotent)."""
+    changed = False
+
+    def _as_set(key: str) -> set[str]:
+        return {str(x).strip().upper() for x in (raw.get(key) or []) if isinstance(x, str) and str(x).strip()}
+
+    locked = _as_set("locked")
+    testing = _as_set("testing")
+    blocked = _as_set("blocked")
+    untested = _as_set("untested")
+
+    if "T04_ADX_TREND_ENTRY" in blocked:
+        blocked.discard("T04_ADX_TREND_ENTRY")
+        testing.add("T04_ADX_TREND_ENTRY")
+        changed = True
+    for sid in ("SMC10_CHOCH", "T08_DONCHIAN_BREAKOUT", "M06_PRICE_ACCELERATION"):
+        for bucket in (testing, blocked, untested):
+            if sid in bucket:
+                bucket.discard(sid)
+                changed = True
+        if sid not in locked:
+            locked.add(sid)
+            changed = True
+
+    watch = _as_set("watch")
+    if "SMC10_CHOCH" in watch and "SMC10_CHOCH" in locked:
+        watch.discard("SMC10_CHOCH")
+        changed = True
+
+    if changed:
+        raw["locked"] = sorted(locked)
+        raw["testing"] = sorted(testing)
+        raw["blocked"] = sorted(blocked)
+        raw["untested"] = sorted(untested)
+        raw["watch"] = sorted(watch)
+        raw["last_updated"] = "2026-05-28"
+    return changed
 
 
 def _v72_load_strategy_status(*, log_startup: bool = False) -> None:
@@ -505,6 +560,8 @@ def _v72_load_strategy_status(*, log_startup: bool = False) -> None:
             raw["untested"] = sorted(set(ut))
             raw["last_updated"] = date.today().isoformat()
             save_json(STRATEGY_STATUS_FILE, raw)
+    if _v75_migrate_strategy_status(raw):
+        save_json(STRATEGY_STATUS_FILE, raw)
     STRATEGY_STATUS = raw
     for tag_k, default_vals in (
         ("solid", ["T10_200EMA_BOUNCE", "B09_RSI_MOMENTUM_BREAK"]),
@@ -855,7 +912,11 @@ def _v7_python_prefilter_bundle(
         ind=ind,
         price=float(price),
     )
-    filtered = [r for r in filtered if str(r[0]).strip().upper() not in BLOCKED_STRATEGIES]
+    filtered = [
+        r
+        for r in filtered
+        if _v75_backtest_strategy_allowed(str(r[0]), past=past, ind=ind)
+    ]
     post_ids = [str(x[0]) for x in filtered]
     log(
         f"[PreFilterAudit] {sym} {tf_key} {analysis_date or ''}: raw={raw_ids} post_v7={post_ids}",
@@ -1629,6 +1690,183 @@ def _trade_condition_snapshot_fields(
     except Exception:  # noqa: BLE001
         pass
     return out
+
+
+def _v75_atr_metrics(past: pd.DataFrame | None, ind: dict[str, Any]) -> tuple[float, float, float]:
+    """Current ATR(14), 20-bar mean ATR, and ratio (for entry guards / V02)."""
+    if past is not None and not past.empty:
+        atr_s = _atr_series_wilder(past, 14)
+        if len(atr_s) >= 20:
+            cur = float(atr_s.iloc[-1])
+            avg = float(atr_s.iloc[-20:].mean())
+            if math.isfinite(cur) and math.isfinite(avg) and avg > 0:
+                return cur, avg, cur / avg
+    cur = float(ind.get("atr", 0) or 0)
+    if cur > 0 and math.isfinite(cur):
+        return cur, cur, 1.0
+    return 0.0, 0.0, 1.0
+
+
+def _v75_entry_candle_body(past: pd.DataFrame | None) -> float:
+    if past is None or past.empty:
+        return 0.0
+    try:
+        row = past.iloc[-1]
+        o = float(row.get("Open", row.get("Close", 0)) or 0)
+        c = float(row.get("Close", 0) or 0)
+        return c - o
+    except (TypeError, ValueError, KeyError, IndexError):
+        return 0.0
+
+
+def _v75_v02_backtest_allowed(past: pd.DataFrame | None, ind: dict[str, Any]) -> tuple[bool, str]:
+    """V02 stays BLOCKED in strategy_status but may fire in backtest when vol is expanding."""
+    snap = _trade_condition_snapshot_fields("", past, ind)
+    vr = str(snap.get("volatility_regime", "UNKNOWN")).strip().upper()
+    if vr not in ("HIGH_VOL", "EXTREME_VOL"):
+        return False, f"volatility_regime={vr}"
+    cur, avg, _ = _v75_atr_metrics(past, ind)
+    if avg <= 0 or cur < avg * 1.2:
+        log(
+            f"[V02 REGIME SKIP] ATR {cur:.5f} < 1.2× 20-period avg {avg:.5f} — not enough volatility expansion",
+            level="info",
+        )
+        return False, "ATR not expanding enough"
+    return True, ""
+
+
+def _v75_backtest_strategy_allowed(
+    sid: str,
+    *,
+    past: pd.DataFrame | None,
+    ind: dict[str, Any],
+) -> bool:
+    sid_u = str(sid or "").strip().upper()
+    if sid_u == "V02_ATR_EXPANSION_ENTRY":
+        ok, _ = _v75_v02_backtest_allowed(past, ind)
+        return ok
+    return sid_u not in BLOCKED_STRATEGIES
+
+
+def _v75_buffer_stop_price(normal_stop: float, entry: float, direction: str, atr: float) -> float:
+    """Widen stop by 0.3×ATR for the first forward candle (v7.5)."""
+    a = float(atr or 0)
+    if a <= 0 or not math.isfinite(a):
+        return float(normal_stop)
+    d = str(direction or "").strip().upper()
+    ns = float(normal_stop)
+    e = float(entry)
+    if d == "LONG":
+        return ns - 0.3 * a
+    if d == "SHORT":
+        return ns + 0.3 * a
+    return ns
+
+
+def _v75_entry_guards(
+    *,
+    sym: str,
+    tf_key: str,
+    direction: str,
+    entry: float,
+    normal_stop: float,
+    past: pd.DataFrame | None,
+    ind: dict[str, Any],
+) -> tuple[bool, str, dict[str, Any]]:
+    """
+    Fix B/C entry filters + compute buffer/normal stops.
+    Returns (ok, skip_reason, metadata dict for trade rows).
+    """
+    sym_u = sym.strip().upper()
+    tf_u = tf_key.strip().lower()
+    d = direction.strip().upper()
+    meta: dict[str, Any] = {
+        "buffer_stop_used": False,
+        "buffer_stop_price": None,
+        "normal_stop_price": round(float(normal_stop), 5),
+        "entry_atr": 0.0,
+        "entry_atr_vs_avg": 0.0,
+        "entry_candle_body": 0.0,
+        "low_atr_skipped": False,
+        "body_skipped": False,
+    }
+    cur_atr, avg_atr, ratio = _v75_atr_metrics(past, ind)
+    meta["entry_atr"] = round(cur_atr, 5)
+    meta["entry_atr_vs_avg"] = round(ratio, 4)
+    body = _v75_entry_candle_body(past)
+    meta["entry_candle_body"] = round(body, 5)
+
+    if avg_atr > 0 and cur_atr < avg_atr * 0.5:
+        meta["low_atr_skipped"] = True
+        log(
+            f"[LOW ATR SKIP] {sym_u} {tf_u}: ATR {cur_atr:.5f} < 50% of 20-period avg "
+            f"{avg_atr:.5f} — stop too tight, skipping",
+            level="info",
+        )
+        return (
+            False,
+            f"[LOW ATR SKIP] {sym_u} {tf_u}: ATR {cur_atr:.5f} < 50% of avg {avg_atr:.5f}",
+            meta,
+        )
+
+    if cur_atr > 0:
+        if d == "LONG" and body < -(1.5 * cur_atr):
+            meta["body_skipped"] = True
+            log(
+                f"[BODY SKIP] {sym_u} {tf_u} LONG: current candle body {body:.5f} < -1.5*ATR — "
+                f"adverse momentum, skipping",
+                level="info",
+            )
+            return (
+                False,
+                f"[BODY SKIP] {sym_u} {tf_u} LONG: body {body:.5f} < -1.5*ATR",
+                meta,
+            )
+        if d == "SHORT" and body > (1.5 * cur_atr):
+            meta["body_skipped"] = True
+            log(
+                f"[BODY SKIP] {sym_u} {tf_u} SHORT: current candle body {body:.5f} > 1.5*ATR — "
+                f"adverse momentum, skipping",
+                level="info",
+            )
+            return (
+                False,
+                f"[BODY SKIP] {sym_u} {tf_u} SHORT: body {body:.5f} > 1.5*ATR",
+                meta,
+            )
+
+    ns = validate_stop_loss(float(entry), float(normal_stop), d, tf_u)
+    meta["normal_stop_price"] = round(ns, 5)
+    buf = _v75_buffer_stop_price(ns, float(entry), d, cur_atr)
+    meta["buffer_stop_price"] = round(buf, 5)
+    meta["buffer_stop_used"] = abs(buf - ns) > 1e-9
+    return True, "", meta
+
+
+def _v75_log_one_candle_loss(
+    *,
+    sym: str,
+    tf_key: str,
+    strat_id: str,
+    direction: str,
+    entry: float,
+    normal_stop: float,
+    buffer_stop: float,
+    forward_df: pd.DataFrame,
+    atr: float,
+    candle_body: float,
+    exit_price: float,
+) -> None:
+    try:
+        low = float(forward_df["Low"].iloc[0])
+    except (TypeError, ValueError, KeyError, IndexError):
+        low = entry
+    log(
+        f"[1-CANDLE LOSS] {sym} {tf_key} {strat_id}: entry={entry:.5f} stop={normal_stop:.5f} "
+        f"buffer_stop={buffer_stop:.5f} low={low:.5f} ATR={atr:.5f} body={candle_body:.5f} — "
+        f"stopped at {exit_price:.5f}",
+        level="info",
+    )
 
 
 def build_strategy_conditions_report(strategy_id: str) -> dict[str, Any]:
@@ -3073,8 +3311,9 @@ def evaluate_forward_candles(
     trend_strength: float = 0.0,
     rate_differential: float = 0.0,
     atr: float = 0.0,
+    buffer_stop_price: float | None = None,
 ) -> dict[str, Any]:
-    """v7.4 — regime-based TP ladders and trailing (TRENDING vs CHOPPY); 4h always CHOPPY."""
+    """v7.5 — first-candle buffer stop; v7.4 regime TP ladders and trailing (TRENDING vs CHOPPY)."""
     _ = strategy_id
     _ = leverage
     _ = tp1
@@ -3150,7 +3389,11 @@ def evaluate_forward_candles(
     ps = float(position_size or 0.0)
     rem = 1.0
     realized = 0.0
-    current_stop = float(stop_loss)
+    normal_stop = float(stop_loss)
+    buf_stop = float(buffer_stop_price) if buffer_stop_price is not None else normal_stop
+    use_buffer = abs(buf_stop - normal_stop) > 1e-9
+    current_stop = buf_stop if use_buffer else normal_stop
+    buffer_active = use_buffer
     hit_tp1 = hit_tp2 = hit_tp3 = hit_stop = False
     trailing_activated = False
     exit_price = float(entry_price)
@@ -3175,6 +3418,9 @@ def evaluate_forward_candles(
 
     rows = list(forward_df.iterrows())
     for i, (_, candle) in enumerate(rows):
+        if buffer_active and i >= 1 and not hit_tp1:
+            current_stop = normal_stop
+            buffer_active = False
         candle_count += 1
         try:
             high = float(candle.get("High", entry_price))
@@ -3411,7 +3657,7 @@ def _v74_apply_recipe_and_monday_boosts(
     tf_key: str,
     analysis_date: str,
 ) -> None:
-    """v7.4 master — Monday 1w boost (tailwind macro) + AUDJPY/USDMXN recipe sizing (after base stack)."""
+    """v7.5 — Monday 1w boost (tailwind macro) + CADJPY/USDJPY/CHFJPY recipe sizing (after base stack)."""
     bal = float(ai.get("_balance_for_sizing") or STARTING_CAPITAL)
     try:
         ent = float(ai.get("entry", 0) or 0)
@@ -3449,9 +3695,13 @@ def _v74_apply_recipe_and_monday_boosts(
         "M03_RSI_MOMENTUM_CONTINUATION",
         "B09_RSI_MOMENTUM_BREAK",
         "T01_EMA_PULLBACK",
+        "M06_PRICE_ACCELERATION",
+        "SMC10_CHOCH",
+        "T08_DONCHIAN_BREAKOUT",
+        "M02_MACD_ZERO_CROSS",
     }
     if (
-        sym_u in ("AUDJPY", "USDMXN")
+        sym_u in ("CADJPY", "USDJPY", "CHFJPY")
         and mb == "STRONG_TAILWIND"
         and conf == "MEDIUM"
         and 2 <= int(locked_confluence) <= 4
@@ -3784,6 +4034,40 @@ def _python_forced_layer2_trade(
         )
 
     strat_id = str(ai.get("strategy_id", strat_id)).strip().upper()
+    direction = str(ai.get("direction", direction)).strip().upper()
+    entry_v75 = float(ai.get("entry", price) or price)
+    stop_v75 = float(ai.get("stop_loss", 0) or 0)
+    ok_v75, skip_v75, v75_meta = _v75_entry_guards(
+        sym=sym,
+        tf_key=tf_key,
+        direction=direction,
+        entry=entry_v75,
+        normal_stop=stop_v75,
+        past=past,
+        ind=ind or {},
+    )
+    if not ok_v75:
+        ai2 = dict(ai)
+        ai2.update(v75_meta)
+        ai2["calendar_action"] = str(cal.get("action", "CLEAR"))
+        ai2["calendar_reason"] = str(cal.get("reason", ""))
+        ai2.update(_v73_regime_row_fields(regime_ctx))
+        return _skipped_backtest_row(
+            sym=sym,
+            timeframe=timeframe,
+            analysis_date=analysis_date,
+            price=float(price),
+            zone_pct=zone_pct,
+            zone_label=zone_label,
+            skip_reason=skip_v75,
+            ai=ai2,
+            tf_key=tf_key,
+            is_exotic=is_exotic,
+        )
+    normal_stop_v75 = float(v75_meta["normal_stop_price"])
+    buffer_stop_v75 = float(v75_meta["buffer_stop_price"] or normal_stop_v75)
+    ai["stop_loss"] = normal_stop_v75
+
     sym_xu = sym.strip().upper()
     if strat_id == "M03_RSI_MOMENTUM_CONTINUATION" and sym_xu not in M03_ALLOWED_TICKERS:
         log(f"[M03 BLOCKED] {sym_xu} not in allowed ticker list", level="info")
@@ -3851,41 +4135,6 @@ def _python_forced_layer2_trade(
             is_exotic=is_exotic,
         )
     trend_mult = float(trend_result.get("size_multiplier", 1.0) or 1.0)
-
-    tr_pre = trend_result.get("trend") or {}
-    if not isinstance(tr_pre, dict):
-        tr_pre = {}
-    ts_pre = float(tr_pre.get("strength", 0) or 0)
-    if (
-        tf_key.strip().lower() == "1w"
-        and scan_d_macro is not None
-        and scan_d_macro.weekday() in (2, 3, 4)
-        and ts_pre <= 0.75
-    ):
-        log(
-            f"[1W TIMING] Skipped {sym} 1w — mid-week entry requires trend_strength > 0.75, "
-            f"current: {ts_pre:.2f}",
-            level="info",
-        )
-        ai2 = dict(ai)
-        ai2["calendar_action"] = str(cal.get("action", "CLEAR"))
-        ai2["calendar_reason"] = str(cal.get("reason", ""))
-        ai2.update(_v73_regime_row_fields(regime_ctx))
-        return _skipped_backtest_row(
-            sym=sym,
-            timeframe=timeframe,
-            analysis_date=analysis_date,
-            price=float(price),
-            zone_pct=zone_pct,
-            zone_label=zone_label,
-            skip_reason=(
-                f"[1W TIMING] Skipped {sym} 1w — mid-week entry requires trend_strength > 0.75, "
-                f"current: {ts_pre:.2f}"
-            ),
-            ai=ai2,
-            tf_key=tf_key,
-            is_exotic=is_exotic,
-        )
 
     sym_u = sym.upper()
     dir_u = str(ai.get("direction", direction)).strip().upper()
@@ -4000,7 +4249,7 @@ def _python_forced_layer2_trade(
     exit_data = evaluate_forward_candles(
         direction,
         entry,
-        stop,
+        normal_stop_v75,
         tp1,
         tp2,
         tp3,
@@ -4012,10 +4261,30 @@ def _python_forced_layer2_trade(
         macro_bias=str(ai.get("macro_bias", "") or ""),
         trend_strength=ts_ev,
         rate_differential=float(ai.get("macro_rate_diff", 0) or 0),
-        atr=float(atr_ref or 0),
+        atr=float(atr_ref or v75_meta.get("entry_atr", 0) or 0),
+        buffer_stop_price=buffer_stop_v75,
     )
     if exit_data.get("outcome") in ("NO_DATA", "INVALID"):
         return None
+
+    if (
+        int(exit_data.get("candles_to_exit", 0) or 0) == 1
+        and bool(exit_data.get("hit_stop"))
+        and str(exit_data.get("outcome", "")).upper() == "LOSS"
+    ):
+        _v75_log_one_candle_loss(
+            sym=sym,
+            tf_key=tf_key,
+            strat_id=strat_id,
+            direction=direction,
+            entry=entry,
+            normal_stop=normal_stop_v75,
+            buffer_stop=buffer_stop_v75,
+            forward_df=fut,
+            atr=float(v75_meta.get("entry_atr", 0) or 0),
+            candle_body=float(v75_meta.get("entry_candle_body", 0) or 0),
+            exit_price=float(exit_data.get("exit_price", entry) or entry),
+        )
 
     position_size = float(ai.get("_position_size", 0) or 0)
     leveraged_exposure = float(ai.get("_leveraged_exposure", 0) or 0)
@@ -4080,7 +4349,7 @@ def _python_forced_layer2_trade(
         "smc_reasoning": "",
         "exit_reasoning": "",
         "entry_price": round(entry, 5),
-        "stop_loss": round(stop, 5),
+        "stop_loss": round(normal_stop_v75, 5),
         "tp1": round(tp1, 5),
         "tp2": round(tp2, 5),
         "tp3": round(tp3, 5),
@@ -4139,6 +4408,7 @@ def _python_forced_layer2_trade(
         "strategy_confluence_count": int(scount),
         "strategy_confluence_mult": float(cf_mult),
         "strategies_agreed": agreed_list,
+        **v75_meta,
         **(
             _trade_condition_snapshot_fields(analysis_date, past, ind or {})
             if chrono_job
@@ -4735,28 +5005,6 @@ def run_one_backtest(
             return _skip_out(str(trend_result.get("reason") or "trend block"), ai)
         trend_mult = float(trend_result.get("size_multiplier", 1.0) or 1.0)
 
-        tr_w = trend_result.get("trend") or {}
-        if not isinstance(tr_w, dict):
-            tr_w = {}
-        ts_w = float(tr_w.get("strength", 0) or 0)
-        if (
-            chrono_yfinance
-            and tf_key == "1w"
-            and scan_d is not None
-            and scan_d.weekday() in (2, 3, 4)
-            and ts_w <= 0.75
-        ):
-            log(
-                f"[1W TIMING] Skipped {sym} 1w — mid-week entry requires trend_strength > 0.75, "
-                f"current: {ts_w:.2f}",
-                level="info",
-            )
-            return _skip_out(
-                f"[1W TIMING] Skipped {sym} 1w — mid-week entry requires trend_strength > 0.75, "
-                f"current: {ts_w:.2f}",
-                ai,
-            )
-
         if chrono_yfinance and sym.upper() in JPY_STORM_PAIRS and macro_bt is not None:
             tr_snap = trend_result.get("trend") or {}
             if not isinstance(tr_snap, dict):
@@ -4799,6 +5047,23 @@ def run_one_backtest(
             return _skip_out("invalid stop for LONG", ai)
         if direction == "SHORT" and (not math.isfinite(stop) or stop <= entry):
             return _skip_out("invalid stop for SHORT", ai)
+
+        ok_v75, skip_v75, v75_meta = _v75_entry_guards(
+            sym=sym,
+            tf_key=tf_key,
+            direction=direction,
+            entry=entry,
+            normal_stop=stop,
+            past=past,
+            ind=ind,
+        )
+        if not ok_v75:
+            return _skip_out(skip_v75, {**ai, **v75_meta})
+
+        normal_stop_v75 = float(v75_meta["normal_stop_price"])
+        buffer_stop_v75 = float(v75_meta["buffer_stop_price"] or normal_stop_v75)
+        stop = normal_stop_v75
+        ai["stop_loss"] = normal_stop_v75
 
         risk = abs(entry - stop)
         if risk <= 0 or not math.isfinite(risk):
@@ -4863,7 +5128,7 @@ def run_one_backtest(
         exit_data = evaluate_forward_candles(
             direction,
             entry,
-            stop,
+            normal_stop_v75,
             tp1,
             tp2,
             tp3,
@@ -4875,14 +5140,34 @@ def run_one_backtest(
             macro_bias=str(ai.get("macro_bias", "") or ""),
             trend_strength=ts_cl,
             rate_differential=float(ai.get("macro_rate_diff", 0) or 0),
-            atr=float(ind.get("atr", 0) or 0),
+            atr=float(ind.get("atr", 0) or v75_meta.get("entry_atr", 0) or 0),
+            buffer_stop_price=buffer_stop_v75,
         )
-        del fut
-        del past
-        del future
-        gc.collect()
         if exit_data.get("outcome") in ("NO_DATA", "INVALID"):
+            del fut
+            del past
+            del future
+            gc.collect()
             return None
+
+        if (
+            int(exit_data.get("candles_to_exit", 0) or 0) == 1
+            and bool(exit_data.get("hit_stop"))
+            and str(exit_data.get("outcome", "")).upper() == "LOSS"
+        ):
+            _v75_log_one_candle_loss(
+                sym=sym,
+                tf_key=tf_key,
+                strat_id=strategy_id_norm,
+                direction=direction,
+                entry=entry,
+                normal_stop=normal_stop_v75,
+                buffer_stop=buffer_stop_v75,
+                forward_df=fut,
+                atr=float(v75_meta.get("entry_atr", 0) or 0),
+                candle_body=float(v75_meta.get("entry_candle_body", 0) or 0),
+                exit_price=float(exit_data.get("exit_price", entry) or entry),
+            )
 
         hit_tp1 = bool(exit_data.get("hit_tp1"))
         hit_tp2 = bool(exit_data.get("hit_tp2"))
@@ -4902,6 +5187,17 @@ def run_one_backtest(
 
         pnl_dollars = round(leveraged_exposure * raw_pct, 2)
         pnl_pct_display = round(raw_pct * 100, 2)
+
+        cond_snap = (
+            _trade_condition_snapshot_fields(analysis_date, past, ind)
+            if chrono_yfinance
+            else {}
+        )
+
+        del fut
+        del past
+        del future
+        gc.collect()
 
         log(
             f"[Backtest] PnL calc: entry={entry} exit={exit_p} direction={direction} "
@@ -5002,7 +5298,7 @@ def run_one_backtest(
             "smc_reasoning": str(ai.get("smc_reasoning") or ""),
             "exit_reasoning": str(ai.get("exit_reasoning") or ""),
             "entry_price": round(entry, 5),
-            "stop_loss": round(stop, 5),
+            "stop_loss": round(normal_stop_v75, 5),
             "tp1": round(tp1, 5),
             "tp2": round(tp2, 5),
             "tp3": round(tp3, 5),
@@ -5073,11 +5369,8 @@ def run_one_backtest(
             "strategy_confluence_count": int(scount),
             "strategy_confluence_mult": float(cf_mult),
             "strategies_agreed": agreed_list,
-            **(
-                _trade_condition_snapshot_fields(analysis_date, past, ind)
-                if chrono_yfinance
-                else {}
-            ),
+            **v75_meta,
+            **cond_snap,
         }
 
     except Exception as e:  # noqa: BLE001
