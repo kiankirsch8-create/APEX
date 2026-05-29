@@ -5,9 +5,9 @@ rolling stats, and periodic self-improvement. All state is simple JSON on ``DATA
 """
 from __future__ import annotations
 
-STRATEGY_VERSION = "v7.5-backtest-locked-trail"
-# v7.5: locked strategies execute in backtest; NEUTRAL+momentum uses ranging/low-vol filter;
-# trailing regime logging + trade analytics fields; T04/SMC10/T08/M06 status, recipe, 1-candle guards.
+STRATEGY_VERSION = "v7.5-emergency-trade-volume"
+# v7.5 emergency: Layer 2 executes when qualified (not blocked by Layer 1); record all scan skips;
+# fragile/all-weather period mode; macro event + proven-combo sizing boosts.
 # v7.4 master: macro 7d price alignment, locked confluence count, NEUTRAL momentum block,
 # M03 tickers / M02 off 4h, 1w mid-week + Monday sizing, trailing regime + recipe boost,
 # condition profiling (chrono) + /api/strategy_conditions/{id}.
@@ -147,6 +147,44 @@ MOMENTUM_STRATEGIES: frozenset[str] = frozenset(
         "T04_ADX_TREND_ENTRY",
     },
 )
+
+FRAGILE_STRATEGIES: frozenset[str] = frozenset(
+    {
+        "M03_RSI_MOMENTUM_CONTINUATION",
+        "M02_MACD_ZERO_CROSS",
+        "B09_RSI_MOMENTUM_BREAK",
+        "T08_DONCHIAN_BREAKOUT",
+        "M06_PRICE_ACCELERATION",
+    },
+)
+
+ALL_WEATHER_STRATEGIES: frozenset[str] = frozenset(
+    {
+        "SMC10_CHOCH",
+        "T04_ADX_TREND_ENTRY",
+        "T10_200EMA_BOUNCE",
+        "V02_ATR_EXPANSION_ENTRY",
+        "R01_EXTREME_ZONE_REVERSION",
+        "T01_EMA_PULLBACK",
+        "SMC05_EQUAL_HL_HUNT",
+    },
+)
+
+# (ticker, strategy_id, min_trades, boost_multiplier)
+PROVEN_COMBINATIONS: tuple[tuple[str, str, int, float], ...] = (
+    ("CADJPY", "M03_RSI_MOMENTUM_CONTINUATION", 30, 1.4),
+    ("USDJPY", "M03_RSI_MOMENTUM_CONTINUATION", 30, 1.3),
+    ("CHFJPY", "M03_RSI_MOMENTUM_CONTINUATION", 20, 1.2),
+    ("CADJPY", "SMC10_CHOCH", 20, 1.3),
+    ("USDJPY", "T08_DONCHIAN_BREAKOUT", 15, 1.2),
+    ("USDJPY", "B09_RSI_MOMENTUM_BREAK", 15, 1.2),
+)
+
+# Running combo stats: (ticker, strategy_id) -> {"count": int, "wins": int}
+COMBO_TRADE_STATS: dict[tuple[str, str], dict[str, int]] = {}
+# Chrono day buffer for period-mode detection (all_trades + day_trades before append to file)
+CHRONO_COMPLETED_TRADES_BUFFER: list[dict[str, Any]] = []
+_PERIOD_MODE_LOGGED_DATES: set[str] = set()
 # v7.0 chrono: completed trades per currency per scan day (sequential sim; caps clustering).
 OPEN_CURRENCY_COUNT: dict[str, int] = {}
 # v7.1 chrono: 4h + intraday share a separate per-day currency pool from 1w/1d.
@@ -950,6 +988,165 @@ def _rebuild_strategy_trade_counts_from_rows(rows: list[dict[str, Any]]) -> None
         sid = str(r.get("strategy_id", "")).strip().upper()
         if sid and sid != "SKIP":
             STRATEGY_TRADE_COUNT[sid] = STRATEGY_TRADE_COUNT.get(sid, 0) + 1
+
+
+def _rebuild_combo_trade_stats_from_rows(rows: list[dict[str, Any]]) -> None:
+    COMBO_TRADE_STATS.clear()
+    for r in rows:
+        if not isinstance(r, dict) or r.get("skipped"):
+            continue
+        if r.get("outcome") not in ("WIN", "LOSS"):
+            continue
+        sym_u = str(r.get("ticker", "")).strip().upper()
+        sid_u = str(r.get("strategy_id", "")).strip().upper()
+        if not sym_u or not sid_u or sid_u == "SKIP":
+            continue
+        st = COMBO_TRADE_STATS.setdefault((sym_u, sid_u), {"count": 0, "wins": 0})
+        st["count"] += 1
+        if str(r.get("outcome", "")).strip().upper() == "WIN":
+            st["wins"] += 1
+
+
+def _record_combo_trade_outcome(ticker: str, strategy_id: str, outcome: str) -> None:
+    sym_u = str(ticker or "").strip().upper()
+    sid_u = str(strategy_id or "").strip().upper()
+    if not sym_u or not sid_u:
+        return
+    st = COMBO_TRADE_STATS.setdefault((sym_u, sid_u), {"count": 0, "wins": 0})
+    st["count"] += 1
+    if str(outcome or "").strip().upper() == "WIN":
+        st["wins"] += 1
+
+
+def _rolling_pnl_last_n_days(n: int, job_id: str, as_of: date) -> float:
+    """Sum completed-trade P&L over the prior ``n`` calendar days (exclusive of as_of day)."""
+    if n <= 0:
+        return 0.0
+    start = as_of - timedelta(days=n)
+    total = 0.0
+    try:
+        rows = load_all_results()
+    except Exception:  # noqa: BLE001
+        return 0.0
+    for r in rows:
+        if not isinstance(r, dict) or r.get("skipped"):
+            continue
+        if str(r.get("outcome", "")).strip().upper() not in ("WIN", "LOSS"):
+            continue
+        jid = str(r.get("job_id") or "").strip()
+        if jid and jid != str(job_id).strip():
+            continue
+        ds = str(r.get("date", ""))[:10]
+        try:
+            d0 = date.fromisoformat(ds)
+        except ValueError:
+            continue
+        if start < d0 <= as_of:
+            try:
+                total += float(r.get("pnl_dollars", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+    return total
+
+
+def _detect_period_mode(
+    balance: float, job_id: str, as_of: date | None
+) -> tuple[str, float, float]:
+    """Classify GOOD / BAD / NEUTRAL period for fragile vs all-weather gating."""
+    if as_of is None:
+        return "NEUTRAL", 50.0, 0.0
+    as_s = as_of.isoformat()
+    wr10 = 0.5
+    completed_buf: list[dict[str, Any]] = []
+    if CHRONO_COMPLETED_TRADES_BUFFER:
+        for r in CHRONO_COMPLETED_TRADES_BUFFER:
+            if not isinstance(r, dict) or r.get("skipped"):
+                continue
+            if str(r.get("outcome", "")).strip().upper() not in ("WIN", "LOSS"):
+                continue
+            ds = str(r.get("date", ""))[:10]
+            if ds and ds <= as_s:
+                completed_buf.append(r)
+    if len(completed_buf) >= 5:
+        recent_10 = completed_buf[-10:]
+        wins = sum(1 for t in recent_10 if str(t.get("outcome", "")).strip().upper() == "WIN")
+        wr10 = wins / float(len(recent_10))
+    else:
+        try:
+            from regime_manager import calculate_rolling_winrate, get_recent_trades
+
+            recent_10 = get_recent_trades(10, job_id, as_of_date=as_of)
+            wr10 = calculate_rolling_winrate(recent_10)
+        except Exception:  # noqa: BLE001
+            wr10 = 0.5
+
+    pnl5d = _rolling_pnl_last_n_days(5, job_id, as_of)
+    if completed_buf:
+        start = as_of - timedelta(days=5)
+        buf_pnl = 0.0
+        for r in completed_buf:
+            ds = str(r.get("date", ""))[:10]
+            try:
+                d0 = date.fromisoformat(ds)
+            except ValueError:
+                continue
+            if start < d0 <= as_of:
+                try:
+                    buf_pnl += float(r.get("pnl_dollars", 0) or 0)
+                except (TypeError, ValueError):
+                    pass
+        if buf_pnl != 0.0 or len(completed_buf) >= 3:
+            pnl5d = buf_pnl
+
+    bal = float(balance or STARTING_CAPITAL)
+    wr_pct = round(wr10 * 100.0, 1)
+    if wr10 >= 0.45 and pnl5d > 0:
+        return "GOOD", wr_pct, pnl5d
+    if wr10 < 0.35 or pnl5d < -(0.02 * bal):
+        return "BAD", wr_pct, pnl5d
+    return "NEUTRAL", wr_pct, pnl5d
+
+
+def _fragile_bad_period_skip(strat_id: str, period_mode: str) -> tuple[bool, str]:
+    sid = str(strat_id or "").strip().upper()
+    pm = str(period_mode or "NEUTRAL").strip().upper()
+    if pm != "BAD" or sid not in FRAGILE_STRATEGIES:
+        return False, ""
+    msg = f"[BAD PERIOD] FRAGILE strategy {sid} paused — bad period mode active"
+    log(msg, level="info")
+    return True, msg
+
+
+def _chrono_scan_skip_row(
+    *,
+    sym: str,
+    timeframe: str,
+    analysis_date: str,
+    tf_key: str,
+    skip_reason: str,
+    price: float = 0.0,
+    is_exotic: bool = False,
+) -> dict[str, Any]:
+    """Minimal skipped row when a chrono scan produces no trade (was silently dropped as None)."""
+    return _skipped_backtest_row(
+        sym=sym.strip().upper(),
+        timeframe=timeframe,
+        analysis_date=analysis_date.strip(),
+        price=float(price),
+        zone_pct=50.0,
+        zone_label="EQUILIBRIUM",
+        skip_reason=skip_reason,
+        ai={
+            "skip_trade": True,
+            "strategy_id": "SKIP",
+            "strategy_met": False,
+            "skip_reason": skip_reason,
+            "direction": "NONE",
+            "conviction_score": 0,
+        },
+        tf_key=tf_key,
+        is_exotic=is_exotic,
+    )
 
 
 def _rebuild_consecutive_losses_from_rows(rows: list[dict[str, Any]]) -> None:
@@ -3796,6 +3993,94 @@ def _v74_apply_recipe_and_monday_boosts(
     ai["_leveraged_exposure"] = round((mrd / sd) * ent, 2)
 
 
+def _v75_apply_macro_event_and_combo_boosts(
+    ai: dict[str, Any],
+    *,
+    sym: str,
+    strat_id: str,
+    locked_confluence: int,
+    tf_key: str,
+    trend_strength: float,
+    rate_diff: float,
+    period_mode: str,
+) -> None:
+    """Macro event 2× boost + proven ticker-strategy combo multiplier (stacks after recipe/Monday)."""
+    bal = float(ai.get("_balance_for_sizing") or STARTING_CAPITAL)
+    try:
+        ent = float(ai.get("entry", 0) or 0)
+        stp = float(ai.get("stop_loss", 0) or 0)
+    except (TypeError, ValueError):
+        return
+    sd = abs(ent - stp)
+    if sd <= 0 or not math.isfinite(sd):
+        return
+    mrd = float(ai.get("_max_risk_dollars", 0) or 0)
+    if mrd <= 0:
+        return
+
+    cap_hi = bal * float(RISK_BY_CONFIDENCE["HIGH"]) * 1.5
+    macro_cap = bal * 0.08
+    sym_u = sym.strip().upper()
+    sid_u = strat_id.strip().upper()
+    tf_lc = tf_key.strip().lower()
+    mb = str(ai.get("macro_bias", "")).strip().upper()
+    conf = str(ai.get("confidence", "")).strip().upper()
+    ts = float(trend_strength or 0)
+    rd = float(rate_diff or 0)
+    trail_reg = (
+        "CHOPPY"
+        if tf_lc == "4h"
+        else detect_trailing_regime(mb, ts, rd)
+    )
+
+    ai["period_mode"] = str(period_mode or "NEUTRAL").strip().upper()
+    ai["macro_event_boost_applied"] = False
+    ai["combination_boost_applied"] = 1.0
+
+    is_macro_event = (
+        mb == "STRONG_TAILWIND"
+        and conf == "MEDIUM"
+        and ts > 0.70
+        and rd > 2.5
+        and int(locked_confluence) >= 2
+        and trail_reg == "TRENDING"
+    )
+    if is_macro_event:
+        mrd = min(mrd * 2.0, macro_cap, cap_hi * 1.5)
+        ai["macro_event_boost_applied"] = True
+        log(
+            f"[MACRO EVENT BOOST] {sym_u}: all conditions met — 2.0x macro boost applied. "
+            f"Final risk: ${mrd:.0f}",
+            level="info",
+        )
+
+    combo_mult = 1.0
+    for tick, sid, min_trades, boost in PROVEN_COMBINATIONS:
+        if sym_u != tick or sid_u != sid:
+            continue
+        st = COMBO_TRADE_STATS.get((sym_u, sid_u), {"count": 0, "wins": 0})
+        if int(st.get("count", 0) or 0) < int(min_trades):
+            break
+        wr = float(st.get("wins", 0) or 0) / max(1, int(st.get("count", 0) or 0))
+        if wr >= 0.40:
+            combo_mult = float(boost)
+            log(
+                f"[COMBO BOOST] {sym_u} {sid_u} WR={wr:.0%} n={st.get('count')} — {combo_mult:.1f}x",
+                level="info",
+            )
+        break
+
+    if combo_mult > 1.0:
+        hard_cap = macro_cap if ai.get("macro_event_boost_applied") else cap_hi
+        mrd = min(mrd * combo_mult, hard_cap)
+        ai["combination_boost_applied"] = combo_mult
+
+    mrd = max(25.0, min(mrd, macro_cap if ai.get("macro_event_boost_applied") else cap_hi))
+    ai["_max_risk_dollars"] = round(mrd, 2)
+    ai["_position_size"] = round(mrd / sd, 2)
+    ai["_leveraged_exposure"] = round((mrd / sd) * ent, 2)
+
+
 def _v73_apply_calendar_regime_position_size(
     ai: dict[str, Any],
     *,
@@ -3969,25 +4254,78 @@ def _python_forced_layer2_trade(
     regime_ctx: dict[str, Any] | None = None,
     chrono_balance: float | None = None,
     chrono_day_pnl: float = 0.0,
+    period_mode: str = "NEUTRAL",
     atr_ref: float | None = None,
     past: pd.DataFrame | None = None,
     ind: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Execute Layer 2+ setup without Claude (v7.1)."""
     if not layer2:
+        if chrono_job:
+            return _chrono_scan_skip_row(
+                sym=sym,
+                timeframe=timeframe,
+                analysis_date=analysis_date,
+                tf_key=tf_key,
+                skip_reason="Layer 2 candidate list empty",
+                price=float(price),
+                is_exotic=is_exotic,
+            )
         return None
     best = layer2[0] if len(layer2) == 1 else max(layer2, key=lambda x: int(x[2]))
     strat_id = str(best[0]).strip().upper()
+    ok_frag, rs_frag = _fragile_bad_period_skip(strat_id, period_mode)
+    if ok_frag:
+        return _skipped_backtest_row(
+            sym=sym,
+            timeframe=timeframe,
+            analysis_date=analysis_date,
+            price=float(price),
+            zone_pct=zone_pct,
+            zone_label=zone_label,
+            skip_reason=rs_frag,
+            ai={
+                "skip_trade": True,
+                "strategy_id": strat_id,
+                "strategy_met": False,
+                "skip_reason": rs_frag,
+                "direction": "NONE",
+                "conviction_score": 0,
+                "period_mode": period_mode,
+            },
+            tf_key=tf_key,
+            is_exotic=is_exotic,
+        )
     meta = best[3] if len(best) > 3 else None
     direction = str(best[1]).strip().upper()
     if direction == "BOTH":
         direction = "LONG" if float(zone_pct) < 50 else "SHORT"
-    if direction not in ("LONG", "SHORT"):
-        return None
+        if direction not in ("LONG", "SHORT"):
+            if chrono_job:
+                return _chrono_scan_skip_row(
+                    sym=sym,
+                    timeframe=timeframe,
+                    analysis_date=analysis_date,
+                    tf_key=tf_key,
+                    skip_reason=f"Invalid direction for {strat_id}",
+                    price=float(price),
+                    is_exotic=is_exotic,
+                )
+            return None
 
     if isinstance(meta, dict) and meta.get("v72_untested"):
         direction = str(meta.get("direction", direction)).strip().upper()
         if direction not in ("LONG", "SHORT"):
+            if chrono_job:
+                return _chrono_scan_skip_row(
+                    sym=sym,
+                    timeframe=timeframe,
+                    analysis_date=analysis_date,
+                    tf_key=tf_key,
+                    skip_reason=f"Invalid UNTESTED direction for {strat_id}",
+                    price=float(price),
+                    is_exotic=is_exotic,
+                )
             return None
         entry = round(float(meta.get("entry", price)), 5)
         stop = round(float(meta["stop_loss"]), 5)
@@ -4028,6 +4366,16 @@ def _python_forced_layer2_trade(
             stop = round(entry * (1 - mult * 0.005), 5)
         risk = abs(entry - stop)
         if risk <= 0:
+            if chrono_job:
+                return _chrono_scan_skip_row(
+                    sym=sym,
+                    timeframe=timeframe,
+                    analysis_date=analysis_date,
+                    tf_key=tf_key,
+                    skip_reason=f"Invalid risk for {strat_id}",
+                    price=float(price),
+                    is_exotic=is_exotic,
+                )
             return None
         tp1 = round(entry + mult * risk * 2, 5)
         tp2 = round(entry + mult * risk * 3, 5)
@@ -4299,6 +4647,21 @@ def _python_forced_layer2_trade(
         analysis_date=analysis_date,
     )
 
+    tr_pre = trend_result.get("trend") or {}
+    if not isinstance(tr_pre, dict):
+        tr_pre = {}
+    ts_boost = float(tr_pre.get("strength", 0) or 0)
+    _v75_apply_macro_event_and_combo_boosts(
+        ai,
+        sym=sym,
+        strat_id=str(ai.get("strategy_id", strat_id)).strip().upper(),
+        locked_confluence=int(scount),
+        tf_key=tf_key,
+        trend_strength=ts_boost,
+        rate_diff=float(ai.get("macro_rate_diff", 0) or 0),
+        period_mode=period_mode,
+    )
+
     entry = float(ai.get("entry", entry) or entry)
     stop = float(ai.get("stop_loss", stop) or stop)
     tp1 = float(ai.get("tp1", tp1) or tp1)
@@ -4309,6 +4672,16 @@ def _python_forced_layer2_trade(
     fwd_n = int(TF_FORWARD_CANDLES.get(tf_key, FORWARD_CANDLES))
     fut = future.head(fwd_n)
     if fut.empty or len(fut) < 1:
+        if chrono_job:
+            return _chrono_scan_skip_row(
+                sym=sym,
+                timeframe=timeframe,
+                analysis_date=analysis_date,
+                tf_key=tf_key,
+                skip_reason="Insufficient forward candles for simulation",
+                price=float(price),
+                is_exotic=is_exotic,
+            )
         return None
 
     if chrono_job and strat_id in UNTESTED_STRATEGIES_V72 and STRATEGY_TRADE_COUNT.get(strat_id, 0) == 0:
@@ -4347,6 +4720,19 @@ def _python_forced_layer2_trade(
         ticker=sym,
     )
     if exit_data.get("outcome") in ("NO_DATA", "INVALID"):
+        if chrono_job:
+            return _skipped_backtest_row(
+                sym=sym,
+                timeframe=timeframe,
+                analysis_date=analysis_date,
+                price=float(price),
+                zone_pct=zone_pct,
+                zone_label=zone_label,
+                skip_reason=str(exit_data.get("exit_reason") or "Forward simulation failed"),
+                ai=ai,
+                tf_key=tf_key,
+                is_exotic=is_exotic,
+            )
         return None
 
     if (
@@ -4493,6 +4879,9 @@ def _python_forced_layer2_trade(
         "strategy_confluence_count": int(scount),
         "strategy_confluence_mult": float(cf_mult),
         "strategies_agreed": agreed_list,
+        "period_mode": str(ai.get("period_mode") or period_mode),
+        "macro_event_boost_applied": bool(ai.get("macro_event_boost_applied")),
+        "combination_boost_applied": float(ai.get("combination_boost_applied", 1.0) or 1.0),
         **v75_meta,
         **(
             _trade_condition_snapshot_fields(analysis_date, past, ind or {})
@@ -4514,6 +4903,7 @@ def run_one_backtest(
     chrono_regime: dict[str, Any] | None = None,
     chrono_balance: float | None = None,
     chrono_day_pnl: float = 0.0,
+    chrono_job_id: str = "",
 ) -> dict[str, Any] | None:
     try:
         sym = (ticker or "").strip().upper()
@@ -4522,6 +4912,28 @@ def run_one_backtest(
             scan_d = date.fromisoformat(analysis_date.strip()[:10])
         except (TypeError, ValueError):
             scan_d = None
+
+        jid = str(chrono_job_id or CHRONO_LIVE_STATUS.get("job_id") or "chrono").strip()
+        if chrono_yfinance and scan_d is not None:
+            period_mode, period_wr10, period_pnl5d = _detect_period_mode(
+                float(chrono_balance or STARTING_CAPITAL), jid, scan_d
+            )
+            day_key = scan_d.isoformat()
+            if day_key not in _PERIOD_MODE_LOGGED_DATES:
+                _PERIOD_MODE_LOGGED_DATES.add(day_key)
+                if period_mode == "GOOD":
+                    log(
+                        f"[GOOD PERIOD] WR10={period_wr10:.0f}% — all strategies active",
+                        level="info",
+                    )
+                elif period_mode == "BAD":
+                    log(
+                        f"[BAD PERIOD] WR10={period_wr10:.0f}% PNL5d=${period_pnl5d:.0f} "
+                        f"— FRAGILE strategies paused",
+                        level="info",
+                    )
+        else:
+            period_mode, period_wr10, period_pnl5d = "NEUTRAL", 50.0, 0.0
 
         if chrono_regime is not None:
             regime_ctx = chrono_regime
@@ -4566,6 +4978,15 @@ def run_one_backtest(
 
         past, future = get_ohlcv(yf_ticker, tf_key, analysis_date.strip(), chrono_yfinance=chrono_yfinance)
         if past is None or future is None or past.empty or future.empty:
+            if chrono_yfinance:
+                return _chrono_scan_skip_row(
+                    sym=sym,
+                    timeframe=timeframe,
+                    analysis_date=analysis_date.strip(),
+                    tf_key=tf_key,
+                    skip_reason="Insufficient OHLC history or forward window",
+                    is_exotic=sym in EXOTIC_REDUCE,
+                )
             return None
         min_past = (
             30
@@ -4575,10 +4996,28 @@ def run_one_backtest(
             else 50
         )
         if len(past) < min_past:
+            if chrono_yfinance:
+                return _chrono_scan_skip_row(
+                    sym=sym,
+                    timeframe=timeframe,
+                    analysis_date=analysis_date.strip(),
+                    tf_key=tf_key,
+                    skip_reason=f"Past bars {len(past)} < minimum {min_past}",
+                    is_exotic=sym in EXOTIC_REDUCE,
+                )
             return None
         fwd_n = int(TF_FORWARD_CANDLES.get(tf_key, FORWARD_CANDLES))
         if len(future) < 5:
             log(f"[Backtest] Not enough future data for {sym} {analysis_date} {tf_key}", level="info")
+            if chrono_yfinance:
+                return _chrono_scan_skip_row(
+                    sym=sym,
+                    timeframe=timeframe,
+                    analysis_date=analysis_date.strip(),
+                    tf_key=tf_key,
+                    skip_reason="Insufficient forward candles",
+                    is_exotic=sym in EXOTIC_REDUCE,
+                )
             return None
 
         gc.collect()
@@ -4595,6 +5034,15 @@ def run_one_backtest(
         latest = past.iloc[-1]
         price = round(float(latest["Close"]), 5)
         if price <= 0:
+            if chrono_yfinance:
+                return _chrono_scan_skip_row(
+                    sym=sym,
+                    timeframe=timeframe,
+                    analysis_date=analysis_date.strip(),
+                    tf_key=tf_key,
+                    skip_reason="Invalid price",
+                    is_exotic=sym in EXOTIC_REDUCE,
+                )
             return None
 
         bbl, bbm, bbu = _pick_bb_cols(past)
@@ -4813,79 +5261,67 @@ def run_one_backtest(
                 chrono_yfinance=True,
             )
 
-        if layer2_list and not layer1_list:
+        if layer2_list:
             picked = _layer2_tuple_for_deterministic_pick(sym, tf_key, zone_pct, layer2_list)
-            if picked is None:
-                return _skipped_backtest_row(
+            if picked is not None:
+                d_pick = str(picked[1]).strip().upper()
+                if d_pick == "BOTH":
+                    d_pick = "LONG" if float(zone_pct) < 50.0 else "SHORT"
+                if chrono_enforce_extended_cooldown:
+                    ok_e, rs_e = _chrono_extended_loss_cooldown_block(sym, timeframe, d_pick, analysis_date)
+                    if not ok_e:
+                        return _skipped_backtest_row(
+                            sym=sym,
+                            timeframe=timeframe,
+                            analysis_date=analysis_date,
+                            price=float(price),
+                            zone_pct=zone_pct,
+                            zone_label=zone_label,
+                            skip_reason=rs_e,
+                            ai={
+                                "skip_trade": True,
+                                "strategy_id": "SKIP",
+                                "strategy_met": False,
+                                "skip_reason": rs_e,
+                                "direction": "NONE",
+                                "conviction_score": 0,
+                            },
+                            tf_key=tf_key,
+                            is_exotic=is_exotic,
+                        )
+                forced = _python_forced_layer2_trade(
                     sym=sym,
                     timeframe=timeframe,
                     analysis_date=analysis_date,
+                    tf_key=tf_key,
                     price=float(price),
                     zone_pct=zone_pct,
                     zone_label=zone_label,
-                    skip_reason="No Layer 2 strategy qualifies after v7.1 deterministic ordering",
-                    ai={
-                        "skip_trade": True,
-                        "strategy_id": "SKIP",
-                        "strategy_met": False,
-                        "skip_reason": "No Layer 2 after v7.1 ordering",
-                        "direction": "NONE",
-                        "conviction_score": 0,
-                    },
-                    tf_key=tf_key,
                     is_exotic=is_exotic,
+                    future=future,
+                    layer2=[picked],
+                    rsi_live=float(ind.get("rsi", 50) or 50),
+                    chrono_risk_mult=chrono_risk_mult,
+                    chrono_tp_mult=chrono_tp_mult,
+                    chrono_job=chrono_yfinance,
+                    calendar_risk=hist_cal,
+                    regime_ctx=regime_ctx,
+                    chrono_balance=chrono_balance,
+                    chrono_day_pnl=chrono_day_pnl,
+                    period_mode=period_mode,
+                    atr_ref=float(ind.get("atr", 0) or 0) or None,
+                    past=past,
+                    ind=ind,
                 )
-            d_pick = str(picked[1]).strip().upper()
-            if d_pick == "BOTH":
-                d_pick = "LONG" if float(zone_pct) < 50.0 else "SHORT"
-            if chrono_enforce_extended_cooldown:
-                ok_e, rs_e = _chrono_extended_loss_cooldown_block(sym, timeframe, d_pick, analysis_date)
-                if not ok_e:
-                    return _skipped_backtest_row(
-                        sym=sym,
-                        timeframe=timeframe,
-                        analysis_date=analysis_date,
-                        price=float(price),
-                        zone_pct=zone_pct,
-                        zone_label=zone_label,
-                        skip_reason=rs_e,
-                        ai={
-                            "skip_trade": True,
-                            "strategy_id": "SKIP",
-                            "strategy_met": False,
-                            "skip_reason": rs_e,
-                            "direction": "NONE",
-                            "conviction_score": 0,
-                        },
-                        tf_key=tf_key,
-                        is_exotic=is_exotic,
-                    )
-            forced = _python_forced_layer2_trade(
-                sym=sym,
-                timeframe=timeframe,
-                analysis_date=analysis_date,
-                tf_key=tf_key,
-                price=float(price),
-                zone_pct=zone_pct,
-                zone_label=zone_label,
-                is_exotic=is_exotic,
-                future=future,
-                layer2=[picked],
-                rsi_live=float(ind.get("rsi", 50) or 50),
-                chrono_risk_mult=chrono_risk_mult,
-                chrono_tp_mult=chrono_tp_mult,
-                chrono_job=chrono_yfinance,
-                calendar_risk=hist_cal,
-                regime_ctx=regime_ctx,
-                chrono_balance=chrono_balance,
-                chrono_day_pnl=chrono_day_pnl,
-                atr_ref=float(ind.get("atr", 0) or 0) or None,
-                past=past,
-                ind=ind,
-            )
-            return forced
+                if forced is not None:
+                    return forced
 
         if not layer1_list:
+            l2_reason = (
+                "No Layer 2 strategy qualifies after v7.1 deterministic ordering"
+                if layer2_list
+                else "No Layer 1 (T01/R01) or Layer 2 candidates"
+            )
             return _skipped_backtest_row(
                 sym=sym,
                 timeframe=timeframe,
@@ -4893,12 +5329,12 @@ def run_one_backtest(
                 price=float(price),
                 zone_pct=zone_pct,
                 zone_label=zone_label,
-                skip_reason="No Layer 1 (T01/R01) candidates for Claude",
+                skip_reason=l2_reason,
                 ai={
                     "skip_trade": True,
                     "strategy_id": "SKIP",
                     "strategy_met": False,
-                    "skip_reason": "No Layer 1 for Claude",
+                    "skip_reason": l2_reason,
                     "direction": "NONE",
                     "conviction_score": 0,
                 },
@@ -4938,8 +5374,12 @@ def run_one_backtest(
             em = str(e).lower()
             if "timeout" in em or "timeout" in et.lower():
                 log(f"[Timeout] {sym} {timeframe} — skipping", level="warning")
+                if chrono_yfinance:
+                    return _skip_out("Claude API timeout", {})
                 return None
             log(f"[Backtest] Claude API error {sym} {timeframe}: {e}", level="warning")
+            if chrono_yfinance:
+                return _skip_out(f"Claude API error: {e}", {})
             return None
         parsed = _parse_json_response(raw)
         ai: dict[str, Any] = parsed if isinstance(parsed, dict) else {}
@@ -5063,6 +5503,9 @@ def run_one_backtest(
         if strategy_id_norm == "M03_RSI_MOMENTUM_CONTINUATION" and sym.strip().upper() not in M03_ALLOWED_TICKERS:
             log(f"[M03 BLOCKED] {sym.strip().upper()} not in allowed ticker list", level="info")
             return _skip_out(f"[M03 BLOCKED] {sym.strip().upper()} not in allowed ticker list", ai)
+        ok_frag, rs_frag = _fragile_bad_period_skip(strategy_id_norm, period_mode)
+        if ok_frag:
+            return _skip_out(rs_frag, ai)
         ok_mom, rs_mom = _momentum_neutral_ranging_skip(
             sym=sym,
             strat_id=strategy_id_norm,
@@ -5189,6 +5632,20 @@ def run_one_backtest(
             analysis_date=analysis_date,
         )
 
+        tr_ev2_pre = trend_result.get("trend") or {}
+        if not isinstance(tr_ev2_pre, dict):
+            tr_ev2_pre = {}
+        _v75_apply_macro_event_and_combo_boosts(
+            ai,
+            sym=sym,
+            strat_id=strategy_id_norm,
+            locked_confluence=int(scount),
+            tf_key=tf_key,
+            trend_strength=float(tr_ev2_pre.get("strength", 0) or 0),
+            rate_diff=float(ai.get("macro_rate_diff", 0) or 0),
+            period_mode=period_mode,
+        )
+
         position_size = float(ai.get("_position_size", 0) or 0)
         leveraged_exposure = float(ai.get("_leveraged_exposure", 0) or 0)
         max_risk_dollars = float(ai.get("_max_risk_dollars", 0) or 0)
@@ -5198,7 +5655,7 @@ def run_one_backtest(
 
         fut = future.head(fwd_n)
         if fut.empty or len(fut) == 0:
-            return None
+            return _skip_out("Insufficient forward candles for simulation", ai)
 
         tr_ev2 = trend_result.get("trend") or {}
         if not isinstance(tr_ev2, dict):
@@ -5229,7 +5686,10 @@ def run_one_backtest(
             del past
             del future
             gc.collect()
-            return None
+            return _skip_out(
+                str(exit_data.get("exit_reason") or "Forward simulation failed"),
+                ai,
+            )
 
         if (
             int(exit_data.get("candles_to_exit", 0) or 0) == 1
@@ -5453,12 +5913,24 @@ def run_one_backtest(
             "strategy_confluence_count": int(scount),
             "strategy_confluence_mult": float(cf_mult),
             "strategies_agreed": agreed_list,
+            "period_mode": str(ai.get("period_mode") or period_mode),
+            "macro_event_boost_applied": bool(ai.get("macro_event_boost_applied")),
+            "combination_boost_applied": float(ai.get("combination_boost_applied", 1.0) or 1.0),
             **v75_meta,
             **cond_snap,
         }
 
     except Exception as e:  # noqa: BLE001
         log(f"[ContinuousBacktest] Error {ticker} {analysis_date}: {e}", level="warning")
+        if chrono_yfinance:
+            return _chrono_scan_skip_row(
+                sym=(ticker or "").strip().upper(),
+                timeframe=timeframe,
+                analysis_date=analysis_date.strip(),
+                tf_key=(timeframe or "").strip().lower(),
+                skip_reason=f"Backtest error: {e}",
+                is_exotic=(ticker or "").strip().upper() in EXOTIC_REDUCE,
+            )
         return None
 
 
@@ -6689,6 +7161,7 @@ def run_chronological_backtest(
         except Exception:  # noqa: BLE001
             pass
         _rebuild_strategy_trade_counts_from_rows(merge_hist)
+        _rebuild_combo_trade_stats_from_rows(merge_hist)
         _rebuild_consecutive_losses_from_rows(merge_hist)
         _v72_load_strategy_status(log_startup=True)
         # FIX 18 — restore zero-trade priority after restart (same rule as end-of-day)
@@ -6884,6 +7357,12 @@ def run_chronological_backtest(
 
             chrono_abort = False
             if not finalize_day_only:
+                global CHRONO_COMPLETED_TRADES_BUFFER
+                CHRONO_COMPLETED_TRADES_BUFFER = [
+                    dict(x)
+                    for x in (list(chrono_data.get("all_trades") or []) + list(day_trades))
+                    if isinstance(x, dict)
+                ]
                 scan_date = datetime.strptime(date_str, "%Y-%m-%d").date()
                 day_regime = cached_regime(job_id, scan_date)
                 log(
@@ -7090,6 +7569,7 @@ def run_chronological_backtest(
                                     chrono_regime=day_regime,
                                     chrono_balance=capital,
                                     chrono_day_pnl=day_pnl,
+                                    chrono_job_id=job_id,
                                 )
                             except Exception as e:  # noqa: BLE001
                                 log(
@@ -7115,6 +7595,21 @@ def run_chronological_backtest(
                                 continue
 
                             if res is None:
+                                row_none = {
+                                    "date": date_str,
+                                    "ticker": ticker,
+                                    "timeframe": timeframe,
+                                    "session": session,
+                                    "job_id": job_id,
+                                    "skipped": True,
+                                    "skip_trade": True,
+                                    "outcome": "SKIPPED",
+                                    "pnl_dollars": 0.0,
+                                    "skip_reason": "Scan produced no result (data or execution abort)",
+                                    "verdict": "SKIP",
+                                }
+                                append_result(row_none)
+                                day_skipped.append(row_none)
                                 npi, nti, ntj = _v71_next_step(pi, ti, tj)
                                 chrono_data["chrono_intraday"] = {
                                     "date": date_str,
@@ -7157,6 +7652,7 @@ def run_chronological_backtest(
                                     )
                                 )
                                 day_skipped.append(row)
+                                append_result(row)
                                 npi, nti, ntj = _v71_next_step(pi, ti, tj)
                                 chrono_data["chrono_intraday"] = {
                                     "date": date_str,
@@ -7225,6 +7721,8 @@ def run_chronological_backtest(
                                 if _rsid2:
                                     STRATEGY_TRADE_COUNT[_rsid2] = STRATEGY_TRADE_COUNT.get(_rsid2, 0) + 1
                                     ZERO_TRADE_STRATEGIES.discard(_rsid2)
+                                    _record_combo_trade_outcome(ticker, _rsid2, oc)
+                                CHRONO_COMPLETED_TRADES_BUFFER.append(dict(row))
                                 drow = str(row.get("direction", "")).strip().upper()
                                 lk = _chrono_combo_key(ticker, timeframe, drow)
                                 if oc == "LOSS":
