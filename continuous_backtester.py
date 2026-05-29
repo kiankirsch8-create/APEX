@@ -4300,22 +4300,32 @@ def _python_forced_layer2_trade(
     direction = str(best[1]).strip().upper()
     if direction == "BOTH":
         direction = "LONG" if float(zone_pct) < 50 else "SHORT"
-    if direction not in ("LONG", "SHORT"):
-        if chrono_job:
-            return _chrono_scan_skip_row(
-                sym=sym,
-                timeframe=timeframe,
-                analysis_date=analysis_date,
-                tf_key=tf_key,
-                skip_reason=f"Invalid direction for {strat_id}",
-                price=float(price),
-                is_exotic=is_exotic,
-            )
-        return None
+        if direction not in ("LONG", "SHORT"):
+            if chrono_job:
+                return _chrono_scan_skip_row(
+                    sym=sym,
+                    timeframe=timeframe,
+                    analysis_date=analysis_date,
+                    tf_key=tf_key,
+                    skip_reason=f"Invalid direction for {strat_id}",
+                    price=float(price),
+                    is_exotic=is_exotic,
+                )
+            return None
 
     if isinstance(meta, dict) and meta.get("v72_untested"):
         direction = str(meta.get("direction", direction)).strip().upper()
         if direction not in ("LONG", "SHORT"):
+            if chrono_job:
+                return _chrono_scan_skip_row(
+                    sym=sym,
+                    timeframe=timeframe,
+                    analysis_date=analysis_date,
+                    tf_key=tf_key,
+                    skip_reason=f"Invalid UNTESTED direction for {strat_id}",
+                    price=float(price),
+                    is_exotic=is_exotic,
+                )
             return None
         entry = round(float(meta.get("entry", price)), 5)
         stop = round(float(meta["stop_loss"]), 5)
@@ -4356,6 +4366,16 @@ def _python_forced_layer2_trade(
             stop = round(entry * (1 - mult * 0.005), 5)
         risk = abs(entry - stop)
         if risk <= 0:
+            if chrono_job:
+                return _chrono_scan_skip_row(
+                    sym=sym,
+                    timeframe=timeframe,
+                    analysis_date=analysis_date,
+                    tf_key=tf_key,
+                    skip_reason=f"Invalid risk for {strat_id}",
+                    price=float(price),
+                    is_exotic=is_exotic,
+                )
             return None
         tp1 = round(entry + mult * risk * 2, 5)
         tp2 = round(entry + mult * risk * 3, 5)
