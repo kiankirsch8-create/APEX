@@ -5,15 +5,16 @@ rolling stats, and periodic self-improvement. All state is simple JSON on ``DATA
 """
 from __future__ import annotations
 
-STRATEGY_VERSION = "v7.5-forensic-adjustments"
-# v7.5: T04/SMC10/T08/M06 status, recipe JPY pairs, drop 1w mid-week filter, V02 backtest regime,
-# 1-candle loss buffer + low-ATR/body entry guards (backtest only).
+STRATEGY_VERSION = "v7.5-backtest-locked-trail"
+# v7.5: locked strategies execute in backtest; NEUTRAL+momentum uses ranging/low-vol filter;
+# trailing regime logging + trade analytics fields; T04/SMC10/T08/M06 status, recipe, 1-candle guards.
 # v7.4 master: macro 7d price alignment, locked confluence count, NEUTRAL momentum block,
 # M03 tickers / M02 off 4h, 1w mid-week + Monday sizing, trailing regime + recipe boost,
 # condition profiling (chrono) + /api/strategy_conditions/{id}.
 # v7.3 session21: FIX 23–30 (macro confidence post-enforce, B02 stops + blocked, trend_manager,
 # chrono strategy confluence, strategy_status). Calendar + regime + macro from prior prompts.
-# v7.2: strategy_status.json + chrono skips LOCKED strategies; UNTESTED loose EMA200/ADX paths (chrono only).
+# v7.2: strategy_status.json; UNTESTED loose EMA200/ADX paths (chrono only).
+# v7.5+: LOCKED/TESTING/UNTESTED all execute in backtest; only BLOCKED skipped.
 # v7.1: chrono phase scan (1w→1d→4h→intraday), risk/tp multipliers, separate 4H currency pool,
 # deterministic Layer-2 strategy order, $25 trailing floor + 0.75R/1.5R locks, exotic USD cap exemption,
 # consecutive-loss extended cooldown, expanded universe (CHF + QQQ).
@@ -137,14 +138,13 @@ M03_ALLOWED_TICKERS: frozenset[str] = frozenset(
     },
 )
 
-NEUTRAL_MACRO_BLOCKED: frozenset[str] = frozenset(
+MOMENTUM_STRATEGIES: frozenset[str] = frozenset(
     {
         "M03_RSI_MOMENTUM_CONTINUATION",
-        "T08_DONCHIAN_BREAKOUT",
-        "T04_ADX_TREND_ENTRY",
-        "V02_ATR_EXPANSION_ENTRY",
         "M06_PRICE_ACCELERATION",
+        "T08_DONCHIAN_BREAKOUT",
         "B10_WEEKLY_RANGE_BREAK",
+        "T04_ADX_TREND_ENTRY",
     },
 )
 # v7.0 chrono: completed trades per currency per scan day (sequential sim; caps clustering).
@@ -427,9 +427,9 @@ def get_currencies(ticker: str) -> list[str]:
     return []
 
 
-# ── v7.2 strategy status (FIX 20 / FIX 21) — chrono uses metadata; LOCKED skipped in chrono scan ──
+# ── v7.2 strategy status — LOCKED_STRATEGY_IDS = confluence counting only (not execution skip) ──
 STRATEGY_STATUS: dict[str, Any] = {}
-LOCKED_STRATEGIES_SCAN_SKIP: frozenset[str] = frozenset()
+LOCKED_STRATEGY_IDS: frozenset[str] = frozenset()
 UNTESTED_STRATEGIES_V72: frozenset[str] = frozenset()
 BLOCKED_STRATEGIES: frozenset[str] = frozenset()
 
@@ -538,7 +538,7 @@ def _v75_migrate_strategy_status(raw: dict[str, Any]) -> bool:
 
 def _v72_load_strategy_status(*, log_startup: bool = False) -> None:
     """Load or create ``strategy_status.json``; refresh module-level LOCKED / UNTESTED / BLOCKED sets."""
-    global STRATEGY_STATUS, LOCKED_STRATEGIES_SCAN_SKIP, UNTESTED_STRATEGIES_V72, BLOCKED_STRATEGIES
+    global STRATEGY_STATUS, LOCKED_STRATEGY_IDS, UNTESTED_STRATEGIES_V72, BLOCKED_STRATEGIES
     default_payload = _v72_default_status_payload()
     raw: Any = None
     if STRATEGY_STATUS_FILE.is_file():
@@ -572,7 +572,7 @@ def _v72_load_strategy_status(*, log_startup: bool = False) -> None:
             raw[tag_k] = list(default_vals)
             raw["last_updated"] = date.today().isoformat()
             save_json(STRATEGY_STATUS_FILE, raw)
-    LOCKED_STRATEGIES_SCAN_SKIP = frozenset(str(x).strip().upper() for x in (raw.get("locked") or []) if x)
+    LOCKED_STRATEGY_IDS = frozenset(str(x).strip().upper() for x in (raw.get("locked") or []) if x)
     UNTESTED_STRATEGIES_V72 = frozenset(str(x).strip().upper() for x in (raw.get("untested") or []) if x)
     blk = raw.get("blocked")
     if not isinstance(blk, list):
@@ -582,7 +582,7 @@ def _v72_load_strategy_status(*, log_startup: bool = False) -> None:
     BLOCKED_STRATEGIES = frozenset(str(x).strip().upper() for x in blk if x)
     if log_startup:
         log(
-            f"[v7.2] strategy_status locked={len(LOCKED_STRATEGIES_SCAN_SKIP)} "
+            f"[v7.2] strategy_status locked={len(LOCKED_STRATEGY_IDS)} "
             f"testing={len(raw.get('testing') or [])} untested={len(UNTESTED_STRATEGIES_V72)} "
             f"blocked={len(BLOCKED_STRATEGIES)}",
             level="info",
@@ -662,7 +662,7 @@ def _v72_one_loose_untested_candidate(
     )
     for sid in sids_sorted:
         sid_u = sid.strip().upper()
-        if sid_u in existing_sids or sid_u in LOCKED_STRATEGIES_SCAN_SKIP:
+        if sid_u in existing_sids or sid_u in LOCKED_STRATEGY_IDS:
             continue
         if not _v72_sid_allowed_on_tf(sid_u, tf_l):
             continue
@@ -715,15 +715,9 @@ def _v72_merge_loose_untested_into_layer2(
     return merged
 
 
-def _v72_strip_locked_from_chrono(
-    rows: list[tuple[str, str, int, dict[str, Any] | None]],
-    *,
-    chrono_yfinance: bool,
-) -> list[tuple[str, str, int, dict[str, Any] | None]]:
-    """FIX 20 correction — graduated LOCKED strategies never run in chrono backtest."""
-    if not chrono_yfinance or not LOCKED_STRATEGIES_SCAN_SKIP:
-        return rows
-    return [r for r in rows if str(r[0]).strip().upper() not in LOCKED_STRATEGIES_SCAN_SKIP]
+def _locked_confluence_sid(sid: str) -> bool:
+    """Only LOCKED list strategies count toward confluence multiplier (backtest)."""
+    return str(sid or "").strip().upper() in LOCKED_STRATEGY_IDS
 
 
 # Prefilter has no rules for these ids — v7.1 uses deterministic “turn” ordering instead of random (FIX 10).
@@ -1717,6 +1711,37 @@ def _v75_entry_candle_body(past: pd.DataFrame | None) -> float:
         return c - o
     except (TypeError, ValueError, KeyError, IndexError):
         return 0.0
+
+
+def _momentum_neutral_ranging_skip(
+    *,
+    sym: str,
+    strat_id: str,
+    macro_bias: str,
+    analysis_date: str,
+    past: pd.DataFrame | None,
+    ind: dict[str, Any],
+) -> tuple[bool, str]:
+    """
+    Skip momentum strategies only when macro is NEUTRAL and conditions are ranging / low vol.
+    Uses trade-condition snapshot (market_phase, volatility_regime) — not sizing regime_manager tiers.
+    """
+    sid = str(strat_id or "").strip().upper()
+    if sid not in MOMENTUM_STRATEGIES:
+        return False, ""
+    if str(macro_bias or "").strip().upper() != "NEUTRAL":
+        return False, ""
+    snap = _trade_condition_snapshot_fields(analysis_date, past, ind)
+    mp = str(snap.get("market_phase", "")).strip().upper()
+    vr = str(snap.get("volatility_regime", "")).strip().upper()
+    if mp == "RANGING" or vr == "LOW_VOL":
+        msg = (
+            f"[NEUTRAL+RANGING SKIP] {sid} {sym.strip().upper()}: NEUTRAL macro + "
+            f"{mp or 'UNKNOWN'} market / {vr or 'UNKNOWN'} vol — momentum strategy skipped"
+        )
+        log(msg, level="info")
+        return True, msg
+    return False, ""
 
 
 def _v75_v02_backtest_allowed(past: pd.DataFrame | None, ind: dict[str, Any]) -> tuple[bool, str]:
@@ -3106,7 +3131,7 @@ def _local_prefilter_confluence_count(sym: str, direction: str, rows: list[Any])
         if not row or len(row) < 2:
             continue
         sid = str(row[0]).strip().upper()
-        if sid not in CONFLUENCE_COUNTING_STRATEGIES:
+        if not _locked_confluence_sid(sid):
             continue
         dr = str(row[1]).strip().upper()
         if dr == "BOTH" or dr == d:
@@ -3312,8 +3337,9 @@ def evaluate_forward_candles(
     rate_differential: float = 0.0,
     atr: float = 0.0,
     buffer_stop_price: float | None = None,
+    ticker: str = "",
 ) -> dict[str, Any]:
-    """v7.5 — first-candle buffer stop; v7.4 regime TP ladders and trailing (TRENDING vs CHOPPY)."""
+    """v7.5 — first-candle buffer stop; v7.4+ regime TP ladders and trailing (TRENDING vs CHOPPY)."""
     _ = strategy_id
     _ = leverage
     _ = tp1
@@ -3376,6 +3402,13 @@ def evaluate_forward_candles(
         if tf_lc == "4h"
         else detect_trailing_regime(macro_bias, trend_strength, rate_differential)
     )
+    sym_l = (ticker or "").strip().upper() or "?"
+    log(
+        f"[TRAIL REGIME] {sym_l} {tf_lc or '?'}: {regime} "
+        f"(macro={str(macro_bias or '').strip().upper()} trend={trend_strength:.2f} "
+        f"rate_diff={rate_differential:.2f})",
+        level="info",
+    )
     mult1, mult2, mult3 = (2.0, 4.0, 7.0) if regime == "TRENDING" else (1.5, 3.0, 5.0)
     sign = 1.0 if d == "LONG" else -1.0
     tp1p = entry_price + sign * risk * mult1
@@ -3402,6 +3435,8 @@ def evaluate_forward_candles(
     choppy_tb_done = False
     peak_hi = float("-inf")
     peak_lo = float("inf")
+    candles_to_tp1: int | None = None
+    peak_profit_dollars = 0.0
 
     def _px_move(px: float) -> float:
         if d == "LONG":
@@ -3437,6 +3472,10 @@ def evaluate_forward_candles(
             prev_low = low
             prev_high = high
 
+        if ps > 0 and rem > 0:
+            mark = close
+            peak_profit_dollars = max(peak_profit_dollars, realized + ps * rem * _px_move(mark))
+
         if regime == "CHOPPY" and hit_tp1 and not hit_tp3 and prev_row is not None:
             if d == "LONG":
                 prop = prev_low - 0.5 * atr_use
@@ -3465,12 +3504,19 @@ def evaluate_forward_candles(
 
             if high >= tp1p and not hit_tp1:
                 hit_tp1 = True
+                candles_to_tp1 = candle_count
                 trailing_activated = True
                 current_stop = _apply_trailing_dollar_floor(
                     entry_price, current_stop, entry_price, d, ps * rem,
                 )
                 if regime == "CHOPPY":
                     _close_frac(0.25, tp1p)
+                    log(
+                        f"[TRAIL] TP1 hit CHOPPY — stop breakeven, closed 25%, trailing started",
+                        level="info",
+                    )
+                else:
+                    log(f"[TRAIL] TP1 hit — stop moved to breakeven, full position kept", level="info")
 
             if high >= tp2p and not hit_tp2 and hit_tp1:
                 hit_tp2 = True
@@ -3521,12 +3567,19 @@ def evaluate_forward_candles(
 
             if low <= tp1p and not hit_tp1:
                 hit_tp1 = True
+                candles_to_tp1 = candle_count
                 trailing_activated = True
                 current_stop = _apply_trailing_dollar_floor(
                     entry_price, current_stop, entry_price, d, ps * rem,
                 )
                 if regime == "CHOPPY":
                     _close_frac(0.25, tp1p)
+                    log(
+                        f"[TRAIL] TP1 hit CHOPPY — stop breakeven, closed 25%, trailing started",
+                        level="info",
+                    )
+                else:
+                    log(f"[TRAIL] TP1 hit — stop moved to breakeven, full position kept", level="info")
 
             if low <= tp2p and not hit_tp2 and hit_tp1:
                 hit_tp2 = True
@@ -3591,19 +3644,43 @@ def evaluate_forward_candles(
     denom = ps * entry_price if ps > 0 and entry_price > 0 else 0.0
     pnl_pct = (realized / denom) if denom > 0 else 0.0
 
+    exit_reason_norm = exit_reason
+    er_l = exit_reason.lower()
+    if hit_tp3 and "tp3" in er_l:
+        exit_reason_norm = "TP3"
+    elif hit_tp2 and "tp2" in er_l:
+        exit_reason_norm = "TP2"
+    elif hit_tp1 and not hit_stop and "window" in er_l:
+        exit_reason_norm = "TP1"
+    elif "time-based" in er_l or "time exit" in er_l:
+        exit_reason_norm = "TIME_EXIT"
+    elif hit_stop and trailing_activated:
+        exit_reason_norm = "TRAIL_STOP"
+    elif hit_stop:
+        exit_reason_norm = "STOP"
+
+    exit_vs_peak = (
+        round((realized / peak_profit_dollars) * 100.0, 2)
+        if peak_profit_dollars > 1e-9
+        else None
+    )
+
     return {
         "outcome": "WIN" if pnl_pct > 0 else "LOSS",
         "exit_price": round(exit_price, 5),
-        "exit_reason": exit_reason,
+        "exit_reason": exit_reason_norm,
         "pnl_pct": round(pnl_pct, 6),
         "hit_tp1": hit_tp1,
         "hit_tp2": hit_tp2,
         "hit_tp3": hit_tp3,
         "hit_stop": hit_stop,
         "candles_to_exit": candle_count,
+        "candles_to_tp1": candles_to_tp1,
         "trailing_activated": trailing_activated,
         "final_stop": round(current_stop, 5),
         "trail_market_regime": regime,
+        "peak_profit_dollars": round(peak_profit_dollars, 2),
+        "exit_vs_peak_pct": exit_vs_peak,
     }
 
 
@@ -4087,11 +4164,15 @@ def _python_forced_layer2_trade(
             tf_key=tf_key,
             is_exotic=is_exotic,
         )
-    if str(ai.get("macro_bias", "")).strip().upper() == "NEUTRAL" and strat_id in NEUTRAL_MACRO_BLOCKED:
-        log(
-            f"[NEUTRAL BLOCK] {strat_id} skipped — momentum strategy not allowed in NEUTRAL macro",
-            level="info",
-        )
+    ok_mom, rs_mom = _momentum_neutral_ranging_skip(
+        sym=sym,
+        strat_id=strat_id,
+        macro_bias=str(ai.get("macro_bias", "")),
+        analysis_date=analysis_date,
+        past=past,
+        ind=ind or {},
+    )
+    if ok_mom:
         ai2 = dict(ai)
         ai2["calendar_action"] = str(cal.get("action", "CLEAR"))
         ai2["calendar_reason"] = str(cal.get("reason", ""))
@@ -4103,7 +4184,7 @@ def _python_forced_layer2_trade(
             price=float(price),
             zone_pct=zone_pct,
             zone_label=zone_label,
-            skip_reason=f"[NEUTRAL BLOCK] {strat_id} skipped — momentum strategy not allowed in NEUTRAL macro",
+            skip_reason=rs_mom,
             ai=ai2,
             tf_key=tf_key,
             is_exotic=is_exotic,
@@ -4152,7 +4233,7 @@ def _python_forced_layer2_trade(
 
     if chrono_job:
         raw_sids = CHRONO_DAY_PREFILTER_SIDS.get((sym_u, dir_u), set())
-        scount = len({s for s in raw_sids if s in CONFLUENCE_COUNTING_STRATEGIES})
+        scount = len({s for s in raw_sids if _locked_confluence_sid(s)})
         triple = {"1w", "1d", "4h"}.issubset(CHRONO_SYMDIR_TFS.get((sym_u, dir_u), set()))
     else:
         layer_sids = {
@@ -4160,7 +4241,7 @@ def _python_forced_layer2_trade(
             for x in layer2
             if len(x) >= 2 and (str(x[1]).strip().upper() in ("BOTH", dir_u))
         }
-        scount = len({s for s in layer_sids if s in CONFLUENCE_COUNTING_STRATEGIES})
+        scount = len({s for s in layer_sids if _locked_confluence_sid(s)})
         triple = False
     cf_mult = _strategy_confluence_multiplier(scount, triple_tf_agreement=triple)
     if scount >= 3 and str(ai.get("tp_target") or "TP1").strip().upper() == "TP2":
@@ -4263,6 +4344,7 @@ def _python_forced_layer2_trade(
         rate_differential=float(ai.get("macro_rate_diff", 0) or 0),
         atr=float(atr_ref or v75_meta.get("entry_atr", 0) or 0),
         buffer_stop_price=buffer_stop_v75,
+        ticker=sym,
     )
     if exit_data.get("outcome") in ("NO_DATA", "INVALID"):
         return None
@@ -4393,6 +4475,9 @@ def _python_forced_layer2_trade(
         "trailing_activated": trailing_activated,
         "final_stop": round(final_stop, 5),
         "trail_market_regime": str(exit_data.get("trail_market_regime") or "CHOPPY"),
+        "candles_to_tp1": exit_data.get("candles_to_tp1"),
+        "peak_profit_dollars": exit_data.get("peak_profit_dollars"),
+        "exit_vs_peak_pct": exit_data.get("exit_vs_peak_pct"),
         "v74_perfect_storm": bool(ai.get("_v74_perfect_storm_m03_jpy")),
         "skipped": False,
         "skip_trade": False,
@@ -4663,12 +4748,6 @@ def run_one_backtest(
                 },
                 tf_key=tf_key,
                 is_exotic=is_exotic,
-            )
-
-        if chrono_yfinance:
-            qualifying_strategies = _v72_strip_locked_from_chrono(
-                list(qualifying_strategies),
-                chrono_yfinance=True,
             )
 
         intel_text = ""
@@ -4984,15 +5063,16 @@ def run_one_backtest(
         if strategy_id_norm == "M03_RSI_MOMENTUM_CONTINUATION" and sym.strip().upper() not in M03_ALLOWED_TICKERS:
             log(f"[M03 BLOCKED] {sym.strip().upper()} not in allowed ticker list", level="info")
             return _skip_out(f"[M03 BLOCKED] {sym.strip().upper()} not in allowed ticker list", ai)
-        if str(ai.get("macro_bias", "")).strip().upper() == "NEUTRAL" and strategy_id_norm in NEUTRAL_MACRO_BLOCKED:
-            log(
-                f"[NEUTRAL BLOCK] {strategy_id_norm} skipped — momentum strategy not allowed in NEUTRAL macro",
-                level="info",
-            )
-            return _skip_out(
-                f"[NEUTRAL BLOCK] {strategy_id_norm} skipped — momentum strategy not allowed in NEUTRAL macro",
-                ai,
-            )
+        ok_mom, rs_mom = _momentum_neutral_ranging_skip(
+            sym=sym,
+            strat_id=strategy_id_norm,
+            macro_bias=str(ai.get("macro_bias", "")),
+            analysis_date=analysis_date,
+            past=past,
+            ind=ind,
+        )
+        if ok_mom:
+            return _skip_out(rs_mom, ai)
 
         trend_result = cached_apply_trend_filter(
             sym,
@@ -5019,7 +5099,7 @@ def run_one_backtest(
 
         if chrono_yfinance:
             raw_s = CHRONO_DAY_PREFILTER_SIDS.get((sym.upper(), direction), set())
-            scount = len({s for s in raw_s if s in CONFLUENCE_COUNTING_STRATEGIES})
+            scount = len({s for s in raw_s if _locked_confluence_sid(s)})
             triple = {"1w", "1d", "4h"}.issubset(CHRONO_SYMDIR_TFS.get((sym.upper(), direction), set()))
         else:
             scount = _local_prefilter_confluence_count(sym, direction, qualifying_strategies)
@@ -5142,6 +5222,7 @@ def run_one_backtest(
             rate_differential=float(ai.get("macro_rate_diff", 0) or 0),
             atr=float(ind.get("atr", 0) or v75_meta.get("entry_atr", 0) or 0),
             buffer_stop_price=buffer_stop_v75,
+            ticker=sym,
         )
         if exit_data.get("outcome") in ("NO_DATA", "INVALID"):
             del fut
@@ -5354,6 +5435,9 @@ def run_one_backtest(
             "trailing_activated": trailing_activated,
             "final_stop": round(final_stop, 5),
             "trail_market_regime": str(exit_data.get("trail_market_regime") or "CHOPPY"),
+            "candles_to_tp1": exit_data.get("candles_to_tp1"),
+            "peak_profit_dollars": exit_data.get("peak_profit_dollars"),
+            "exit_vs_peak_pct": exit_data.get("exit_vs_peak_pct"),
             "v74_perfect_storm": bool(ai.get("_v74_perfect_storm_m03_jpy")),
             "skipped": False,
             "skip_trade": False,
