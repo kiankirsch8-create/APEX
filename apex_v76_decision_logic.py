@@ -14,10 +14,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 import pandas as pd
+import yfinance as yf
 
 from calendar_manager import check_calendar_risk
 from macro_manager import (
-    align_macro_bias_with_price,
     apply_macro_confidence_adjustment,
     get_macro_bias,
     macro_result_fields,
@@ -27,6 +27,176 @@ from prefilter_v6 import python_prefilter
 from regime_manager import get_regime_cached
 from strategies_v5_data import STRATEGIES
 from trend_manager import apply_trend_filter
+
+LogFn = Callable[..., None]
+
+# ---------------------------------------------------------------------------
+# Macro 7d price alignment (inlined — older VPS macro_manager may lack this)
+# ---------------------------------------------------------------------------
+
+
+def _v76_yf_symbol(ticker: str) -> str:
+    t = (ticker or "").strip().upper()
+    if len(t) == 6 and t.isalpha():
+        return f"{t}=X"
+    return t
+
+
+def _v76_fetch_daily_ohlc(ticker: str, as_of_date: date) -> pd.DataFrame | None:
+    """~20d daily bars for macro price alignment when ``past`` OHLC is unavailable."""
+    sym = _v76_yf_symbol(ticker)
+    start_d = as_of_date - timedelta(days=20)
+    end_d = as_of_date + timedelta(days=1)
+    try:
+        df = yf.download(
+            sym,
+            start=start_d.isoformat(),
+            end=end_d.isoformat(),
+            interval="1d",
+            progress=False,
+            auto_adjust=False,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    if df is None or df.empty:
+        return None
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.copy()
+        df.columns = df.columns.get_level_values(0)
+    df = df.rename(columns={c: str(c).title() for c in df.columns})
+    if "Adj Close" in df.columns and "Close" not in df.columns:
+        df = df.rename(columns={"Adj Close": "Close"})
+    return df.dropna(subset=["Close"]) if "Close" in df.columns else None
+
+
+def _v76_macro_tier_economics(bias: str) -> tuple[float, int]:
+    b = str(bias or "").strip().upper()
+    if b == "STRONG_TAILWIND":
+        return 1.20, 1
+    if b == "TAILWIND":
+        return 1.10, 0
+    if b == "NEUTRAL":
+        return 1.0, 0
+    if b == "HEADWIND":
+        return 0.85, 0
+    if b == "STRONG_HEADWIND":
+        return 0.70, -1
+    return 1.0, 0
+
+
+def _v76_downgrade_macro_bias_one_level(bias: str) -> str:
+    b = str(bias or "").strip().upper()
+    if b == "STRONG_TAILWIND":
+        return "TAILWIND"
+    if b == "TAILWIND":
+        return "NEUTRAL"
+    if b == "HEADWIND":
+        return "STRONG_HEADWIND"
+    return b
+
+
+def _v76_downgrade_macro_bias_two_levels(bias: str) -> str:
+    b = str(bias or "").strip().upper()
+    if b == "STRONG_TAILWIND":
+        return "NEUTRAL"
+    if b == "TAILWIND":
+        return "HEADWIND"
+    if b == "NEUTRAL":
+        return "HEADWIND"
+    if b == "HEADWIND":
+        return "STRONG_HEADWIND"
+    return b
+
+
+def _v76_check_macro_price_alignment(
+    ticker: str,
+    direction: str,
+    macro_bias: str,
+    price_data: pd.DataFrame | None,
+    *,
+    as_of_date: date | None = None,
+) -> tuple[str, float | None, str]:
+    tku = (ticker or "").strip().upper()
+    dire = (direction or "").strip().upper()
+    mb0 = str(macro_bias or "").strip().upper()
+    if dire not in ("LONG", "SHORT") or not (len(tku) == 6 and tku.isalpha()):
+        return mb0, None, "skip_non_fx"
+    if mb0 not in ("STRONG_TAILWIND", "TAILWIND", "NEUTRAL", "HEADWIND", "STRONG_HEADWIND"):
+        return mb0, None, "skip_bias_tier"
+
+    df = price_data
+    if df is None or getattr(df, "empty", True) or "Close" not in df.columns:
+        end_d = as_of_date or date.today()
+        df = _v76_fetch_daily_ohlc(tku, end_d)
+    if df is None or getattr(df, "empty", True) or "Close" not in df.columns:
+        return mb0, None, "no_price_data"
+
+    closes = pd.to_numeric(df["Close"], errors="coerce").dropna()
+    if len(closes) < 8:
+        return mb0, None, "short_history"
+    c_now = float(closes.iloc[-1])
+    c_7 = float(closes.iloc[-8])
+    if not math.isfinite(c_now) or not math.isfinite(c_7) or c_7 == 0:
+        return mb0, None, "bad_closes"
+    momentum = (c_now - c_7) / abs(c_7) * 100.0
+
+    agree_hi = 0.3
+    agree_lo = -0.3
+    if dire == "LONG":
+        if momentum > agree_hi:
+            return mb0, momentum, "price_agrees"
+        if agree_lo <= momentum <= agree_hi:
+            return _v76_downgrade_macro_bias_one_level(mb0), momentum, "neutral_momentum_band"
+        return _v76_downgrade_macro_bias_two_levels(mb0), momentum, "price_contradicts"
+    if momentum < agree_lo:
+        return mb0, momentum, "price_agrees"
+    if agree_lo <= momentum <= agree_hi:
+        return _v76_downgrade_macro_bias_one_level(mb0), momentum, "neutral_momentum_band"
+    return _v76_downgrade_macro_bias_two_levels(mb0), momentum, "price_contradicts"
+
+
+def align_macro_bias_with_price(
+    ticker: str,
+    direction: str,
+    macro: dict[str, Any],
+    *,
+    as_of_date: date | None = None,
+    price_df: pd.DataFrame | None = None,
+    log_fn: LogFn | None = None,
+) -> dict[str, Any]:
+    """v7.4 7d price alignment — local copy for VPS without updated macro_manager."""
+    out = dict(macro)
+    mb0 = str(out.get("bias", "NEUTRAL")).strip().upper()
+    adj, mom, tag = _v76_check_macro_price_alignment(
+        ticker,
+        direction,
+        mb0,
+        price_df,
+        as_of_date=as_of_date,
+    )
+    if adj != mb0 and mom is not None:
+        sm, cu = _v76_macro_tier_economics(adj)
+        out["bias"] = adj
+        out["size_multiplier"] = sm
+        out["confidence_upgrade"] = cu
+        msg = (
+            f"[MACRO TRANSITION] {ticker.upper()}: {mb0}→{adj} "
+            f"(7d momentum: {mom:+.1f}%, price contradicting macro direction)"
+            if "contradict" in tag
+            else (
+                f"[MACRO TRANSITION] {ticker.upper()}: {mb0}→{adj} "
+                f"(7d momentum: {mom:+.1f}%, neutral price action)"
+                if "neutral_momentum" in tag
+                else f"[MACRO TRANSITION] {ticker.upper()}: {mb0}→{adj} (7d momentum: {mom:+.1f}%, {tag})"
+            )
+        )
+        if log_fn:
+            try:
+                log_fn(msg, level="info")
+            except TypeError:
+                log_fn(msg)
+    return out
+
 
 # ---------------------------------------------------------------------------
 # Constants (v7.6 backtest parity)
