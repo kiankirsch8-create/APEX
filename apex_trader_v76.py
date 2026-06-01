@@ -1,12 +1,12 @@
 """
-APEX v7.6 Live Trader — 1:1 mirror of ``continuous_backtester.py`` decision logic.
+APEX v7.6 Live Trader — mirrors backtest v7.6 decision logic without ``continuous_backtester``.
 
-- Reuses backtest modules/functions (macro, trend, regime, calendar, prefilter, sizing, trailing).
-- Execution via MetaTrader 5 (optional DRY_RUN logs decisions without orders).
-- Does NOT modify the backtest engine or intelligence modules.
+- Decision stack in ``apex_v76_decision_logic.py`` (no ``pandas_ta`` / numba / llvmlite).
+- MT5 execution via ``apex_trader.py`` only (OHLC, indicators, orders, trailing).
+- Allowed third-party: MetaTrader5, pandas, numpy, yfinance, requests, anthropic (via managers).
 
-Deploy: place this file in ``C:\\Apex`` next to ``continuous_backtester.py``, ``macro_manager.py``,
-``apex_trader.py``, etc. Set ``APEX_MT5_PASSWORD``. Optional: ``APEX_HOME=C:\\Apex``.
+Deploy: copy ``apex_trader_v76.py``, ``apex_v76_decision_logic.py``, ``apex_trader.py``,
+``macro_manager.py``, ``prefilter_v6.py``, etc. into ``C:\\Apex``. Set ``APEX_MT5_PASSWORD``.
 """
 
 from __future__ import annotations
@@ -135,52 +135,8 @@ def _import_local_module(name: str, apex_root: Path | None = None) -> ModuleType
     raise ModuleNotFoundError(
         f"No module named '{name}'. Expected file like {expect}. "
         f"Searched: {roots_list}. "
-        f"Copy the full APEX repo (same as Railway) into C:\\Apex — "
-        f"continuous_backtester.py and macro_manager.py must be present."
+        f"Copy the full APEX repo into C:\\Apex (apex_trader.py, macro_manager.py, prefilter_v6.py, etc.)."
     ) from last_err
-
-
-# Modules ``continuous_backtester`` imports at load time (preload so VPS path issues surface early).
-_BACKTEST_DEPENDENCY_MODULES: tuple[str, ...] = (
-    "utils",
-    "strategies_v5_data",
-    "prefilter_v6",
-    "intelligence_fetch_cached",
-    "calendar_manager",
-    "trend_manager",
-    "regime_manager",
-    "macro_manager",
-)
-
-
-def _preload_backtest_dependencies() -> None:
-    for mod_name in _BACKTEST_DEPENDENCY_MODULES:
-        _import_local_module(mod_name)
-
-
-def _import_continuous_backtester_module() -> ModuleType:
-    _preload_backtest_dependencies()
-    for root in _all_apex_roots():
-        root_s = str(root)
-        if root_s not in sys.path:
-            sys.path.insert(0, root_s)
-        py_path = root / "continuous_backtester.py"
-        if py_path.is_file():
-            if "continuous_backtester" in sys.modules:
-                return sys.modules["continuous_backtester"]
-            try:
-                return importlib.import_module("continuous_backtester")
-            except ModuleNotFoundError:
-                return _load_module_from_file("continuous_backtester", py_path)
-    missing = [m for m in ("continuous_backtester", *_BACKTEST_DEPENDENCY_MODULES) if not _find_module_py(m)]
-    roots_hint = ", ".join(str(r) for r in _all_apex_roots())
-    raise ModuleNotFoundError(
-        "Cannot load backtest engine on VPS. Missing modules: "
-        + ", ".join(missing)
-        + f". Install dir(s) checked: {roots_hint}. "
-        "Download the latest main branch from GitHub into C:\\Apex "
-        "(must include continuous_backtester.py)."
-    )
 
 
 _APEX_ROOT = _bootstrap_apex_sys_path()
@@ -189,13 +145,11 @@ _APEX_ROOT = _bootstrap_apex_sys_path()
 if os.name == "nt" and not (os.environ.get("APEX_DATA_DIR") or "").strip():
     os.environ.setdefault("APEX_DATA_DIR", str(_APEX_ROOT))
 
-# Third-party (same stack as apex_trader / continuous_backtester).
+# Third-party (VPS-safe — no pandas_ta / numba).
 try:
-    import pandas as pd  # noqa: F401
+    import pandas as pd
 except ImportError as e:  # noqa: BLE001
-    raise ImportError(
-        "pandas is required. Install: pip install pandas numpy yfinance pandas-ta anthropic"
-    ) from e
+    raise ImportError("pandas is required (pip install pandas numpy yfinance)") from e
 
 try:
     import numpy as np  # noqa: F401
@@ -207,29 +161,12 @@ try:
 except ImportError as e:  # noqa: BLE001
     raise ImportError("yfinance is required (pip install yfinance)") from e
 
-try:
-    import pandas_ta  # noqa: F401
-except ImportError as e:  # noqa: BLE001
-    raise ImportError(
-        "pandas-ta is required by continuous_backtester (pip install pandas-ta)"
-    ) from e
-
-try:
-    from anthropic import Anthropic  # noqa: F401
-except ImportError as e:  # noqa: BLE001
-    raise ImportError(
-        "anthropic is required by continuous_backtester (pip install anthropic)"
-    ) from e
-
-# Live mode for macro_manager (must be set before importing continuous_backtester).
 _macro_manager = _import_local_module("macro_manager", _APEX_ROOT)
 set_backtest_mode = _macro_manager.set_backtest_mode
-
 set_backtest_mode(False)
 
-cb = _import_continuous_backtester_module()
-
-set_backtest_mode(False)
+# v7.6 decision logic (inlined module — no continuous_backtester import).
+_v76_logic = _import_local_module("apex_v76_decision_logic", _APEX_ROOT)
 
 # MT5 helpers only — do not use legacy live signal logic from apex_trader.
 at = _import_local_module("apex_trader", _APEX_ROOT)
@@ -570,8 +507,8 @@ def _circuit_breaker_live(
         return True, f"[HALTED] Trading suspended until {halt_dt.isoformat(sep=' ', timespec='minutes')}"
 
     daily_rows = st.get("daily_pnl") if isinstance(st.get("daily_pnl"), list) else []
-    trailing_5d = cb._v76_rolling_5d_pnl(daily_rows, as_of=scan_d, current_day_pnl=day_pnl)
-    cap = float(balance or cb.STARTING_CAPITAL)
+    trailing_5d = _v76_logic._v76_rolling_5d_pnl(daily_rows, as_of=scan_d, current_day_pnl=day_pnl)
+    cap = float(balance or _v76_logic.STARTING_CAPITAL)
     if cap <= 0:
         return False, ""
     pct = trailing_5d / cap
@@ -604,13 +541,8 @@ def _live_period_mode(st: dict[str, Any], balance: float, scan_d: date) -> str:
         ds = str(r.get("date", ""))[:10]
         if ds and ds <= scan_d.isoformat():
             buf.append(r)
-    saved = cb.CHRONO_COMPLETED_TRADES_BUFFER
-    try:
-        cb.CHRONO_COMPLETED_TRADES_BUFFER = buf
-        pm, _, _ = cb._detect_period_mode(balance, "live", scan_d)
-        return pm
-    finally:
-        cb.CHRONO_COMPLETED_TRADES_BUFFER = saved
+    pm, _, _ = _v76_logic._detect_period_mode(balance, "live", scan_d, buf)
+    return pm
 
 
 def _locked_layer2_only(
@@ -623,7 +555,7 @@ def _locked_layer2_only(
     out: list[tuple[str, str, int] | tuple[str, str, int, dict[str, Any] | None]] = []
     for row in layer2:
         sid = str(row[0]).strip().upper()
-        if sid not in cb.LOCKED_STRATEGY_IDS or not cb._v75_backtest_strategy_allowed(sid):
+        if sid not in _v76_logic.LOCKED_STRATEGY_IDS or not _v76_logic._v75_backtest_strategy_allowed(sid):
             continue
         if tf_l == "4h" and sid == "M02_MACD_ZERO_CROSS":
             continue
@@ -662,13 +594,13 @@ def _accumulate_live_prefilter(
         sid = str(row[0]).strip().upper()
         dr = str(row[1]).strip().upper()
         if dr == "BOTH":
-            cb.CHRONO_DAY_PREFILTER_SIDS[(sym_u, "LONG")].add(sid)
-            cb.CHRONO_DAY_PREFILTER_SIDS[(sym_u, "SHORT")].add(sid)
+            _v76_logic.CHRONO_DAY_PREFILTER_SIDS[(sym_u, "LONG")].add(sid)
+            _v76_logic.CHRONO_DAY_PREFILTER_SIDS[(sym_u, "SHORT")].add(sid)
         elif dr in ("LONG", "SHORT"):
-            cb.CHRONO_DAY_PREFILTER_SIDS[(sym_u, dr)].add(sid)
-        cb.CHRONO_SYMDIR_TFS[(sym_u, dr if dr in ("LONG", "SHORT") else "LONG")].add(tf_key)
-        if sym_u in cb.JPY_STORM_PAIRS:
-            cb.CHRONO_JPY_PAIRS_SIGNALLED.add(sym_u)
+            _v76_logic.CHRONO_DAY_PREFILTER_SIDS[(sym_u, dr)].add(sid)
+        _v76_logic.CHRONO_SYMDIR_TFS[(sym_u, dr if dr in ("LONG", "SHORT") else "LONG")].add(tf_key)
+        if sym_u in _v76_logic.JPY_STORM_PAIRS:
+            _v76_logic.CHRONO_JPY_PAIRS_SIGNALLED.add(sym_u)
 
 
 def build_trade_plan_v76(
@@ -693,11 +625,11 @@ def build_trade_plan_v76(
   Run the Layer-2 Python path from the backtest (steps 23 in pipeline map) without forward simulation.
   """
     tf_key = timeframe.strip().lower()
-    is_exotic = sym in cb.EXOTIC_REDUCE
+    is_exotic = sym in _v76_logic.EXOTIC_REDUCE
     if not layer2_locked:
         return ScanSkip(reason="No LOCKED Layer-2 candidate after filters")
 
-    picked = cb._layer2_tuple_for_deterministic_pick(sym, tf_key, zone_pct, layer2_locked)
+    picked = _v76_logic._layer2_tuple_for_deterministic_pick(sym, tf_key, zone_pct, layer2_locked)
     if picked is None:
         return ScanSkip(reason="No Layer 2 pick after deterministic ordering")
 
@@ -710,14 +642,7 @@ def build_trade_plan_v76(
     if tf_key == "4h" and str(picked[0]).strip().upper() == "M02_MACD_ZERO_CROSS":
         return ScanSkip(reason="M02 blocked on 4h timeframe")
 
-    # Build a one-row future frame so we can call backtest Layer-2 executor, then strip sim outcome.
-    try:
-        last_row = past.iloc[-1:].copy()
-        fut_stub = last_row.copy()
-    except Exception:  # noqa: BLE001
-        return ScanSkip(reason="Cannot build forward stub from OHLC")
-
-    res = cb._python_forced_layer2_trade(
+    res = _v76_logic.python_layer2_live_plan(
         sym=sym,
         timeframe=timeframe,
         analysis_date=analysis_date,
@@ -726,20 +651,17 @@ def build_trade_plan_v76(
         zone_pct=zone_pct,
         zone_label=zone_label,
         is_exotic=is_exotic,
-        future=fut_stub,
         layer2=[picked],
         rsi_live=float(ind.get("rsi", 50) or 50),
         chrono_risk_mult=chrono_risk_mult,
         chrono_tp_mult=chrono_tp_mult,
-        chrono_job=True,
-        calendar_risk=cb.cached_calendar_historical(sym, date.fromisoformat(analysis_date[:10])),
         regime_ctx=regime_ctx,
         chrono_balance=balance,
         chrono_day_pnl=day_pnl,
         period_mode=period_mode,
-        atr_ref=float(ind.get("atr", 0) or 0) or None,
         past=past,
         ind=ind,
+        log_fn=live_log,
     )
     if res is None:
         return ScanSkip(reason="Layer 2 produced no result")
@@ -761,7 +683,7 @@ def build_trade_plan_v76(
     mb = str(res.get("macro_bias", "") or "")
     ts = float(res.get("trend_strength", 0) or 0)
     rd = float(res.get("macro_rate_diff", 0) or 0)
-    trail_reg = cb._resolve_trailing_regime(mb, ts, rd, timeframe=timeframe)
+    trail_reg = _v76_logic.resolve_trailing_regime(mb, ts, rd, timeframe=timeframe, log_fn=live_log)
     tp1, tp2, tp3 = _regime_tp_levels(direction, entry, stop, trail_reg)
 
     risk_usd = float(res.get("max_risk_dollars", 0) or 0)
@@ -847,7 +769,7 @@ def evaluate_cell_v76(
     elif zone_pct <= 33:
         zone_label = "DISCOUNT"
 
-    qualifies, qualifying, _reason = cb._v7_python_prefilter_bundle(
+    qualifies, qualifying, _reason = _v76_logic._v7_python_prefilter_bundle(
         sym,
         tf_key,
         float(price),
@@ -877,7 +799,7 @@ def evaluate_cell_v76(
             fields={"ticker": sym.upper(), "timeframe": tf, "price": round(float(price), 5)},
         )
 
-    layer2 = [q for q in qualifying if str(q[0]).strip().upper() not in cb.LAYER1_STRATEGY_IDS]
+    layer2 = [q for q in qualifying if str(q[0]).strip().upper() not in _v76_logic.LAYER1_STRATEGY_IDS]
     layer2_locked = _locked_layer2_only(layer2, tf_key=tf_key)
     locked_ids = [str(r[0]).strip().upper() for r in layer2_locked]
     live_log(
@@ -991,7 +913,7 @@ def order_send_v76(
             "atr_live": float(plan.ai.get("entry_atr", 0) or plan.ai.get("atr", 0) or 0),
             "macro_rate_diff": plan.ai.get("macro_rate_diff"),
         }
-        meta.update(cb.merged_macro_result_fields(plan.ai))
+        meta.update(_macro_manager.merged_macro_result_fields(plan.ai))
         res = at.order_send_live(mt5, broker_sym, plan.direction, plan.stop_loss, plan.risk_usd, meta)
         lots = float(res.get("volume", 0) or 0)
         retcode = res.get("retcode") if isinstance(res, dict) else None
@@ -1096,7 +1018,7 @@ def manage_trailing_v76(mt5: Any) -> None:
 
 
 def run_full_scan_v76() -> None:
-    cb._v72_load_strategy_status(log_startup=True)
+    _v76_logic.v72_load_strategy_status(at.BASE_DIR, log_fn=live_log)
     st = load_v76_state()
     scan_d = datetime.now(timezone.utc).date()
     analysis_date = scan_d.isoformat()
@@ -1109,7 +1031,7 @@ def run_full_scan_v76() -> None:
         date=analysis_date,
         slot=slot,
         dry_run=DRY_RUN,
-        locked_count=len(cb.LOCKED_STRATEGY_IDS),
+        locked_count=len(_v76_logic.LOCKED_STRATEGY_IDS),
     )
 
     halted, halt_reason = _circuit_breaker_live(
@@ -1154,7 +1076,7 @@ def run_full_scan_v76() -> None:
     period_mode = _live_period_mode(st, balance, scan_d)
     st["last_period_mode"] = period_mode
     job_id = os.environ.get("APEX_JOB_ID", "live")
-    regime_ctx = cb.cached_regime(job_id, scan_d)
+    regime_ctx = _v76_logic.cached_regime(job_id, scan_d)
     live_log(
         "info",
         "[SCAN CYCLE] context",
@@ -1166,11 +1088,11 @@ def run_full_scan_v76() -> None:
         regime_wr10=regime_ctx.get("wr_10"),
     )
 
-    cb.CHRONO_DAY_PREFILTER_SIDS.clear()
-    cb.CHRONO_SYMDIR_TFS.clear()
-    cb.CHRONO_JPY_PAIRS_SIGNALLED.clear()
-    cb.CHRONO_JPY_STORM_SNAPSHOT.clear()
-    cb.CHRONO_JPY_RISK_DAY = 0.0
+    _v76_logic.CHRONO_DAY_PREFILTER_SIDS.clear()
+    _v76_logic.CHRONO_SYMDIR_TFS.clear()
+    _v76_logic.CHRONO_JPY_PAIRS_SIGNALLED.clear()
+    _v76_logic.CHRONO_JPY_STORM_SNAPSHOT.clear()
+    _v76_logic.CHRONO_JPY_RISK_DAY = 0.0
 
     scan_cells: list[tuple[str, str]] = []
     checked = 0
@@ -1188,7 +1110,7 @@ def run_full_scan_v76() -> None:
                 live_log("info", "[SCAN CHECK] skip", ticker=sym.upper(), timeframe=tf, reason="indicators_failed")
                 continue
             ind, price, zone_pct = built
-            qualifies, qualifying, pre_reason = cb._v7_python_prefilter_bundle(
+            qualifies, qualifying, pre_reason = _v76_logic._v7_python_prefilter_bundle(
                 sym,
                 tf_key,
                 float(price),
@@ -1354,7 +1276,7 @@ def main_loop_v76() -> None:
         magic=APEX_V76_MAGIC,
         dry_run=DRY_RUN,
         log_file=str(live_v76_log_path()),
-        locked_count=len(cb.LOCKED_STRATEGY_IDS),
+        locked_count=len(_v76_logic.LOCKED_STRATEGY_IDS),
     )
     publish_live_status(None, status="starting")
     if not DRY_RUN:
