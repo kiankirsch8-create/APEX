@@ -5,11 +5,14 @@ APEX v7.6 Live Trader — 1:1 mirror of ``continuous_backtester.py`` decision lo
 - Execution via MetaTrader 5 (optional DRY_RUN logs decisions without orders).
 - Does NOT modify the backtest engine or intelligence modules.
 
-Deploy: copy to VPS (e.g. ``C:\\Apex\\apex_trader_v76.py``). Set ``APEX_MT5_PASSWORD``.
+Deploy: place this file in ``C:\\Apex`` next to ``continuous_backtester.py``, ``macro_manager.py``,
+``apex_trader.py``, etc. Set ``APEX_MT5_PASSWORD``. Optional: ``APEX_HOME=C:\\Apex``.
 """
 
 from __future__ import annotations
 
+import importlib
+import importlib.util
 import json
 import os
 import sys
@@ -19,20 +22,217 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
-import pandas as pd
+
+def _bootstrap_apex_sys_path() -> Path:
+    """
+    Ensure ``C:\\Apex`` (or this script's directory) is on ``sys.path`` before any local imports.
+    Fixes ModuleNotFoundError when the process cwd is not the Apex install folder (common on VPS).
+    """
+    here = Path(__file__).resolve().parent
+    candidates: list[Path] = [here]
+    for env_key in ("APEX_HOME", "APEX_ROOT", "APEX_DATA_DIR"):
+        raw = (os.environ.get(env_key) or "").strip()
+        if raw:
+            candidates.append(Path(raw).expanduser().resolve())
+    if os.name == "nt":
+        candidates.append(Path(r"C:\Apex"))
+    seen: set[str] = set()
+    for root in candidates:
+        try:
+            root = root.resolve()
+        except OSError:
+            continue
+        key = str(root).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if root.is_dir():
+            root_s = str(root)
+            if root_s not in sys.path:
+                sys.path.insert(0, root_s)
+    if str(here) not in sys.path:
+        sys.path.insert(0, str(here))
+    return here
+
+
+def _load_module_from_file(name: str, path: Path) -> ModuleType:
+    """Load ``name`` from an explicit ``.py`` path (VPS layout)."""
+    path = path.resolve()
+    if not path.is_file():
+        raise ModuleNotFoundError(f"{name} not found at {path}")
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load {name} from {path}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _all_apex_roots() -> list[Path]:
+    """Every directory that may hold flat Apex ``*.py`` modules (VPS layout)."""
+    roots: list[Path] = []
+    here = Path(__file__).resolve().parent
+    for r in (here, Path.cwd()):
+        try:
+            roots.append(r.resolve())
+        except OSError:
+            pass
+    for env_key in ("APEX_HOME", "APEX_ROOT", "APEX_DATA_DIR"):
+        raw = (os.environ.get(env_key) or "").strip()
+        if raw:
+            try:
+                roots.append(Path(raw).expanduser().resolve())
+            except OSError:
+                pass
+    if os.name == "nt":
+        roots.append(Path(r"C:\Apex"))
+    out: list[Path] = []
+    seen: set[str] = set()
+    for r in roots:
+        key = str(r).lower()
+        if key not in seen and r.is_dir():
+            seen.add(key)
+            out.append(r)
+    return out
+
+
+def _find_module_py(name: str) -> Path | None:
+    for root in _all_apex_roots():
+        p = root / f"{name}.py"
+        if p.is_file():
+            return p
+    return None
+
+
+def _import_local_module(name: str, apex_root: Path | None = None) -> ModuleType:
+    """Import a flat module from the Apex install directory (``C:\\Apex``-style layout)."""
+    if name in sys.modules:
+        return sys.modules[name]
+    search_roots = _all_apex_roots()
+    if apex_root is not None:
+        ar = apex_root.resolve()
+        if ar not in search_roots:
+            search_roots = [ar, *search_roots]
+    last_err: ModuleNotFoundError | None = None
+    for root in search_roots:
+        root_s = str(root)
+        if root_s not in sys.path:
+            sys.path.insert(0, root_s)
+        try:
+            return importlib.import_module(name)
+        except ModuleNotFoundError as e:
+            last_err = e
+            py_path = root / f"{name}.py"
+            if py_path.is_file():
+                return _load_module_from_file(name, py_path)
+    hint = _find_module_py(name)
+    expect = hint or (apex_root or Path(__file__).resolve().parent) / f"{name}.py"
+    roots_list = ", ".join(str(r) for r in search_roots[:6])
+    raise ModuleNotFoundError(
+        f"No module named '{name}'. Expected file like {expect}. "
+        f"Searched: {roots_list}. "
+        f"Copy the full APEX repo (same as Railway) into C:\\Apex — "
+        f"continuous_backtester.py and macro_manager.py must be present."
+    ) from last_err
+
+
+# Modules ``continuous_backtester`` imports at load time (preload so VPS path issues surface early).
+_BACKTEST_DEPENDENCY_MODULES: tuple[str, ...] = (
+    "utils",
+    "strategies_v5_data",
+    "prefilter_v6",
+    "intelligence_fetch_cached",
+    "calendar_manager",
+    "trend_manager",
+    "regime_manager",
+    "macro_manager",
+)
+
+
+def _preload_backtest_dependencies() -> None:
+    for mod_name in _BACKTEST_DEPENDENCY_MODULES:
+        _import_local_module(mod_name)
+
+
+def _import_continuous_backtester_module() -> ModuleType:
+    _preload_backtest_dependencies()
+    for root in _all_apex_roots():
+        root_s = str(root)
+        if root_s not in sys.path:
+            sys.path.insert(0, root_s)
+        py_path = root / "continuous_backtester.py"
+        if py_path.is_file():
+            if "continuous_backtester" in sys.modules:
+                return sys.modules["continuous_backtester"]
+            try:
+                return importlib.import_module("continuous_backtester")
+            except ModuleNotFoundError:
+                return _load_module_from_file("continuous_backtester", py_path)
+    missing = [m for m in ("continuous_backtester", *_BACKTEST_DEPENDENCY_MODULES) if not _find_module_py(m)]
+    roots_hint = ", ".join(str(r) for r in _all_apex_roots())
+    raise ModuleNotFoundError(
+        "Cannot load backtest engine on VPS. Missing modules: "
+        + ", ".join(missing)
+        + f". Install dir(s) checked: {roots_hint}. "
+        "Download the latest main branch from GitHub into C:\\Apex "
+        "(must include continuous_backtester.py)."
+    )
+
+
+_APEX_ROOT = _bootstrap_apex_sys_path()
+
+# Default data dir on Windows VPS when not set (matches apex_trader / backtest JSON paths).
+if os.name == "nt" and not (os.environ.get("APEX_DATA_DIR") or "").strip():
+    os.environ.setdefault("APEX_DATA_DIR", str(_APEX_ROOT))
+
+# Third-party (same stack as apex_trader / continuous_backtester).
+try:
+    import pandas as pd  # noqa: F401
+except ImportError as e:  # noqa: BLE001
+    raise ImportError(
+        "pandas is required. Install: pip install pandas numpy yfinance pandas-ta anthropic"
+    ) from e
+
+try:
+    import numpy as np  # noqa: F401
+except ImportError as e:  # noqa: BLE001
+    raise ImportError("numpy is required (pip install numpy)") from e
+
+try:
+    import yfinance as yf  # noqa: F401
+except ImportError as e:  # noqa: BLE001
+    raise ImportError("yfinance is required (pip install yfinance)") from e
+
+try:
+    import pandas_ta  # noqa: F401
+except ImportError as e:  # noqa: BLE001
+    raise ImportError(
+        "pandas-ta is required by continuous_backtester (pip install pandas-ta)"
+    ) from e
+
+try:
+    from anthropic import Anthropic  # noqa: F401
+except ImportError as e:  # noqa: BLE001
+    raise ImportError(
+        "anthropic is required by continuous_backtester (pip install anthropic)"
+    ) from e
 
 # Live mode for macro_manager (must be set before importing continuous_backtester).
-from macro_manager import set_backtest_mode
+_macro_manager = _import_local_module("macro_manager", _APEX_ROOT)
+set_backtest_mode = _macro_manager.set_backtest_mode
 
 set_backtest_mode(False)
 
-import continuous_backtester as cb  # noqa: E402  — backtest sets mode True on import; reset below
+cb = _import_continuous_backtester_module()
 
 set_backtest_mode(False)
 
-import apex_trader as at  # noqa: E402 — MT5 helpers only; trading logic is v76 + cb
+# MT5 helpers only — do not use legacy live signal logic from apex_trader.
+at = _import_local_module("apex_trader", _APEX_ROOT)
 
 # ---------------------------------------------------------------------------
 # v7.6 live configuration
