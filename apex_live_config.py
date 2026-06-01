@@ -23,6 +23,11 @@ CHRONO_ACTIVE_PATH: str = "/api/chrono/active"
 CHRONO_START_PATH: str = "/api/chrono/start"
 CHRONO_STOP_PATH_TEMPLATE: str = "/api/chrono/{job_id}/stop"
 
+# v7.6 MT5 live trader (VPS writes logs; API reads via ``APEX_LIVE_V76_DIR``)
+LIVE_V76_LOGS_PATH: str = "/api/live/logs"
+LIVE_V76_STATUS_PATH: str = "/api/live/status"
+LIVE_V76_POLL_INTERVAL_SEC: float = 3.0
+
 # --- Display -----------------------------------------------------------------
 
 APP_LIVE_LABEL: str = "APEX live"

@@ -1122,6 +1122,81 @@ async def get_chrono_live() -> dict[str, Any]:
     return continuous_backtester.CHRONO_LIVE_STATUS.copy()
 
 
+def _live_v76_data_dir() -> Any:
+    from pathlib import Path
+
+    raw = os.environ.get("APEX_LIVE_V76_DIR") or os.environ.get("APEX_DATA_DIR") or str(DATA_DIR)
+    return Path(raw).resolve()
+
+
+def _read_live_v76_logs(max_lines: int) -> dict[str, Any]:
+    n = max(1, min(int(max_lines), 10000))
+    try:
+        import apex_trader_v76 as v76
+
+        return v76.get_live_logs_api(n)
+    except Exception:  # noqa: BLE001
+        path = _live_v76_data_dir() / "apex_v76_live.log"
+        if not path.is_file():
+            return {"lines": [], "count": 0, "log_path": str(path), "source": "file_missing"}
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                lines = [ln.rstrip("\n") for ln in f.readlines()[-n:]]
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=str(e)) from e
+        return {
+            "lines": lines,
+            "count": len(lines),
+            "log_path": str(path),
+            "source": "file",
+            "updated_at": utcnow_iso(),
+        }
+
+
+def _read_live_v76_status() -> dict[str, Any]:
+    try:
+        import apex_trader_v76 as v76
+
+        return v76.get_live_status_api()
+    except Exception:  # noqa: BLE001
+        path = _live_v76_data_dir() / "apex_v76_live_status.json"
+        if not path.is_file():
+            return {
+                "status": "unknown",
+                "detail": "No live status file yet. Run apex_trader_v76 on VPS or set APEX_LIVE_V76_DIR.",
+                "status_path": str(path),
+            }
+        data = load_json(path, default=None)
+        if not isinstance(data, dict):
+            return {"status": "error", "detail": "Invalid status file"}
+        data["source"] = "file"
+        return data
+
+
+@app.get("/api/live/logs")
+async def get_live_v76_logs(
+    lines: int = Query(default=300, ge=1, le=10000, description="Number of recent log lines"),
+) -> dict[str, Any]:
+    """Tail ``apex_v76_live.log`` from the VPS (poll ~3s from phone, same as chrono live)."""
+    return _read_live_v76_logs(lines)
+
+
+@app.get("/api/live/logs/text", response_class=PlainTextResponse)
+async def get_live_v76_logs_text(
+    lines: int = Query(default=200, ge=1, le=5000),
+) -> str:
+    """Plain-text log tail for mobile browsers."""
+    payload = _read_live_v76_logs(lines)
+    body = "\n".join(payload.get("lines") or [])
+    return body + ("\n" if body else "(no log lines yet)\n")
+
+
+@app.get("/api/live/status")
+async def get_live_v76_status() -> dict[str, Any]:
+    """Balance, equity, open positions, period mode, circuit halt — mirrors chrono live JSON style."""
+    return _read_live_v76_status()
+
+
 @app.get("/api/cache/stats")
 async def get_intelligence_cache_stats() -> dict[str, Any]:
     """SQLite intelligence cache: entry count, size, and same-process hit counters."""
