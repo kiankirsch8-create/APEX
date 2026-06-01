@@ -345,8 +345,6 @@ STRATEGY_TRADE_COUNT: dict[str, int] = {}
 ZERO_TRADE_STRATEGIES: set[str] = set()
 COMBO_TRADE_STATS: dict[tuple[str, str], dict[str, int]] = {}
 
-LogFn = Callable[..., None]
-
 
 def _v72_locked_ids_default() -> frozenset[str]:
     return frozenset(
