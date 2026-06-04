@@ -12,13 +12,14 @@ import threading
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import yfinance as yf
 
 from fastapi import BackgroundTasks, Body, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field, model_validator
 
 import analyzer
@@ -26,6 +27,7 @@ import backtest_analyzer
 import chart_analyzer_v2
 import chart_vision
 import continuous_backtester
+import dashboard_helpers
 import funded_simulator
 import intelligence_cache
 import prefetch_intelligence
@@ -1197,6 +1199,33 @@ async def get_live_v76_status() -> dict[str, Any]:
     return _read_live_v76_status()
 
 
+# ---------------------------------------------------------------------------
+# APEX master dashboard (read-only)
+# ---------------------------------------------------------------------------
+
+_DASHBOARD_HTML = Path(__file__).resolve().parent / "static" / "apex_dashboard.html"
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def apex_master_dashboard() -> HTMLResponse:
+    """Mobile-first command center for live + backtest status."""
+    if not _DASHBOARD_HTML.is_file():
+        raise HTTPException(status_code=404, detail="Dashboard HTML not deployed")
+    return HTMLResponse(_DASHBOARD_HTML.read_text(encoding="utf-8"))
+
+
+@app.get("/api/dashboard/config")
+async def get_dashboard_config() -> dict[str, Any]:
+    """Client config: API bases, live baseline, benchmark curve."""
+    return dashboard_helpers.dashboard_config()
+
+
+@app.get("/api/dashboard/summary", response_class=PlainTextResponse)
+async def get_dashboard_summary() -> str:
+    """Plain-text status for iPhone Siri shortcut."""
+    return dashboard_helpers.build_dashboard_summary_text()
+
+
 @app.get("/api/cache/stats")
 async def get_intelligence_cache_stats() -> dict[str, Any]:
     """SQLite intelligence cache: entry count, size, and same-process hit counters."""
@@ -1775,6 +1804,13 @@ async def root() -> dict:
             "GET /api/chart/{ticker}",
             "GET /api/portfolio-advice",
             "POST /api/portfolio-advice/generate",
+            "GET /dashboard",
+            "GET /api/dashboard/config",
+            "GET /api/dashboard/summary",
+            "GET /api/live/status",
+            "GET /api/live/logs",
+            "GET /api/live/logs/text",
+            "GET /api/chrono/active",
         ],
     }
 

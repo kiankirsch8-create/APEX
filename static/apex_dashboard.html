@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0a0a0f" />
+  <title>APEX — Master Dashboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            apex: {
+              bg: '#0a0a0f',
+              card: '#12121a',
+              border: '#1e1e2e',
+              cyan: '#00d4ff',
+              green: '#00e676',
+              red: '#ff1744',
+              amber: '#ffab00',
+            },
+          },
+        },
+      },
+    };
+  </script>
+  <style>
+    html, body { background: #0a0a0f; min-height: 100%; }
+    .spin { animation: spin 1s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .fade-in { animation: fadeIn 0.25s ease-out; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+    .tab-active { color: #00d4ff; border-top: 2px solid #00d4ff; }
+    .expandable { transition: max-height 0.3s ease, opacity 0.25s ease; overflow: hidden; }
+    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar-thumb { background: #1e1e2e; border-radius: 4px; }
+  </style>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/prop-types@15/prop-types.min.js"></script>
+  <script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body class="text-gray-100 antialiased pb-24">
+  <div id="root"></div>
+  <script type="text/babel" data-presets="react">
+    const { useState, useEffect, useCallback, useMemo, useRef } = React;
+    const {
+      LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceDot, Legend,
+    } = Recharts;
+
+    const LIVE_START_CAPITAL = 96908.79;
+    const LIVE_CURRENCY = 'EUR';
+    const POLL_MS = 30000;
+    const BENCHMARK = [
+      ['2020-01-01', 10000], ['2020-06-01', 26930], ['2020-12-01', 29027],
+      ['2021-01-01', 30111], ['2021-06-01', 36623], ['2021-12-01', 35969],
+      ['2022-01-01', 36441], ['2022-03-01', 56867], ['2022-06-01', 110659],
+    ];
+    const PROGRESS_START = new Date('2020-01-01');
+    const PROGRESS_END = new Date('2022-06-30');
+
+    function fmtMoney(v, cur = 'USD') {
+      if (v == null || Number.isNaN(Number(v))) return '—';
+      const sym = cur === 'EUR' ? '€' : '$';
+      return sym + Number(v).toLocaleString(undefined, { maximumFractionDigits: 0 });
+    }
+
+    function fmtPct(v) {
+      if (v == null || Number.isNaN(Number(v))) return '—';
+      const n = Number(v);
+      return (n >= 0 ? '+' : '') + n.toFixed(1) + '%';
+    }
+
+    function benchmarkAt(dateStr) {
+      if (!dateStr) return null;
+      const d = new Date(dateStr.slice(0, 10));
+      const pts = BENCHMARK.map(([ds, c]) => [new Date(ds), c]);
+      if (d <= pts[0][0]) return pts[0][1];
+      if (d >= pts[pts.length - 1][0]) return pts[pts.length - 1][1];
+      for (let i = 0; i < pts.length - 1; i++) {
+        const [d0, c0] = pts[i];
+        const [d1, c1] = pts[i + 1];
+        if (d >= d0 && d <= d1) {
+          const span = d1 - d0 || 1;
+          const frac = (d - d0) / span;
+          return c0 + (c1 - c0) * frac;
+        }
+      }
+      return null;
+    }
+
+    function progressPct(dateStr) {
+      if (!dateStr) return 0;
+      const d = new Date(dateStr.slice(0, 10));
+      const span = PROGRESS_END - PROGRESS_START || 1;
+      return Math.max(0, Math.min(100, ((d - PROGRESS_START) / span) * 100));
+    }
+
+    function logColor(line) {
+      const s = String(line);
+      if (/\[ERROR\]|\[CRITICAL\]/i.test(s)) return 'text-apex-red';
+      if (/\[WARNING\]/i.test(s)) return 'text-apex-amber';
+      if (/\[TRADE\]/i.test(s)) return 'text-apex-cyan';
+      if (/\[SKIP\]/i.test(s)) return 'text-gray-500';
+      if (/\[SIGNAL\]/i.test(s)) return 'text-blue-400';
+      if (/\[TRAIL\]/i.test(s)) return 'text-purple-400';
+      if (/\[SCAN CYCLE\]/i.test(s)) return 'text-white';
+      return 'text-gray-400';
+    }
+
+    function Pill({ label, value, tone = 'neutral' }) {
+      const tones = {
+        good: 'bg-emerald-500/15 text-apex-green border-emerald-500/30',
+        bad: 'bg-red-500/15 text-apex-red border-red-500/30',
+        warn: 'bg-amber-500/15 text-apex-amber border-amber-500/30',
+        neutral: 'bg-gray-500/10 text-gray-300 border-gray-600/40',
+        cyan: 'bg-cyan-500/10 text-apex-cyan border-cyan-500/30',
+      };
+      return (
+        <div className={`rounded-full border px-3 py-2 text-center min-h-[44px] flex flex-col justify-center ${tones[tone] || tones.neutral}`}>
+          <div className="text-[10px] uppercase tracking-wider opacity-70">{label}</div>
+          <div className="text-sm font-semibold">{value}</div>
+        </div>
+      );
+    }
+
+    function Stat({ label, value, sub, positive }) {
+      const color = positive == null ? 'text-white' : positive ? 'text-apex-green' : 'text-apex-red';
+      return (
+        <div className="flex-1 min-w-[100px]">
+          <div className="text-xs text-gray-500 uppercase tracking-wide">{label}</div>
+          <div className={`text-xl font-bold ${color}`}>{value}</div>
+          {sub ? <div className="text-xs text-gray-500 mt-0.5">{sub}</div> : null}
+        </div>
+      );
+    }
+
+    async function fetchJson(url) {
+      const r = await fetch(url, { cache: 'no-store' });
+      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+      return r.json();
+    }
+
+    async function fetchText(url) {
+      const r = await fetch(url, { cache: 'no-store' });
+      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+      return r.text();
+    }
+
+    function App() {
+      const [tab, setTab] = useState('overview');
+      const [chrono, setChrono] = useState(null);
+      const [live, setLive] = useState(null);
+      const [logs, setLogs] = useState('');
+      const [strategies, setStrategies] = useState([]);
+      const [chronoErr, setChronoErr] = useState(false);
+      const [liveErr, setLiveErr] = useState(false);
+      const [lastUpdated, setLastUpdated] = useState(null);
+      const [countdown, setCountdown] = useState(30);
+      const [posOpen, setPosOpen] = useState(false);
+      const [logsOpen, setLogsOpen] = useState(false);
+      const [spinning, setSpinning] = useState(false);
+      const [apiBase, setApiBase] = useState('');
+      const [liveBase, setLiveBase] = useState('');
+      const logRef = useRef(null);
+
+      useEffect(() => {
+        fetchJson('/api/dashboard/config').then((c) => {
+          setApiBase(c.api_base || '');
+          setLiveBase(c.live_base || c.api_base || '');
+        }).catch(() => {});
+      }, []);
+
+      const base = apiBase || '';
+      const liveUrl = (path) => (liveBase || base || '') + path;
+
+      const refresh = useCallback(async () => {
+        setSpinning(true);
+        let cOk = false, lOk = false;
+        try {
+          const c = await fetchJson(base + '/api/chrono/active');
+          setChrono(c);
+          setChronoErr(false);
+          cOk = true;
+          const jid = c.job_id;
+          if (jid) {
+            try {
+              const tr = await fetchJson(base + `/api/chrono/${jid}/trades?limit=3000`);
+              const agg = {};
+              (tr.results || []).forEach((t) => {
+                if (t.skipped || !['WIN', 'LOSS'].includes(String(t.outcome || '').toUpperCase())) return;
+                const sid = String(t.strategy_id || 'UNKNOWN').toUpperCase();
+                if (!agg[sid]) agg[sid] = { id: sid, trades: 0, wins: 0, pnl: 0 };
+                agg[sid].trades += 1;
+                if (String(t.outcome).toUpperCase() === 'WIN') agg[sid].wins += 1;
+                agg[sid].pnl += Number(t.pnl_dollars || 0);
+              });
+              setStrategies(Object.values(agg).sort((a, b) => b.pnl - a.pnl).slice(0, 5));
+            } catch { setStrategies([]); }
+          }
+        } catch {
+          setChronoErr(true);
+        }
+        try {
+          const l = await fetchJson(liveUrl('/api/live/status'));
+          setLive(l);
+          setLiveErr(false);
+          lOk = true;
+        } catch {
+          setLiveErr(true);
+        }
+        try {
+          const txt = await fetchText(liveUrl('/api/live/logs/text?lines=50'));
+          setLogs(txt);
+        } catch { /* keep last logs */ }
+        setLastUpdated(new Date());
+        setCountdown(30);
+        setSpinning(false);
+      }, [base, liveBase]);
+
+      useEffect(() => {
+        refresh();
+        const id = setInterval(refresh, POLL_MS);
+        return () => clearInterval(id);
+      }, [refresh]);
+
+      useEffect(() => {
+        const t = setInterval(() => setCountdown((c) => (c <= 1 ? 30 : c - 1)), 1000);
+        return () => clearInterval(t);
+      }, []);
+
+      useEffect(() => {
+        if (logsOpen && logRef.current) {
+          logRef.current.scrollTop = logRef.current.scrollHeight;
+        }
+      }, [logs, logsOpen]);
+
+      const balance = live?.balance != null ? Number(live.balance) : null;
+      const equity = live?.equity != null ? Number(live.equity) : balance;
+      const dailyPnl = live?.daily_pnl != null ? Number(live.daily_pnl) : null;
+      const baselineDelta = equity != null ? equity - LIVE_START_CAPITAL : null;
+      const positions = live?.open_positions || [];
+      const floatPnl = positions.reduce((s, p) => s + Number(p.profit || p.pnl || 0), 0);
+      const periodMode = (live?.period_mode || 'UNKNOWN').toUpperCase();
+      const haltRaw = live?.circuit_halt_until || live?.circuit_halt;
+      const circuitActive = haltRaw && new Date(haltRaw) > new Date();
+      const trailModes = positions.map((p) => p.trail_regime).filter(Boolean);
+      const trailMode = trailModes.length
+        ? (trailModes.filter((x) => x === 'TRENDING').length >= trailModes.length / 2 ? 'TRENDING' : 'CHOPPY')
+        : (live?.trail_regime || 'CHOPPY');
+
+      const cap = chrono?.capital != null ? Number(chrono.capital) : null;
+      const curDate = chrono?.current_date;
+      const bench = benchmarkAt(curDate);
+      const benchDelta = cap != null && bench != null ? ((cap - bench) / bench) * 100 : null;
+      const dailyRows = chrono?.daily_pnl || [];
+      let totalTrades = 0, totalWins = 0;
+      dailyRows.forEach((r) => {
+        totalTrades += Number(r.trades || 0);
+        totalWins += Number(r.wins || 0);
+      });
+      const winRate = totalTrades > 0 ? (totalWins / totalTrades) * 100 : null;
+
+      const chartData = useMemo(() => {
+        const rows = dailyRows.slice(-30);
+        return rows.map((r) => {
+          const d = String(r.date || '').slice(0, 10);
+          return {
+            date: d.slice(5),
+            v76: Number(r.capital || 0),
+            bench: benchmarkAt(d),
+          };
+        });
+      }, [dailyRows]);
+
+      const logLines = (logs || '').split('\n').filter(Boolean);
+      const displayLogs = logsOpen ? logLines : logLines.slice(-10);
+
+      const periodTone = periodMode === 'GOOD' ? 'good' : periodMode === 'BAD' ? 'bad' : 'warn';
+
+      const LiveSection = () => (
+        <section className="bg-apex-card border border-apex-border rounded-2xl p-4 mb-4 fade-in">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-apex-cyan font-bold text-lg">Live Trading</h2>
+            {liveErr ? <span className="text-xs text-apex-red">Live offline</span> : null}
+          </div>
+          <div className="flex flex-wrap gap-4 mb-4">
+            <Stat label="Balance" value={fmtMoney(balance, LIVE_CURRENCY)}
+              sub={baselineDelta != null ? `${fmtMoney(baselineDelta, LIVE_CURRENCY)} vs baseline` : null}
+              positive={baselineDelta == null ? null : baselineDelta >= 0} />
+            <Stat label="Equity" value={fmtMoney(equity, LIVE_CURRENCY)} positive={equity != null && equity >= LIVE_START_CAPITAL} />
+            <Stat label="Daily P&L" value={fmtMoney(dailyPnl, LIVE_CURRENCY)} positive={dailyPnl == null ? null : dailyPnl >= 0} />
+          </div>
+          <div className="grid grid-cols-3 gap-2 mb-4">
+            <Pill label="Period" value={periodMode} tone={periodTone} />
+            <Pill label="Circuit" value={circuitActive ? 'ACTIVE' : 'INACTIVE'} tone={circuitActive ? 'bad' : 'good'} />
+            <Pill label="Trail" value={trailMode} tone={trailMode === 'TRENDING' ? 'cyan' : 'neutral'} />
+          </div>
+          <button type="button" onClick={() => setPosOpen(!posOpen)}
+            className="w-full min-h-[44px] flex items-center justify-between text-left bg-black/30 rounded-xl px-4 py-3 border border-apex-border">
+            <span>{positions.length} open position{positions.length !== 1 ? 's' : ''}</span>
+            <span className={floatPnl >= 0 ? 'text-apex-green' : 'text-apex-red'}>
+              Float {fmtMoney(floatPnl, LIVE_CURRENCY)}
+            </span>
+          </button>
+          <div className={`expandable ${posOpen ? 'max-h-[800px] opacity-100 mt-3' : 'max-h-0 opacity-0'}`}>
+            {positions.map((p, i) => (
+              <div key={i} className="border border-apex-border rounded-lg p-3 mb-2 text-sm">
+                <div className="flex justify-between font-semibold">
+                  <span>{p.symbol || p.ticker} · {p.direction}</span>
+                  <span className={(p.profit || p.pnl || 0) >= 0 ? 'text-apex-green' : 'text-apex-red'}>
+                    {fmtMoney(p.profit ?? p.pnl, LIVE_CURRENCY)}
+                  </span>
+                </div>
+                <div className="text-gray-500 text-xs mt-1 grid grid-cols-2 gap-1">
+                  <span>Lots {p.volume ?? p.lot_size ?? '—'}</span>
+                  <span>Entry {p.entry ?? p.entry_price ?? '—'}</span>
+                  <span>Now {p.current_price ?? '—'}</span>
+                  <span>TP {p.tp1}/{p.tp2}/{p.tp3}</span>
+                </div>
+              </div>
+            ))}
+            {!positions.length && <p className="text-gray-500 text-sm text-center py-2">No open positions</p>}
+          </div>
+        </section>
+      );
+
+      const BacktestSection = () => (
+        <section className="bg-apex-card border border-apex-border rounded-2xl p-4 mb-4 fade-in">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-apex-cyan font-bold text-lg">Backtest v7.6</h2>
+            {chronoErr ? <span className="text-xs text-apex-red">Backtest offline</span> : null}
+          </div>
+          <div className="flex flex-wrap gap-4 mb-3">
+            <Stat label="Sim date" value={curDate ? curDate.slice(0, 10) : '—'} />
+            <Stat label="Capital" value={fmtMoney(cap, 'USD')} positive={cap != null && cap >= 10000} />
+            <Stat label="Days" value={chrono?.days_processed ?? '—'} />
+          </div>
+          <div className="mb-3">
+            <div className="flex justify-between text-xs text-gray-500 mb-1">
+              <span>Jan 2020</span>
+              <span>{progressPct(curDate).toFixed(0)}%</span>
+              <span>Jun 2022</span>
+            </div>
+            <div className="h-2 bg-black/40 rounded-full overflow-hidden">
+              <div className="h-full bg-apex-cyan rounded-full transition-all duration-500"
+                style={{ width: `${progressPct(curDate)}%` }} />
+            </div>
+          </div>
+          <div className="flex flex-wrap gap-4 text-sm">
+            <div>Trades <span className="font-bold">{totalTrades || '—'}</span></div>
+            <div>Win rate <span className="font-bold">{winRate != null ? winRate.toFixed(1) + '%' : '—'}</span></div>
+            {benchDelta != null ? (
+              <div className={benchDelta >= 0 ? 'text-apex-green' : 'text-apex-red'}>
+                v7.6 is {fmtPct(benchDelta)} vs benchmark ({fmtMoney(bench, 'USD')})
+              </div>
+            ) : null}
+          </div>
+        </section>
+      );
+
+      const ChartSection = () => (
+        <section className="bg-apex-card border border-apex-border rounded-2xl p-4 mb-4 fade-in">
+          <h2 className="text-apex-cyan font-bold text-lg mb-3">Capital Curve</h2>
+          {chartData.length ? (
+            <div className="h-52 w-full">
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={chartData} margin={{ top: 5, right: 5, left: 0, bottom: 0 }}>
+                  <XAxis dataKey="date" tick={{ fill: '#666', fontSize: 10 }} />
+                  <YAxis tick={{ fill: '#666', fontSize: 10 }} width={48}
+                    tickFormatter={(v) => '$' + (v >= 1000 ? Math.round(v / 1000) + 'k' : v)} />
+                  <Tooltip contentStyle={{ background: '#12121a', border: '1px solid #1e1e2e' }}
+                    formatter={(v) => fmtMoney(v, 'USD')} />
+                  <Legend wrapperStyle={{ fontSize: 11 }} />
+                  <Line type="monotone" dataKey="v76" name="v7.6" stroke="#00d4ff" strokeWidth={2} dot={false} />
+                  <Line type="monotone" dataKey="bench" name="Benchmark" stroke="#666" strokeDasharray="4 4" dot={false} />
+                  {chartData.length ? (
+                    <ReferenceDot x={chartData[chartData.length - 1].date} y={chartData[chartData.length - 1].v76}
+                      r={5} fill="#00e676" stroke="#00e676" />
+                  ) : null}
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          ) : (
+            <p className="text-gray-500 text-sm py-8 text-center">No backtest curve data yet</p>
+          )}
+        </section>
+      );
+
+      const LogSection = () => (
+        <section className="bg-apex-card border border-apex-border rounded-2xl p-4 mb-4 fade-in">
+          <button type="button" onClick={() => setLogsOpen(!logsOpen)}
+            className="w-full min-h-[44px] flex items-center justify-between text-left">
+            <h2 className="text-apex-cyan font-bold text-lg">Recent Log</h2>
+            <span className="text-xs text-gray-500">{logsOpen ? 'Show 10' : 'Show 50'}</span>
+          </button>
+          <div ref={logRef}
+            className={`mt-2 font-mono text-xs leading-relaxed overflow-y-auto ${logsOpen ? 'max-h-80' : 'max-h-40'}`}>
+            {displayLogs.map((ln, i) => (
+              <div key={i} className={`py-0.5 ${logColor(ln)}`}>{ln}</div>
+            ))}
+            {!displayLogs.length && <p className="text-gray-500">No log lines</p>}
+          </div>
+        </section>
+      );
+
+      const StrategySection = () => (
+        <section className="bg-apex-card border border-apex-border rounded-2xl p-4 mb-4 fade-in">
+          <h2 className="text-apex-cyan font-bold text-lg mb-3">Top Strategies</h2>
+          <div className="space-y-2">
+            {strategies.map((s) => (
+              <div key={s.id} className="flex justify-between items-center border border-apex-border rounded-lg px-3 py-2 text-sm min-h-[44px]">
+                <span className="truncate pr-2">{s.id.replace(/_/g, ' ')}</span>
+                <span className="text-gray-500 shrink-0">{s.trades} · {(s.wins / s.trades * 100).toFixed(0)}%</span>
+                <span className={`shrink-0 font-semibold ${s.pnl >= 0 ? 'text-apex-green' : 'text-apex-red'}`}>
+                  {fmtMoney(s.pnl, 'USD')}
+                </span>
+              </div>
+            ))}
+            {!strategies.length && <p className="text-gray-500 text-sm">No strategy stats yet</p>}
+          </div>
+        </section>
+      );
+
+      const PositionsTab = () => (
+        <div>
+          <LiveSection />
+          <div className="expandable max-h-none opacity-100">
+            {positions.map((p, i) => (
+              <div key={i} className="bg-apex-card border border-apex-border rounded-xl p-4 mb-3">
+                <div className="text-lg font-bold text-apex-cyan">{p.symbol || p.ticker}</div>
+                <div className="grid grid-cols-2 gap-2 mt-2 text-sm">
+                  <div>Direction <b>{p.direction}</b></div>
+                  <div>Volume <b>{p.volume}</b></div>
+                  <div>Entry <b>{p.entry ?? p.entry_price}</b></div>
+                  <div>Current <b>{p.current_price}</b></div>
+                  <div>SL <b>{p.sl}</b></div>
+                  <div className={(p.profit || 0) >= 0 ? 'text-apex-green' : 'text-apex-red'}>
+                    P&L <b>{fmtMoney(p.profit ?? p.pnl, LIVE_CURRENCY)}</b>
+                  </div>
+                  <div>TP1 <b>{p.tp1}</b></div>
+                  <div>Trail <b>{p.trail_regime || '—'}</b></div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+
+      return (
+        <div className="max-w-lg mx-auto px-3 pt-3 md:max-w-3xl">
+          <header className="flex items-center justify-between mb-4 min-h-[44px]">
+            <div className="text-2xl font-black text-apex-cyan tracking-tight">APEX</div>
+            <div className="text-right text-xs text-gray-500">
+              <div className="flex items-center gap-2 justify-end">
+                {spinning ? <span className="spin inline-block w-3 h-3 border-2 border-apex-cyan border-t-transparent rounded-full" /> : null}
+                <span>{lastUpdated ? lastUpdated.toLocaleTimeString() : '—'}</span>
+              </div>
+              <div>Refresh in {countdown}s</div>
+            </div>
+          </header>
+
+          {(chronoErr && liveErr) ? (
+            <div className="bg-red-500/20 border border-red-500/40 text-apex-red rounded-xl p-4 mb-4 text-center font-bold">
+              APEX OFFLINE — showing last known data
+            </div>
+          ) : null}
+
+          {tab === 'overview' && (
+            <>
+              <LiveSection />
+              <BacktestSection />
+              <ChartSection />
+              <LogSection />
+              <StrategySection />
+            </>
+          )}
+          {tab === 'positions' && <PositionsTab />}
+          {tab === 'backtest' && (<><BacktestSection /><ChartSection /><StrategySection /></>)}
+          {tab === 'logs' && <LogSection />}
+
+          <nav className="fixed bottom-0 left-0 right-0 bg-apex-card border-t border-apex-border flex z-50 safe-area-pb">
+            {[
+              ['overview', 'Overview'],
+              ['positions', 'Positions'],
+              ['backtest', 'Backtest'],
+              ['logs', 'Logs'],
+            ].map(([k, label]) => (
+              <button key={k} type="button" onClick={() => setTab(k)}
+                className={`flex-1 min-h-[52px] text-sm ${tab === k ? 'tab-active' : 'text-gray-500'}`}>
+                {label}
+              </button>
+            ))}
+          </nav>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
