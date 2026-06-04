@@ -20,10 +20,15 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 from types import ModuleType
 from typing import Any
+
+try:
+    import requests
+except ImportError as e:  # noqa: BLE001
+    raise ImportError("requests is required (pip install requests)") from e
 
 
 def _bootstrap_apex_sys_path() -> Path:
@@ -403,6 +408,414 @@ def _sizing_fields_from_ai(ai: dict[str, Any]) -> dict[str, Any]:
         "v74_perfect_storm": ai.get("_v74_perfect_storm_m03_jpy"),
     }
 
+
+# ---------------------------------------------------------------------------
+# Benzinga live intelligence (calendar + news) — mirrors calendar_manager.py
+# ---------------------------------------------------------------------------
+
+BENZINGA_API_KEY = (os.environ.get("BENZINGA_API_KEY") or "").strip()
+_BZ_CAL_URL = "https://api.benzinga.com/api/v2.1/calendar/economics"
+_BZ_NEWS_URL = "https://api.benzinga.com/api/v2/news"
+_BZ_CAL_CACHE: list[dict[str, Any]] = []
+_BZ_CAL_FETCHED_AT: datetime | None = None
+_BZ_CAL_TTL = timedelta(hours=1)
+_BZ_NEWS_CACHE: dict[str, tuple[list[dict[str, Any]], datetime]] = {}
+_BZ_NEWS_TTL = timedelta(minutes=30)
+_BZ_SENTIMENT_STRONG = 0.40
+
+_BZ_CCY_COUNTRIES: dict[str, frozenset[str]] = {
+    "USD": frozenset({"USA"}),
+    "EUR": frozenset({"EMU", "EU", "DEU", "FRA", "ITA", "ESP", "NLD", "IRL"}),
+    "GBP": frozenset({"GBR"}),
+    "JPY": frozenset({"JPN"}),
+    "AUD": frozenset({"AUS"}),
+    "CAD": frozenset({"CAN"}),
+    "CHF": frozenset({"CHE"}),
+    "NZD": frozenset({"NZL"}),
+}
+
+_BZ_POS_KW = (
+    "rise", "gain", "surge", "rally", "strong", "bullish", "hawkish", "hike",
+    "rate increase", "beat", "growth", "recovery", "upside", "advance",
+)
+_BZ_NEG_KW = (
+    "fall", "drop", "decline", "weak", "bearish", "dovish", "cut", "miss",
+    "recession", "downside", "slowdown", "slump", "plunge", "selloff",
+)
+
+
+def _bz_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _bz_pair_currencies(ticker: str) -> list[str]:
+    t = (ticker or "").strip().upper()
+    if len(t) == 6 and t.isalpha():
+        return [t[:3], t[3:]]
+    return ["USD"]
+
+
+def _log_benzinga(kind: str, ticker: str, data: dict[str, Any], **extra: Any) -> None:
+    headlines = data.get("headlines") or []
+    hl = "; ".join(str(h) for h in headlines[:3]) if headlines else ""
+    live_log(
+        "info",
+        f"[BENZINGA] {kind}",
+        ticker=(ticker or "").strip().upper(),
+        action=data.get("action"),
+        reason=data.get("reason"),
+        size_multiplier=data.get("size_multiplier"),
+        sentiment=data.get("sentiment"),
+        event=data.get("event"),
+        headlines=hl or None,
+        **extra,
+    )
+
+
+def _benzinga_parse_event_dt(event: dict[str, Any]) -> datetime:
+    d_str = str(event.get("date") or "").strip()[:10]
+    t_str = str(event.get("time") or "").strip()
+    try:
+        day = date.fromisoformat(d_str)
+    except ValueError:
+        return datetime.now(timezone.utc)
+    tl = t_str.lower()
+    if not t_str or "tentative" in tl or "tbd" in tl:
+        return datetime.combine(day, dt_time(12, 0), tzinfo=timezone.utc)
+    parts = t_str.split(":")
+    try:
+        h = int(parts[0])
+        m = int(parts[1]) if len(parts) > 1 else 0
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            return datetime.combine(day, dt_time(h, m), tzinfo=timezone.utc)
+    except (ValueError, IndexError):
+        pass
+    return datetime.combine(day, dt_time(12, 0), tzinfo=timezone.utc)
+
+
+def _benzinga_fetch_calendar() -> list[dict[str, Any]]:
+    """Fetch high-importance economics from Benzinga; cache 1h; fail-open."""
+    global _BZ_CAL_CACHE, _BZ_CAL_FETCHED_AT
+    if not BENZINGA_API_KEY:
+        return []
+    now = datetime.now(timezone.utc)
+    if _BZ_CAL_FETCHED_AT is not None and (now - _BZ_CAL_FETCHED_AT) < _BZ_CAL_TTL:
+        return list(_BZ_CAL_CACHE)
+    day = now.date()
+    merged: list[dict[str, Any]] = []
+    try:
+        r = requests.get(
+            _BZ_CAL_URL,
+            params={
+                "token": BENZINGA_API_KEY,
+                "date_from": (day - timedelta(days=2)).isoformat(),
+                "date_to": (day + timedelta(days=2)).isoformat(),
+                "importance": 3,
+                "pagesize": 1000,
+            },
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, dict):
+            raw = data.get("economics") or data.get("data") or []
+            if isinstance(raw, list):
+                merged = [e for e in raw if isinstance(e, dict)]
+    except Exception as e:  # noqa: BLE001
+        live_log("warning", "[BENZINGA] calendar fetch failed", error=str(e))
+    if merged:
+        _BZ_CAL_CACHE = merged
+        _BZ_CAL_FETCHED_AT = now
+        return list(_BZ_CAL_CACHE)
+    if _BZ_CAL_CACHE:
+        live_log("warning", "[BENZINGA] calendar using stale cache after fetch failure")
+        return list(_BZ_CAL_CACHE)
+    return []
+
+
+def _benzinga_high_impact_events(currency: str, scan_datetime: datetime) -> list[dict[str, Any]]:
+    """HIGH impact (importance>=3) within ±48h — mirrors ``get_high_impact_events``."""
+    ccy = (currency or "").strip().upper()
+    if not ccy:
+        return []
+    countries = _BZ_CCY_COUNTRIES.get(ccy, frozenset({ccy}))
+    scan_utc = _bz_utc(scan_datetime)
+    result: list[dict[str, Any]] = []
+    for event in _benzinga_fetch_calendar():
+        imp = int(event.get("importance") or 0)
+        if imp < 3:
+            continue
+        country = str(event.get("country") or "").strip().upper()
+        if country not in countries:
+            continue
+        try:
+            event_dt = _benzinga_parse_event_dt(event)
+        except Exception:  # noqa: BLE001
+            continue
+        ev_utc = _bz_utc(event_dt)
+        hours_diff = abs((ev_utc - scan_utc).total_seconds() / 3600.0)
+        if hours_diff <= 48.0:
+            hours_away = (ev_utc - scan_utc).total_seconds() / 3600.0
+            title = str(event.get("event_name") or event.get("description") or "High impact event")
+            result.append(
+                {
+                    "title": title[:120],
+                    "currency": ccy,
+                    "event_dt": ev_utc,
+                    "hours_away": hours_away,
+                    "country": country,
+                    "importance": imp,
+                }
+            )
+    return result
+
+
+def _benzinga_check_calendar_risk(ticker: str, scan_datetime: datetime) -> dict[str, Any]:
+    """Mirror ``calendar_manager.check_calendar_risk`` using Benzinga economics feed."""
+    if not BENZINGA_API_KEY:
+        out = {
+            "action": "CLEAR",
+            "reason": "BENZINGA_API_KEY not set — calendar skipped",
+            "size_multiplier": 1.0,
+            "source": "benzinga",
+        }
+        _log_benzinga("calendar", ticker, out)
+        return out
+
+    currencies = _bz_pair_currencies(ticker)
+    all_ev: list[dict[str, Any]] = []
+    for ccy in currencies:
+        all_ev.extend(_benzinga_high_impact_events(ccy, scan_datetime))
+
+    if not all_ev:
+        out = {
+            "action": "CLEAR",
+            "reason": "No high-impact Benzinga events within 48h",
+            "size_multiplier": 1.0,
+            "source": "benzinga",
+            "currencies_checked": ",".join(currencies),
+        }
+        _log_benzinga("calendar", ticker, out, currencies=currencies)
+        return out
+
+    closest = min(all_ev, key=lambda e: abs(float(e.get("hours_away", 0.0))))
+    h = float(closest["hours_away"])
+    ah = abs(h)
+    title = str(closest.get("title") or "Event")
+    currency = str(closest.get("currency") or "")
+    event_dt = closest.get("event_dt")
+    suffix = f"in {h:.1f}h" if h >= 0 else f"{abs(h):.1f}h ago"
+
+    if ah <= 4.0:
+        out = {
+            "action": "BLOCK",
+            "reason": f"HIGH IMPACT {title} for {currency} {suffix}",
+            "size_multiplier": 0.0,
+            "source": "benzinga",
+            "event": title,
+            "currency": currency,
+            "hours_away": round(h, 2),
+            "event_dt": event_dt.isoformat() if isinstance(event_dt, datetime) else None,
+            "currencies_checked": ",".join(currencies),
+        }
+    elif ah <= 12.0:
+        out = {
+            "action": "REDUCE",
+            "reason": f"HIGH IMPACT {title} for {currency} {suffix} — size 50%",
+            "size_multiplier": 0.5,
+            "source": "benzinga",
+            "event": title,
+            "currency": currency,
+            "hours_away": round(h, 2),
+            "event_dt": event_dt.isoformat() if isinstance(event_dt, datetime) else None,
+            "currencies_checked": ",".join(currencies),
+        }
+    elif ah <= 24.0:
+        out = {
+            "action": "REDUCE",
+            "reason": f"HIGH IMPACT {title} for {currency} {suffix} — size 75%",
+            "size_multiplier": 0.75,
+            "source": "benzinga",
+            "event": title,
+            "currency": currency,
+            "hours_away": round(h, 2),
+            "event_dt": event_dt.isoformat() if isinstance(event_dt, datetime) else None,
+            "currencies_checked": ",".join(currencies),
+        }
+    elif ah <= 48.0:
+        out = {
+            "action": "WATCH",
+            "reason": f"HIGH IMPACT {title} for {currency} {suffix} — monitoring",
+            "size_multiplier": 1.0,
+            "source": "benzinga",
+            "event": title,
+            "currency": currency,
+            "hours_away": round(h, 2),
+            "event_dt": event_dt.isoformat() if isinstance(event_dt, datetime) else None,
+            "currencies_checked": ",".join(currencies),
+        }
+    else:
+        out = {
+            "action": "CLEAR",
+            "reason": "No high-impact Benzinga events within 48h",
+            "size_multiplier": 1.0,
+            "source": "benzinga",
+            "currencies_checked": ",".join(currencies),
+        }
+    _log_benzinga("calendar", ticker, out, currencies=currencies)
+    return out
+
+
+def _benzinga_fetch_forex_news() -> list[dict[str, Any]]:
+    if not BENZINGA_API_KEY:
+        return []
+    now = datetime.now(timezone.utc)
+    cache_key = "forex"
+    hit = _BZ_NEWS_CACHE.get(cache_key)
+    if hit is not None and (now - hit[1]) < _BZ_NEWS_TTL:
+        return list(hit[0])
+    arts: list[dict[str, Any]] = []
+    try:
+        r = requests.get(
+            _BZ_NEWS_URL,
+            params={"token": BENZINGA_API_KEY, "topics": "forex", "pageSize": 30},
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, list):
+            arts = [a for a in data if isinstance(a, dict)]
+        elif isinstance(data, dict):
+            raw = data.get("news") or data.get("data") or []
+            if isinstance(raw, list):
+                arts = [a for a in raw if isinstance(a, dict)]
+    except Exception as e:  # noqa: BLE001
+        live_log("warning", "[BENZINGA] news fetch failed", error=str(e))
+        if hit is not None:
+            return list(hit[0])
+        return []
+    _BZ_NEWS_CACHE[cache_key] = (arts, now)
+    return list(arts)
+
+
+def _benzinga_score_pair_headlines(
+    articles: list[dict[str, Any]],
+    base: str,
+    quote: str,
+) -> tuple[float | None, list[str]]:
+    b = (base or "").strip().upper()[:3]
+    q = (quote or "").strip().upper()[:3]
+    if not b or not q:
+        return None, []
+    keywords = (b, q, f"{b}/{q}", f"{b}{q}", f"{b} {q}")
+    scores: list[float] = []
+    matched: list[str] = []
+    for a in articles:
+        text = (str(a.get("title") or "") + " " + str(a.get("body") or "")).lower()
+        if not any(k.lower() in text for k in keywords):
+            continue
+        headline = str(a.get("title") or "").strip()
+        if headline:
+            matched.append(headline[:120])
+        p = sum(1 for w in _BZ_POS_KW if w in text)
+        n = sum(1 for w in _BZ_NEG_KW if w in text)
+        if p + n > 0:
+            scores.append((p - n) / float(p + n))
+    if not scores:
+        return None, matched
+    return round(float(sum(scores) / len(scores)), 3), matched
+
+
+def _benzinga_news_sentiment_risk(ticker: str, direction: str) -> dict[str, Any]:
+    """Recent Benzinga forex headlines; 50% size cut if sentiment strongly contradicts direction."""
+    sym = (ticker or "").strip().upper()
+    dir_u = (direction or "").strip().upper()
+    if not BENZINGA_API_KEY:
+        out = {
+            "action": "CLEAR",
+            "reason": "BENZINGA_API_KEY not set — news skipped",
+            "size_multiplier": 1.0,
+            "sentiment": None,
+            "headlines": [],
+            "source": "benzinga",
+        }
+        _log_benzinga("news", sym, out, direction=dir_u)
+        return out
+    if len(sym) != 6 or dir_u not in ("LONG", "SHORT"):
+        out = {
+            "action": "CLEAR",
+            "reason": "invalid pair/direction for news check",
+            "size_multiplier": 1.0,
+            "sentiment": None,
+            "headlines": [],
+            "source": "benzinga",
+        }
+        _log_benzinga("news", sym, out, direction=dir_u)
+        return out
+
+    base, quote = sym[:3], sym[3:]
+    articles = _benzinga_fetch_forex_news()
+    score, headlines = _benzinga_score_pair_headlines(articles, base, quote)
+    if score is None:
+        out = {
+            "action": "CLEAR",
+            "reason": "no matching Benzinga forex headlines for pair",
+            "size_multiplier": 1.0,
+            "sentiment": None,
+            "headlines": headlines,
+            "articles_scanned": len(articles),
+            "source": "benzinga",
+        }
+        _log_benzinga("news", sym, out, direction=dir_u, articles_scanned=len(articles))
+        return out
+
+    contradicts = (
+        (dir_u == "LONG" and score <= -_BZ_SENTIMENT_STRONG)
+        or (dir_u == "SHORT" and score >= _BZ_SENTIMENT_STRONG)
+    )
+    if contradicts:
+        out = {
+            "action": "REDUCE",
+            "reason": (
+                f"headline sentiment {score:+.2f} strongly contradicts {dir_u} "
+                f"(threshold ±{_BZ_SENTIMENT_STRONG})"
+            ),
+            "size_multiplier": 0.5,
+            "sentiment": score,
+            "headlines": headlines[:8],
+            "articles_scanned": len(articles),
+            "source": "benzinga",
+        }
+    else:
+        out = {
+            "action": "CLEAR",
+            "reason": f"headline sentiment {score:+.2f} ok for {dir_u}",
+            "size_multiplier": 1.0,
+            "sentiment": score,
+            "headlines": headlines[:8],
+            "articles_scanned": len(articles),
+            "source": "benzinga",
+        }
+    _log_benzinga("news", sym, out, direction=dir_u, articles_scanned=len(articles))
+    return out
+
+
+def _apply_benzinga_size_mult(plan: TradePlan, mult: float, label: str) -> None:
+    if mult >= 1.0 or mult <= 0.0:
+        return
+    plan.risk_usd = round(plan.risk_usd * mult, 2)
+    plan.risk_pct = round(plan.risk_pct * mult, 4)
+    plan.ai["_max_risk_dollars"] = plan.risk_usd
+    plan.ai["_account_risk_pct"] = plan.risk_pct
+    plan.log_fields["max_risk_dollars"] = plan.risk_usd
+    plan.log_fields["final_risk_pct"] = plan.risk_pct
+    prev = str(plan.log_fields.get("benzinga_size_adjustments") or "")
+    note = f"{label}×{mult}"
+    plan.log_fields["benzinga_size_adjustments"] = f"{prev}; {note}".strip("; ")
+
+
 # Phase risk/tp multipliers — same as ``_chrono_v71_phases`` (1w / 1d / 4h).
 TF_PHASE_MULT: dict[str, tuple[float, float]] = {
     "1w": (1.0, 1.0),
@@ -751,6 +1164,20 @@ def evaluate_cell_v76(
     if tf_key == "4h":
         pass  # allowed
     analysis_date = scan_d.isoformat()
+    now_utc = datetime.now(timezone.utc)
+
+    bz_cal = _benzinga_check_calendar_risk(sym, now_utc)
+    if str(bz_cal.get("action", "")).upper() == "BLOCK":
+        return ScanSkip(
+            reason=f"BENZINGA calendar BLOCK: {bz_cal.get('reason', '')}",
+            fields={
+                "ticker": sym.upper(),
+                "timeframe": tf,
+                "benzinga_calendar_action": bz_cal.get("action"),
+                "benzinga_calendar_reason": bz_cal.get("reason"),
+                "benzinga_event": bz_cal.get("event"),
+            },
+        )
 
     past = at.fetch_past_for_prefilter(sym, tf_key)
     if past is None or past.empty or len(past) < 40:
@@ -819,7 +1246,7 @@ def evaluate_cell_v76(
         )
 
     risk_m, tp_m = TF_PHASE_MULT.get(tf_key, (1.0, 1.0))
-    return build_trade_plan_v76(
+    result = build_trade_plan_v76(
         sym=sym,
         timeframe=tf,
         analysis_date=analysis_date,
@@ -836,6 +1263,51 @@ def evaluate_cell_v76(
         chrono_risk_mult=risk_m,
         chrono_tp_mult=tp_m,
     )
+    if isinstance(result, ScanSkip):
+        return result
+
+    plan: TradePlan = result
+    cal_mult = float(bz_cal.get("size_multiplier", 1.0) or 1.0)
+    if str(bz_cal.get("action", "")).upper() == "REDUCE" and 0.0 < cal_mult < 1.0:
+        _apply_benzinga_size_mult(plan, cal_mult, "calendar")
+        _log_benzinga(
+            "calendar_size",
+            sym,
+            {
+                "action": "REDUCE",
+                "reason": bz_cal.get("reason"),
+                "size_multiplier": cal_mult,
+                "event": bz_cal.get("event"),
+            },
+            timeframe=tf,
+            risk_usd=plan.risk_usd,
+        )
+
+    bz_news = _benzinga_news_sentiment_risk(sym, plan.direction)
+    news_mult = float(bz_news.get("size_multiplier", 1.0) or 1.0)
+    if str(bz_news.get("action", "")).upper() == "REDUCE" and 0.0 < news_mult < 1.0:
+        _apply_benzinga_size_mult(plan, news_mult, "news")
+        _log_benzinga(
+            "news_size",
+            sym,
+            {
+                "action": "REDUCE",
+                "reason": bz_news.get("reason"),
+                "size_multiplier": news_mult,
+                "sentiment": bz_news.get("sentiment"),
+                "headlines": bz_news.get("headlines"),
+            },
+            timeframe=tf,
+            direction=plan.direction,
+            risk_usd=plan.risk_usd,
+        )
+
+    plan.log_fields["benzinga_calendar_action"] = bz_cal.get("action")
+    plan.log_fields["benzinga_calendar_reason"] = bz_cal.get("reason")
+    plan.log_fields["benzinga_news_action"] = bz_news.get("action")
+    plan.log_fields["benzinga_news_reason"] = bz_news.get("reason")
+    plan.log_fields["benzinga_news_sentiment"] = bz_news.get("sentiment")
+    return plan
 
 
 def lot_size_from_risk(mt5: Any, sym: str, entry: float, sl: float, risk_usd: float) -> float:
