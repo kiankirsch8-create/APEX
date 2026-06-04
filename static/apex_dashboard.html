@@ -138,146 +138,12 @@
       );
     }
 
-    async function fetchJson(url) {
-      const r = await fetch(url, { cache: 'no-store' });
-      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-      return r.json();
-    }
-
-    async function fetchText(url) {
-      const r = await fetch(url, { cache: 'no-store' });
-      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-      return r.text();
-    }
-
-    function App() {
-      const [tab, setTab] = useState('overview');
-      const [chrono, setChrono] = useState(null);
-      const [live, setLive] = useState(null);
-      const [logs, setLogs] = useState('');
-      const [strategies, setStrategies] = useState([]);
-      const [chronoErr, setChronoErr] = useState(false);
-      const [liveErr, setLiveErr] = useState(false);
-      const [lastUpdated, setLastUpdated] = useState(null);
-      const [countdown, setCountdown] = useState(30);
-      const [posOpen, setPosOpen] = useState(false);
-      const [logsOpen, setLogsOpen] = useState(false);
-      const [spinning, setSpinning] = useState(false);
-      const [liveSource, setLiveSource] = useState('');
-      const logRef = useRef(null);
-      const pollBusy = useRef(false);
-
-      const refresh = async () => {
-        if (pollBusy.current) return;
-        pollBusy.current = true;
-        setSpinning(true);
-        try {
-          try {
-            const c = await fetchJson('/api/chrono/active');
-            setChrono(c);
-            setChronoErr(false);
-            const jid = c.job_id;
-            if (jid) {
-              try {
-                const tr = await fetchJson(`/api/chrono/${jid}/trades?limit=3000`);
-                const agg = {};
-                (tr.results || []).forEach((t) => {
-                  if (t.skipped || !['WIN', 'LOSS'].includes(String(t.outcome || '').toUpperCase())) return;
-                  const sid = String(t.strategy_id || 'UNKNOWN').toUpperCase();
-                  if (!agg[sid]) agg[sid] = { id: sid, trades: 0, wins: 0, pnl: 0 };
-                  agg[sid].trades += 1;
-                  if (String(t.outcome).toUpperCase() === 'WIN') agg[sid].wins += 1;
-                  agg[sid].pnl += Number(t.pnl_dollars || 0);
-                });
-                setStrategies(Object.values(agg).sort((a, b) => b.pnl - a.pnl).slice(0, 5));
-              } catch { setStrategies([]); }
-            }
-          } catch {
-            setChronoErr(true);
-          }
-          try {
-            const l = await fetchJson('/api/live/status');
-            setLive(l);
-            setLiveErr(false);
-            setLiveSource(String(l.source || l.vps_url || ''));
-          } catch {
-            setLiveErr(true);
-          }
-          try {
-            const txt = await fetchText('/api/live/logs/text?lines=50');
-            setLogs(txt);
-          } catch { /* keep last logs */ }
-          setLastUpdated(new Date());
-          setCountdown(POLL_SEC);
-        } finally {
-          pollBusy.current = false;
-          setSpinning(false);
-        }
-      };
-
-      useEffect(() => {
-        refresh();
-        const id = setInterval(refresh, POLL_MS);
-        return () => clearInterval(id);
-      }, []);
-
-      useEffect(() => {
-        const t = setInterval(() => {
-          setCountdown((c) => (c <= 1 ? POLL_SEC : c - 1));
-        }, 1000);
-        return () => clearInterval(t);
-      }, []);
-
-      useEffect(() => {
-        if (logsOpen && logRef.current) {
-          logRef.current.scrollTop = logRef.current.scrollHeight;
-        }
-      }, [logs, logsOpen]);
-
-      const balance = live?.balance != null ? Number(live.balance) : null;
-      const equity = live?.equity != null ? Number(live.equity) : balance;
-      const dailyPnl = live?.daily_pnl != null ? Number(live.daily_pnl) : null;
-      const baselineDelta = equity != null ? equity - LIVE_START_CAPITAL : null;
-      const positions = live?.open_positions || [];
-      const floatPnl = positions.reduce((s, p) => s + Number(p.profit || p.pnl || 0), 0);
-      const periodMode = (live?.period_mode || 'UNKNOWN').toUpperCase();
-      const haltRaw = live?.circuit_halt_until || live?.circuit_halt;
-      const circuitActive = haltRaw && new Date(haltRaw) > new Date();
-      const trailModes = positions.map((p) => p.trail_regime).filter(Boolean);
-      const trailMode = trailModes.length
-        ? (trailModes.filter((x) => x === 'TRENDING').length >= trailModes.length / 2 ? 'TRENDING' : 'CHOPPY')
-        : (live?.trail_regime || 'CHOPPY');
-
-      const cap = chrono?.capital != null ? Number(chrono.capital) : null;
-      const curDate = chrono?.current_date;
-      const bench = benchmarkAt(curDate);
-      const benchDelta = cap != null && bench != null ? ((cap - bench) / bench) * 100 : null;
-      const dailyRows = chrono?.daily_pnl || [];
-      let totalTrades = 0, totalWins = 0;
-      dailyRows.forEach((r) => {
-        totalTrades += Number(r.trades || 0);
-        totalWins += Number(r.wins || 0);
-      });
-      const winRate = totalTrades > 0 ? (totalWins / totalTrades) * 100 : null;
-
-      const chartData = useMemo(() => {
-        const rows = dailyRows.slice(-30);
-        return rows.map((r) => {
-          const d = String(r.date || '').slice(0, 10);
-          return {
-            date: d.slice(5),
-            v76: Number(r.capital || 0),
-            bench: benchmarkAt(d),
-          };
-        });
-      }, [dailyRows]);
-
-      const logLines = (logs || '').split('\n').filter(Boolean);
-      const displayLogs = logsOpen ? logLines : logLines.slice(-10);
-
+    function LiveSection({
+      liveErr, liveSource, balance, equity, dailyPnl, baselineDelta,
+      periodMode, circuitActive, trailMode, positions, floatPnl, posOpen, setPosOpen,
+    }) {
       const periodTone = periodMode === 'GOOD' ? 'good' : periodMode === 'BAD' ? 'bad' : 'warn';
-
-      const LiveSection = () => (
+      return (
         <section className="bg-apex-card border border-apex-border rounded-2xl p-4 mb-4 fade-in">
           <div className="flex items-center justify-between mb-3">
             <h2 className="text-apex-cyan font-bold text-lg">Live Trading</h2>
@@ -326,8 +192,10 @@
           </div>
         </section>
       );
+    }
 
-      const BacktestSection = () => (
+    function BacktestSection({ chronoErr, curDate, cap, daysProcessed, benchDelta, bench, totalTrades, winRate }) {
+      return (
         <section className="bg-apex-card border border-apex-border rounded-2xl p-4 mb-4 fade-in">
           <div className="flex items-center justify-between mb-3">
             <h2 className="text-apex-cyan font-bold text-lg">Backtest v7.6</h2>
@@ -336,7 +204,7 @@
           <div className="flex flex-wrap gap-4 mb-3">
             <Stat label="Sim date" value={curDate ? curDate.slice(0, 10) : '—'} />
             <Stat label="Capital" value={fmtMoney(cap, 'USD')} positive={cap != null && cap >= 10000} />
-            <Stat label="Days" value={chrono?.days_processed ?? '—'} />
+            <Stat label="Days" value={daysProcessed ?? '—'} />
           </div>
           <div className="mb-3">
             <div className="flex justify-between text-xs text-gray-500 mb-1">
@@ -360,8 +228,10 @@
           </div>
         </section>
       );
+    }
 
-      const ChartSection = () => (
+    function ChartSection({ chartData }) {
+      return (
         <section className="bg-apex-card border border-apex-border rounded-2xl p-4 mb-4 fade-in">
           <h2 className="text-apex-cyan font-bold text-lg mb-3">Capital Curve</h2>
           {chartData.length ? (
@@ -388,8 +258,10 @@
           )}
         </section>
       );
+    }
 
-      const LogSection = () => (
+    function LogSection({ logsOpen, setLogsOpen, displayLogs, logRef }) {
+      return (
         <section className="bg-apex-card border border-apex-border rounded-2xl p-4 mb-4 fade-in">
           <button type="button" onClick={() => setLogsOpen(!logsOpen)}
             className="w-full min-h-[44px] flex items-center justify-between text-left">
@@ -405,8 +277,10 @@
           </div>
         </section>
       );
+    }
 
-      const StrategySection = () => (
+    function StrategySection({ strategies }) {
+      return (
         <section className="bg-apex-card border border-apex-border rounded-2xl p-4 mb-4 fade-in">
           <h2 className="text-apex-cyan font-bold text-lg mb-3">Top Strategies</h2>
           <div className="space-y-2">
@@ -423,10 +297,12 @@
           </div>
         </section>
       );
+    }
 
-      const PositionsTab = () => (
+    function PositionsTab({ liveProps, positions }) {
+      return (
         <div>
-          <LiveSection />
+          <LiveSection {...liveProps} />
           <div className="expandable max-h-none opacity-100">
             {positions.map((p, i) => (
               <div key={i} className="bg-apex-card border border-apex-border rounded-xl p-4 mb-3">
@@ -448,6 +324,162 @@
           </div>
         </div>
       );
+    }
+
+    async function fetchJson(url) {
+      const r = await fetch(url, { cache: 'no-store' });
+      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+      return r.json();
+    }
+
+    async function fetchText(url) {
+      const r = await fetch(url, { cache: 'no-store' });
+      if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+      return r.text();
+    }
+
+    function App() {
+      const [tab, setTab] = useState('overview');
+      const [chrono, setChrono] = useState(null);
+      const [live, setLive] = useState(null);
+      const [logs, setLogs] = useState('');
+      const [strategies, setStrategies] = useState([]);
+      const [chronoErr, setChronoErr] = useState(false);
+      const [liveErr, setLiveErr] = useState(false);
+      const [lastUpdated, setLastUpdated] = useState(null);
+      const [posOpen, setPosOpen] = useState(false);
+      const [logsOpen, setLogsOpen] = useState(false);
+      const [spinning, setSpinning] = useState(false);
+      const [liveSource, setLiveSource] = useState('');
+      const logRef = useRef(null);
+      const pollBusy = useRef(false);
+      const countdownRef = useRef(null);
+      const countdownVal = useRef(POLL_SEC);
+
+      const syncCountdown = (sec) => {
+        countdownVal.current = sec;
+        if (countdownRef.current) countdownRef.current.textContent = `Refresh in ${sec}s`;
+      };
+
+      const refresh = async () => {
+        if (pollBusy.current) return;
+        pollBusy.current = true;
+        setSpinning(true);
+        try {
+          try {
+            const c = await fetchJson('/api/chrono/active');
+            setChrono(c);
+            setChronoErr(false);
+            const jid = c.job_id;
+            if (jid) {
+              try {
+                const tr = await fetchJson(`/api/chrono/${jid}/trades?limit=3000`);
+                const agg = {};
+                (tr.results || []).forEach((t) => {
+                  if (t.skipped || !['WIN', 'LOSS'].includes(String(t.outcome || '').toUpperCase())) return;
+                  const sid = String(t.strategy_id || 'UNKNOWN').toUpperCase();
+                  if (!agg[sid]) agg[sid] = { id: sid, trades: 0, wins: 0, pnl: 0 };
+                  agg[sid].trades += 1;
+                  if (String(t.outcome).toUpperCase() === 'WIN') agg[sid].wins += 1;
+                  agg[sid].pnl += Number(t.pnl_dollars || 0);
+                });
+                setStrategies(Object.values(agg).sort((a, b) => b.pnl - a.pnl).slice(0, 5));
+              } catch { setStrategies([]); }
+            }
+          } catch {
+            setChronoErr(true);
+          }
+          try {
+            const l = await fetchJson('/api/live/status');
+            setLive(l);
+            setLiveErr(false);
+            setLiveSource(String(l.source || l.vps_url || ''));
+          } catch {
+            setLiveErr(true);
+          }
+          try {
+            const txt = await fetchText('/api/live/logs/text?lines=50');
+            setLogs(txt);
+          } catch { /* keep last logs */ }
+          setLastUpdated(new Date());
+          syncCountdown(POLL_SEC);
+        } finally {
+          pollBusy.current = false;
+          setSpinning(false);
+        }
+      };
+
+      useEffect(() => {
+        refresh();
+        const id = setInterval(refresh, POLL_MS);
+        return () => clearInterval(id);
+      }, []);
+
+      useEffect(() => {
+        syncCountdown(POLL_SEC);
+        const t = setInterval(() => {
+          const next = countdownVal.current <= 1 ? POLL_SEC : countdownVal.current - 1;
+          syncCountdown(next);
+        }, 1000);
+        return () => clearInterval(t);
+      }, []);
+
+      useEffect(() => {
+        if (logsOpen && logRef.current) {
+          logRef.current.scrollTop = logRef.current.scrollHeight;
+        }
+      }, [logs, logsOpen]);
+
+      const balance = live?.balance != null ? Number(live.balance) : null;
+      const equity = live?.equity != null ? Number(live.equity) : balance;
+      const dailyPnl = live?.daily_pnl != null ? Number(live.daily_pnl) : null;
+      const baselineDelta = equity != null ? equity - LIVE_START_CAPITAL : null;
+      const positions = live?.open_positions || [];
+      const floatPnl = positions.reduce((s, p) => s + Number(p.profit || p.pnl || 0), 0);
+      const periodMode = (live?.period_mode || 'UNKNOWN').toUpperCase();
+      const haltRaw = live?.circuit_halt_until || live?.circuit_halt;
+      const circuitActive = haltRaw && new Date(haltRaw) > new Date();
+      const trailModes = positions.map((p) => p.trail_regime).filter(Boolean);
+      const trailMode = trailModes.length
+        ? (trailModes.filter((x) => x === 'TRENDING').length >= trailModes.length / 2 ? 'TRENDING' : 'CHOPPY')
+        : (live?.trail_regime || 'CHOPPY');
+
+      const cap = chrono?.capital != null ? Number(chrono.capital) : null;
+      const curDate = chrono?.current_date;
+      const bench = benchmarkAt(curDate);
+      const benchDelta = cap != null && bench != null ? ((cap - bench) / bench) * 100 : null;
+      const dailyRows = chrono?.daily_pnl || [];
+      let totalTrades = 0, totalWins = 0;
+      dailyRows.forEach((r) => {
+        totalTrades += Number(r.trades || 0);
+        totalWins += Number(r.wins || 0);
+      });
+      const winRate = totalTrades > 0 ? (totalWins / totalTrades) * 100 : null;
+
+      const chartData = useMemo(() => {
+        const rows = (chrono?.daily_pnl || []).slice(-30);
+        return rows.map((r) => {
+          const d = String(r.date || '').slice(0, 10);
+          return {
+            date: d.slice(5),
+            v76: Number(r.capital || 0),
+            bench: benchmarkAt(d),
+          };
+        });
+      }, [chrono?.current_date, chrono?.daily_pnl?.length, chrono?.capital]);
+
+      const logLines = (logs || '').split('\n').filter(Boolean);
+      const displayLogs = logsOpen ? logLines : logLines.slice(-10);
+
+      const liveProps = {
+        liveErr, liveSource, balance, equity, dailyPnl, baselineDelta,
+        periodMode, circuitActive, trailMode, positions, floatPnl, posOpen, setPosOpen,
+      };
+
+      const backtestProps = {
+        chronoErr, curDate, cap, daysProcessed: chrono?.days_processed,
+        benchDelta, bench, totalTrades, winRate,
+      };
 
       return (
         <div className="max-w-lg mx-auto px-3 pt-3 md:max-w-3xl">
@@ -458,7 +490,7 @@
                 {spinning ? <span className="spin inline-block w-3 h-3 border-2 border-apex-cyan border-t-transparent rounded-full" /> : null}
                 <span>{lastUpdated ? lastUpdated.toLocaleTimeString() : '—'}</span>
               </div>
-              <div>Refresh in {countdown}s</div>
+              <div ref={countdownRef} />
             </div>
           </header>
 
@@ -470,16 +502,16 @@
 
           {tab === 'overview' && (
             <>
-              <LiveSection />
-              <BacktestSection />
-              <ChartSection />
-              <LogSection />
-              <StrategySection />
+              <LiveSection {...liveProps} />
+              <BacktestSection {...backtestProps} />
+              <ChartSection chartData={chartData} />
+              <LogSection logsOpen={logsOpen} setLogsOpen={setLogsOpen} displayLogs={displayLogs} logRef={logRef} />
+              <StrategySection strategies={strategies} />
             </>
           )}
-          {tab === 'positions' && <PositionsTab />}
-          {tab === 'backtest' && (<><BacktestSection /><ChartSection /><StrategySection /></>)}
-          {tab === 'logs' && <LogSection />}
+          {tab === 'positions' && <PositionsTab liveProps={liveProps} positions={positions} />}
+          {tab === 'backtest' && (<><BacktestSection {...backtestProps} /><ChartSection chartData={chartData} /><StrategySection strategies={strategies} /></>)}
+          {tab === 'logs' && <LogSection logsOpen={logsOpen} setLogsOpen={setLogsOpen} displayLogs={displayLogs} logRef={logRef} />}
 
           <nav className="fixed bottom-0 left-0 right-0 bg-apex-card border-t border-apex-border flex z-50 safe-area-pb">
             {[
