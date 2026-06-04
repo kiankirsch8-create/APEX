@@ -29,6 +29,7 @@ import chart_vision
 import continuous_backtester
 import dashboard_helpers
 import funded_simulator
+import live_vps_proxy
 import intelligence_cache
 import prefetch_intelligence
 import intraday_backtester
@@ -1132,47 +1133,13 @@ def _live_v76_data_dir() -> Any:
 
 
 def _read_live_v76_logs(max_lines: int) -> dict[str, Any]:
-    n = max(1, min(int(max_lines), 10000))
-    try:
-        import apex_trader_v76 as v76
-
-        return v76.get_live_logs_api(n)
-    except Exception:  # noqa: BLE001
-        path = _live_v76_data_dir() / "apex_v76_live.log"
-        if not path.is_file():
-            return {"lines": [], "count": 0, "log_path": str(path), "source": "file_missing"}
-        try:
-            with open(path, encoding="utf-8", errors="replace") as f:
-                lines = [ln.rstrip("\n") for ln in f.readlines()[-n:]]
-        except OSError as e:
-            raise HTTPException(status_code=500, detail=str(e)) from e
-        return {
-            "lines": lines,
-            "count": len(lines),
-            "log_path": str(path),
-            "source": "file",
-            "updated_at": utcnow_iso(),
-        }
+    payload = live_vps_proxy.read_live_logs(max_lines)
+    payload.setdefault("log_path", str(_live_v76_data_dir() / "apex_v76_live.log"))
+    return payload
 
 
 def _read_live_v76_status() -> dict[str, Any]:
-    try:
-        import apex_trader_v76 as v76
-
-        return v76.get_live_status_api()
-    except Exception:  # noqa: BLE001
-        path = _live_v76_data_dir() / "apex_v76_live_status.json"
-        if not path.is_file():
-            return {
-                "status": "unknown",
-                "detail": "No live status file yet. Run apex_trader_v76 on VPS or set APEX_LIVE_V76_DIR.",
-                "status_path": str(path),
-            }
-        data = load_json(path, default=None)
-        if not isinstance(data, dict):
-            return {"status": "error", "detail": "Invalid status file"}
-        data["source"] = "file"
-        return data
+    return live_vps_proxy.read_live_status()
 
 
 @app.get("/api/live/logs")

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import os
-from datetime import date, datetime
+from datetime import date
 from typing import Any
 
-from utils import DATA_DIR, load_json, utcnow_iso
+from live_vps_proxy import read_live_logs, read_live_status, vps_live_base_url
+from utils import utcnow_iso
 
 LIVE_START_DATE = "2026-06-01"
 LIVE_START_CAPITAL = 96908.79
@@ -28,50 +29,19 @@ CHRONO_PROGRESS_START = date(2020, 1, 1)
 CHRONO_PROGRESS_END = date(2022, 6, 30)
 
 
-def _live_v76_data_dir() -> Any:
-    from pathlib import Path
-
-    raw = os.environ.get("APEX_LIVE_V76_DIR") or os.environ.get("APEX_DATA_DIR") or str(DATA_DIR)
-    return Path(raw).resolve()
-
-
 def read_live_status_snapshot() -> dict[str, Any]:
-    try:
-        import apex_trader_v76 as v76
-
-        return v76.get_live_status_api()
-    except Exception:  # noqa: BLE001
-        path = _live_v76_data_dir() / "apex_v76_live_status.json"
-        if path.is_file():
-            data = load_json(path, default=None)
-            if isinstance(data, dict):
-                data.setdefault("source", "file")
-                return data
-        return {"status": "offline", "source": "missing"}
+    return read_live_status()
 
 
 def read_live_logs_text(max_lines: int = 50) -> str:
-    n = max(1, min(int(max_lines), 500))
-    try:
-        import apex_trader_v76 as v76
-
-        payload = v76.get_live_logs_api(n)
-        lines = payload.get("lines") or []
-        return "\n".join(str(x) for x in lines)
-    except Exception:  # noqa: BLE001
-        path = _live_v76_data_dir() / "apex_v76_live.log"
-        if not path.is_file():
-            return ""
-        try:
-            with open(path, encoding="utf-8", errors="replace") as f:
-                rows = f.readlines()
-            return "".join(rows[-n:]).rstrip("\n")
-        except OSError:
-            return ""
+    payload = read_live_logs(max_lines)
+    lines = payload.get("lines") or []
+    return "\n".join(str(x) for x in lines)
 
 
 def read_chrono_active() -> dict[str, Any]:
     import continuous_backtester as cb
+    from utils import load_json
 
     active = cb.get_active_chrono()
     live = cb.CHRONO_LIVE_STATUS.copy()
@@ -218,10 +188,11 @@ def build_dashboard_summary_text() -> str:
 
 def dashboard_config() -> dict[str, Any]:
     base = (os.environ.get("APEX_PUBLIC_BASE_URL") or "").strip().rstrip("/")
-    live_base = (os.environ.get("APEX_LIVE_BASE_URL") or base or "").strip().rstrip("/")
+    vps = vps_live_base_url()
     return {
         "api_base": base or None,
-        "live_base": live_base or None,
+        "vps_live_url": vps or None,
+        "poll_interval_sec": 30,
         "live_start_date": LIVE_START_DATE,
         "live_start_capital": LIVE_START_CAPITAL,
         "live_start_currency": LIVE_START_CURRENCY,

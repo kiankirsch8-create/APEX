@@ -45,7 +45,7 @@
 <body class="text-gray-100 antialiased pb-24">
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
-    const { useState, useEffect, useCallback, useMemo, useRef } = React;
+    const { useState, useEffect, useMemo, useRef } = React;
     const {
       LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceDot, Legend,
     } = Recharts;
@@ -53,6 +53,7 @@
     const LIVE_START_CAPITAL = 96908.79;
     const LIVE_CURRENCY = 'EUR';
     const POLL_MS = 30000;
+    const POLL_SEC = POLL_MS / 1000;
     const BENCHMARK = [
       ['2020-01-01', 10000], ['2020-06-01', 26930], ['2020-12-01', 29027],
       ['2021-01-01', 30111], ['2021-06-01', 36623], ['2021-12-01', 35969],
@@ -162,72 +163,68 @@
       const [posOpen, setPosOpen] = useState(false);
       const [logsOpen, setLogsOpen] = useState(false);
       const [spinning, setSpinning] = useState(false);
-      const [apiBase, setApiBase] = useState('');
-      const [liveBase, setLiveBase] = useState('');
+      const [liveSource, setLiveSource] = useState('');
       const logRef = useRef(null);
+      const pollBusy = useRef(false);
 
-      useEffect(() => {
-        fetchJson('/api/dashboard/config').then((c) => {
-          setApiBase(c.api_base || '');
-          setLiveBase(c.live_base || c.api_base || '');
-        }).catch(() => {});
-      }, []);
-
-      const base = apiBase || '';
-      const liveUrl = (path) => (liveBase || base || '') + path;
-
-      const refresh = useCallback(async () => {
+      const refresh = async () => {
+        if (pollBusy.current) return;
+        pollBusy.current = true;
         setSpinning(true);
-        let cOk = false, lOk = false;
         try {
-          const c = await fetchJson(base + '/api/chrono/active');
-          setChrono(c);
-          setChronoErr(false);
-          cOk = true;
-          const jid = c.job_id;
-          if (jid) {
-            try {
-              const tr = await fetchJson(base + `/api/chrono/${jid}/trades?limit=3000`);
-              const agg = {};
-              (tr.results || []).forEach((t) => {
-                if (t.skipped || !['WIN', 'LOSS'].includes(String(t.outcome || '').toUpperCase())) return;
-                const sid = String(t.strategy_id || 'UNKNOWN').toUpperCase();
-                if (!agg[sid]) agg[sid] = { id: sid, trades: 0, wins: 0, pnl: 0 };
-                agg[sid].trades += 1;
-                if (String(t.outcome).toUpperCase() === 'WIN') agg[sid].wins += 1;
-                agg[sid].pnl += Number(t.pnl_dollars || 0);
-              });
-              setStrategies(Object.values(agg).sort((a, b) => b.pnl - a.pnl).slice(0, 5));
-            } catch { setStrategies([]); }
+          try {
+            const c = await fetchJson('/api/chrono/active');
+            setChrono(c);
+            setChronoErr(false);
+            const jid = c.job_id;
+            if (jid) {
+              try {
+                const tr = await fetchJson(`/api/chrono/${jid}/trades?limit=3000`);
+                const agg = {};
+                (tr.results || []).forEach((t) => {
+                  if (t.skipped || !['WIN', 'LOSS'].includes(String(t.outcome || '').toUpperCase())) return;
+                  const sid = String(t.strategy_id || 'UNKNOWN').toUpperCase();
+                  if (!agg[sid]) agg[sid] = { id: sid, trades: 0, wins: 0, pnl: 0 };
+                  agg[sid].trades += 1;
+                  if (String(t.outcome).toUpperCase() === 'WIN') agg[sid].wins += 1;
+                  agg[sid].pnl += Number(t.pnl_dollars || 0);
+                });
+                setStrategies(Object.values(agg).sort((a, b) => b.pnl - a.pnl).slice(0, 5));
+              } catch { setStrategies([]); }
+            }
+          } catch {
+            setChronoErr(true);
           }
-        } catch {
-          setChronoErr(true);
+          try {
+            const l = await fetchJson('/api/live/status');
+            setLive(l);
+            setLiveErr(false);
+            setLiveSource(String(l.source || l.vps_url || ''));
+          } catch {
+            setLiveErr(true);
+          }
+          try {
+            const txt = await fetchText('/api/live/logs/text?lines=50');
+            setLogs(txt);
+          } catch { /* keep last logs */ }
+          setLastUpdated(new Date());
+          setCountdown(POLL_SEC);
+        } finally {
+          pollBusy.current = false;
+          setSpinning(false);
         }
-        try {
-          const l = await fetchJson(liveUrl('/api/live/status'));
-          setLive(l);
-          setLiveErr(false);
-          lOk = true;
-        } catch {
-          setLiveErr(true);
-        }
-        try {
-          const txt = await fetchText(liveUrl('/api/live/logs/text?lines=50'));
-          setLogs(txt);
-        } catch { /* keep last logs */ }
-        setLastUpdated(new Date());
-        setCountdown(30);
-        setSpinning(false);
-      }, [base, liveBase]);
+      };
 
       useEffect(() => {
         refresh();
         const id = setInterval(refresh, POLL_MS);
         return () => clearInterval(id);
-      }, [refresh]);
+      }, []);
 
       useEffect(() => {
-        const t = setInterval(() => setCountdown((c) => (c <= 1 ? 30 : c - 1)), 1000);
+        const t = setInterval(() => {
+          setCountdown((c) => (c <= 1 ? POLL_SEC : c - 1));
+        }, 1000);
         return () => clearInterval(t);
       }, []);
 
@@ -284,7 +281,10 @@
         <section className="bg-apex-card border border-apex-border rounded-2xl p-4 mb-4 fade-in">
           <div className="flex items-center justify-between mb-3">
             <h2 className="text-apex-cyan font-bold text-lg">Live Trading</h2>
-            {liveErr ? <span className="text-xs text-apex-red">Live offline</span> : null}
+            <div className="text-right text-xs">
+              {liveErr ? <span className="text-apex-red block">Live offline</span> : null}
+              {liveSource ? <span className="text-gray-600 block truncate max-w-[140px]">{liveSource.replace('vps:', 'VPS ')}</span> : null}
+            </div>
           </div>
           <div className="flex flex-wrap gap-4 mb-4">
             <Stat label="Balance" value={fmtMoney(balance, LIVE_CURRENCY)}
