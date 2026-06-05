@@ -191,6 +191,10 @@ OPEN_CURRENCY_COUNT: dict[str, int] = {}
 OPEN_CURRENCY_COUNT_4H: dict[str, int] = {}
 # USD side of these pairs is exempt from FIX 2 currency cap (FIX 15).
 EXOTIC_PAIRS: frozenset[str] = frozenset({"USDMXN", "USDZAR", "USDNOK", "USDSEK"})
+# Circuit breaker — chrono simulated halt end (walk-forward date, not wall clock).
+CHRONO_CIRCUIT_HALT_UNTIL: date | None = None
+CHRONO_DAILY_PNL_FOR_CB: list[dict[str, Any]] = []
+CHRONO_PENDING_HALT_UNTIL: str | None = None
 # Global completed-trade counts by strategy_id (hydrated at chrono job start from results + job file).
 STRATEGY_TRADE_COUNT: dict[str, int] = {}
 # Extended loss streak (FIX 16): key TICKER_tf_DIRECTION → consecutive loss count.
@@ -1115,6 +1119,100 @@ def _fragile_bad_period_skip(strat_id: str, period_mode: str) -> tuple[bool, str
     msg = f"[BAD PERIOD] FRAGILE strategy {sid} paused — bad period mode active"
     log(msg, level="info")
     return True, msg
+
+
+def _add_trading_days(start: date, n: int) -> date:
+    """Advance ``n`` weekdays from ``start`` (exclusive of non-trading days)."""
+    d = start
+    added = 0
+    while added < n:
+        d += timedelta(days=1)
+        if d.weekday() < 5:
+            added += 1
+    return d
+
+
+def _circuit_breaker_rolling_5d_pnl(
+    daily_rows: list[dict[str, Any]],
+    *,
+    as_of: date,
+    current_day_pnl: float,
+) -> float:
+    """Sum P&L over the last 5 trading days including the in-progress scan day."""
+    by_date: dict[str, float] = {}
+    for row in daily_rows:
+        if not isinstance(row, dict):
+            continue
+        ds = str(row.get("date", ""))[:10]
+        if not ds:
+            continue
+        try:
+            d0 = date.fromisoformat(ds)
+        except ValueError:
+            continue
+        if d0 > as_of:
+            continue
+        try:
+            by_date[ds] = float(row.get("pnl", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+    as_s = as_of.isoformat()
+    by_date[as_s] = float(current_day_pnl)
+    dates_sorted = sorted(by_date.keys())
+    last5 = dates_sorted[-5:]
+    return sum(by_date[d] for d in last5)
+
+
+def _circuit_breaker_check(
+    scan_d: date,
+    capital: float,
+    current_day_pnl: float,
+) -> tuple[bool, str]:
+    """
+    Return (should_halt_skip, reason). Sets CHRONO_PENDING_HALT_UNTIL when a new trip fires.
+    """
+    global CHRONO_CIRCUIT_HALT_UNTIL, CHRONO_PENDING_HALT_UNTIL
+
+    if CHRONO_CIRCUIT_HALT_UNTIL is not None and scan_d >= CHRONO_CIRCUIT_HALT_UNTIL:
+        CHRONO_CIRCUIT_HALT_UNTIL = None
+        CHRONO_PENDING_HALT_UNTIL = ""
+        return False, ""
+
+    if CHRONO_CIRCUIT_HALT_UNTIL is not None and scan_d < CHRONO_CIRCUIT_HALT_UNTIL:
+        return True, f"[HALTED] suspended until {CHRONO_CIRCUIT_HALT_UNTIL.isoformat()}"
+
+    trailing_5d = _circuit_breaker_rolling_5d_pnl(
+        CHRONO_DAILY_PNL_FOR_CB,
+        as_of=scan_d,
+        current_day_pnl=current_day_pnl,
+    )
+    cap = float(capital or STARTING_CAPITAL)
+    if cap <= 0:
+        return False, ""
+
+    pct = trailing_5d / cap
+    if pct > -0.08:
+        return False, ""
+
+    halt_until = _add_trading_days(scan_d, 2)
+    CHRONO_CIRCUIT_HALT_UNTIL = halt_until
+    CHRONO_PENDING_HALT_UNTIL = halt_until.isoformat()
+    pct_disp = round(pct * 100.0, 2)
+    msg = f"[CIRCUIT BREAKER] 5-day P&L is {pct_disp}% — halting 48 hours"
+    log(msg, level="warning")
+    return True, msg
+
+
+def _persist_circuit_halt_if_needed(chrono_data: dict[str, Any]) -> None:
+    """Persist or clear circuit-halt state on the chrono job file."""
+    global CHRONO_PENDING_HALT_UNTIL
+    if CHRONO_PENDING_HALT_UNTIL is None:
+        return
+    if CHRONO_PENDING_HALT_UNTIL == "":
+        chrono_data.pop("circuit_halt_until", None)
+    else:
+        chrono_data["circuit_halt_until"] = CHRONO_PENDING_HALT_UNTIL
+    CHRONO_PENDING_HALT_UNTIL = None
 
 
 def _chrono_scan_skip_row(
@@ -7319,6 +7417,67 @@ def run_chronological_backtest(
                     if icap is not None:
                         capital = float(icap)
 
+            scan_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+            global CHRONO_DAILY_PNL_FOR_CB, CHRONO_CIRCUIT_HALT_UNTIL, CHRONO_PENDING_HALT_UNTIL
+            CHRONO_DAILY_PNL_FOR_CB = [
+                dict(x) for x in (chrono_data.get("daily_pnl") or []) if isinstance(x, dict)
+            ]
+            CHRONO_PENDING_HALT_UNTIL = None
+            hu_raw = chrono_data.get("circuit_halt_until")
+            CHRONO_CIRCUIT_HALT_UNTIL = None
+            if hu_raw:
+                try:
+                    CHRONO_CIRCUIT_HALT_UNTIL = date.fromisoformat(str(hu_raw)[:10])
+                except ValueError:
+                    CHRONO_CIRCUIT_HALT_UNTIL = None
+
+            cb_skip, cb_reason = _circuit_breaker_check(scan_date, capital, day_pnl)
+            _persist_circuit_halt_if_needed(chrono_data)
+            if cb_skip:
+                if cb_reason:
+                    log(cb_reason, level="warning")
+                halt_row = {
+                    "date": date_str,
+                    "ticker": "ALL",
+                    "timeframe": "ALL",
+                    "job_id": job_id,
+                    "skipped": True,
+                    "skip_trade": True,
+                    "outcome": "SKIPPED",
+                    "pnl_dollars": 0.0,
+                    "skip_reason": (cb_reason or "circuit breaker halt")[:500],
+                    "verdict": "HALT",
+                    "halt_active": True,
+                }
+                day_skipped.append(halt_row)
+                append_result(halt_row)
+                daily_summary = {
+                    "date": date_str,
+                    "pnl": round(day_pnl, 2),
+                    "trades": len(day_trades),
+                    "skipped": len(day_skipped),
+                    "capital": round(capital, 2),
+                    "wins": sum(1 for t in day_trades if t.get("outcome") == "WIN"),
+                    "losses": sum(1 for t in day_trades if t.get("outcome") == "LOSS"),
+                    "halt_active": True,
+                }
+                chrono_data.setdefault("daily_pnl", []).append(daily_summary)
+                chrono_data.setdefault("all_trades", []).extend(day_trades)
+                chrono_data.setdefault("skipped", []).extend(day_skipped)
+                chrono_data.pop("chrono_intraday", None)
+                chrono_data["capital"] = round(capital, 2)
+                chrono_data["current_date"] = date_str
+                chrono_data["status"] = "running"
+                chrono_data["days_processed"] = int(chrono_data.get("days_processed", 0) or 0) + 1
+                save_json(chrono_path, chrono_data)
+                log(
+                    f"[Chrono {job_id}] {date_str}: HALTED — 0 new trades, "
+                    f"capital {capital:.2f}",
+                    level="info",
+                )
+                current += timedelta(days=1)
+                continue
+
             TRADED_TICKERS_TODAY.clear()
             CHRONO_DAY_PREFILTER_SIDS.clear()
             CHRONO_SYMDIR_TFS.clear()
@@ -7776,6 +7935,7 @@ def run_chronological_backtest(
                 "capital": round(capital, 2),
                 "wins": sum(1 for t in day_trades if t.get("outcome") == "WIN"),
                 "losses": sum(1 for t in day_trades if t.get("outcome") == "LOSS"),
+                "halt_active": False,
             }
 
             chrono_data.setdefault("daily_pnl", []).append(daily_summary)
