@@ -3584,6 +3584,28 @@ def detect_trailing_regime(macro_bias_adjusted: str, trend_strength: float, macr
     return "CHOPPY"
 
 
+def _resolve_trailing_regime(
+    macro_bias_adjusted: str,
+    trend_strength: float,
+    rate_differential: float,
+    *,
+    timeframe: str = "",
+) -> str:
+    """STRONG_TAILWIND → TRENDING trail; 4h always CHOPPY; else ``detect_trailing_regime``."""
+    tf_lc = (timeframe or "").strip().lower()
+    if tf_lc == "4h":
+        return "CHOPPY"
+    mb = str(macro_bias_adjusted or "").strip().upper()
+    if mb == "STRONG_TAILWIND":
+        log(
+            "[TRAIL OVERRIDE] STRONG_TAILWIND detected — forcing TRENDING mode "
+            "regardless of other conditions",
+            level="info",
+        )
+        return "TRENDING"
+    return detect_trailing_regime(macro_bias_adjusted, trend_strength, rate_differential)
+
+
 def detect_perfect_storm() -> tuple[bool, int]:
     """
     v7.4 — ≥3 listed JPY pairs signalled today, all STRONG_TAILWIND + HIGH conf + trend>0.65
@@ -3628,6 +3650,8 @@ def evaluate_forward_candles(
     leverage: int = 0,
     timeframe: str = "",
     macro_bias: str = "",
+    macro_bias_adjusted: str = "",
+    trail_regime: str = "",
     trend_strength: float = 0.0,
     rate_differential: float = 0.0,
     atr: float = 0.0,
@@ -3692,16 +3716,23 @@ def evaluate_forward_candles(
 
     entry_price = float(entry)
     tf_lc = (timeframe or "").strip().lower()
-    regime = (
-        "CHOPPY"
-        if tf_lc == "4h"
-        else detect_trailing_regime(macro_bias, trend_strength, rate_differential)
-    )
+    tr_in = str(trail_regime or "").strip().upper()
+    if tr_in in ("TRENDING", "CHOPPY"):
+        regime = tr_in
+    else:
+        regime = _resolve_trailing_regime(
+            macro_bias_adjusted or macro_bias,
+            trend_strength,
+            rate_differential,
+            timeframe=timeframe,
+        )
+    if tf_lc == "4h":
+        regime = "CHOPPY"
     sym_l = (ticker or "").strip().upper() or "?"
     log(
         f"[TRAIL REGIME] {sym_l} {tf_lc or '?'}: {regime} "
-        f"(macro={str(macro_bias or '').strip().upper()} trend={trend_strength:.2f} "
-        f"rate_diff={rate_differential:.2f})",
+        f"(macro_adj={str(macro_bias_adjusted or macro_bias or '').strip().upper()} "
+        f"trend={trend_strength:.2f} rate_diff={rate_differential:.2f})",
         level="info",
     )
     mult1, mult2, mult3 = (2.0, 4.0, 7.0) if regime == "TRENDING" else (1.5, 3.0, 5.0)
@@ -4797,6 +4828,13 @@ def _python_forced_layer2_trade(
     if not isinstance(tr_ev, dict):
         tr_ev = {}
     ts_ev = float(tr_ev.get("strength", 0) or 0)
+    mb_adj = str(ai.get("macro_bias_adjusted") or ai.get("macro_bias") or "")
+    trail_reg = _resolve_trailing_regime(
+        mb_adj,
+        ts_ev,
+        float(ai.get("macro_rate_diff", 0) or 0),
+        timeframe=tf_key,
+    )
 
     exit_data = evaluate_forward_candles(
         direction,
@@ -4811,6 +4849,8 @@ def _python_forced_layer2_trade(
         leverage=LEVERAGE,
         timeframe=tf_key,
         macro_bias=str(ai.get("macro_bias", "") or ""),
+        macro_bias_adjusted=mb_adj,
+        trail_regime=trail_reg,
         trend_strength=ts_ev,
         rate_differential=float(ai.get("macro_rate_diff", 0) or 0),
         atr=float(atr_ref or v75_meta.get("entry_atr", 0) or 0),
@@ -5761,6 +5801,13 @@ def run_one_backtest(
         if not isinstance(tr_ev2, dict):
             tr_ev2 = {}
         ts_cl = float(tr_ev2.get("strength", 0) or 0)
+        mb_adj = str(ai.get("macro_bias_adjusted") or ai.get("macro_bias") or "")
+        trail_reg = _resolve_trailing_regime(
+            mb_adj,
+            ts_cl,
+            float(ai.get("macro_rate_diff", 0) or 0),
+            timeframe=tf_key,
+        )
 
         exit_data = evaluate_forward_candles(
             direction,
@@ -5775,6 +5822,8 @@ def run_one_backtest(
             leverage=LEVERAGE,
             timeframe=tf_key,
             macro_bias=str(ai.get("macro_bias", "") or ""),
+            macro_bias_adjusted=mb_adj,
+            trail_regime=trail_reg,
             trend_strength=ts_cl,
             rate_differential=float(ai.get("macro_rate_diff", 0) or 0),
             atr=float(ind.get("atr", 0) or v75_meta.get("entry_atr", 0) or 0),
