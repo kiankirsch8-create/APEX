@@ -5,7 +5,7 @@ rolling stats, and periodic self-improvement. All state is simple JSON on ``DATA
 """
 from __future__ import annotations
 
-STRATEGY_VERSION = "v7.6-backtest-optimization"
+STRATEGY_VERSION = "v7.5-emergency-trade-volume"
 # v7.5 emergency: Layer 2 executes when qualified (not blocked by Layer 1); record all scan skips;
 # fragile/all-weather period mode; macro event + proven-combo sizing boosts.
 # v7.4 master: macro 7d price alignment, locked confluence count, NEUTRAL momentum block,
@@ -185,23 +185,6 @@ COMBO_TRADE_STATS: dict[tuple[str, str], dict[str, int]] = {}
 # Chrono day buffer for period-mode detection (all_trades + day_trades before append to file)
 CHRONO_COMPLETED_TRADES_BUFFER: list[dict[str, Any]] = []
 _PERIOD_MODE_LOGGED_DATES: set[str] = set()
-# v7.6 circuit breaker — simulated halt end (chrono walk-forward time, not wall clock).
-CHRONO_CIRCUIT_HALT_UNTIL: datetime | None = None
-CHRONO_DAILY_PNL_FOR_CB: list[dict[str, Any]] = []
-CHRONO_PENDING_HALT_UNTIL: str | None = None
-
-V76_FORENSIC_BLOCKED: frozenset[str] = frozenset(
-    {
-        "Q06_REGIME_DETECTION",
-        "SMC01_SR_FLIP",
-        "R10_COT_EXTREME_REVERSION",
-        "B07_INSIDE_BAR_BREAKOUT",
-        "SMC02_ORDER_BLOCK",
-        "R09_WEEKLY_GAP_FILL",
-        "Q04_CARRY_TRADE_MOMENTUM",
-        "T09_KELTNER_TREND_RIDE",
-    },
-)
 # v7.0 chrono: completed trades per currency per scan day (sequential sim; caps clustering).
 OPEN_CURRENCY_COUNT: dict[str, int] = {}
 # v7.1 chrono: 4h + intraday share a separate per-day currency pool from 1w/1d.
@@ -529,7 +512,7 @@ def _v72_blocked_ids_default() -> frozenset[str]:
         {
             "B02_VOLATILITY_COMPRESSION",
             "V02_ATR_EXPANSION_ENTRY",
-            *V76_FORENSIC_BLOCKED,
+            "R09_WEEKLY_GAP_FILL",
         }
     )
 
@@ -591,39 +574,6 @@ def _v75_migrate_strategy_status(raw: dict[str, Any]) -> bool:
     return changed
 
 
-def _v76_migrate_strategy_status(raw: dict[str, Any]) -> bool:
-    """v7.6 — block 8 forensic losers (idempotent)."""
-    changed = False
-
-    def _as_set(key: str) -> set[str]:
-        return {str(x).strip().upper() for x in (raw.get(key) or []) if isinstance(x, str) and str(x).strip()}
-
-    locked = _as_set("locked")
-    testing = _as_set("testing")
-    blocked = _as_set("blocked")
-    untested = _as_set("untested")
-
-    for sid in V76_FORENSIC_BLOCKED:
-        moved = False
-        for bucket in (locked, testing, untested):
-            if sid in bucket:
-                bucket.discard(sid)
-                moved = True
-        if sid not in blocked:
-            blocked.add(sid)
-            moved = True
-        if moved:
-            changed = True
-
-    if changed:
-        raw["locked"] = sorted(locked)
-        raw["testing"] = sorted(testing)
-        raw["blocked"] = sorted(blocked)
-        raw["untested"] = sorted(untested)
-        raw["last_updated"] = date.today().isoformat()
-    return changed
-
-
 def _v72_load_strategy_status(*, log_startup: bool = False) -> None:
     """Load or create ``strategy_status.json``; refresh module-level LOCKED / UNTESTED / BLOCKED sets."""
     global STRATEGY_STATUS, LOCKED_STRATEGY_IDS, UNTESTED_STRATEGIES_V72, BLOCKED_STRATEGIES
@@ -649,8 +599,6 @@ def _v72_load_strategy_status(*, log_startup: bool = False) -> None:
             raw["last_updated"] = date.today().isoformat()
             save_json(STRATEGY_STATUS_FILE, raw)
     if _v75_migrate_strategy_status(raw):
-        save_json(STRATEGY_STATUS_FILE, raw)
-    if _v76_migrate_strategy_status(raw):
         save_json(STRATEGY_STATUS_FILE, raw)
     STRATEGY_STATUS = raw
     for tag_k, default_vals in (
@@ -1962,149 +1910,6 @@ def _v75_entry_candle_body(past: pd.DataFrame | None) -> float:
         return 0.0
 
 
-def _v76_atr14_over_atr50(past: pd.DataFrame | None, ind: dict[str, Any]) -> float:
-    """ATR(14) / ATR(50) for NEUTRAL+RANGING diagnostics."""
-    if past is not None and not past.empty:
-        atr14_s = _atr_series_wilder(past, 14)
-        atr50_s = _atr_series_wilder(past, 50)
-        if len(atr14_s) >= 1 and len(atr50_s) >= 1:
-            a14 = float(atr14_s.iloc[-1])
-            a50 = float(atr50_s.iloc[-1])
-            if math.isfinite(a14) and math.isfinite(a50) and a50 > 0:
-                return a14 / a50
-    cur, avg, ratio = _v75_atr_metrics(past, ind)
-    if avg > 0 and cur > 0:
-        return cur / avg
-    return float(ratio or 1.0)
-
-
-def _v76_1d_trend_strength(sym: str, direction: str, strat_id: str, analysis_date: str) -> float:
-    """1d trend strength for NEUTRAL+RANGING diagnostics."""
-    try:
-        tr = cached_apply_trend_filter(
-            sym.strip().upper(),
-            str(direction or "LONG").strip().upper(),
-            str(strat_id or "").strip().upper(),
-            analysis_date.strip()[:10],
-        )
-        td = tr.get("trend") if isinstance(tr, dict) else {}
-        if not isinstance(td, dict):
-            td = {}
-        return float(td.get("strength", 0) or 0)
-    except Exception:  # noqa: BLE001
-        return 0.0
-
-
-def _resolve_trailing_regime(
-    macro_bias: str,
-    trend_strength: float,
-    rate_differential: float,
-    *,
-    timeframe: str = "",
-) -> str:
-    """v7.6 — STRONG_TAILWIND forces TRENDING trail; else existing detect_trailing_regime (4h stays CHOPPY)."""
-    mb = str(macro_bias or "").strip().upper()
-    tf_lc = (timeframe or "").strip().lower()
-    if mb == "STRONG_TAILWIND":
-        log(
-            "[TRAIL OVERRIDE] STRONG_TAILWIND detected — forcing TRENDING mode "
-            "regardless of other conditions",
-            level="info",
-        )
-        return "TRENDING"
-    if tf_lc == "4h":
-        return "CHOPPY"
-    return detect_trailing_regime(macro_bias, trend_strength, rate_differential)
-
-
-def _v76_rolling_5d_pnl(
-    daily_rows: list[dict[str, Any]],
-    *,
-    as_of: date,
-    current_day_pnl: float,
-) -> float:
-    """Sum P&L over the last 5 trading days including the in-progress scan day."""
-    by_date: dict[str, float] = {}
-    for row in daily_rows:
-        if not isinstance(row, dict):
-            continue
-        ds = str(row.get("date", ""))[:10]
-        if not ds:
-            continue
-        try:
-            d0 = date.fromisoformat(ds)
-        except ValueError:
-            continue
-        if d0 > as_of:
-            continue
-        try:
-            by_date[ds] = float(row.get("pnl", 0) or 0)
-        except (TypeError, ValueError):
-            continue
-    as_s = as_of.isoformat()
-    by_date[as_s] = float(current_day_pnl)
-    dates_sorted = sorted(by_date.keys())
-    last5 = dates_sorted[-5:]
-    return sum(by_date[d] for d in last5)
-
-
-def _v76_circuit_breaker_check(
-    scan_d: date,
-    capital: float,
-    current_day_pnl: float,
-) -> tuple[bool, str]:
-    """
-    Return (should_halt_skip, reason). Sets CHRONO_PENDING_HALT_UNTIL when a new trip fires.
-    halt_active is implied when should_halt_skip is True.
-    """
-    global CHRONO_CIRCUIT_HALT_UNTIL, CHRONO_PENDING_HALT_UNTIL
-
-    scan_dt = datetime.combine(scan_d, datetime.min.time())
-    if CHRONO_CIRCUIT_HALT_UNTIL is not None and scan_dt >= CHRONO_CIRCUIT_HALT_UNTIL:
-        CHRONO_CIRCUIT_HALT_UNTIL = None
-        CHRONO_PENDING_HALT_UNTIL = ""
-        return False, ""
-    if CHRONO_CIRCUIT_HALT_UNTIL is not None and scan_dt < CHRONO_CIRCUIT_HALT_UNTIL:
-        until_s = CHRONO_CIRCUIT_HALT_UNTIL.isoformat(sep=" ", timespec="minutes")
-        return True, f"[HALTED] Trading suspended until {until_s}"
-
-    trailing_5d = _v76_rolling_5d_pnl(
-        CHRONO_DAILY_PNL_FOR_CB,
-        as_of=scan_d,
-        current_day_pnl=current_day_pnl,
-    )
-    cap = float(capital or STARTING_CAPITAL)
-    if cap <= 0:
-        return False, ""
-    pct = trailing_5d / cap
-    if pct > -0.08:
-        return False, ""
-
-    halt_until = scan_dt + timedelta(hours=48)
-    CHRONO_CIRCUIT_HALT_UNTIL = halt_until
-    CHRONO_PENDING_HALT_UNTIL = halt_until.isoformat()
-    pct_disp = round(pct * 100.0, 2)
-    until_s = halt_until.isoformat(sep=" ", timespec="minutes")
-    msg = (
-        f"[CIRCUIT BREAKER] 5-day P&L is {pct_disp}% — HALTING all trading for 48 hours. "
-        f"Resumes at {until_s}"
-    )
-    log(msg, level="warning")
-    return True, msg
-
-
-def _v76_persist_circuit_halt_if_needed(chrono_data: dict[str, Any]) -> None:
-    """Persist or clear circuit-halt state on the chrono job file after a scan."""
-    global CHRONO_PENDING_HALT_UNTIL
-    if CHRONO_PENDING_HALT_UNTIL is None:
-        return
-    if CHRONO_PENDING_HALT_UNTIL == "":
-        chrono_data.pop("circuit_halt_until", None)
-    else:
-        chrono_data["circuit_halt_until"] = CHRONO_PENDING_HALT_UNTIL
-    CHRONO_PENDING_HALT_UNTIL = None
-
-
 def _momentum_neutral_ranging_skip(
     *,
     sym: str,
@@ -2113,12 +1918,10 @@ def _momentum_neutral_ranging_skip(
     analysis_date: str,
     past: pd.DataFrame | None,
     ind: dict[str, Any],
-    direction: str = "LONG",
-    timeframe: str = "",
 ) -> tuple[bool, str]:
     """
     Skip momentum strategies only when macro is NEUTRAL and conditions are ranging / low vol.
-    v7.6: allow when 1d trend_strength > 0.55; diagnostic log on every skip attempt.
+    Uses trade-condition snapshot (market_phase, volatility_regime) — not sizing regime_manager tiers.
     """
     sid = str(strat_id or "").strip().upper()
     if sid not in MOMENTUM_STRATEGIES:
@@ -2128,24 +1931,7 @@ def _momentum_neutral_ranging_skip(
     snap = _trade_condition_snapshot_fields(analysis_date, past, ind)
     mp = str(snap.get("market_phase", "")).strip().upper()
     vr = str(snap.get("volatility_regime", "")).strip().upper()
-    regime_label = mp if mp == "RANGING" or vr == "LOW_VOL" else f"{mp}/{vr}"
-    ts_1d = _v76_1d_trend_strength(sym, direction, sid, analysis_date)
-    atr_ratio = _v76_atr14_over_atr50(past, ind)
-
     if mp == "RANGING" or vr == "LOW_VOL":
-        log(
-            f"[NEUTRAL+RANGING SKIP DIAGNOSTIC] {sym.strip().upper()} {timeframe or '?'}: "
-            f"regime={regime_label} macro={str(macro_bias or '').strip().upper()} "
-            f"trend_strength={ts_1d:.2f} atr_ratio={atr_ratio:.2f}",
-            level="info",
-        )
-        if ts_1d > 0.55:
-            log(
-                f"[NEUTRAL+RANGING OVERRIDE] trend_strength {ts_1d:.2f} > 0.55, "
-                f"allowing momentum strategy {sid}",
-                level="info",
-            )
-            return False, ""
         msg = (
             f"[NEUTRAL+RANGING SKIP] {sid} {sym.strip().upper()}: NEUTRAL macro + "
             f"{mp or 'UNKNOWN'} market / {vr or 'UNKNOWN'} vol — momentum strategy skipped"
@@ -3808,11 +3594,10 @@ def evaluate_forward_candles(
 
     entry_price = float(entry)
     tf_lc = (timeframe or "").strip().lower()
-    regime = _resolve_trailing_regime(
-        macro_bias,
-        trend_strength,
-        rate_differential,
-        timeframe=timeframe,
+    regime = (
+        "CHOPPY"
+        if tf_lc == "4h"
+        else detect_trailing_regime(macro_bias, trend_strength, rate_differential)
     )
     sym_l = (ticker or "").strip().upper() or "?"
     log(
@@ -4241,6 +4026,12 @@ def _v75_apply_macro_event_and_combo_boosts(
     mb = str(ai.get("macro_bias", "")).strip().upper()
     conf = str(ai.get("confidence", "")).strip().upper()
     ts = float(trend_strength or 0)
+    rd = float(rate_diff or 0)
+    trail_reg = (
+        "CHOPPY"
+        if tf_lc == "4h"
+        else detect_trailing_regime(mb, ts, rd)
+    )
 
     ai["period_mode"] = str(period_mode or "NEUTRAL").strip().upper()
     ai["macro_event_boost_applied"] = False
@@ -4249,16 +4040,17 @@ def _v75_apply_macro_event_and_combo_boosts(
     is_macro_event = (
         mb == "STRONG_TAILWIND"
         and conf == "MEDIUM"
-        and ts > 0.60
+        and ts > 0.70
+        and rd > 2.5
         and int(locked_confluence) >= 2
+        and trail_reg == "TRENDING"
     )
     if is_macro_event:
-        mrd = min(mrd * 2.0, macro_cap)
+        mrd = min(mrd * 2.0, macro_cap, cap_hi * 1.5)
         ai["macro_event_boost_applied"] = True
-        risk_pct = (mrd / bal * 100.0) if bal > 0 else 0.0
         log(
-            f"[MACRO EVENT BOOST] {sym_u} {sid_u}: 2.0x applied, "
-            f"final_risk={risk_pct:.2f}%, capital_at_risk=${mrd:.0f}",
+            f"[MACRO EVENT BOOST] {sym_u}: all conditions met — 2.0x macro boost applied. "
+            f"Final risk: ${mrd:.0f}",
             level="info",
         )
 
@@ -4439,7 +4231,6 @@ def _skipped_backtest_row(
         "strategies_agreed": ai.get("strategies_agreed")
         if isinstance(ai.get("strategies_agreed"), list)
         else [],
-        "halt_active": bool(ai.get("halt_active", False)),
     }
 
 
@@ -4728,8 +4519,6 @@ def _python_forced_layer2_trade(
         analysis_date=analysis_date,
         past=past,
         ind=ind or {},
-        direction=str(ai.get("direction", "LONG")),
-        timeframe=timeframe,
     )
     if ok_mom:
         ai2 = dict(ai)
@@ -5145,33 +4934,6 @@ def run_one_backtest(
                     )
         else:
             period_mode, period_wr10, period_pnl5d = "NEUTRAL", 50.0, 0.0
-
-        if chrono_yfinance and scan_d is not None:
-            cb_skip, cb_reason = _v76_circuit_breaker_check(
-                scan_d,
-                float(chrono_balance or STARTING_CAPITAL),
-                float(chrono_day_pnl or 0),
-            )
-            if cb_skip:
-                return _skipped_backtest_row(
-                    sym=sym,
-                    timeframe=timeframe,
-                    analysis_date=analysis_date.strip(),
-                    price=0.0,
-                    zone_pct=50.0,
-                    zone_label="EQUILIBRIUM",
-                    skip_reason=cb_reason[:500],
-                    ai={
-                        "strategy_id": "SKIP",
-                        "strategy_met": False,
-                        "skip_trade": True,
-                        "direction": "NONE",
-                        "conviction_score": 0,
-                        "halt_active": True,
-                    },
-                    tf_key=tf_key,
-                    is_exotic=sym in EXOTIC_REDUCE,
-                )
 
         if chrono_regime is not None:
             regime_ctx = chrono_regime
@@ -5751,8 +5513,6 @@ def run_one_backtest(
             analysis_date=analysis_date,
             past=past,
             ind=ind,
-            direction=direction,
-            timeframe=timeframe,
         )
         if ok_mom:
             return _skip_out(rs_mom, ai)
@@ -7557,7 +7317,6 @@ def run_chronological_backtest(
                     if icap is not None:
                         capital = float(icap)
 
-            global CHRONO_DAILY_PNL_FOR_CB, CHRONO_CIRCUIT_HALT_UNTIL, CHRONO_PENDING_HALT_UNTIL
             TRADED_TICKERS_TODAY.clear()
             CHRONO_DAY_PREFILTER_SIDS.clear()
             CHRONO_SYMDIR_TFS.clear()
@@ -7566,17 +7325,6 @@ def run_chronological_backtest(
             CHRONO_JPY_RISK_DAY = 0.0
             OPEN_CURRENCY_COUNT.clear()
             OPEN_CURRENCY_COUNT_4H.clear()
-            CHRONO_DAILY_PNL_FOR_CB = [
-                dict(x) for x in (chrono_data.get("daily_pnl") or []) if isinstance(x, dict)
-            ]
-            CHRONO_PENDING_HALT_UNTIL = None
-            hu_raw = chrono_data.get("circuit_halt_until")
-            CHRONO_CIRCUIT_HALT_UNTIL = None
-            if hu_raw:
-                try:
-                    CHRONO_CIRCUIT_HALT_UNTIL = datetime.fromisoformat(str(hu_raw))
-                except ValueError:
-                    CHRONO_CIRCUIT_HALT_UNTIL = None
             for _row in day_trades:
                 _tk = str(_row.get("ticker", "")).strip().upper()
                 if _tk:
@@ -7828,7 +7576,6 @@ def run_chronological_backtest(
                                     f"[Chrono {job_id}] Error {ticker} {timeframe} {date_str}: {e}",
                                     level="warning",
                                 )
-                                _v76_persist_circuit_halt_if_needed(chrono_data)
                                 npi, nti, ntj = _v71_next_step(pi, ti, tj)
                                 chrono_data["chrono_intraday"] = {
                                     "date": date_str,
@@ -7846,8 +7593,6 @@ def run_chronological_backtest(
                                 chrono_data["status"] = "running"
                                 save_json(chrono_path, chrono_data)
                                 continue
-
-                            _v76_persist_circuit_halt_if_needed(chrono_data)
 
                             if res is None:
                                 row_none = {
@@ -7895,7 +7640,6 @@ def run_chronological_backtest(
                                     "pnl_dollars": 0.0,
                                     "skip_reason": str(res.get("skip_reason", "") or ""),
                                     "verdict": res.get("verdict"),
-                                    "halt_active": bool(res.get("halt_active")),
                                 }
                                 row.update(
                                     _v73_regime_row_fields(
