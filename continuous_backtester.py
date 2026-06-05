@@ -5358,6 +5358,27 @@ def run_one_backtest(
             intel_text=intel_text,
             qualifying_str=qualifying_str,
         )
+        ai: dict[str, Any] = {}
+
+        def _skip_out(reason: str, src: dict[str, Any] | None = None) -> dict[str, Any]:
+            log(f"[SKIP] {sym} {timeframe}: {reason}", level="info")
+            merged_ai = dict(src if src is not None else ai)
+            merged_ai["calendar_action"] = str(hist_cal.get("action", "CLEAR"))
+            merged_ai["calendar_reason"] = str(hist_cal.get("reason", ""))
+            merged_ai.update(_v73_regime_row_fields(regime_ctx))
+            return _skipped_backtest_row(
+                sym=sym,
+                timeframe=timeframe,
+                analysis_date=analysis_date,
+                price=float(price),
+                zone_pct=zone_pct,
+                zone_label=zone_label,
+                skip_reason=reason,
+                ai=merged_ai,
+                tf_key=tf_key,
+                is_exotic=is_exotic,
+            )
+
         try:
             client = _client()
             raw = cached_claude_master_text(
@@ -5382,26 +5403,7 @@ def run_one_backtest(
                 return _skip_out(f"Claude API error: {e}", {})
             return None
         parsed = _parse_json_response(raw)
-        ai: dict[str, Any] = parsed if isinstance(parsed, dict) else {}
-
-        def _skip_out(reason: str, src: dict[str, Any] | None = None) -> dict[str, Any]:
-            log(f"[SKIP] {sym} {timeframe}: {reason}", level="info")
-            merged_ai = dict(src if src is not None else ai)
-            merged_ai["calendar_action"] = str(hist_cal.get("action", "CLEAR"))
-            merged_ai["calendar_reason"] = str(hist_cal.get("reason", ""))
-            merged_ai.update(_v73_regime_row_fields(regime_ctx))
-            return _skipped_backtest_row(
-                sym=sym,
-                timeframe=timeframe,
-                analysis_date=analysis_date,
-                price=float(price),
-                zone_pct=zone_pct,
-                zone_label=zone_label,
-                skip_reason=reason,
-                ai=merged_ai,
-                tf_key=tf_key,
-                is_exotic=is_exotic,
-            )
+        ai = parsed if isinstance(parsed, dict) else {}
 
         if not ai:
             return _skip_out("empty or invalid JSON from model", {})
