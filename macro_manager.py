@@ -132,22 +132,43 @@ def merged_macro_result_fields(ai: dict[str, Any] | None) -> dict[str, Any]:
     return out
 
 
-def apply_macro_confidence_adjustment(confidence: str, macro: dict[str, Any]) -> str:
+def apply_macro_confidence_adjustment(
+    confidence: str,
+    macro: dict[str, Any],
+    strategy_id: str | None = None,
+) -> str:
     c = (confidence or "LOW").strip().upper()
     if c not in ("HIGH", "MEDIUM", "LOW"):
         c = "LOW"
     up = int(macro.get("confidence_upgrade", 0) or 0)
+    result = c
     if up == 1:
         if c == "LOW":
-            return "MEDIUM"
-        if c == "MEDIUM":
-            return "HIGH"
-    if up == -1:
+            result = "MEDIUM"
+        elif c == "MEDIUM":
+            result = "HIGH"
+    elif up == -1:
         if c == "HIGH":
-            return "MEDIUM"
-        if c == "MEDIUM":
-            return "LOW"
-    return c
+            result = "MEDIUM"
+        elif c == "MEDIUM":
+            result = "LOW"
+
+    strategy_confidence_caps = {
+        "T01_EMA_PULLBACK": "MEDIUM",
+    }
+    sid_u = str(strategy_id or "").strip().upper()
+    if sid_u and sid_u in strategy_confidence_caps:
+        cap = strategy_confidence_caps[sid_u]
+        confidence_rank = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
+        if confidence_rank.get(result, 0) > confidence_rank.get(cap, 3):
+            from utils import log
+
+            log(
+                f"[CONFIDENCE CAP] {sid_u} capped at {cap} (was {result})",
+                level="info",
+            )
+            return cap
+    return result
 
 
 def get_rate_differential(base: str, quote: str) -> float:

@@ -227,6 +227,12 @@ ACTIVE_CHRONO_FILE = DATA_DIR / "active_chrono_job.json"
 STRATEGY_STATUS_FILE = DATA_DIR / "strategy_status.json"
 
 STARTING_CAPITAL = 10000.0
+BLOCKED_PAIRS: frozenset[str] = frozenset({"EURAUD", "QQQ", "EURNZD", "GBPNZD", "USDCAD"})
+# Group 1 forensic blocks (union with strategy_status.json ``blocked`` at evaluation time)
+BLOCKED_STRATEGIES_GROUP1: frozenset[str] = frozenset(
+    {"Q03_MONTHLY_SEASONALITY", "R08_MONTHLY_LEVEL_REJECTION"},
+)
+COMPOUNDING_ENABLED = False
 # Backtest-only: "private" enables stepped compounding; "funded" keeps fixed $10k sizing base.
 _acct_raw = (os.environ.get("APEX_ACCOUNT_TYPE") or "private").strip().lower()
 ACCOUNT_TYPE = _acct_raw if _acct_raw in ("private", "funded") else "private"
@@ -480,6 +486,29 @@ STRATEGY_STATUS: dict[str, Any] = {}
 LOCKED_STRATEGY_IDS: frozenset[str] = frozenset()
 UNTESTED_STRATEGIES_V72: frozenset[str] = frozenset()
 BLOCKED_STRATEGIES: frozenset[str] = frozenset()
+
+_BLOCKED_PAIR_LOGGED: set[str] = set()
+_BLOCKED_STRATEGY_LOGGED: set[str] = set()
+
+
+def _reset_group1_skip_log_state() -> None:
+    global _BLOCKED_PAIR_LOGGED, _BLOCKED_STRATEGY_LOGGED
+    _BLOCKED_PAIR_LOGGED = set()
+    _BLOCKED_STRATEGY_LOGGED = set()
+
+
+def _is_group1_blocked_strategy(strategy_id: str) -> bool:
+    return str(strategy_id or "").strip().upper() in BLOCKED_STRATEGIES_GROUP1
+
+
+def _log_group1_blocked_strategy_once(strategy_id: str) -> None:
+    sid_u = str(strategy_id or "").strip().upper()
+    if sid_u and sid_u not in _BLOCKED_STRATEGY_LOGGED:
+        log(
+            f"[BLOCKED STRATEGY] {sid_u} skipped — in BLOCKED_STRATEGIES list",
+            level="info",
+        )
+        _BLOCKED_STRATEGY_LOGGED.add(sid_u)
 
 
 def _v72_locked_ids_default() -> frozenset[str]:
@@ -802,6 +831,9 @@ def _v7_filter_layer2_qualifiers(
     sym_u = (sym or "").strip().upper()
     for sid, direction, score in qualifying:
         sid_u = str(sid).strip().upper()
+        if _is_group1_blocked_strategy(sid_u):
+            _log_group1_blocked_strategy_once(sid_u)
+            continue
         if sid_u in LAYER1_STRATEGY_IDS:
             out.append((sid, direction, score, None))
             continue
@@ -1229,7 +1261,7 @@ def _maybe_bump_compounding_base(
     period_mode: str = "NEUTRAL",
 ) -> float:
     """Step compounding base upward when capital doubles; freeze during BAD period; funded stays fixed."""
-    if ACCOUNT_TYPE == "funded":
+    if not COMPOUNDING_ENABLED or ACCOUNT_TYPE == "funded":
         return float(STARTING_CAPITAL)
     base = max(float(STARTING_CAPITAL), float(compounding_base or STARTING_CAPITAL))
     cur = max(0.0, float(current_capital or STARTING_CAPITAL))
@@ -1250,7 +1282,7 @@ def _attach_chrono_sizing_context(
     """Set chrono sizing fields: current capital for caps, compounding base for risk %."""
     cur = float(current_capital or STARTING_CAPITAL)
     base = float(compounding_base or STARTING_CAPITAL)
-    if ACCOUNT_TYPE == "funded":
+    if not COMPOUNDING_ENABLED or ACCOUNT_TYPE == "funded":
         base = float(STARTING_CAPITAL)
     ai["_balance_for_sizing"] = cur
     ai["_current_capital_for_cap"] = cur
@@ -2157,6 +2189,9 @@ def _v75_backtest_strategy_allowed(
     ind: dict[str, Any],
 ) -> bool:
     sid_u = str(sid or "").strip().upper()
+    if _is_group1_blocked_strategy(sid_u):
+        _log_group1_blocked_strategy_once(sid_u)
+        return False
     if sid_u == "V02_ATR_EXPANSION_ENTRY":
         ok, _ = _v75_v02_backtest_allowed(past, ind)
         return ok
@@ -3473,7 +3508,11 @@ def _v73_post_enforce_macro_confidence(
     pre = str(ai.get("confidence", "LOW")).strip().upper()
     if pre not in ("HIGH", "MEDIUM", "LOW"):
         pre = "LOW"
-    new_c = apply_macro_confidence_adjustment(pre, macro_bt)
+    new_c = apply_macro_confidence_adjustment(
+        pre,
+        macro_bt,
+        strategy_id=str(ai.get("strategy_id", "")),
+    )
     if new_c != pre:
         ai["confidence_pre_upgrade"] = pre
         ai["confidence"] = new_c
@@ -5209,6 +5248,20 @@ def run_one_backtest(
 ) -> dict[str, Any] | None:
     try:
         sym = (ticker or "").strip().upper()
+        if sym in BLOCKED_PAIRS:
+            if sym not in _BLOCKED_PAIR_LOGGED:
+                log(f"[BLOCKED PAIR] {sym} skipped — in BLOCKED_PAIRS list", level="info")
+                _BLOCKED_PAIR_LOGGED.add(sym)
+            if chrono_yfinance:
+                return _chrono_scan_skip_row(
+                    sym=sym,
+                    timeframe=timeframe,
+                    analysis_date=analysis_date.strip(),
+                    tf_key=timeframe.lower().strip(),
+                    skip_reason=f"[BLOCKED PAIR] {sym} in BLOCKED_PAIRS list",
+                    is_exotic=sym in EXOTIC_REDUCE,
+                )
+            return None
         tf_key = timeframe.lower().strip()
         try:
             scan_d = date.fromisoformat(analysis_date.strip()[:10])
@@ -7454,6 +7507,11 @@ def run_chronological_backtest(
 
     chrono_path = chrono_results_path(job_id)
     log(f"[Chrono] Starting chronological backtest {job_id}: {start_date} → {end_date}", level="info")
+    log(
+        f"[COMPOUNDING] Mode is {'ENABLED' if COMPOUNDING_ENABLED else 'DISABLED'}",
+        level="info",
+    )
+    _reset_group1_skip_log_state()
 
     chrono_data: dict[str, Any]
     if chrono_path.is_file():
