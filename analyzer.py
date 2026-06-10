@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import traceback
 from datetime import datetime
 from typing import Any
 
@@ -95,6 +96,13 @@ async def analyze_stock(
     _sanitize_timeframe_for_market_cap(parsed, enriched)
     parsed["_raw_signals"] = triggered_signals
     parsed["_total_budget_usd"] = total_budget_usd
+
+    # Merger / acquisition override — if either the screener flagged this
+    # name as deal-bound, OR Claude's own analysis mentions a tender offer
+    # or announced merger, we force the rating to AVOID. Outside investors
+    # can't generate alpha on a name pinned to a deal price.
+    if _is_merger_situation(parsed, triggered_signals):
+        _apply_merger_override(parsed)
     return parsed
 
 
@@ -115,6 +123,89 @@ def _sanitize_timeframe_for_market_cap(parsed: dict[str, Any], enriched: dict[st
     if mcap_f > 50_000_000_000 and "week" in original_tf:
         parsed["investment_timeframe"] = "6 to 18 months"
         parsed["timeframe_basis"] = "Mega cap re-rating minimum 6 months"
+
+
+# ---------------------------------------------------------------------------
+# Merger / acquisition detection + override
+# ---------------------------------------------------------------------------
+_MERGER_SIGNAL_NAMES = {"MERGER_ANNOUNCED", "TRADING_AT_DEAL_PRICE", "MERGER_ARBITRAGE_ONLY"}
+
+# Words that, when found in the analyzer's own narrative, indicate that
+# Claude itself spotted a definite M&A situation. Kept tight — we don't
+# want to AVOID a stock simply because a thesis mentions "potential M&A
+# upside"; the override only fires on strong, present-tense markers.
+_MERGER_TEXT_PATTERNS = (
+    r"\btender\s+offer\b",
+    r"\bdefinitive\s+(merger|acquisition)\s+agreement\b",
+    r"\bgoing[-\s]private\b",
+    r"\bbeing\s+acquired\b",
+    r"\bagreed\s+to\s+be\s+acquired\b",
+    r"\bdeal\s+price\b",
+    r"\bmerger\s+arbitrage\b",
+)
+
+
+def _is_merger_situation(report: dict, triggered_signals: list[dict]) -> bool:
+    """Return True if either the screener or Claude flagged this as M&A."""
+    # 1. Screener-level signal
+    for s in triggered_signals or []:
+        if isinstance(s, dict) and s.get("name") in _MERGER_SIGNAL_NAMES:
+            return True
+
+    # 2. Existing triggered_signals string list on the parsed report
+    for name in report.get("triggered_signals", []) or []:
+        if isinstance(name, str) and name in _MERGER_SIGNAL_NAMES:
+            return True
+
+    # 3. Claude's narrative — only fire on strong, present-tense markers
+    haystack_parts = [
+        report.get("thesis"),
+        report.get("verdict"),
+        report.get("historical_analog"),
+        report.get("probability_reasoning"),
+    ]
+    # Include risks descriptions too
+    for r in report.get("risks", []) or []:
+        if isinstance(r, dict):
+            haystack_parts.append(r.get("description"))
+            haystack_parts.append(r.get("name"))
+    haystack = " \n ".join(p for p in haystack_parts if isinstance(p, str)).lower()
+    if not haystack:
+        return False
+    for pat in _MERGER_TEXT_PATTERNS:
+        if re.search(pat, haystack):
+            return True
+    return False
+
+
+def _apply_merger_override(report: dict) -> None:
+    """Force AVOID / NEUTRAL / 0% upside / 0% probability and tag the
+    triggered_signals list with MERGER_ARBITRAGE_ONLY."""
+    ticker = report.get("ticker", "?")
+    prev_rating = report.get("apex_rating")
+    log(
+        f"[Analyzer] {ticker} flagged as merger/acquisition — overriding "
+        f"rating='{prev_rating}' → AVOID, upside/probability → 0"
+    )
+    report["apex_rating"] = "AVOID"
+    report["direction"] = "NEUTRAL"
+    report["upside_percentage"] = 0
+    report["probability_percentage"] = 0
+
+    signals = report.get("triggered_signals") or []
+    if not isinstance(signals, list):
+        signals = []
+    if "MERGER_ARBITRAGE_ONLY" not in signals:
+        signals.append("MERGER_ARBITRAGE_ONLY")
+    report["triggered_signals"] = signals
+
+    # Make the override visible to downstream consumers (scorer, frontend)
+    report["merger_override_applied"] = True
+    if not report.get("verdict"):
+        report["verdict"] = (
+            f"{ticker} is in an announced M&A situation — AVOID; only merger "
+            "arbitrage funds should hold this."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -451,6 +542,161 @@ def _parse_json(raw: str) -> dict | None:
         return json.loads(match.group(0))
     except json.JSONDecodeError:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Vision — chart screenshot analysis
+# ---------------------------------------------------------------------------
+CHART_VISION_MODEL = "claude-opus-4-5"
+CHART_VISION_MAX_TOKENS = 1500
+
+_CHART_PROMPT_TEMPLATE = (
+    "Analyze this stock chart for {ticker}. Identify:\n"
+    "1. The primary chart pattern (bull flag, cup and handle, "
+    "ascending triangle, inverse H&S, double bottom, etc.)\n"
+    "2. Key support and resistance levels with exact prices\n"
+    "3. Volume pattern: accumulation or distribution\n"
+    "4. RSI divergence if visible\n"
+    "5. The single most important technical signal\n"
+    "6. Recommended entry zone, stop loss, take profit\n"
+    "Return as JSON with fields: pattern_name, pattern_confidence, "
+    "support_levels, resistance_levels, volume_signal, "
+    "rsi_signal, entry_zone, stop_loss, take_profit_1, "
+    "take_profit_2, technical_verdict"
+)
+
+
+async def analyze_chart_image(
+    image_base64: str,
+    ticker: str,
+    media_type: str = "image/png",
+) -> dict[str, Any]:
+    """Send a base64-encoded chart screenshot to Claude with vision.
+
+    Parameters
+    ----------
+    image_base64 : str
+        Base64-encoded image payload (no ``data:image/...;base64,`` prefix —
+        a prefix, if supplied, is stripped automatically).
+    ticker : str
+        Stock symbol the chart belongs to. Used in the prompt and in the
+        returned JSON.
+    media_type : str, default 'image/png'
+        Image MIME type. Supports 'image/png', 'image/jpeg', 'image/webp',
+        'image/gif' — anything the Anthropic vision API supports.
+
+    Returns
+    -------
+    dict
+        JSON with the schema specified in the analysis prompt:
+        ``pattern_name``, ``pattern_confidence``, ``support_levels``,
+        ``resistance_levels``, ``volume_signal``, ``rsi_signal``,
+        ``entry_zone``, ``stop_loss``, ``take_profit_1``,
+        ``take_profit_2``, ``technical_verdict``. On parse failure, a
+        structured error dict is returned (never raises).
+    """
+    ticker_up = (ticker or "?").upper()
+    payload = _strip_data_url_prefix(image_base64)
+    if not payload:
+        return _vision_error(ticker_up, "empty image payload")
+
+    prompt = _CHART_PROMPT_TEMPLATE.format(ticker=ticker_up)
+
+    def _do_call() -> str:
+        client = _client()
+        msg = client.messages.create(
+            model=CHART_VISION_MODEL,
+            max_tokens=CHART_VISION_MAX_TOKENS,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": payload,
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": prompt
+                            + "\n\nReturn ONLY raw JSON — no markdown fences, no commentary.",
+                        },
+                    ],
+                }
+            ],
+        )
+        if not msg.content:
+            return ""
+        out = []
+        for block in msg.content:
+            if getattr(block, "type", None) == "text":
+                out.append(block.text)
+        return "\n".join(out).strip()
+
+    try:
+        raw = await asyncio.to_thread(_do_call)
+    except Exception as e:  # noqa: BLE001
+        err_class = type(e).__name__
+        status = getattr(e, "status_code", None)
+        body = getattr(e, "body", None) or getattr(e, "response", None)
+        request_id = getattr(e, "request_id", None)
+        log(
+            f"[Analyzer/Vision] {ticker_up} chart-vision call FAILED — "
+            f"model='{CHART_VISION_MODEL}' exc={err_class} status={status} "
+            f"request_id={request_id} message={str(e)!r} body={body!r}",
+            "error",
+        )
+        log(f"[Analyzer/Vision] traceback:\n{traceback.format_exc()}", "error")
+        return _vision_error(ticker_up, f"{err_class}: {e}")
+
+    parsed = _parse_json(raw)
+    if parsed is None:
+        log(
+            f"[Analyzer/Vision] {ticker_up} could not parse JSON from vision response "
+            f"(len={len(raw)}); first 200 chars: {raw[:200]!r}",
+            "warning",
+        )
+        return _vision_error(ticker_up, "invalid JSON in vision response", raw=raw[:500])
+
+    parsed.setdefault("ticker", ticker_up)
+    parsed.setdefault("model", CHART_VISION_MODEL)
+    parsed.setdefault("generated_at", utcnow_iso())
+    return parsed
+
+
+def _strip_data_url_prefix(b64: str) -> str:
+    if not b64:
+        return ""
+    b64 = b64.strip()
+    if b64.startswith("data:") and "base64," in b64:
+        b64 = b64.split("base64,", 1)[1]
+    return b64
+
+
+def _vision_error(ticker: str, reason: str, raw: str | None = None) -> dict:
+    out = {
+        "ticker": ticker,
+        "model": CHART_VISION_MODEL,
+        "generated_at": utcnow_iso(),
+        "pattern_name": None,
+        "pattern_confidence": None,
+        "support_levels": [],
+        "resistance_levels": [],
+        "volume_signal": None,
+        "rsi_signal": None,
+        "entry_zone": None,
+        "stop_loss": None,
+        "take_profit_1": None,
+        "take_profit_2": None,
+        "technical_verdict": "VISION_UNAVAILABLE",
+        "error": reason,
+    }
+    if raw is not None:
+        out["raw_response_preview"] = raw
+    return out
 
 
 # ---------------------------------------------------------------------------
