@@ -112,6 +112,7 @@ def macro_result_fields(m: dict[str, Any]) -> dict[str, Any]:
         "macro_sentiment": float(m.get("sentiment_score", 0.0) or 0.0),
         "macro_size_multiplier": float(m.get("size_multiplier", 1.0) or 1.0),
         "macro_confidence_upgrade": int(m.get("confidence_upgrade", 0) or 0),
+        "st_layer1_failed": bool(m.get("st_layer1_failed", False)),
     }
 
 
@@ -160,6 +161,248 @@ def _yf_symbol(ticker: str) -> str:
     if len(t) == 6 and t.isalpha():
         return f"{t}=X"
     return t
+
+
+JPY_ST_CORR_GROUP: frozenset[str] = frozenset(
+    {"USDJPY", "GBPJPY", "CHFJPY", "CADJPY", "AUDJPY", "NZDJPY", "EURJPY"},
+)
+EUR_ST_CORR_GROUP: frozenset[str] = frozenset(
+    {"EURUSD", "EURGBP", "EURJPY", "EURAUD", "EURNZD", "EURCAD", "EURCHF"},
+)
+COMMODITY_ST_CORR_GROUP: frozenset[str] = frozenset(
+    {
+        "AUDUSD",
+        "NZDUSD",
+        "USDCAD",
+        "AUDCAD",
+        "AUDNZD",
+        "AUDCHF",
+        "NZDCAD",
+        "NZDCHF",
+        "CADCHF",
+        "GBPAUD",
+        "GBPNZD",
+        "GBPCAD",
+        "EURAUD",
+        "EURNZD",
+        "EURCAD",
+    },
+)
+
+
+def _fetch_weekly_ohlc(ticker: str, as_of_date: date | None) -> pd.DataFrame | None:
+    """Weekly OHLC through ``as_of_date`` (same ``safe_yf_fetch`` contract as daily trend)."""
+    tku = (ticker or "").strip().upper()
+    end_d = as_of_date or datetime.now(timezone.utc).date()
+    start_d = end_d - timedelta(days=140)
+    try:
+        from continuous_backtester import safe_yf_fetch
+
+        df = safe_yf_fetch(
+            _yf_symbol(tku),
+            start_d.isoformat(),
+            (end_d + timedelta(days=1)).isoformat(),
+            "1wk",
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.debug("_fetch_weekly_ohlc %s: %s", tku, e)
+        return None
+    if df is None or getattr(df, "empty", True):
+        return None
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.copy()
+        df.columns = df.columns.get_level_values(0)
+    for col in ("Open", "High", "Low", "Close"):
+        if col not in df.columns:
+            return None
+    out = df.copy()
+    out.index = pd.to_datetime(out.index)
+    if out.index.tz is not None:
+        out.index = out.index.tz_localize(None)
+    out = out[out.index.date <= end_d]
+    if out.empty:
+        return None
+    return out
+
+
+def _check_8wk_ema_alignment(
+    ticker: str,
+    direction: str,
+    as_of_date: date | None = None,
+) -> bool:
+    """
+    Layer 1 hard gate for STRONG_TAILWIND.
+    Returns True if:
+      - LONG: weekly close > 8-period EMA of weekly closes
+      - SHORT: weekly close < 8-period EMA of weekly closes
+    Uses the same weekly price source that get_price_trend uses.
+    Returns True (passes) if data is unavailable, to avoid blocking legitimate signals on data gaps.
+    """
+    dire = (direction or "").strip().upper()
+    if dire not in ("LONG", "SHORT"):
+        return True
+    df = _fetch_weekly_ohlc(ticker, as_of_date)
+    if df is None or len(df) < 8:
+        return True
+    try:
+        closes = pd.to_numeric(df["Close"], errors="coerce").dropna()
+        if len(closes) < 8:
+            return True
+        ema8 = float(closes.ewm(span=8, adjust=False).mean().iloc[-1])
+        last_close = float(closes.iloc[-1])
+        if not math.isfinite(ema8) or not math.isfinite(last_close):
+            return True
+        if dire == "LONG":
+            return last_close > ema8
+        return last_close < ema8
+    except Exception as e:  # noqa: BLE001
+        logger.debug("_check_8wk_ema_alignment %s: %s", ticker, e)
+        return True
+
+
+def _st_correlation_group(ticker: str) -> frozenset[str] | None:
+    t = (ticker or "").strip().upper()
+    if t in JPY_ST_CORR_GROUP:
+        return JPY_ST_CORR_GROUP
+    if len(t) == 6 and t.isalpha():
+        base, quote = t[:3], t[3:]
+        if "EUR" in (base, quote):
+            return EUR_ST_CORR_GROUP
+        if any(c in (base, quote) for c in ("AUD", "NZD", "CAD")):
+            return COMMODITY_ST_CORR_GROUP
+    return None
+
+
+def _weekly_atr(df: pd.DataFrame, period: int = 8) -> float | None:
+    try:
+        high = pd.to_numeric(df["High"], errors="coerce")
+        low = pd.to_numeric(df["Low"], errors="coerce")
+        close = pd.to_numeric(df["Close"], errors="coerce")
+        prev_close = close.shift(1)
+        tr = pd.concat(
+            [
+                (high - low).abs(),
+                (high - prev_close).abs(),
+                (low - prev_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        atr_s = tr.rolling(period).mean().dropna()
+        if atr_s.empty:
+            return None
+        val = float(atr_s.iloc[-1])
+        return val if math.isfinite(val) and val > 0 else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def compute_st_layer2_score(
+    ticker: str,
+    direction: str,
+    trend_strength: float,
+    rate_diff: float,
+    *,
+    as_of_date: date | None = None,
+) -> dict[str, Any]:
+    """
+    Computes STRONG_TAILWIND Layer 2 confirmation score (0-5).
+    Only called when macro bias is already STRONG_TAILWIND.
+    Each criterion adds 1 point.
+    """
+    dire = (direction or "").strip().upper()
+    tku = (ticker or "").strip().upper()
+    criteria_met: list[str] = []
+    score = 0
+
+    # 1 — rate differential widening (4 weeks)
+    try:
+        if len(tku) == 6 and tku.isalpha():
+            base, quote = tku[:3], tku[3:]
+            rd_now = float(rate_diff)
+            _ = as_of_date
+            rd_prev = get_rate_differential(base, quote)
+            if dire == "LONG":
+                sig_now, sig_prev = rd_now, rd_prev
+            else:
+                sig_now, sig_prev = -rd_now, -rd_prev
+            if sig_now - sig_prev >= 0.25:
+                score += 1
+                criteria_met.append("rate_diff_widening")
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 2 — last 3 weekly closes directional
+    try:
+        wdf = _fetch_weekly_ohlc(tku, as_of_date)
+        if wdf is not None and len(wdf) >= 4:
+            closes = pd.to_numeric(wdf["Close"], errors="coerce").dropna()
+            if len(closes) >= 4:
+                c1, c2, c3, c4 = (
+                    float(closes.iloc[-4]),
+                    float(closes.iloc[-3]),
+                    float(closes.iloc[-2]),
+                    float(closes.iloc[-1]),
+                )
+                if dire == "LONG" and c2 > c1 and c3 > c2 and c4 > c3:
+                    score += 1
+                    criteria_met.append("weekly_closes_directional")
+                elif dire == "SHORT" and c2 < c1 and c3 < c2 and c4 < c3:
+                    score += 1
+                    criteria_met.append("weekly_closes_directional")
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 3 — cross-pair correlation
+    try:
+        grp = _st_correlation_group(tku)
+        if grp is not None and dire in ("LONG", "SHORT"):
+            st_count = 0
+            for sym in grp:
+                mb_row = get_macro_bias(sym, dire, as_of_date=as_of_date)
+                if str(mb_row.get("bias", "")).strip().upper() == "STRONG_TAILWIND":
+                    st_count += 1
+            if st_count >= 3:
+                score += 1
+                criteria_met.append("cross_pair_correlation")
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 4 — trend strength
+    try:
+        if float(trend_strength or 0) > 0.70:
+            score += 1
+            criteria_met.append("trend_strength")
+    except (TypeError, ValueError):
+        pass
+
+    # 5 — no recent reversal candle (last 2 weekly)
+    try:
+        wdf2 = _fetch_weekly_ohlc(tku, as_of_date)
+        if wdf2 is not None and len(wdf2) >= 8:
+            atr8 = _weekly_atr(wdf2, period=8)
+            if atr8 is not None and atr8 > 0:
+                tail = wdf2.tail(2)
+                bad = False
+                for _, row in tail.iterrows():
+                    o = float(row["Open"])
+                    c = float(row["Close"])
+                    body = abs(c - o)
+                    if dire == "LONG" and c < o and body > 0.5 * atr8:
+                        bad = True
+                        break
+                    if dire == "SHORT" and c > o and body > 0.5 * atr8:
+                        bad = True
+                        break
+                if not bad:
+                    score += 1
+                    criteria_met.append("no_reversal_candle")
+    except Exception:  # noqa: BLE001
+        pass
+
+    return {
+        "st_layer2_score": int(score),
+        "st_criteria_met": criteria_met,
+    }
 
 
 def get_price_trend(
@@ -389,6 +632,30 @@ def get_macro_bias(
     composite = max(-1.0, min(1.0, composite))
 
     if composite >= 0.50:
+        price_confirms = _check_8wk_ema_alignment(t, dire, as_of_date=as_of_date)
+        if not price_confirms:
+            from utils import log
+
+            log(
+                f"[ST LAYER1 FAIL] {t} {dire}: composite={composite:.3f} >= 0.50 but "
+                f"8wk EMA gate failed — downgraded to TAILWIND. "
+                f"rate_diff={rate_diff:+.2f}%, trend={trend}",
+                level="info",
+            )
+            return {
+                "bias": "TAILWIND",
+                "composite_score": round(composite, 3),
+                "rate_differential": rate_diff,
+                "price_trend": trend,
+                "sentiment_score": round(sentiment_score, 3),
+                "confidence_upgrade": 0,
+                "size_multiplier": 1.10,
+                "note": (
+                    f"STRONG_TAILWIND downgraded to TAILWIND — 8wk EMA gate failed, "
+                    f"rate diff {rate_diff:+.2f}%, {trend}"
+                ),
+                "st_layer1_failed": True,
+            }
         return {
             "bias": "STRONG_TAILWIND",
             "composite_score": round(composite, 3),
@@ -399,7 +666,7 @@ def get_macro_bias(
             "size_multiplier": 1.20,
             "note": (
                 f"Strong macro tailwind — rate diff {rate_diff:+.2f}%, {trend}, "
-                f"sentiment {sentiment_score:+.2f}"
+                f"sentiment {sentiment_score:+.2f}, 8wk EMA confirmed"
             ),
         }
     if composite >= 0.20:

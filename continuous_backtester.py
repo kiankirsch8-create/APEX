@@ -4257,32 +4257,81 @@ def _v75_apply_macro_event_and_combo_boosts(
     conf = str(ai.get("confidence", "")).strip().upper()
     ts = float(trend_strength or 0)
     rd = float(rate_diff or 0)
+
+    ai["period_mode"] = str(period_mode or "NEUTRAL").strip().upper()
+    ai["st_boost_tier"] = "NONE"
+    ai["st_layer2_score"] = 0
+    ai["st_criteria_met"] = []
+    ai["macro_event_boost_applied"] = False
+    ai["combination_boost_applied"] = 1.0
+    ai.pop("_trail_regime_st", None)
+
+    if mb == "STRONG_TAILWIND" and conf == "MEDIUM" and tf_lc != "4h":
+        from macro_manager import compute_st_layer2_score
+
+        as_of_raw = ai.get("_as_of_date")
+        as_of_d: date | None = None
+        if isinstance(as_of_raw, date):
+            as_of_d = as_of_raw
+        elif as_of_raw is not None:
+            try:
+                as_of_d = date.fromisoformat(str(as_of_raw).strip()[:10])
+            except (TypeError, ValueError):
+                as_of_d = None
+
+        layer2 = compute_st_layer2_score(
+            ticker=sym,
+            direction=str(ai.get("direction", "LONG")),
+            trend_strength=ts,
+            rate_diff=rd,
+            as_of_date=as_of_d,
+        )
+        confluence_bonus = 1 if int(locked_confluence) >= 2 else 0
+        effective_score = int(layer2["st_layer2_score"]) + confluence_bonus
+
+        if effective_score == 0:
+            tier = "BASE"
+            boost_mult = 1.0
+            cap_used = cap_hi
+        elif effective_score <= 2:
+            tier = "STANDARD"
+            boost_mult = 1.25
+            cap_used = cap_hi
+        elif effective_score <= 4:
+            tier = "ENHANCED"
+            boost_mult = 1.50
+            cap_used = max(cap_hi, bal * 0.06)
+        else:
+            tier = "FULL_GOLDEN"
+            boost_mult = 1.67
+            cap_used = macro_cap
+            ai["macro_event_boost_applied"] = True
+
+        mrd = min(
+            mrd * boost_mult,
+            cap_used,
+            cap_hi * 1.5 if tier != "FULL_GOLDEN" else macro_cap,
+        )
+
+        ai["st_boost_tier"] = tier
+        ai["st_layer2_score"] = layer2["st_layer2_score"]
+        ai["st_criteria_met"] = layer2["st_criteria_met"]
+
+        log(
+            f"[ST TIER {tier}] {sym_u}: layer2={layer2['st_layer2_score']}/5, "
+            f"confluence_bonus={confluence_bonus}, effective={effective_score}, "
+            f"boost={boost_mult}x, criteria={layer2['st_criteria_met']}",
+            level="info",
+        )
+
     trail_reg = (
         "CHOPPY"
         if tf_lc == "4h"
         else detect_trailing_regime(mb, ts, rd)
     )
-
-    ai["period_mode"] = str(period_mode or "NEUTRAL").strip().upper()
-    ai["macro_event_boost_applied"] = False
-    ai["combination_boost_applied"] = 1.0
-
-    is_macro_event = (
-        mb == "STRONG_TAILWIND"
-        and conf == "MEDIUM"
-        and ts > 0.70
-        and rd > 2.5
-        and int(locked_confluence) >= 2
-        and trail_reg == "TRENDING"
-    )
-    if is_macro_event:
-        mrd = min(mrd * 2.0, macro_cap, cap_hi * 1.5)
-        ai["macro_event_boost_applied"] = True
-        log(
-            f"[MACRO EVENT BOOST] {sym_u}: all conditions met — 2.0x macro boost applied. "
-            f"Final risk: ${mrd:.0f}",
-            level="info",
-        )
+    if mb == "STRONG_TAILWIND" and ai.get("st_boost_tier") == "BASE" and tf_lc != "4h":
+        trail_reg = "CHOPPY"
+        ai["_trail_regime_st"] = "CHOPPY"
 
     combo_mult = 1.0
     for tick, sid, min_trades, boost in PROVEN_COMBINATIONS:
@@ -4656,6 +4705,8 @@ def _python_forced_layer2_trade(
         log_fn=log,
     )
     ai.update(macro_result_fields(macro_bt))
+    if scan_d_macro is not None:
+        ai["_as_of_date"] = scan_d_macro
     log(
         f"[MACRO] {sym} {direction} — {macro_bt['bias']} (score {macro_bt['composite_score']:+.2f}) "
         f"rate_diff={macro_bt['rate_differential']:+.2f}% {macro_bt['price_trend']}",
@@ -4942,6 +4993,8 @@ def _python_forced_layer2_trade(
         float(ai.get("macro_rate_diff", 0) or 0),
         timeframe=tf_key,
     )
+    if ai.get("_trail_regime_st") == "CHOPPY":
+        trail_reg = "CHOPPY"
 
     exit_data = evaluate_forward_candles(
         direction,
@@ -5127,6 +5180,9 @@ def _python_forced_layer2_trade(
         "period_mode": str(ai.get("period_mode") or period_mode),
         "macro_event_boost_applied": bool(ai.get("macro_event_boost_applied")),
         "combination_boost_applied": float(ai.get("combination_boost_applied", 1.0) or 1.0),
+        "st_boost_tier": str(ai.get("st_boost_tier") or "NONE"),
+        "st_layer2_score": int(ai.get("st_layer2_score", 0) or 0),
+        "st_criteria_met": list(ai.get("st_criteria_met") or []),
         **v75_meta,
         **(
             _trade_condition_snapshot_fields(analysis_date, past, ind or {})
@@ -5705,6 +5761,8 @@ def run_one_backtest(
                 log_fn=log,
             )
             ai.update(macro_result_fields(macro_bt))
+            if scan_d is not None:
+                ai["_as_of_date"] = scan_d
             log(
                 f"[MACRO] {sym} {d0} — {macro_bt['bias']} (score {macro_bt['composite_score']:+.2f}) "
                 f"rate_diff={macro_bt['rate_differential']:+.2f}% {macro_bt['price_trend']}",
@@ -5924,6 +5982,8 @@ def run_one_backtest(
             float(ai.get("macro_rate_diff", 0) or 0),
             timeframe=tf_key,
         )
+        if ai.get("_trail_regime_st") == "CHOPPY":
+            trail_reg = "CHOPPY"
 
         exit_data = evaluate_forward_candles(
             direction,
@@ -6181,6 +6241,9 @@ def run_one_backtest(
             "period_mode": str(ai.get("period_mode") or period_mode),
             "macro_event_boost_applied": bool(ai.get("macro_event_boost_applied")),
             "combination_boost_applied": float(ai.get("combination_boost_applied", 1.0) or 1.0),
+            "st_boost_tier": str(ai.get("st_boost_tier") or "NONE"),
+            "st_layer2_score": int(ai.get("st_layer2_score", 0) or 0),
+            "st_criteria_met": list(ai.get("st_criteria_met") or []),
             **v75_meta,
             **cond_snap,
         }
