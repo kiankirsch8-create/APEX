@@ -40,6 +40,8 @@ CENTRAL_BANK_RATES: dict[str, float] = {
 
 IS_BACKTEST: bool = False
 
+_MACRO_BIAS_RESULT_CACHE: dict[tuple[str, str, str], dict[str, Any]] = {}
+
 _trend_cache: dict[str, str] = {}
 _trend_cache_time: dict[str, datetime] = {}
 _trend_lock = threading.Lock()
@@ -376,16 +378,20 @@ def compute_st_layer2_score(
     except Exception:  # noqa: BLE001
         pass
 
-    # 3 — cross-pair correlation
+    # 3 — cross-pair correlation (bonus: 2+ other cached pairs in group show STRONG_TAILWIND)
     try:
         grp = _st_correlation_group(tku)
         if grp is not None and dire in ("LONG", "SHORT"):
-            st_count = 0
-            for sym in grp:
-                mb_row = get_macro_bias(sym, dire, as_of_date=as_of_date)
-                if str(mb_row.get("bias", "")).strip().upper() == "STRONG_TAILWIND":
-                    st_count += 1
-            if st_count >= 3:
+            st_others = 0
+            for pair in grp:
+                if pair == tku:
+                    continue
+                cached_mb = get_macro_bias_cached(pair, dire, as_of_date=as_of_date)
+                if cached_mb is None:
+                    continue
+                if str(cached_mb.get("bias", "")).strip().upper() == "STRONG_TAILWIND":
+                    st_others += 1
+            if st_others >= 2:
                 score += 1
                 criteria_met.append("cross_pair_correlation")
     except Exception:  # noqa: BLE001
@@ -614,7 +620,48 @@ def get_news_sentiment(base: str, quote: str) -> float:
     return out
 
 
+def _macro_bias_cache_key(
+    ticker: str,
+    direction: str,
+    as_of_date: date | None,
+) -> tuple[str, str, str]:
+    return (
+        (ticker or "").strip().upper(),
+        (direction or "").strip().upper(),
+        as_of_date.isoformat() if as_of_date else "",
+    )
+
+
+def get_macro_bias_cached(
+    ticker: str,
+    direction: str,
+    *,
+    as_of_date: date | None = None,
+) -> dict[str, Any] | None:
+    """Return cached macro bias only — never computes on miss (for cross-pair Layer 2)."""
+    key = _macro_bias_cache_key(ticker, direction, as_of_date)
+    hit = _MACRO_BIAS_RESULT_CACHE.get(key)
+    if hit is None:
+        return None
+    return dict(hit)
+
+
 def get_macro_bias(
+    ticker: str,
+    direction: str,
+    *,
+    as_of_date: date | None = None,
+) -> dict[str, Any]:
+    key = _macro_bias_cache_key(ticker, direction, as_of_date)
+    cached = _MACRO_BIAS_RESULT_CACHE.get(key)
+    if cached is not None:
+        return dict(cached)
+    result = _compute_macro_bias(ticker, direction, as_of_date=as_of_date)
+    _MACRO_BIAS_RESULT_CACHE[key] = dict(result)
+    return result
+
+
+def _compute_macro_bias(
     ticker: str,
     direction: str,
     *,
