@@ -38,6 +38,60 @@ CENTRAL_BANK_RATES: dict[str, float] = {
     "ZAR": 8.25,
 }
 
+# Piecewise-constant CB policy rates for chrono backtests (RATE-VEL / weeks_ago lookups).
+_CB_RATE_TIMELINE: tuple[tuple[date, dict[str, float]], ...] = (
+    (
+        date(2020, 1, 1),
+        {
+            "USD": 1.75,
+            "EUR": -0.50,
+            "GBP": 0.75,
+            "JPY": -0.10,
+            "AUD": 0.75,
+            "CAD": 1.75,
+            "NZD": 1.00,
+            "CHF": -0.75,
+            "NOK": 1.50,
+            "SEK": 0.00,
+            "MXN": 7.25,
+            "ZAR": 6.50,
+        },
+    ),
+    (
+        date(2020, 3, 16),
+        {"USD": 0.25, "GBP": 0.10, "AUD": 0.25, "CAD": 0.25, "NZD": 0.25},
+    ),
+    (
+        date(2022, 3, 17),
+        {"USD": 0.50, "GBP": 0.75, "CAD": 0.50, "NZD": 1.00, "AUD": 0.10},
+    ),
+    (
+        date(2022, 7, 1),
+        {"USD": 1.75, "EUR": 0.00, "GBP": 1.25, "CAD": 2.50, "NZD": 2.50, "AUD": 1.35},
+    ),
+    (
+        date(2023, 7, 1),
+        {
+            "USD": 5.25,
+            "EUR": 4.00,
+            "GBP": 5.00,
+            "JPY": -0.10,
+            "AUD": 4.10,
+            "CAD": 5.00,
+            "NZD": 5.50,
+            "CHF": 1.75,
+        },
+    ),
+    (
+        date(2024, 9, 1),
+        {"USD": 5.00, "EUR": 3.65, "GBP": 5.00, "AUD": 4.35, "NZD": 5.25, "CHF": 1.50},
+    ),
+    (
+        date(2025, 1, 1),
+        {"USD": 4.50, "EUR": 3.00, "GBP": 4.75, "JPY": 0.50, "CAD": 3.75, "NZD": 4.25, "CHF": 0.50},
+    ),
+)
+
 IS_BACKTEST: bool = False
 
 _MACRO_BIAS_RESULT_CACHE: dict[tuple[str, str, str], dict[str, Any]] = {}
@@ -176,10 +230,34 @@ def apply_macro_confidence_adjustment(
     return result
 
 
-def get_rate_differential(base: str, quote: str) -> float:
+def _cb_rates_on(ref: date) -> dict[str, float]:
+    merged: dict[str, float] = dict(_CB_RATE_TIMELINE[0][1])
+    for eff, patch in _CB_RATE_TIMELINE:
+        if eff > ref:
+            break
+        merged.update(patch)
+    if ref >= _CB_RATE_TIMELINE[-1][0]:
+        merged.update(CENTRAL_BANK_RATES)
+    else:
+        for ccy, rate in CENTRAL_BANK_RATES.items():
+            merged.setdefault(ccy, rate)
+    return merged
+
+
+def get_rate_differential(
+    base: str,
+    quote: str,
+    *,
+    weeks_ago: int = 0,
+    as_of_date: date | None = None,
+) -> float:
+    ref = as_of_date or datetime.now(timezone.utc).date()
+    if weeks_ago > 0:
+        ref = ref - timedelta(weeks=int(weeks_ago))
+    rates = _cb_rates_on(ref)
     b = (base or "").strip().upper()[:3]
     q = (quote or "").strip().upper()[:3]
-    return float(CENTRAL_BANK_RATES.get(b, 0.0)) - float(CENTRAL_BANK_RATES.get(q, 0.0))
+    return float(rates.get(b, 0.0)) - float(rates.get(q, 0.0))
 
 
 def _yf_symbol(ticker: str) -> str:
@@ -331,29 +409,32 @@ def compute_st_layer2_score(
     as_of_date: date | None = None,
 ) -> dict[str, Any]:
     """
-    Computes STRONG_TAILWIND Layer 2 confirmation score (0-5).
+    Computes STRONG_TAILWIND Layer 2 confirmation score (0-6).
     Only called when macro bias is already STRONG_TAILWIND.
-    Each criterion adds 1 point.
+    Criterion 1 (RATE-VEL) adds 0-2; criteria 2-5 add 0-1 each.
     """
     dire = (direction or "").strip().upper()
     tku = (ticker or "").strip().upper()
     criteria_met: list[str] = []
     score = 0
 
-    # 1 — rate differential widening (4 weeks)
+    # 1 — RATE-VEL gradient (0-2 pts from 4-week differential velocity)
     try:
         if len(tku) == 6 and tku.isalpha():
             base, quote = tku[:3], tku[3:]
-            rd_now = float(rate_diff)
-            _ = as_of_date
-            rd_prev = get_rate_differential(base, quote)
+            rd_now = get_rate_differential(base, quote, as_of_date=as_of_date)
+            rd_4w = get_rate_differential(base, quote, weeks_ago=4, as_of_date=as_of_date)
             if dire == "LONG":
-                sig_now, sig_prev = rd_now, rd_prev
+                sig_now, sig_prev = rd_now, rd_4w
             else:
-                sig_now, sig_prev = -rd_now, -rd_prev
-            if sig_now - sig_prev >= 0.25:
+                sig_now, sig_prev = -rd_now, -rd_4w
+            weekly_velocity = (sig_now - sig_prev) / 4.0
+            if weekly_velocity >= 0.10:
+                score += 2
+                criteria_met.append("rate_vel_fast")
+            elif weekly_velocity >= 0.03:
                 score += 1
-                criteria_met.append("rate_diff_widening")
+                criteria_met.append("rate_vel_slow")
     except Exception:  # noqa: BLE001
         pass
 
