@@ -4372,7 +4372,7 @@ def _v75_apply_macro_event_and_combo_boosts(
             ai["st_criteria_met"] = layer2["st_criteria_met"]
 
             log(
-                f"[ST TIER {tier}] {sym_u}: layer2={layer2['st_layer2_score']}/5, "
+                f"[ST TIER {tier}] {sym_u}: layer2={layer2['st_layer2_score']}/6, "
                 f"confluence_bonus={confluence_bonus}, effective={effective_score}, "
                 f"boost={boost_mult}x, criteria={layer2['st_criteria_met']}",
                 level="info",
