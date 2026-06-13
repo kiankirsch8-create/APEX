@@ -4343,23 +4343,23 @@ def _v75_apply_macro_event_and_combo_boosts(
             confluence_bonus = 1 if int(locked_confluence) >= 2 else 0
             effective_score = int(layer2["st_layer2_score"]) + confluence_bonus
 
-            if effective_score == 0:
+            if effective_score >= 4:
+                tier = "FULL_GOLDEN"
+                boost_mult = 2.0
+                cap_used = macro_cap
+                ai["macro_event_boost_applied"] = True
+            elif effective_score >= 3:
+                tier = "ENHANCED"
+                boost_mult = 1.80
+                cap_used = max(cap_hi, bal * 0.06)
+            elif effective_score >= 1:
+                tier = "STANDARD"
+                boost_mult = 1.40
+                cap_used = cap_hi
+            else:
                 tier = "BASE"
                 boost_mult = 1.0
                 cap_used = cap_hi
-            elif effective_score <= 2:
-                tier = "STANDARD"
-                boost_mult = 1.25
-                cap_used = cap_hi
-            elif effective_score <= 4:
-                tier = "ENHANCED"
-                boost_mult = 1.50
-                cap_used = max(cap_hi, bal * 0.06)
-            else:
-                tier = "FULL_GOLDEN"
-                boost_mult = 1.67
-                cap_used = macro_cap
-                ai["macro_event_boost_applied"] = True
 
             mrd = min(
                 mrd * boost_mult,
