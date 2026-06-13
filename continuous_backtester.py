@@ -4306,62 +4306,77 @@ def _v75_apply_macro_event_and_combo_boosts(
     ai.pop("_trail_regime_st", None)
 
     if mb == "STRONG_TAILWIND" and conf == "MEDIUM" and tf_lc != "4h":
-        from macro_manager import compute_st_layer2_score
-
-        as_of_raw = ai.get("_as_of_date")
-        as_of_d: date | None = None
-        if isinstance(as_of_raw, date):
-            as_of_d = as_of_raw
-        elif as_of_raw is not None:
-            try:
-                as_of_d = date.fromisoformat(str(as_of_raw).strip()[:10])
-            except (TypeError, ValueError):
-                as_of_d = None
-
-        layer2 = compute_st_layer2_score(
-            ticker=sym,
-            direction=str(ai.get("direction", "LONG")),
-            trend_strength=ts,
-            rate_diff=rd,
-            as_of_date=as_of_d,
-        )
-        confluence_bonus = 1 if int(locked_confluence) >= 2 else 0
-        effective_score = int(layer2["st_layer2_score"]) + confluence_bonus
-
-        if effective_score == 0:
+        skip_l2 = bool(ai.get("skip_layer2_scoring"))
+        if skip_l2:
             tier = "BASE"
             boost_mult = 1.0
             cap_used = cap_hi
-        elif effective_score <= 2:
-            tier = "STANDARD"
-            boost_mult = 1.25
-            cap_used = cap_hi
-        elif effective_score <= 4:
-            tier = "ENHANCED"
-            boost_mult = 1.50
-            cap_used = max(cap_hi, bal * 0.06)
+            mrd = min(mrd * boost_mult, cap_used, cap_hi * 1.5)
+            ai["st_boost_tier"] = tier
+            ai["st_layer2_score"] = 0
+            ai["st_criteria_met"] = []
+            log(
+                f"[ST TIER {tier}] {sym_u}: layer1 EMA gate failed — skip_layer2_scoring, "
+                f"boost={boost_mult}x",
+                level="info",
+            )
         else:
-            tier = "FULL_GOLDEN"
-            boost_mult = 1.67
-            cap_used = macro_cap
-            ai["macro_event_boost_applied"] = True
+            from macro_manager import compute_st_layer2_score
 
-        mrd = min(
-            mrd * boost_mult,
-            cap_used,
-            cap_hi * 1.5 if tier != "FULL_GOLDEN" else macro_cap,
-        )
+            as_of_raw = ai.get("_as_of_date")
+            as_of_d: date | None = None
+            if isinstance(as_of_raw, date):
+                as_of_d = as_of_raw
+            elif as_of_raw is not None:
+                try:
+                    as_of_d = date.fromisoformat(str(as_of_raw).strip()[:10])
+                except (TypeError, ValueError):
+                    as_of_d = None
 
-        ai["st_boost_tier"] = tier
-        ai["st_layer2_score"] = layer2["st_layer2_score"]
-        ai["st_criteria_met"] = layer2["st_criteria_met"]
+            layer2 = compute_st_layer2_score(
+                ticker=sym,
+                direction=str(ai.get("direction", "LONG")),
+                trend_strength=ts,
+                rate_diff=rd,
+                as_of_date=as_of_d,
+            )
+            confluence_bonus = 1 if int(locked_confluence) >= 2 else 0
+            effective_score = int(layer2["st_layer2_score"]) + confluence_bonus
 
-        log(
-            f"[ST TIER {tier}] {sym_u}: layer2={layer2['st_layer2_score']}/5, "
-            f"confluence_bonus={confluence_bonus}, effective={effective_score}, "
-            f"boost={boost_mult}x, criteria={layer2['st_criteria_met']}",
-            level="info",
-        )
+            if effective_score == 0:
+                tier = "BASE"
+                boost_mult = 1.0
+                cap_used = cap_hi
+            elif effective_score <= 2:
+                tier = "STANDARD"
+                boost_mult = 1.25
+                cap_used = cap_hi
+            elif effective_score <= 4:
+                tier = "ENHANCED"
+                boost_mult = 1.50
+                cap_used = max(cap_hi, bal * 0.06)
+            else:
+                tier = "FULL_GOLDEN"
+                boost_mult = 1.67
+                cap_used = macro_cap
+                ai["macro_event_boost_applied"] = True
+
+            mrd = min(
+                mrd * boost_mult,
+                cap_used,
+                cap_hi * 1.5 if tier != "FULL_GOLDEN" else macro_cap,
+            )
+
+            ai["st_boost_tier"] = tier
+            ai["st_layer2_score"] = layer2["st_layer2_score"]
+            ai["st_criteria_met"] = layer2["st_criteria_met"]
+
+            log(
+                f"[ST TIER {tier}] {sym_u}: layer2={layer2['st_layer2_score']}/5, "
+                f"confluence_bonus={confluence_bonus}, effective={effective_score}, "
+                f"boost={boost_mult}x, criteria={layer2['st_criteria_met']}",
+                level="info",
+            )
 
     trail_reg = (
         "CHOPPY"
