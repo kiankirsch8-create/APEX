@@ -113,6 +113,9 @@ def macro_result_fields(m: dict[str, Any]) -> dict[str, Any]:
         "macro_size_multiplier": float(m.get("size_multiplier", 1.0) or 1.0),
         "macro_confidence_upgrade": int(m.get("confidence_upgrade", 0) or 0),
         "st_layer1_failed": bool(m.get("st_layer1_failed", False)),
+        "skip_layer2_scoring": bool(m.get("skip_layer2_scoring", False)),
+        "st_boost_tier": str(m.get("st_boost_tier") or ""),
+        "st_multiplier": float(m.get("st_multiplier", 0) or 0),
     }
 
 
@@ -659,23 +662,26 @@ def get_macro_bias(
 
             log(
                 f"[ST LAYER1 FAIL] {t} {dire}: composite={composite:.3f} >= 0.50 but "
-                f"8wk EMA gate failed — downgraded to TAILWIND. "
+                f"8wk EMA gate failed — STRONG_TAILWIND at BASE tier (no boost). "
                 f"rate_diff={rate_diff:+.2f}%, trend={trend}",
                 level="info",
             )
             return {
-                "bias": "TAILWIND",
+                "bias": "STRONG_TAILWIND",
                 "composite_score": round(composite, 3),
                 "rate_differential": rate_diff,
                 "price_trend": trend,
                 "sentiment_score": round(sentiment_score, 3),
-                "confidence_upgrade": 0,
-                "size_multiplier": 1.10,
+                "confidence_upgrade": 1,
+                "size_multiplier": 1.20,
                 "note": (
-                    f"STRONG_TAILWIND downgraded to TAILWIND — 8wk EMA gate failed, "
+                    f"STRONG_TAILWIND — 8wk EMA gate failed, BASE tier (no boost), "
                     f"rate diff {rate_diff:+.2f}%, {trend}"
                 ),
                 "st_layer1_failed": True,
+                "st_boost_tier": "BASE",
+                "st_multiplier": 1.00,
+                "skip_layer2_scoring": True,
             }
         return {
             "bias": "STRONG_TAILWIND",
