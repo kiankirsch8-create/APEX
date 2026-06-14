@@ -409,9 +409,9 @@ def compute_st_layer2_score(
     as_of_date: date | None = None,
 ) -> dict[str, Any]:
     """
-    Computes STRONG_TAILWIND Layer 2 confirmation score (0-6).
+    Computes STRONG_TAILWIND Layer 2 confirmation score (0-7).
     Only called when macro bias is already STRONG_TAILWIND.
-    Criterion 1 (RATE-VEL) adds 0-2; criteria 2-5 add 0-1 each.
+    Criterion 1 (RATE-VEL) adds 0-2; criteria 2-5 add 0-1 each; CB-CALENDAR adds 0-1.
     """
     dire = (direction or "").strip().upper()
     tku = (ticker or "").strip().upper()
@@ -510,9 +510,28 @@ def compute_st_layer2_score(
     except Exception:  # noqa: BLE001
         pass
 
+    cb_boost = 0
+    try:
+        from calendar_manager import get_cb_calendar_boost
+
+        trade_date = as_of_date or datetime.now(timezone.utc).date()
+        cb_boost = get_cb_calendar_boost(tku, trade_date, "STRONG_TAILWIND")
+        if cb_boost > 0:
+            score += cb_boost
+            criteria_met.append("cb_calendar_boost")
+            from utils import log
+
+            log(
+                f"[CB-CALENDAR] {tku} on {trade_date}: CB meeting within 3 days, +1 boost applied",
+                level="info",
+            )
+    except Exception:  # noqa: BLE001
+        pass
+
     return {
         "st_layer2_score": int(score),
         "st_criteria_met": criteria_met,
+        "cb_calendar_boost": bool(cb_boost > 0),
     }
 
 

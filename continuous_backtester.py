@@ -4301,6 +4301,7 @@ def _v75_apply_macro_event_and_combo_boosts(
     ai["st_boost_tier"] = "NONE"
     ai["st_layer2_score"] = 0
     ai["st_criteria_met"] = []
+    ai["cb_calendar_boost"] = False
     ai["macro_event_boost_applied"] = False
     ai["combination_boost_applied"] = 1.0
     ai.pop("_trail_regime_st", None)
@@ -4370,9 +4371,10 @@ def _v75_apply_macro_event_and_combo_boosts(
             ai["st_boost_tier"] = tier
             ai["st_layer2_score"] = layer2["st_layer2_score"]
             ai["st_criteria_met"] = layer2["st_criteria_met"]
+            ai["cb_calendar_boost"] = bool(layer2.get("cb_calendar_boost"))
 
             log(
-                f"[ST TIER {tier}] {sym_u}: layer2={layer2['st_layer2_score']}/6, "
+                f"[ST TIER {tier}] {sym_u}: layer2={layer2['st_layer2_score']}/7, "
                 f"confluence_bonus={confluence_bonus}, effective={effective_score}, "
                 f"boost={boost_mult}x, criteria={layer2['st_criteria_met']}",
                 level="info",
@@ -5237,6 +5239,7 @@ def _python_forced_layer2_trade(
         "st_boost_tier": str(ai.get("st_boost_tier") or "NONE"),
         "st_layer2_score": int(ai.get("st_layer2_score", 0) or 0),
         "st_criteria_met": list(ai.get("st_criteria_met") or []),
+        "cb_calendar_boost": bool(ai.get("cb_calendar_boost")),
         **v75_meta,
         **(
             _trade_condition_snapshot_fields(analysis_date, past, ind or {})
@@ -6312,6 +6315,7 @@ def run_one_backtest(
             "st_boost_tier": str(ai.get("st_boost_tier") or "NONE"),
             "st_layer2_score": int(ai.get("st_layer2_score", 0) or 0),
             "st_criteria_met": list(ai.get("st_criteria_met") or []),
+            "cb_calendar_boost": bool(ai.get("cb_calendar_boost")),
             **v75_meta,
             **cond_snap,
         }
