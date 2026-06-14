@@ -227,7 +227,9 @@ ACTIVE_CHRONO_FILE = DATA_DIR / "active_chrono_job.json"
 STRATEGY_STATUS_FILE = DATA_DIR / "strategy_status.json"
 
 STARTING_CAPITAL = 10000.0
-BLOCKED_PAIRS: frozenset[str] = frozenset({"EURAUD", "QQQ", "EURNZD", "GBPNZD", "USDCAD"})
+BLOCKED_PAIRS: frozenset[str] = frozenset(
+    {"EURAUD", "QQQ", "EURNZD", "GBPNZD", "USDCAD", "USDMXN"},
+)
 # Group 1 forensic blocks (union with strategy_status.json ``blocked`` at evaluation time)
 BLOCKED_STRATEGIES_GROUP1: frozenset[str] = frozenset(
     {"Q03_MONTHLY_SEASONALITY", "R08_MONTHLY_LEVEL_REJECTION"},
@@ -491,6 +493,14 @@ _BLOCKED_PAIR_LOGGED: set[str] = set()
 _BLOCKED_STRATEGY_LOGGED: set[str] = set()
 
 
+def _log_group1_startup_blocks() -> None:
+    log(f"[STARTUP] BLOCKED_PAIRS active: {sorted(BLOCKED_PAIRS)}", level="info")
+    log(
+        f"[STARTUP] BLOCKED_STRATEGIES active: {sorted(BLOCKED_STRATEGIES_GROUP1)}",
+        level="info",
+    )
+
+
 def _reset_group1_skip_log_state() -> None:
     global _BLOCKED_PAIR_LOGGED, _BLOCKED_STRATEGY_LOGGED
     _BLOCKED_PAIR_LOGGED = set()
@@ -505,7 +515,7 @@ def _log_group1_blocked_strategy_once(strategy_id: str) -> None:
     sid_u = str(strategy_id or "").strip().upper()
     if sid_u and sid_u not in _BLOCKED_STRATEGY_LOGGED:
         log(
-            f"[BLOCKED STRATEGY] {sid_u} skipped — in BLOCKED_STRATEGIES list",
+            f"[BLOCKED STRATEGY] {sid_u} skipped — in BLOCKED_STRATEGIES_GROUP1 list",
             level="info",
         )
         _BLOCKED_STRATEGY_LOGGED.add(sid_u)
@@ -808,7 +818,6 @@ _V7_STALE_FALLBACK_IDS: frozenset[str] = frozenset(
         "B04_NY_OPEN_BREAKOUT",
         "Q01_DAY_OF_WEEK_EDGE",
         "Q02_TIME_OF_DAY_MOMENTUM",
-        "Q03_MONTHLY_SEASONALITY",
         "Q04_CARRY_TRADE_MOMENTUM",
         "Q05_CORRELATION_DIVERGENCE",
         "Q06_REGIME_DETECTION",
@@ -1454,11 +1463,15 @@ def _layer2_tuple_for_deterministic_pick(
     for sid in l2_sorted:
         if _sort_key(sid)[0] >= 9_000_000:
             continue
+        if _is_group1_blocked_strategy(sid):
+            continue
         if sid in by_sid:
             return by_sid[sid][0]
     # Pass 2 — stale / no-conditions strategies on their deterministic turn
     for sid in l2_sorted:
         if _sort_key(sid)[0] >= 9_000_000:
+            continue
+        if _is_group1_blocked_strategy(sid):
             continue
         if sid in _V7_STALE_FALLBACK_IDS:
             dire = "LONG" if float(zone_pct) < 50.0 else "SHORT"
@@ -4608,6 +4621,38 @@ def _python_forced_layer2_trade(
         return None
     best = layer2[0] if len(layer2) == 1 else max(layer2, key=lambda x: int(x[2]))
     strat_id = str(best[0]).strip().upper()
+    if _is_group1_blocked_strategy(strat_id):
+        _log_group1_blocked_strategy_once(strat_id)
+        blocked_reason = f"[BLOCKED STRATEGY] {strat_id} in BLOCKED_STRATEGIES_GROUP1 list"
+        if chrono_job:
+            return _chrono_scan_skip_row(
+                sym=sym,
+                timeframe=timeframe,
+                analysis_date=analysis_date,
+                tf_key=tf_key,
+                skip_reason=blocked_reason,
+                price=float(price),
+                is_exotic=is_exotic,
+            )
+        return _skipped_backtest_row(
+            sym=sym,
+            timeframe=timeframe,
+            analysis_date=analysis_date,
+            price=float(price),
+            zone_pct=zone_pct,
+            zone_label=zone_label,
+            skip_reason=blocked_reason,
+            ai={
+                "skip_trade": True,
+                "strategy_id": strat_id,
+                "strategy_met": False,
+                "skip_reason": blocked_reason,
+                "direction": "NONE",
+                "conviction_score": 0,
+            },
+            tf_key=tf_key,
+            is_exotic=is_exotic,
+        )
     ok_frag, rs_frag = _fragile_bad_period_skip(strat_id, period_mode)
     if ok_frag:
         return _skipped_backtest_row(
@@ -7032,6 +7077,7 @@ def build_work_batch(existing_keys: set[str], batch_size: int) -> list[tuple[str
 def continuous_backtest_loop() -> None:
     global CHRONO_RUNNING
     log("[Loop] Starting continuous backtest loop", level="info")
+    _log_group1_startup_blocks()
     tests_since_improve = 0
     loop_completed_tests = 0
 
@@ -7526,6 +7572,7 @@ def run_chronological_backtest(
         f"[COMPOUNDING] Mode is {'ENABLED' if COMPOUNDING_ENABLED else 'DISABLED'}",
         level="info",
     )
+    _log_group1_startup_blocks()
     _reset_group1_skip_log_state()
 
     chrono_data: dict[str, Any]
