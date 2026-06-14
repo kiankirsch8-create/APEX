@@ -2036,6 +2036,164 @@ def _atr_series_wilder(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return tr.ewm(alpha=1.0 / period, adjust=False).mean()
 
 
+def _yf_fx_ticker(ticker: str) -> str:
+    t = (ticker or "").strip().upper()
+    if len(t) == 6 and t.isalpha():
+        return f"{t}=X"
+    return t
+
+
+def _vol_scale_daily_ohlc(
+    ticker: str,
+    as_of_date: date,
+    *,
+    bars_needed: int,
+    past: pd.DataFrame | None = None,
+) -> pd.DataFrame | None:
+    if past is not None and not past.empty:
+        df = past.copy()
+        if not isinstance(df.index, pd.DatetimeIndex):
+            try:
+                df.index = pd.to_datetime(df.index)
+            except Exception:  # noqa: BLE001
+                pass
+        if isinstance(df.index, pd.DatetimeIndex):
+            day_end = pd.Timestamp(as_of_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+            df = df[df.index <= day_end]
+        if len(df) >= bars_needed:
+            return df
+    start_d = as_of_date - timedelta(days=int(bars_needed * 1.6) + 30)
+    df = safe_yf_fetch(
+        _yf_fx_ticker(ticker),
+        start_d.isoformat(),
+        (as_of_date + timedelta(days=1)).isoformat(),
+        "1d",
+    )
+    if df is None or df.empty:
+        return None
+    if isinstance(df.index, pd.DatetimeIndex):
+        day_end = pd.Timestamp(as_of_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+        df = df[df.index <= day_end]
+    return df if len(df) >= bars_needed else None
+
+
+def get_vol_scale_multiplier(
+    ticker: str,
+    current_date: date | str,
+    macro_bias: str,
+    *,
+    lookback_days: int = 14,
+    baseline_days: int = 126,
+    past: pd.DataFrame | None = None,
+) -> float:
+    """
+    Inverse-volatility position sizing multiplier for NEUTRAL/HEADWIND/STRONG_HEADWIND.
+    STRONG_TAILWIND and TAILWIND bypass (return 1.0). Clamped to 0.50–1.50.
+    """
+    mb = str(macro_bias or "").strip().upper()
+    if mb in ("STRONG_TAILWIND", "TAILWIND"):
+        return 1.0
+
+    try:
+        if isinstance(current_date, date):
+            ref = current_date
+        else:
+            ref = date.fromisoformat(str(current_date).strip()[:10])
+
+        bars_needed = baseline_days + lookback_days + 20
+        ohlc = _vol_scale_daily_ohlc(
+            ticker,
+            ref,
+            bars_needed=bars_needed,
+            past=past,
+        )
+        if ohlc is None or ohlc.empty:
+            return 1.0
+
+        closes = pd.to_numeric(ohlc["Close"], errors="coerce").dropna()
+        if len(closes) < lookback_days + 20:
+            return 1.0
+
+        atr_s = _atr_series_wilder(ohlc, lookback_days)
+        if atr_s.empty or len(atr_s) < lookback_days + 20:
+            return 1.0
+
+        current_atr = float(atr_s.iloc[-1])
+        current_price = float(closes.iloc[-1])
+        if not math.isfinite(current_atr) or not math.isfinite(current_price) or current_price <= 0:
+            return 1.0
+        current_atr_pct = current_atr / current_price
+
+        baseline_atrs: list[float] = []
+        upper = min(baseline_days, len(atr_s))
+        for i in range(20, upper):
+            atr_i = float(atr_s.iloc[i])
+            price_i = float(closes.iloc[i])
+            if math.isfinite(atr_i) and math.isfinite(price_i) and price_i > 0:
+                baseline_atrs.append(atr_i / price_i)
+
+        if not baseline_atrs:
+            return 1.0
+
+        baseline_atr_pct = sum(baseline_atrs) / len(baseline_atrs)
+        if baseline_atr_pct <= 0:
+            return 1.0
+
+        vol_ratio = current_atr_pct / baseline_atr_pct
+        if vol_ratio <= 0:
+            return 1.0
+
+        raw_scale = 1.0 / vol_ratio
+        return float(max(0.50, min(1.50, raw_scale)))
+    except Exception:  # noqa: BLE001
+        return 1.0
+
+
+def _apply_vol_scale_position_size(
+    ai: dict[str, Any],
+    *,
+    sym: str,
+    macro_bias: str,
+    trade_date: date | str,
+    past: pd.DataFrame | None = None,
+) -> None:
+    """Apply VOL-SCALE to final ``_max_risk_dollars`` before forward simulation."""
+    vol_scale = get_vol_scale_multiplier(
+        sym,
+        trade_date,
+        macro_bias,
+        past=past,
+    )
+    ai["vol_scale_applied"] = round(float(vol_scale), 4)
+    if vol_scale == 1.0:
+        return
+
+    try:
+        ent = float(ai.get("entry", 0) or 0)
+        stp = float(ai.get("stop_loss", 0) or 0)
+    except (TypeError, ValueError):
+        return
+    sd = abs(ent - stp)
+    if sd <= 0 or not math.isfinite(sd):
+        return
+
+    mrd = float(ai.get("_max_risk_dollars", 0) or 0)
+    if mrd <= 0:
+        return
+
+    mrd = max(25.0, mrd * vol_scale)
+    ai["_max_risk_dollars"] = round(mrd, 2)
+    ps = mrd / sd
+    ai["_position_size"] = round(ps, 2)
+    ai["_leveraged_exposure"] = round(ps * ent, 2)
+
+    log(
+        f"[VOL-SCALE] {sym.strip().upper()}: vol_scale={vol_scale:.2f} "
+        f"(regime={str(macro_bias or '').strip().upper()}) → adjusted mrd=${mrd:.0f}",
+        level="info",
+    )
+
+
 def _trade_condition_snapshot_fields(
     analysis_date: str,
     past: pd.DataFrame | None,
@@ -4301,6 +4459,7 @@ def _v75_apply_macro_event_and_combo_boosts(
     ai["st_boost_tier"] = "NONE"
     ai["st_layer2_score"] = 0
     ai["st_criteria_met"] = []
+    ai["cb_calendar_boost"] = False
     ai["macro_event_boost_applied"] = False
     ai["combination_boost_applied"] = 1.0
     ai.pop("_trail_regime_st", None)
@@ -4370,9 +4529,10 @@ def _v75_apply_macro_event_and_combo_boosts(
             ai["st_boost_tier"] = tier
             ai["st_layer2_score"] = layer2["st_layer2_score"]
             ai["st_criteria_met"] = layer2["st_criteria_met"]
+            ai["cb_calendar_boost"] = bool(layer2.get("cb_calendar_boost"))
 
             log(
-                f"[ST TIER {tier}] {sym_u}: layer2={layer2['st_layer2_score']}/6, "
+                f"[ST TIER {tier}] {sym_u}: layer2={layer2['st_layer2_score']}/7, "
                 f"confluence_bonus={confluence_bonus}, effective={effective_score}, "
                 f"boost={boost_mult}x, criteria={layer2['st_criteria_met']}",
                 level="info",
@@ -5003,6 +5163,14 @@ def _python_forced_layer2_trade(
     )
     _apply_compounding_single_trade_cap(ai)
 
+    _apply_vol_scale_position_size(
+        ai,
+        sym=sym,
+        macro_bias=str(ai.get("macro_bias_adjusted") or ai.get("macro_bias") or ""),
+        trade_date=scan_d_macro if scan_d_macro is not None else analysis_date,
+        past=past,
+    )
+
     entry = float(ai.get("entry", entry) or entry)
     stop = float(ai.get("stop_loss", stop) or stop)
     tp1 = float(ai.get("tp1", tp1) or tp1)
@@ -5237,6 +5405,8 @@ def _python_forced_layer2_trade(
         "st_boost_tier": str(ai.get("st_boost_tier") or "NONE"),
         "st_layer2_score": int(ai.get("st_layer2_score", 0) or 0),
         "st_criteria_met": list(ai.get("st_criteria_met") or []),
+        "cb_calendar_boost": bool(ai.get("cb_calendar_boost")),
+        "vol_scale_applied": float(ai.get("vol_scale_applied", 1.0) or 1.0),
         **v75_meta,
         **(
             _trade_condition_snapshot_fields(analysis_date, past, ind or {})
@@ -6028,6 +6198,14 @@ def run_one_backtest(
         )
         _apply_compounding_single_trade_cap(ai)
 
+        _apply_vol_scale_position_size(
+            ai,
+            sym=sym,
+            macro_bias=str(ai.get("macro_bias_adjusted") or ai.get("macro_bias") or ""),
+            trade_date=analysis_date,
+            past=past,
+        )
+
         position_size = float(ai.get("_position_size", 0) or 0)
         leveraged_exposure = float(ai.get("_leveraged_exposure", 0) or 0)
         max_risk_dollars = float(ai.get("_max_risk_dollars", 0) or 0)
@@ -6312,6 +6490,8 @@ def run_one_backtest(
             "st_boost_tier": str(ai.get("st_boost_tier") or "NONE"),
             "st_layer2_score": int(ai.get("st_layer2_score", 0) or 0),
             "st_criteria_met": list(ai.get("st_criteria_met") or []),
+            "cb_calendar_boost": bool(ai.get("cb_calendar_boost")),
+            "vol_scale_applied": float(ai.get("vol_scale_applied", 1.0) or 1.0),
             **v75_meta,
             **cond_snap,
         }
