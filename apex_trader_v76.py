@@ -14,6 +14,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import json
+import math
 import os
 import sys
 import threading
@@ -187,6 +188,7 @@ TICKERS: list[str] = list(at.TICKERS)
 V76_STATE_FILE = at.BASE_DIR / "apex_v76_live_state.json"
 V76_TICKET_META = at.BASE_DIR / "apex_trader_v76_tickets.json"
 V76_DECISION_LOG = at.BASE_DIR / "apex_v76_decisions.jsonl"
+LIVE_TRADES_FORENSIC = at.BASE_DIR / "live_trades_forensic.json"
 
 # Deep live log + remote API snapshot (VPS: ``APEX_DATA_DIR`` / ``C:\Apex``; Railway: set ``APEX_LIVE_V76_DIR``).
 _LOG_RING_MAX = 8000
@@ -480,6 +482,203 @@ def ticket_meta_v76_save(d: dict[str, Any]) -> None:
     at._save(V76_TICKET_META, d)
 
 
+def load_live_trades_forensic() -> list[dict[str, Any]]:
+    raw = at._load(LIVE_TRADES_FORENSIC, [])
+    return list(raw) if isinstance(raw, list) else []
+
+
+def append_live_trade_forensic(record: dict[str, Any]) -> None:
+    """Append one closed-trade row to ``live_trades_forensic.json`` (JSON array)."""
+    rows = load_live_trades_forensic()
+    rows.append(record)
+    at._save(LIVE_TRADES_FORENSIC, rows)
+
+
+def _pip_size_for_ticker(ticker: str) -> float:
+    t = (ticker or "").strip().upper()
+    if len(t) == 6 and "JPY" in t:
+        return 0.01
+    if len(t) == 6:
+        return 0.0001
+    return 0.0001
+
+
+def _pips_moved(direction: str, entry: float, exit_price: float, ticker: str) -> float:
+    pip = _pip_size_for_ticker(ticker)
+    if pip <= 0 or not math.isfinite(entry) or not math.isfinite(exit_price):
+        return 0.0
+    if str(direction or "").strip().upper() == "LONG":
+        return round((exit_price - entry) / pip, 1)
+    return round((entry - exit_price) / pip, 1)
+
+
+def _classify_live_exit_reason(meta: dict[str, Any], deals: list[Any], mt5m: Any) -> str:
+    hit1 = bool(meta.get("hit_tp1"))
+    hit2 = bool(meta.get("hit_tp2"))
+    hit3 = bool(meta.get("hit_tp3_partial") or meta.get("hit_tp3_full"))
+
+    last_out = None
+    for d in deals:
+        if int(getattr(d, "entry", -1)) == mt5m.DEAL_ENTRY_OUT:
+            last_out = d
+
+    reason_code = int(getattr(last_out, "reason", -1)) if last_out is not None else -1
+    if reason_code == mt5m.DEAL_REASON_CLIENT:
+        return "MANUAL"
+    if reason_code == mt5m.DEAL_REASON_TP:
+        if hit3:
+            return "TP3"
+        if hit2:
+            return "TP2"
+        if hit1:
+            return "TP1"
+        return "TP3"
+    if reason_code == mt5m.DEAL_REASON_SL:
+        if hit1 or hit2:
+            return "TRAIL"
+        return "SL"
+    if hit3:
+        return "TP3"
+    if hit2:
+        return "TP2"
+    if hit1:
+        return "TP1"
+    return "MANUAL"
+
+
+def _forensic_record_from_close(mt5: Any, ticket: int, meta: dict[str, Any]) -> dict[str, Any]:
+    import MetaTrader5 as mt5m
+
+    t0 = datetime.now(timezone.utc) - timedelta(days=90)
+    now = datetime.now(timezone.utc)
+    deals = [
+        d
+        for d in (mt5.history_deals_get(t0.replace(tzinfo=None), datetime.utcnow(), position=ticket) or [])
+        if int(getattr(d, "magic", 0) or 0) == APEX_V76_MAGIC
+    ]
+
+    entry_price = float(meta.get("entry_fill", 0) or 0)
+    exit_price = entry_price
+    pnl = 0.0
+    volume = 0.0
+    open_ts: int | None = None
+    close_ts: int | None = None
+
+    for d in deals:
+        ent = int(getattr(d, "entry", -1))
+        if ent == mt5m.DEAL_ENTRY_IN:
+            open_ts = int(d.time) if open_ts is None else min(open_ts, int(d.time))
+            if entry_price <= 0:
+                entry_price = float(d.price)
+            volume = max(volume, float(d.volume))
+        elif ent == mt5m.DEAL_ENTRY_OUT:
+            pnl += float(d.profit)
+            exit_price = float(d.price)
+            close_ts = int(d.time)
+
+    direction = str(meta.get("direction", "")).strip().upper()
+    ticker = str(meta.get("ticker", "")).strip().upper()
+    if not ticker:
+        ticker = at.position_forex_base6(str(meta.get("symbol", ""))) or str(meta.get("symbol", ""))
+
+    hold_hours = 0.0
+    if open_ts is not None and close_ts is not None and close_ts >= open_ts:
+        hold_hours = round((close_ts - open_ts) / 3600.0, 2)
+
+    close_date = (
+        datetime.fromtimestamp(close_ts, tz=timezone.utc).strftime("%Y-%m-%d")
+        if close_ts is not None
+        else datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    )
+
+    exit_reason = _classify_live_exit_reason(meta, deals, mt5m)
+    outcome = "WIN" if pnl > 0 else "LOSS"
+
+    return {
+        "date": close_date,
+        "ticker": ticker,
+        "direction": direction,
+        "strategy_id": str(meta.get("strategy", meta.get("strategy_id", ""))).strip().upper(),
+        "confidence": str(meta.get("confidence", "")).strip().upper(),
+        "macro_bias": str(meta.get("macro_bias", "")).strip().upper(),
+        "period_mode": str(meta.get("period_mode", "")).strip().upper(),
+        "st_boost_tier": str(meta.get("st_boost_tier", "NONE")).strip().upper(),
+        "trail_regime": str(meta.get("trail_regime", meta.get("trail_market_regime", "CHOPPY"))).strip().upper(),
+        "entry_price": round(entry_price, 5),
+        "exit_price": round(exit_price, 5),
+        "pnl_dollars": round(pnl, 2),
+        "pnl_pips": _pips_moved(direction, entry_price, exit_price, ticker),
+        "outcome": outcome,
+        "position_size": round(volume, 2) if volume > 0 else round(float(meta.get("position_size", 0) or 0), 2),
+        "max_risk_dollars": round(
+            float(meta.get("final_risk_usd", meta.get("max_risk_dollars", 0)) or 0),
+            2,
+        ),
+        "hold_time_hours": hold_hours,
+        "exit_reason": exit_reason,
+    }
+
+
+def _finalize_closed_positions_v76(mt5: Any, *, prior_meta: dict[str, Any] | None = None) -> None:
+    """Detect closed v76 tickets, append forensic rows, prune ticket meta."""
+    if mt5 is None:
+        return
+    try:
+        if not mt5.terminal_info():
+            return
+    except Exception:  # noqa: BLE001
+        return
+
+    open_ids = {
+        int(p.ticket)
+        for p in (mt5.positions_get() or [])
+        if int(getattr(p, "magic", 0) or 0) == APEX_V76_MAGIC
+    }
+    current_meta = ticket_meta_v76_load()
+    to_log: dict[str, dict[str, Any]] = {}
+
+    for src in (prior_meta, current_meta):
+        if not isinstance(src, dict):
+            continue
+        for k, m in src.items():
+            if not isinstance(m, dict):
+                continue
+            try:
+                tid = int(k)
+            except (TypeError, ValueError):
+                continue
+            if tid in open_ids:
+                continue
+            to_log[k] = m
+
+    if not to_log:
+        return
+
+    changed = False
+    for k, m in to_log.items():
+        try:
+            tid = int(k)
+        except (TypeError, ValueError):
+            continue
+        record = _forensic_record_from_close(mt5, tid, m)
+        append_live_trade_forensic(record)
+        live_log(
+            "info",
+            "[FORENSIC] position closed",
+            ticket=tid,
+            ticker=record.get("ticker"),
+            outcome=record.get("outcome"),
+            exit_reason=record.get("exit_reason"),
+            pnl_dollars=record.get("pnl_dollars"),
+        )
+        if k in current_meta:
+            del current_meta[k]
+            changed = True
+
+    if changed:
+        ticket_meta_v76_save(current_meta)
+
+
 def _today_iso() -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
@@ -729,6 +928,7 @@ def build_trade_plan_v76(
             "tp2": tp2,
             "tp3": tp3,
             "combination_boost_applied": res.get("combination_boost_applied"),
+            "st_boost_tier": res.get("st_boost_tier", "NONE"),
             "dry_run": DRY_RUN,
         },
     )
@@ -912,6 +1112,7 @@ def order_send_v76(
             "final_risk_pct": plan.risk_pct,
             "atr_live": float(plan.ai.get("entry_atr", 0) or plan.ai.get("atr", 0) or 0),
             "macro_rate_diff": plan.ai.get("macro_rate_diff"),
+            "st_boost_tier": plan.ai.get("st_boost_tier", "NONE"),
         }
         meta.update(_macro_manager.merged_macro_result_fields(plan.ai))
         res = at.order_send_live(mt5, broker_sym, plan.direction, plan.stop_loss, plan.risk_usd, meta)
@@ -1033,6 +1234,7 @@ def _meta_from_adopted_position(pos: Any) -> dict[str, Any]:
         "ticker": ticker,
         "symbol": str(pos.symbol),
         "adopted_on_startup": True,
+        "st_boost_tier": "NONE",
         "hit_tp1": False,
         "hit_tp2": False,
         "hit_tp3_partial": False,
@@ -1070,6 +1272,7 @@ def _adopt_open_positions(mt5: Any) -> None:
 def manage_trailing_v76(mt5: Any) -> None:
     """Trailing with deep logging (before/after each pass)."""
     _log_positions_trailing_phase(mt5, phase="BEFORE")
+    pre_meta = ticket_meta_v76_load()
     old_magic = at.APEX_MAGIC
     old_meta_path = at.TICKET_META_FILE
     try:
@@ -1079,6 +1282,7 @@ def manage_trailing_v76(mt5: Any) -> None:
     finally:
         at.APEX_MAGIC = old_magic
         at.TICKET_META_FILE = old_meta_path
+    _finalize_closed_positions_v76(mt5, prior_meta=pre_meta)
     _log_positions_trailing_phase(mt5, phase="AFTER")
     publish_live_status(mt5, status="running")
 
