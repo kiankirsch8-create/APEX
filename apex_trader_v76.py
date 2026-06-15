@@ -1001,6 +1001,72 @@ def _log_positions_trailing_phase(mt5: Any, *, phase: str) -> None:
         )
 
 
+def _meta_from_adopted_position(pos: Any) -> dict[str, Any]:
+    """Minimal ticket meta from an open MT5 position (prior trader / restart adoption)."""
+    ticket = int(pos.ticket)
+    d = "LONG" if int(getattr(pos, "type", 0) or 0) == 0 else "SHORT"
+    entry = float(pos.price_open)
+    sl = float(pos.sl or 0.0)
+    if sl <= 0:
+        risk = abs(entry) * 0.01
+        sl = entry - risk if d == "LONG" else entry + risk
+    else:
+        risk = abs(entry - sl)
+    if risk <= 0:
+        risk = abs(entry) * 0.01
+    trail_reg = "CHOPPY"
+    tp1, tp2, tp3 = _regime_tp_levels(d, entry, sl, trail_reg)
+    broker_tp = float(pos.tp or 0.0)
+    if broker_tp > 0:
+        tp3 = broker_tp
+    ticker = at.position_forex_base6(str(pos.symbol)) or str(pos.symbol)
+    return {
+        "ticket": ticket,
+        "entry_fill": entry,
+        "direction": d,
+        "sl": sl,
+        "r": risk,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "trail_regime": trail_reg,
+        "ticker": ticker,
+        "symbol": str(pos.symbol),
+        "adopted_on_startup": True,
+        "hit_tp1": False,
+        "hit_tp2": False,
+        "hit_tp3_partial": False,
+    }
+
+
+def _adopt_open_positions(mt5: Any) -> None:
+    """Register open v76-magic MT5 tickets in ``apex_trader_v76_tickets.json`` on startup."""
+    if mt5 is None:
+        return
+    try:
+        if not mt5.terminal_info():
+            return
+    except Exception:  # noqa: BLE001
+        return
+
+    raw = mt5.positions_get() or []
+    meta = ticket_meta_v76_load()
+    updated = False
+    for pos in raw:
+        if int(getattr(pos, "magic", 0) or 0) != APEX_V76_MAGIC:
+            continue
+        ticket = int(pos.ticket)
+        key = str(ticket)
+        if isinstance(meta.get(key), dict):
+            continue
+        meta[key] = _meta_from_adopted_position(pos)
+        updated = True
+        live_log("info", f"[ADOPT] Ticket {ticket} {pos.symbol} adopted from MT5 on startup")
+
+    if updated:
+        ticket_meta_v76_save(meta)
+
+
 def manage_trailing_v76(mt5: Any) -> None:
     """Trailing with deep logging (before/after each pass)."""
     _log_positions_trailing_phase(mt5, phase="BEFORE")
@@ -1282,6 +1348,7 @@ def main_loop_v76() -> None:
     if not DRY_RUN:
         at.emit_startup_diagnostics()
 
+    adopted_positions = False
     while True:
         try:
             mt5 = None if DRY_RUN else at.ensure_mt5()
@@ -1289,6 +1356,10 @@ def main_loop_v76() -> None:
                 log_v76("MT5 reconnect in 30s", "warning")
                 time.sleep(30)
                 continue
+
+            if not DRY_RUN and mt5 and not adopted_positions:
+                _adopt_open_positions(mt5)
+                adopted_positions = True
 
             now = datetime.now(timezone.utc)
             ran = False
