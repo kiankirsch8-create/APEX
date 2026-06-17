@@ -1284,11 +1284,11 @@ def manage_trailing_live(mt5: Any) -> None:
                 elif _partial_close(vol * 0.30, mt5.ORDER_TYPE_SELL, bid, "TREND 30% @TP3"):
                     m["hit_tp3_partial"] = True
                     m["peak_hi"] = max(float(m.get("peak_hi", entry)), px)
-                ph = float(m.get("peak_hi", px))
-                ph = max(ph, px)
-                m["peak_hi"] = ph
-                trail = ph - 2.0 * atru
-                nsl = max(cur_sl, trail) if cur_sl > 0 else trail
+                    ph = float(m.get("peak_hi", px))
+                    ph = max(ph, px)
+                    m["peak_hi"] = ph
+                    trail = ph - 2.0 * atru
+                    nsl = max(cur_sl, trail) if cur_sl > 0 else trail
             elif hit2 and treg == "TRENDING" and hit3p and tp3 > 0 and not m.get("continuation_active"):
                 ph = max(float(m.get("peak_hi", px)), px)
                 m["peak_hi"] = ph
@@ -1338,11 +1338,11 @@ def manage_trailing_live(mt5: Any) -> None:
                 elif _partial_close(vol * 0.30, mt5.ORDER_TYPE_BUY, ask, "TREND 30% @TP3"):
                     m["hit_tp3_partial"] = True
                     m["peak_lo"] = min(float(m.get("peak_lo", entry)), px)
-                pl = float(m.get("peak_lo", px))
-                pl = min(pl, px)
-                m["peak_lo"] = pl
-                trail = pl + 2.0 * atru
-                nsl = min(cur_sl, trail) if cur_sl > 0 else trail
+                    pl = float(m.get("peak_lo", px))
+                    pl = min(pl, px)
+                    m["peak_lo"] = pl
+                    trail = pl + 2.0 * atru
+                    nsl = min(cur_sl, trail) if cur_sl > 0 else trail
             elif hit2 and treg == "TRENDING" and hit3p and tp3 > 0 and not m.get("continuation_active"):
                 pl = min(float(m.get("peak_lo", px)), px)
                 m["peak_lo"] = pl
