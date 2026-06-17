@@ -86,6 +86,9 @@ CHRONO_JPY_PAIRS_SIGNALLED: set[str] = set()
 JPY_STORM_PAIRS: frozenset[str] = frozenset(
     {"USDJPY", "CADJPY", "AUDJPY", "GBPJPY", "NZDJPY", "CHFJPY"},
 )
+JPY_RECIPE_PAIRS: frozenset[str] = frozenset(
+    {"CADJPY", "USDJPY", "CHFJPY", "GBPJPY", "AUDJPY"},
+)
 V74_ALLOWED_4H_STRATEGIES: frozenset[str] = frozenset(
     {
         "T01_EMA_PULLBACK",
@@ -563,6 +566,7 @@ def _v72_locked_ids_default() -> frozenset[str]:
             "SMC10_CHOCH",
             "T08_DONCHIAN_BREAKOUT",
             "M06_PRICE_ACCELERATION",
+            "B01_RANGE_BREAKOUT",  # 50.7% WR, W/L 2.58, +$4,105 over 31 months — promoted from data
         }
     )
 
@@ -570,7 +574,6 @@ def _v72_locked_ids_default() -> frozenset[str]:
 def _v72_testing_ids_default() -> frozenset[str]:
     return frozenset(
         {
-            "B01_RANGE_BREAKOUT",
             "B09_RSI_MOMENTUM_BREAK",
             "T04_ADX_TREND_ENTRY",
             "T10_200EMA_BOUNCE",
@@ -634,6 +637,13 @@ def _v75_migrate_strategy_status(raw: dict[str, Any]) -> bool:
         if sid not in locked:
             locked.add(sid)
             changed = True
+    if "B01_RANGE_BREAKOUT" not in locked:
+        for bucket in (testing, blocked, untested):
+            if "B01_RANGE_BREAKOUT" in bucket:
+                bucket.discard("B01_RANGE_BREAKOUT")
+                changed = True
+        locked.add("B01_RANGE_BREAKOUT")
+        changed = True
 
     watch = _as_set("watch")
     if "SMC10_CHOCH" in watch and "SMC10_CHOCH" in locked:
@@ -4452,7 +4462,7 @@ def _v74_apply_recipe_and_monday_boosts(
     tf_key: str,
     analysis_date: str,
 ) -> None:
-    """v7.5 — Monday 1w boost (tailwind macro) + CADJPY/USDJPY/CHFJPY recipe sizing (after base stack)."""
+    """v7.5 — Monday 1w boost (tailwind macro) + JPY recipe sizing (after base stack)."""
     bal = float(ai.get("_balance_for_sizing") or STARTING_CAPITAL)
     try:
         ent = float(ai.get("entry", 0) or 0)
@@ -4486,28 +4496,10 @@ def _v74_apply_recipe_and_monday_boosts(
             f"{str(ai.get('direction', '')).strip().upper()}: 1.25x Monday multiplier applied",
             level="info",
         )
-    rec_sid = {
-        "M03_RSI_MOMENTUM_CONTINUATION",
-        "B09_RSI_MOMENTUM_BREAK",
-        "T01_EMA_PULLBACK",
-        "M06_PRICE_ACCELERATION",
-        "SMC10_CHOCH",
-        "T08_DONCHIAN_BREAKOUT",
-        "M02_MACD_ZERO_CROSS",
-    }
-    if (
-        sym_u in ("CADJPY", "USDJPY", "CHFJPY")
-        and mb == "STRONG_TAILWIND"
-        and conf == "MEDIUM"
-        and 2 <= int(locked_confluence) <= 4
-        and strat_id in rec_sid
-    ):
+    if sym_u in JPY_RECIPE_PAIRS and mb == "STRONG_TAILWIND" and conf == "MEDIUM":
         cap5 = bal * 0.05
         mrd = min(mrd * 1.5, cap5, cap_hi)
-        log(
-            f"[RECIPE BOOST] {sym_u} {strat_id} STRONG_TAILWIND MEDIUM conf:{locked_confluence} — 1.5x boost",
-            level="info",
-        )
+        log(f"[RECIPE BOOST] {sym_u}: JPY recipe 1.5x (ST+MEDIUM)", level="info")
     mrd = max(25.0, min(mrd, cap_hi))
     ai["_max_risk_dollars"] = round(mrd, 2)
     ai["_position_size"] = round(mrd / sd, 2)
