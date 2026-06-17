@@ -616,6 +616,7 @@ def _forensic_record_from_close(mt5: Any, ticket: int, meta: dict[str, Any]) -> 
         ),
         "hold_time_hours": hold_hours,
         "exit_reason": exit_reason,
+        "pyramid_trade": bool(meta.get("pyramid_trade")),
     }
 
 
@@ -932,6 +933,11 @@ def build_trade_plan_v76(
             "dry_run": DRY_RUN,
         },
     )
+    tier, score = _st_pyramid_entry_fields(plan)
+    plan.ai["st_boost_tier"] = tier
+    plan.ai["st_layer2_score"] = score
+    plan.log_fields["st_boost_tier"] = tier
+    plan.log_fields["st_layer2_score"] = score
     return plan
 
 
@@ -1066,6 +1072,16 @@ def order_send_v76(
                 "magic_number": APEX_V76_MAGIC,
             }
         )
+        dry_meta: dict[str, Any] = {
+            "macro_bias": plan.ai.get("macro_bias"),
+            "sl": plan.stop_loss,
+            "r": abs(entry - plan.stop_loss),
+            "final_risk_usd": plan.risk_usd,
+        }
+        _init_pyramid_tracking(dry_meta, plan, entry)
+        if dry_meta.get("pyramid"):
+            row["pyramid_trade"] = True
+            row["pyramid_candidate"] = dry_meta.get("pyramid")
         append_decision_log(row)
         live_log(
             "info",
@@ -1113,9 +1129,20 @@ def order_send_v76(
             "atr_live": float(plan.ai.get("entry_atr", 0) or plan.ai.get("atr", 0) or 0),
             "macro_rate_diff": plan.ai.get("macro_rate_diff"),
             "st_boost_tier": plan.ai.get("st_boost_tier", "NONE"),
+            "st_layer2_score": int(plan.ai.get("st_layer2_score", 0) or 0),
         }
         meta.update(_macro_manager.merged_macro_result_fields(plan.ai))
         res = at.order_send_live(mt5, broker_sym, plan.direction, plan.stop_loss, plan.risk_usd, meta)
+        if res.get("ok") and res.get("ticket"):
+            k = str(int(res["ticket"]))
+            tm = ticket_meta_v76_load()
+            if isinstance(tm.get(k), dict):
+                _init_pyramid_tracking(
+                    tm[k],
+                    plan,
+                    float(res.get("entry", plan.entry) or plan.entry),
+                )
+                ticket_meta_v76_save(tm)
         lots = float(res.get("volume", 0) or 0)
         retcode = res.get("retcode") if isinstance(res, dict) else None
         row = dict(plan.log_fields)
@@ -1202,6 +1229,345 @@ def _log_positions_trailing_phase(mt5: Any, *, phase: str) -> None:
         )
 
 
+def _st_pyramid_entry_fields(plan: TradePlan) -> tuple[str, int]:
+    """ST tier + Layer 2 score for pyramid tracking (reuses plan ai or recomputes)."""
+    ai = plan.ai
+    mb = str(ai.get("macro_bias", "")).strip().upper()
+    if mb != "STRONG_TAILWIND":
+        return "NONE", 0
+    tier = str(ai.get("st_boost_tier", "")).strip().upper()
+    score = int(ai.get("st_layer2_score", 0) or 0)
+    if tier and tier != "NONE":
+        return tier, score
+    ts = float(ai.get("trend_strength", 0) or 0)
+    rd = float(ai.get("macro_rate_diff", 0) or 0)
+    scount = int(ai.get("strategy_confluence_count", 0) or 0)
+    layer2 = _macro_manager.compute_st_layer2_score(
+        plan.sym,
+        plan.direction,
+        ts,
+        rd,
+        as_of_date=date.today(),
+    )
+    score = int(layer2.get("st_layer2_score", 0) or 0)
+    eff = score + (1 if scount >= 2 else 0)
+    if eff >= 4:
+        tier = "FULL_GOLDEN"
+    elif eff >= 3:
+        tier = "ENHANCED"
+    elif eff >= 1:
+        tier = "STANDARD"
+    else:
+        tier = "BASE"
+    return tier, score
+
+
+def _init_pyramid_tracking(meta: dict[str, Any], plan: TradePlan, entry_fill: float) -> None:
+    """Record STRONG_TAILWIND open for staged pyramid-in (Step 1)."""
+    mb = str(meta.get("macro_bias") or plan.ai.get("macro_bias", "")).strip().upper()
+    if mb != "STRONG_TAILWIND":
+        return
+    tier, score = _st_pyramid_entry_fields(plan)
+    meta["st_boost_tier"] = tier
+    meta["st_layer2_score"] = score
+    entry = float(entry_fill or plan.entry)
+    sl = float(meta.get("sl", plan.stop_loss) or plan.stop_loss)
+    sl_dist = float(meta.get("r", abs(entry - sl)) or abs(entry - sl))
+    if sl_dist <= 0:
+        sl_dist = abs(entry - sl) or abs(entry) * 0.005
+    mrd = float(meta.get("final_risk_usd", plan.risk_usd) or plan.risk_usd)
+    meta["pyramid"] = {
+        "entry_price": entry,
+        "symbol": plan.sym,
+        "direction": plan.direction,
+        "initial_tier": tier,
+        "initial_mrd": mrd,
+        "entry_layer2_score": score,
+        "sl_distance": sl_dist,
+        "pyramid_added": False,
+    }
+    meta["pyramid_trade"] = True
+
+
+def _check_pyramid_eligible(meta: dict[str, Any], current_price: float, current_score: int) -> bool:
+    """
+    Add-in eligible when:
+    1. Trade is at 0.75R+ profit (proven, not chasing)
+    2. Not already pyramided
+    3. Original tier was STANDARD or BASE (room to scale up)
+    4. Current Layer 2 score improved AND reached ENHANCED threshold (>=3)
+    """
+    if meta.get("pyramid_added"):
+        return False
+    if meta.get("initial_tier") not in ("STANDARD", "BASE"):
+        return False
+    entry = float(meta.get("entry_price", 0) or 0)
+    sl_dist = float(meta.get("sl_distance", 0) or 0)
+    if sl_dist <= 0 or entry <= 0:
+        return False
+    direction = str(meta.get("direction", "")).strip().upper()
+    if direction == "LONG":
+        profit_r = (current_price - entry) / sl_dist
+    else:
+        profit_r = (entry - current_price) / sl_dist
+    if profit_r < 0.75:
+        return False
+    if current_score <= int(meta.get("entry_layer2_score", 0) or 0) or current_score < 3:
+        return False
+    return True
+
+
+def _execute_pyramid_add_mrd(meta: dict[str, Any], current_capital: float) -> float:
+    """Step 3 — 50% of original risk, hard-capped at 2.5% total capital exposure."""
+    add_mrd = float(meta.get("initial_mrd", 0) or 0) * 0.50
+    max_total = float(current_capital) * 0.025
+    initial = float(meta.get("initial_mrd", 0) or 0)
+    return min(add_mrd, max(0.0, max_total - initial))
+
+
+def _pyramid_profit_r(meta: dict[str, Any], current_price: float) -> float:
+    entry = float(meta.get("entry_price", 0) or 0)
+    sl_dist = float(meta.get("sl_distance", 0) or 0)
+    if sl_dist <= 0:
+        return 0.0
+    direction = str(meta.get("direction", "")).strip().upper()
+    if direction == "LONG":
+        return (current_price - entry) / sl_dist
+    return (entry - current_price) / sl_dist
+
+
+def _pyramid_move_sl_breakeven(mt5: Any, pos: Any, entry_fill: float) -> bool:
+    """Move original position stop to breakeven before pyramid add-in."""
+    import MetaTrader5 as mt5m
+
+    tick = mt5.symbol_info_tick(pos.symbol)
+    if tick is None:
+        return False
+    d = "LONG" if int(getattr(pos, "type", 0) or 0) == 0 else "SHORT"
+    bid, ask = float(tick.bid), float(tick.ask)
+    nsl = at.mt5_round_price(mt5, pos.symbol, float(entry_fill))
+    if d == "LONG":
+        nsl = at.clamp_sl_buy_live(mt5, pos.symbol, bid, nsl)
+        if nsl >= bid:
+            return False
+    else:
+        nsl = at.clamp_sl_sell_live(mt5, pos.symbol, ask, nsl)
+        if nsl <= ask:
+            return False
+    res = mt5.order_send(
+        {
+            "action": mt5m.TRADE_ACTION_SLTP,
+            "symbol": pos.symbol,
+            "position": int(pos.ticket),
+            "sl": float(nsl),
+            "tp": float(pos.tp or 0.0),
+        }
+    )
+    return bool(res and res.retcode == mt5m.TRADE_RETCODE_DONE)
+
+
+def _pyramid_send_add_order(
+    mt5: Any,
+    broker_sym: str,
+    direction: str,
+    sl: float,
+    add_mrd: float,
+) -> dict[str, Any]:
+    """Send pyramid add-in market order at computed risk dollars."""
+    import MetaTrader5 as mt5m
+
+    tick = mt5.symbol_info_tick(broker_sym)
+    if tick is None:
+        return {"ok": False, "error": "no_tick"}
+    d = direction.strip().upper()
+    entry = float(tick.ask if d == "LONG" else tick.bid)
+    mpl = at.mpl_sl(mt5, broker_sym, entry, sl, d)
+    if mpl is None or mpl <= 0:
+        return {"ok": False, "error": "mpl"}
+    vol = at.norm_vol(mt5, broker_sym, add_mrd / mpl)
+    if vol <= 0:
+        return {"ok": False, "error": "zero_volume"}
+    typ = mt5m.ORDER_TYPE_BUY if d == "LONG" else mt5m.ORDER_TYPE_SELL
+    price = float(tick.ask if d == "LONG" else tick.bid)
+    old_magic = at.APEX_MAGIC
+    old_comment = at.ORDER_COMMENT
+    try:
+        at.APEX_MAGIC = APEX_V76_MAGIC
+        at.ORDER_COMMENT = ORDER_COMMENT_V76
+        res = mt5.order_send(
+            {
+                "action": mt5m.TRADE_ACTION_DEAL,
+                "symbol": broker_sym,
+                "volume": vol,
+                "type": typ,
+                "price": price,
+                "sl": float(sl),
+                "tp": 0.0,
+                "deviation": 25,
+                "magic": APEX_V76_MAGIC,
+                "comment": ORDER_COMMENT_V76,
+                "type_time": mt5m.ORDER_TIME_GTC,
+                "type_filling": at.fill_mode(mt5, broker_sym),
+            }
+        )
+    finally:
+        at.APEX_MAGIC = old_magic
+        at.ORDER_COMMENT = old_comment
+    if res is None or res.retcode != mt5m.TRADE_RETCODE_DONE:
+        return {"ok": False, "error": getattr(res, "comment", str(res))}
+    time.sleep(0.25)
+    ticket = None
+    for p in mt5.positions_get(symbol=broker_sym) or []:
+        if int(getattr(p, "magic", 0) or 0) != APEX_V76_MAGIC:
+            continue
+        if int(p.ticket) == int(getattr(res, "position", 0) or 0):
+            ticket = int(p.ticket)
+            break
+    if ticket is None:
+        candidates = [
+            p
+            for p in (mt5.positions_get(symbol=broker_sym) or [])
+            if int(getattr(p, "magic", 0) or 0) == APEX_V76_MAGIC
+        ]
+        if candidates:
+            ticket = int(max(candidates, key=lambda pp: int(pp.ticket)).ticket)
+    return {"ok": True, "ticket": ticket, "volume": vol, "entry": entry}
+
+
+def _current_st_layer2_score(sym_u: str, direction: str, meta: dict[str, Any]) -> int:
+    """Recompute Layer 2 score during trail cycle (macro fields cached on ticket meta)."""
+    ts = float(meta.get("trend_strength", 0) or 0)
+    rd = float(meta.get("macro_rate_diff", 0) or 0)
+    layer2 = _macro_manager.compute_st_layer2_score(
+        sym_u,
+        direction,
+        ts,
+        rd,
+        as_of_date=date.today(),
+    )
+    return int(layer2.get("st_layer2_score", 0) or 0)
+
+
+def _process_pyramid_in_v76(mt5: Any) -> None:
+    """Trail-cycle pyramid-in check (Steps 2–3)."""
+    if DRY_RUN or mt5 is None:
+        return
+    try:
+        if not mt5.terminal_info():
+            return
+    except Exception:  # noqa: BLE001
+        return
+
+    ai = mt5.account_info()
+    current_capital = float(ai.balance) if ai is not None else float(at.STARTING_BALANCE)
+
+    meta = ticket_meta_v76_load()
+    old_magic = at.APEX_MAGIC
+    try:
+        at.APEX_MAGIC = APEX_V76_MAGIC
+        positions = at.open_apex_positions(mt5) or []
+    finally:
+        at.APEX_MAGIC = old_magic
+
+    changed = False
+    for pos in positions:
+        k = str(int(pos.ticket))
+        m = meta.get(k)
+        if not isinstance(m, dict):
+            continue
+        if m.get("is_pyramid_add"):
+            continue
+        pyr = m.get("pyramid")
+        if not isinstance(pyr, dict):
+            continue
+        if pyr.get("pyramid_added"):
+            continue
+
+        tick = mt5.symbol_info_tick(pos.symbol)
+        if tick is None:
+            continue
+        d = str(m.get("direction", "")).strip().upper()
+        px = float(tick.bid if d == "LONG" else tick.ask)
+        sym_u = str(
+            pyr.get("symbol")
+            or m.get("ticker")
+            or at.position_forex_base6(str(pos.symbol))
+            or pos.symbol
+        ).strip().upper()
+        current_score = _current_st_layer2_score(sym_u, d, m)
+        if not _check_pyramid_eligible(pyr, px, current_score):
+            continue
+
+        add_mrd = _execute_pyramid_add_mrd(pyr, current_capital)
+        if add_mrd < 25.0:
+            continue
+
+        profit_r = _pyramid_profit_r(pyr, px)
+        entry_fill = float(m.get("entry_fill", pyr.get("entry_price", pos.price_open)))
+        if not _pyramid_move_sl_breakeven(mt5, pos, entry_fill):
+            live_log(
+                "warning",
+                "[PYRAMID-IN] breakeven SL move failed — skip add",
+                ticket=int(pos.ticket),
+                symbol=sym_u,
+            )
+            continue
+
+        sl = float(pos.sl or m.get("sl", 0) or 0)
+        add_res = _pyramid_send_add_order(mt5, str(pos.symbol), d, sl, add_mrd)
+        if not add_res.get("ok"):
+            live_log(
+                "warning",
+                "[PYRAMID-IN] add order failed",
+                ticket=int(pos.ticket),
+                symbol=sym_u,
+                error=add_res.get("error"),
+            )
+            continue
+
+        pyr["pyramid_added"] = True
+        m["pyramid"] = pyr
+        m["pyramid_trade"] = True
+        m["final_risk_usd"] = round(float(pyr.get("initial_mrd", 0) or 0) + add_mrd, 2)
+        m["hit_tp1"] = True
+
+        add_ticket = add_res.get("ticket")
+        if add_ticket:
+            add_k = str(int(add_ticket))
+            add_meta = {
+                "ticker": sym_u,
+                "symbol": str(pos.symbol),
+                "direction": d,
+                "strategy": m.get("strategy"),
+                "tf": m.get("tf"),
+                "entry_fill": float(add_res.get("entry", px)),
+                "sl": sl,
+                "final_risk_usd": round(add_mrd, 2),
+                "pyramid_trade": True,
+                "is_pyramid_add": True,
+                "pyramid_parent_ticket": int(pos.ticket),
+                "macro_bias": m.get("macro_bias"),
+                "st_boost_tier": m.get("st_boost_tier"),
+                "trail_regime": m.get("trail_regime", "CHOPPY"),
+            }
+            meta[add_k] = add_meta
+
+        live_log(
+            "info",
+            f"[PYRAMID-IN] {sym_u}: +${add_mrd:.0f} to position "
+            f"(tier {pyr.get('initial_tier')}, score {pyr.get('entry_layer2_score')}→{current_score}, "
+            f"at {profit_r:.2f}R). Original SL→breakeven.",
+            ticket=int(pos.ticket),
+            add_mrd=round(add_mrd, 2),
+            pyramid_trade=True,
+        )
+        meta[k] = m
+        changed = True
+
+    if changed:
+        ticket_meta_v76_save(meta)
+
+
 def _meta_from_adopted_position(pos: Any) -> dict[str, Any]:
     """Minimal ticket meta from an open MT5 position (prior trader / restart adoption)."""
     ticket = int(pos.ticket)
@@ -1282,6 +1648,7 @@ def manage_trailing_v76(mt5: Any) -> None:
     finally:
         at.APEX_MAGIC = old_magic
         at.TICKET_META_FILE = old_meta_path
+    _process_pyramid_in_v76(mt5)
     _finalize_closed_positions_v76(mt5, prior_meta=pre_meta)
     _log_positions_trailing_phase(mt5, phase="AFTER")
     publish_live_status(mt5, status="running")
