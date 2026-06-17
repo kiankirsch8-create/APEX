@@ -513,6 +513,9 @@ def _pips_moved(direction: str, entry: float, exit_price: float, ticker: str) ->
 
 
 def _classify_live_exit_reason(meta: dict[str, Any], deals: list[Any], mt5m: Any) -> str:
+    tagged = str(meta.get("live_exit_reason", "")).strip().upper()
+    if tagged == "TP3_TRAIL":
+        return "TP3_TRAIL"
     hit1 = bool(meta.get("hit_tp1"))
     hit2 = bool(meta.get("hit_tp2"))
     hit3 = bool(meta.get("hit_tp3_partial") or meta.get("hit_tp3_full"))
@@ -617,6 +620,7 @@ def _forensic_record_from_close(mt5: Any, ticket: int, meta: dict[str, Any]) -> 
         "hold_time_hours": hold_hours,
         "exit_reason": exit_reason,
         "pyramid_trade": bool(meta.get("pyramid_trade")),
+        "continuation_active": bool(meta.get("continuation_active")),
     }
 
 
