@@ -4038,6 +4038,390 @@ def detect_perfect_storm() -> tuple[bool, int]:
     return True, len(snaps)
 
 
+def _trend_continuation_eligible(
+    trail_regime: str,
+    macro_bias: str,
+    period_mode: str,
+) -> bool:
+    """TREND-CONTINUATION: TRENDING + STRONG_TAILWIND + GOOD period only."""
+    return (
+        str(trail_regime or "").strip().upper() == "TRENDING"
+        and str(macro_bias or "").strip().upper() == "STRONG_TAILWIND"
+        and str(period_mode or "").strip().upper() == "GOOD"
+    )
+
+
+def _last_swing_high_from_series(highs: list[float]) -> float:
+    """3-candle swing high: high[i] > high[i-1] and high[i] > high[i+1] (search from end)."""
+    if len(highs) < 3:
+        return 0.0
+    for i in range(len(highs) - 2, 0, -1):
+        if highs[i] > highs[i - 1] and highs[i] > highs[i + 1]:
+            return float(highs[i])
+    return 0.0
+
+
+def _last_swing_low_from_series(lows: list[float]) -> float:
+    if len(lows) < 3:
+        return 0.0
+    for i in range(len(lows) - 2, 0, -1):
+        if lows[i] < lows[i - 1] and lows[i] < lows[i + 1]:
+            return float(lows[i])
+    return 0.0
+
+
+def get_last_swing_high(
+    forward_df: pd.DataFrame,
+    *,
+    lookback: int = 20,
+) -> float:
+    """H4-style swing high from OHLC rows (last ``lookback`` bars)."""
+    if forward_df is None or forward_df.empty:
+        return 0.0
+    tail = forward_df.tail(max(3, lookback))
+    highs = pd.to_numeric(tail["High"], errors="coerce").dropna().astype(float).tolist()
+    return _last_swing_high_from_series(highs)
+
+
+def get_last_swing_low(
+    forward_df: pd.DataFrame,
+    *,
+    lookback: int = 20,
+) -> float:
+    if forward_df is None or forward_df.empty:
+        return 0.0
+    tail = forward_df.tail(max(3, lookback))
+    lows = pd.to_numeric(tail["Low"], errors="coerce").dropna().astype(float).tolist()
+    return _last_swing_low_from_series(lows)
+
+
+def _trend_continuation_forward_sim(
+    direction: str,
+    entry: float,
+    stop_loss: float,
+    forward_df: pd.DataFrame,
+    *,
+    position_size: float = 0.0,
+    timeframe: str = "",
+    macro_bias: str = "",
+    trail_regime: str = "",
+    trend_strength: float = 0.0,
+    rate_differential: float = 0.0,
+    atr: float = 0.0,
+    buffer_stop_price: float | None = None,
+    ticker: str = "",
+) -> dict[str, Any]:
+    """
+    Forward sim for TREND-CONTINUATION trades (evaluate_forward_candles unchanged).
+    At TP3: close 75% of remainder, keep 25% runner with 5R floor + H4 swing trail.
+    """
+    d = str(direction or "").strip().upper()
+    if forward_df is None or forward_df.empty or d not in ("LONG", "SHORT"):
+        return evaluate_forward_candles(
+            direction,
+            entry,
+            stop_loss,
+            entry,
+            entry,
+            entry,
+            forward_df,
+            position_size=position_size,
+            timeframe=timeframe,
+            macro_bias=macro_bias,
+            trail_regime=trail_regime,
+            trend_strength=trend_strength,
+            rate_differential=rate_differential,
+            atr=atr,
+            buffer_stop_price=buffer_stop_price,
+            ticker=ticker,
+        )
+
+    entry_price = float(entry)
+    risk = abs(entry_price - float(stop_loss))
+    if risk <= 0:
+        return evaluate_forward_candles(
+            direction,
+            entry,
+            stop_loss,
+            entry,
+            entry,
+            entry,
+            forward_df,
+            position_size=position_size,
+            timeframe=timeframe,
+            macro_bias=macro_bias,
+            trail_regime=trail_regime,
+            trend_strength=trend_strength,
+            rate_differential=rate_differential,
+            atr=atr,
+            buffer_stop_price=buffer_stop_price,
+            ticker=ticker,
+        )
+
+    sign = 1.0 if d == "LONG" else -1.0
+    tp1p = entry_price + sign * risk * 2.0
+    tp2p = entry_price + sign * risk * 4.0
+    tp3p = entry_price + sign * risk * 7.0
+    ps = float(position_size or 0.0)
+    rem = 1.0
+    realized = 0.0
+    normal_stop = float(stop_loss)
+    buf_stop = float(buffer_stop_price) if buffer_stop_price is not None else normal_stop
+    use_buffer = abs(buf_stop - normal_stop) > 1e-9
+    current_stop = buf_stop if use_buffer else normal_stop
+    buffer_active = use_buffer
+    hit_tp1 = hit_tp2 = hit_tp3 = hit_stop = False
+    trailing_activated = False
+    exit_price = entry_price
+    exit_reason = "Window ended"
+    candle_count = 0
+    candles_to_tp1: int | None = None
+    peak_profit_dollars = 0.0
+    continuation_active = False
+    continuation_sl = normal_stop
+    last_swing_high = 0.0
+    last_swing_low = 0.0
+
+    def _px_move(px: float) -> float:
+        return px - entry_price if d == "LONG" else entry_price - px
+
+    def _close_frac(frac: float, px: float) -> None:
+        nonlocal rem, realized
+        if frac <= 0 or rem <= 0 or ps <= 0:
+            return
+        q = ps * rem * min(1.0, frac)
+        realized += q * _px_move(px)
+        rem = max(0.0, rem * (1.0 - min(1.0, frac)))
+
+    rows = list(forward_df.iterrows())
+    for i, (_, candle) in enumerate(rows):
+        if buffer_active and i >= 1 and not hit_tp1:
+            current_stop = normal_stop
+            buffer_active = False
+        candle_count += 1
+        try:
+            high = float(candle.get("High", entry_price))
+            low = float(candle.get("Low", entry_price))
+            close = float(candle.get("Close", entry_price))
+        except (TypeError, ValueError):
+            continue
+
+        if ps > 0 and rem > 0:
+            peak_profit_dollars = max(
+                peak_profit_dollars,
+                realized + ps * rem * _px_move(close),
+            )
+
+        if continuation_active and rem > 0:
+            hist = forward_df.iloc[: i + 1]
+            sh = get_last_swing_high(hist, lookback=20)
+            sl_sw = get_last_swing_low(hist, lookback=20)
+            if d == "LONG":
+                if sh > last_swing_high and sl_sw > 0 and sl_sw > continuation_sl:
+                    continuation_sl = sl_sw
+                    last_swing_high = sh
+                    log(
+                        f"[TREND-CONTINUATION] {ticker}: SL→{continuation_sl:.5f}",
+                        level="info",
+                    )
+                if low <= continuation_sl:
+                    hit_stop = True
+                    q = ps * rem
+                    realized += q * (continuation_sl - entry_price)
+                    rem = 0.0
+                    exit_price = continuation_sl
+                    exit_reason = "TP3_TRAIL"
+                    break
+            else:
+                if sl_sw > 0 and (last_swing_low <= 0 or sl_sw < last_swing_low):
+                    if sh > 0 and sh < continuation_sl:
+                        continuation_sl = sh
+                        last_swing_low = sl_sw
+                        log(
+                            f"[TREND-CONTINUATION] {ticker}: SL→{continuation_sl:.5f}",
+                            level="info",
+                        )
+                if high >= continuation_sl:
+                    hit_stop = True
+                    q = ps * rem
+                    realized += q * (entry_price - continuation_sl)
+                    rem = 0.0
+                    exit_price = continuation_sl
+                    exit_reason = "TP3_TRAIL"
+                    break
+            continue
+
+        if d == "LONG":
+            if low <= current_stop and rem > 0:
+                hit_stop = True
+                q = ps * rem
+                realized += q * (current_stop - entry_price)
+                rem = 0.0
+                exit_price = current_stop
+                exit_reason = "Trailing stop" if trailing_activated or hit_tp1 else "Stop loss"
+                break
+            if high >= tp1p and not hit_tp1:
+                hit_tp1 = True
+                candles_to_tp1 = candle_count
+                trailing_activated = True
+                current_stop = _apply_trailing_dollar_floor(
+                    entry_price, current_stop, entry_price, d, ps * rem,
+                )
+            if high >= tp2p and not hit_tp2 and hit_tp1:
+                hit_tp2 = True
+                trailing_activated = True
+                _close_frac(0.20, tp2p)
+                current_stop = _apply_trailing_dollar_floor(
+                    entry_price, current_stop, tp1p, d, ps * rem,
+                )
+            if high >= tp3p and not hit_tp3 and hit_tp2:
+                hit_tp3 = True
+                trailing_activated = True
+                _close_frac(0.75, tp3p)
+                continuation_sl = entry_price + risk * 5.0
+                continuation_active = True
+                last_swing_high = high
+                log(
+                    f"[TREND-CONTINUATION] {ticker}: TP3 runner 25% rem, floor SL={continuation_sl:.5f}",
+                    level="info",
+                )
+        else:
+            if high >= current_stop and rem > 0:
+                hit_stop = True
+                q = ps * rem
+                realized += q * (entry_price - current_stop)
+                rem = 0.0
+                exit_price = current_stop
+                exit_reason = "Trailing stop" if trailing_activated or hit_tp1 else "Stop loss"
+                break
+            if low <= tp1p and not hit_tp1:
+                hit_tp1 = True
+                candles_to_tp1 = candle_count
+                trailing_activated = True
+                current_stop = _apply_trailing_dollar_floor(
+                    entry_price, current_stop, entry_price, d, ps * rem,
+                )
+            if low <= tp2p and not hit_tp2 and hit_tp1:
+                hit_tp2 = True
+                trailing_activated = True
+                _close_frac(0.20, tp2p)
+                current_stop = _apply_trailing_dollar_floor(
+                    entry_price, current_stop, tp1p, d, ps * rem,
+                )
+            if low <= tp3p and not hit_tp3 and hit_tp2:
+                hit_tp3 = True
+                trailing_activated = True
+                _close_frac(0.75, tp3p)
+                continuation_sl = entry_price - risk * 5.0
+                continuation_active = True
+                last_swing_low = low
+                log(
+                    f"[TREND-CONTINUATION] {ticker}: TP3 runner 25% rem, floor SL={continuation_sl:.5f}",
+                    level="info",
+                )
+
+    if not hit_stop and rem > 0 and not forward_df.empty:
+        try:
+            exit_price = float(forward_df["Close"].iloc[-1])
+        except (TypeError, ValueError, KeyError, IndexError):
+            exit_price = float(entry_price)
+        if ps > 0:
+            realized += ps * rem * _px_move(exit_price)
+        rem = 0.0
+        if continuation_active:
+            exit_reason = "TP3_TRAIL"
+
+    denom = ps * entry_price if ps > 0 and entry_price > 0 else 0.0
+    pnl_pct = (realized / denom) if denom > 0 else 0.0
+    exit_reason_norm = exit_reason
+    if exit_reason == "TP3_TRAIL":
+        exit_reason_norm = "TP3_TRAIL"
+    elif hit_tp3 and "tp3" in exit_reason.lower():
+        exit_reason_norm = "TP3"
+
+    return {
+        "outcome": "WIN" if pnl_pct > 0 else "LOSS",
+        "exit_price": round(exit_price, 5),
+        "exit_reason": exit_reason_norm,
+        "pnl_pct": round(pnl_pct, 6),
+        "hit_tp1": hit_tp1,
+        "hit_tp2": hit_tp2,
+        "hit_tp3": hit_tp3,
+        "hit_stop": hit_stop,
+        "candles_to_exit": candle_count,
+        "candles_to_tp1": candles_to_tp1,
+        "trailing_activated": trailing_activated,
+        "final_stop": round(continuation_sl if continuation_active else current_stop, 5),
+        "trail_market_regime": "TRENDING",
+        "peak_profit_dollars": round(peak_profit_dollars, 2),
+        "continuation_active": continuation_active,
+    }
+
+
+def _evaluate_forward_with_trend_continuation(
+    direction: str,
+    entry: float,
+    stop_loss: float,
+    tp1: float,
+    tp2: float,
+    tp3: float,
+    forward_df: pd.DataFrame,
+    strategy_id: str = "",
+    *,
+    position_size: float = 0.0,
+    leverage: int = 0,
+    timeframe: str = "",
+    macro_bias: str = "",
+    macro_bias_adjusted: str = "",
+    trail_regime: str = "",
+    trend_strength: float = 0.0,
+    rate_differential: float = 0.0,
+    atr: float = 0.0,
+    buffer_stop_price: float | None = None,
+    ticker: str = "",
+    period_mode: str = "NEUTRAL",
+) -> dict[str, Any]:
+    """Position-management wrapper — leaves ``evaluate_forward_candles`` untouched."""
+    mb = str(macro_bias_adjusted or macro_bias or "").strip().upper()
+    if _trend_continuation_eligible(trail_regime, mb, period_mode):
+        return _trend_continuation_forward_sim(
+            direction,
+            entry,
+            stop_loss,
+            forward_df,
+            position_size=position_size,
+            timeframe=timeframe,
+            macro_bias=mb,
+            trail_regime=trail_regime,
+            trend_strength=trend_strength,
+            rate_differential=rate_differential,
+            atr=atr,
+            buffer_stop_price=buffer_stop_price,
+            ticker=ticker,
+        )
+    return evaluate_forward_candles(
+        direction,
+        entry,
+        stop_loss,
+        tp1,
+        tp2,
+        tp3,
+        forward_df,
+        strategy_id,
+        position_size=position_size,
+        leverage=leverage,
+        timeframe=timeframe,
+        macro_bias=macro_bias,
+        macro_bias_adjusted=macro_bias_adjusted,
+        trail_regime=trail_regime,
+        trend_strength=trend_strength,
+        rate_differential=rate_differential,
+        atr=atr,
+        buffer_stop_price=buffer_stop_price,
+        ticker=ticker,
+    )
+
+
 def evaluate_forward_candles(
     direction: str,
     entry: float,
@@ -5370,7 +5754,7 @@ def _python_forced_layer2_trade(
             is_exotic=is_exotic,
         )
 
-    exit_data = evaluate_forward_candles(
+    exit_data = _evaluate_forward_with_trend_continuation(
         direction,
         entry,
         normal_stop_v75,
@@ -5390,6 +5774,7 @@ def _python_forced_layer2_trade(
         atr=float(atr_ref or v75_meta.get("entry_atr", 0) or 0),
         buffer_stop_price=buffer_stop_v75,
         ticker=sym,
+        period_mode=str(ai.get("period_mode") or period_mode),
     )
     if exit_data.get("outcome") in ("NO_DATA", "INVALID"):
         if chrono_job:
@@ -5535,6 +5920,7 @@ def _python_forced_layer2_trade(
         "trailing_activated": trailing_activated,
         "final_stop": round(final_stop, 5),
         "trail_market_regime": str(exit_data.get("trail_market_regime") or "CHOPPY"),
+        "continuation_active": bool(exit_data.get("continuation_active")),
         "candles_to_tp1": exit_data.get("candles_to_tp1"),
         "peak_profit_dollars": exit_data.get("peak_profit_dollars"),
         "exit_vs_peak_pct": exit_data.get("exit_vs_peak_pct"),
@@ -6388,7 +6774,7 @@ def run_one_backtest(
         if ai.get("_trail_regime_st") == "CHOPPY":
             trail_reg = "CHOPPY"
 
-        exit_data = evaluate_forward_candles(
+        exit_data = _evaluate_forward_with_trend_continuation(
             direction,
             entry,
             normal_stop_v75,
@@ -6408,6 +6794,7 @@ def run_one_backtest(
             atr=float(ind.get("atr", 0) or v75_meta.get("entry_atr", 0) or 0),
             buffer_stop_price=buffer_stop_v75,
             ticker=sym,
+            period_mode=str(ai.get("period_mode") or period_mode),
         )
         if exit_data.get("outcome") in ("NO_DATA", "INVALID"):
             del fut
@@ -6625,6 +7012,7 @@ def run_one_backtest(
             "trailing_activated": trailing_activated,
             "final_stop": round(final_stop, 5),
             "trail_market_regime": str(exit_data.get("trail_market_regime") or "CHOPPY"),
+            "continuation_active": bool(exit_data.get("continuation_active")),
             "candles_to_tp1": exit_data.get("candles_to_tp1"),
             "peak_profit_dollars": exit_data.get("peak_profit_dollars"),
             "exit_vs_peak_pct": exit_data.get("exit_vs_peak_pct"),

@@ -1104,6 +1104,33 @@ def order_send_live(
 # ---------------------------------------------------------------------------
 
 
+def _trend_continuation_eligible_meta(m: dict[str, Any]) -> bool:
+    treg = str(m.get("trail_regime", "")).strip().upper()
+    mb = str(m.get("macro_bias_adjusted") or m.get("macro_bias") or "").strip().upper()
+    pm = str(m.get("period_mode", "")).strip().upper()
+    return treg == "TRENDING" and mb == "STRONG_TAILWIND" and pm == "GOOD"
+
+
+def _mt5_h4_swing_high_low(mt5: Any, symbol: str, lookback: int = 22) -> tuple[float, float]:
+    """Last 3-candle swing high/low on H4 (lookback bars)."""
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_H4, 0, lookback)
+    if rates is None or len(rates) < 3:
+        return 0.0, 0.0
+    highs = [float(r["high"]) for r in rates]
+    lows = [float(r["low"]) for r in rates]
+    swing_hi = 0.0
+    swing_lo = 0.0
+    for i in range(len(highs) - 2, 0, -1):
+        if highs[i] > highs[i - 1] and highs[i] > highs[i + 1]:
+            swing_hi = highs[i]
+            break
+    for i in range(len(lows) - 2, 0, -1):
+        if lows[i] < lows[i - 1] and lows[i] < lows[i + 1]:
+            swing_lo = lows[i]
+            break
+    return swing_hi, swing_lo
+
+
 def manage_trailing_live(mt5: Any) -> None:
     import MetaTrader5 as mt5
 
@@ -1190,7 +1217,39 @@ def manage_trailing_live(mt5: Any) -> None:
             )
             return False
 
-        if d == "LONG":
+        if m.get("continuation_active"):
+            cont_sl = float(m.get("continuation_sl", cur_sl) or cur_sl)
+            sym_u = str(m.get("ticker") or position_forex_base6(pos.symbol) or pos.symbol)
+            sh, sl_sw = _mt5_h4_swing_high_low(mt5, pos.symbol)
+            if d == "LONG":
+                if sh > float(m.get("last_swing_high", 0)) and sl_sw > cont_sl:
+                    cont_sl = sl_sw
+                    m["continuation_sl"] = cont_sl
+                    m["last_swing_high"] = sh
+                    log_msg(f"[TREND-CONTINUATION] {sym_u}: SL→{cont_sl:.5f}", "info")
+                if bid <= cont_sl:
+                    m["live_exit_reason"] = "TP3_TRAIL"
+                    close_position_at_market(mt5, pos)
+                    meta[k] = m
+                    continue
+                nsl = cont_sl
+            else:
+                if sl_sw > 0 and (
+                    float(m.get("last_swing_low", 0)) <= 0 or sl_sw < float(m.get("last_swing_low", 0))
+                ):
+                    if sh > 0 and sh < cont_sl:
+                        cont_sl = sh
+                        m["continuation_sl"] = cont_sl
+                        m["last_swing_low"] = sl_sw
+                        log_msg(f"[TREND-CONTINUATION] {sym_u}: SL→{cont_sl:.5f}", "info")
+                if ask >= cont_sl:
+                    m["live_exit_reason"] = "TP3_TRAIL"
+                    close_position_at_market(mt5, pos)
+                    meta[k] = m
+                    continue
+                nsl = cont_sl
+
+        elif d == "LONG":
             px = bid
             if not hit1 and tp1 > 0 and px >= tp1:
                 nsl = entry
@@ -1211,15 +1270,26 @@ def manage_trailing_live(mt5: Any) -> None:
                 if _partial_close(vol * 1.0, mt5.ORDER_TYPE_SELL, bid, "CHOPPY 100% @TP3"):
                     m["hit_tp3_full"] = True
             elif hit2 and treg == "TRENDING" and not hit3p and tp3 > 0 and px >= tp3:
-                if _partial_close(vol * 0.30, mt5.ORDER_TYPE_SELL, bid, "TREND 30% @TP3"):
+                if _trend_continuation_eligible_meta(m):
+                    if _partial_close(vol * 0.75, mt5.ORDER_TYPE_SELL, bid, "TREND-CONT 75% @TP3"):
+                        m["hit_tp3_partial"] = True
+                        m["continuation_active"] = True
+                        sl_dist = float(m.get("r", abs(entry - float(m.get("sl", entry)))) or abs(entry) * 0.005)
+                        m["continuation_sl"] = entry + 5.0 * sl_dist
+                        m["last_swing_high"] = px
+                        log_msg(
+                            f"[TREND-CONTINUATION] {pos.symbol}: runner 25% rem, floor SL={m['continuation_sl']:.5f}",
+                            "info",
+                        )
+                elif _partial_close(vol * 0.30, mt5.ORDER_TYPE_SELL, bid, "TREND 30% @TP3"):
                     m["hit_tp3_partial"] = True
                     m["peak_hi"] = max(float(m.get("peak_hi", entry)), px)
-                ph = float(m.get("peak_hi", px))
-                ph = max(ph, px)
-                m["peak_hi"] = ph
-                trail = ph - 2.0 * atru
-                nsl = max(cur_sl, trail) if cur_sl > 0 else trail
-            elif hit2 and treg == "TRENDING" and hit3p and tp3 > 0:
+                    ph = float(m.get("peak_hi", px))
+                    ph = max(ph, px)
+                    m["peak_hi"] = ph
+                    trail = ph - 2.0 * atru
+                    nsl = max(cur_sl, trail) if cur_sl > 0 else trail
+            elif hit2 and treg == "TRENDING" and hit3p and tp3 > 0 and not m.get("continuation_active"):
                 ph = max(float(m.get("peak_hi", px)), px)
                 m["peak_hi"] = ph
                 trail = ph - 2.0 * atru
@@ -1254,15 +1324,26 @@ def manage_trailing_live(mt5: Any) -> None:
                 if _partial_close(vol * 1.0, mt5.ORDER_TYPE_BUY, ask, "CHOPPY 100% @TP3"):
                     m["hit_tp3_full"] = True
             elif hit2 and treg == "TRENDING" and not hit3p and tp3 > 0 and px <= tp3:
-                if _partial_close(vol * 0.30, mt5.ORDER_TYPE_BUY, ask, "TREND 30% @TP3"):
+                if _trend_continuation_eligible_meta(m):
+                    if _partial_close(vol * 0.75, mt5.ORDER_TYPE_BUY, ask, "TREND-CONT 75% @TP3"):
+                        m["hit_tp3_partial"] = True
+                        m["continuation_active"] = True
+                        sl_dist = float(m.get("r", abs(entry - float(m.get("sl", entry)))) or abs(entry) * 0.005)
+                        m["continuation_sl"] = entry - 5.0 * sl_dist
+                        m["last_swing_low"] = px
+                        log_msg(
+                            f"[TREND-CONTINUATION] {pos.symbol}: runner 25% rem, floor SL={m['continuation_sl']:.5f}",
+                            "info",
+                        )
+                elif _partial_close(vol * 0.30, mt5.ORDER_TYPE_BUY, ask, "TREND 30% @TP3"):
                     m["hit_tp3_partial"] = True
                     m["peak_lo"] = min(float(m.get("peak_lo", entry)), px)
-                pl = float(m.get("peak_lo", px))
-                pl = min(pl, px)
-                m["peak_lo"] = pl
-                trail = pl + 2.0 * atru
-                nsl = min(cur_sl, trail) if cur_sl > 0 else trail
-            elif hit2 and treg == "TRENDING" and hit3p and tp3 > 0:
+                    pl = float(m.get("peak_lo", px))
+                    pl = min(pl, px)
+                    m["peak_lo"] = pl
+                    trail = pl + 2.0 * atru
+                    nsl = min(cur_sl, trail) if cur_sl > 0 else trail
+            elif hit2 and treg == "TRENDING" and hit3p and tp3 > 0 and not m.get("continuation_active"):
                 pl = min(float(m.get("peak_lo", px)), px)
                 m["peak_lo"] = pl
                 trail = pl + 2.0 * atru
