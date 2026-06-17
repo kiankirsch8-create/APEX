@@ -248,7 +248,7 @@ BLOCKED_STRATEGIES_GROUP1: frozenset[str] = frozenset(
         "B06_TRIANGLE_BREAKOUT",  # 37.5% WR, -$546, W/L 1.27 — below threshold
     },
 )
-COMPOUNDING_ENABLED = False
+COMPOUNDING_ENABLED = True
 # Backtest-only: "private" enables stepped compounding; "funded" keeps fixed $10k sizing base.
 _acct_raw = (os.environ.get("APEX_ACCOUNT_TYPE") or "private").strip().lower()
 ACCOUNT_TYPE = _acct_raw if _acct_raw in ("private", "funded") else "private"
@@ -1288,6 +1288,28 @@ def _persist_circuit_halt_if_needed(chrono_data: dict[str, Any]) -> None:
     CHRONO_PENDING_HALT_UNTIL = None
 
 
+def _get_drawdown_scale(current_capital: float, peak_capital: float) -> float:
+    """
+    Reduces position sizing during drawdown only. Returns to full size on recovery.
+    Prevents compounding from amplifying losses (the Jun-Aug 2021 failure mode).
+    Does nothing during normal/winning periods — not a conservative filter.
+    """
+    if peak_capital <= 0:
+        return 1.0
+    dd = (current_capital - peak_capital) / peak_capital
+    if dd <= -0.15:
+        return 0.25
+    elif dd <= -0.10:
+        return 0.50
+    elif dd <= -0.05:
+        return 0.75
+    return 1.00
+
+
+def _update_run_peak_capital(current_capital: float, peak_capital: float) -> float:
+    return max(float(peak_capital or STARTING_CAPITAL), float(current_capital or STARTING_CAPITAL))
+
+
 def _maybe_bump_compounding_base(
     current_capital: float,
     compounding_base: float,
@@ -1312,15 +1334,18 @@ def _attach_chrono_sizing_context(
     *,
     current_capital: float,
     compounding_base: float,
+    peak_capital: float | None = None,
 ) -> None:
-    """Set chrono sizing fields: current capital for caps, compounding base for risk %."""
+    """Set chrono sizing fields: live capital for risk %, peak for drawdown scale."""
     cur = float(current_capital or STARTING_CAPITAL)
-    base = float(compounding_base or STARTING_CAPITAL)
-    if not COMPOUNDING_ENABLED or ACCOUNT_TYPE == "funded":
-        base = float(STARTING_CAPITAL)
+    peak = _update_run_peak_capital(cur, float(peak_capital if peak_capital is not None else cur))
     ai["_balance_for_sizing"] = cur
     ai["_current_capital_for_cap"] = cur
-    ai["_compounding_base_for_sizing"] = base
+    ai["_peak_capital_for_sizing"] = peak
+    if not COMPOUNDING_ENABLED or ACCOUNT_TYPE == "funded":
+        ai["_compounding_base_for_sizing"] = float(STARTING_CAPITAL)
+    else:
+        ai["_compounding_base_for_sizing"] = cur
 
 
 def _sizing_base_for_risk(ai: dict[str, Any]) -> tuple[float, float]:
@@ -1371,9 +1396,12 @@ def _persist_chrono_capital_state(
     *,
     capital: float,
     compounding_base: float,
+    peak_capital: float | None = None,
 ) -> None:
     chrono_data["capital"] = round(capital, 2)
     chrono_data["compounding_base_capital"] = round(compounding_base, 2)
+    if peak_capital is not None:
+        chrono_data["peak_capital"] = round(peak_capital, 2)
 
 
 def _chrono_scan_skip_row(
@@ -3665,8 +3693,36 @@ def _v73_refresh_risk_fields_from_ai_confidence(
         risk_pct *= 0.6
     if ai.get("_v74_perfect_storm_m03_jpy") and confidence == "HIGH":
         risk_pct = 0.028
-    size_base, current_cap = _sizing_base_for_risk(ai)
-    risk_dollars = size_base * risk_pct
+    current_cap = float(
+        ai.get("_current_capital_for_cap")
+        or ai.get("_balance_for_sizing")
+        or STARTING_CAPITAL
+    )
+    if (
+        COMPOUNDING_ENABLED
+        and ACCOUNT_TYPE == "private"
+        and ai.get("_compounding_base_for_sizing") is not None
+    ):
+        size_base = current_cap
+    else:
+        size_base, current_cap = _sizing_base_for_risk(ai)
+    peak_capital = float(ai.get("_peak_capital_for_sizing") or current_cap)
+    if current_cap > peak_capital:
+        peak_capital = current_cap
+        ai["_peak_capital_for_sizing"] = peak_capital
+    drawdown_scale = 1.0
+    if COMPOUNDING_ENABLED and ACCOUNT_TYPE == "private":
+        drawdown_scale = _get_drawdown_scale(current_cap, peak_capital)
+        if drawdown_scale < 1.0:
+            log(
+                f"[DRAWDOWN-SCALE] Capital ${current_cap:,.0f} is "
+                f"{(current_cap / peak_capital - 1) * 100:.1f}% from peak. "
+                f"Sizing → {drawdown_scale:.0%}",
+                level="info",
+            )
+    risk_dollars = size_base * risk_pct * drawdown_scale
+    ai["_sizing_base"] = round(size_base, 2)
+    ai["_drawdown_scale_applied"] = round(drawdown_scale, 2)
     if ai.get("_compounding_base_for_sizing") is not None and ACCOUNT_TYPE == "private":
         risk_dollars = min(risk_dollars, current_cap * SINGLE_TRADE_MAX_PCT_OF_CURRENT)
     else:
@@ -4785,6 +4841,7 @@ def _python_forced_layer2_trade(
     regime_ctx: dict[str, Any] | None = None,
     chrono_balance: float | None = None,
     chrono_compounding_base: float | None = None,
+    chrono_peak_capital: float | None = None,
     chrono_day_pnl: float = 0.0,
     period_mode: str = "NEUTRAL",
     atr_ref: float | None = None,
@@ -5003,6 +5060,7 @@ def _python_forced_layer2_trade(
             ai,
             current_capital=float(chrono_balance or STARTING_CAPITAL),
             compounding_base=float(chrono_compounding_base or STARTING_CAPITAL),
+            peak_capital=float(chrono_peak_capital or chrono_balance or STARTING_CAPITAL),
         )
     _v73_post_enforce_macro_confidence(ai, macro_bt, tf_key=tf_key, price=float(price), sym=sym)
     cal = calendar_risk or {
@@ -5454,6 +5512,8 @@ def _python_forced_layer2_trade(
         "leveraged_exposure": round(leveraged_exposure, 2),
         "max_risk_dollars": max_risk_dollars,
         "account_risk_pct": sizing_risk_pct,
+        "sizing_base": round(float(ai.get("_sizing_base", 0) or 0), 2),
+        "drawdown_scale_applied": round(float(ai.get("_drawdown_scale_applied", 1.0) or 1.0), 2),
         "risk_pct_of_price": risk_pct_display,
         "hit_tp1": hit_tp1,
         "hit_tp2": hit_tp2,
@@ -5530,6 +5590,7 @@ def run_one_backtest(
     chrono_regime: dict[str, Any] | None = None,
     chrono_balance: float | None = None,
     chrono_compounding_base: float | None = None,
+    chrono_peak_capital: float | None = None,
     chrono_day_pnl: float = 0.0,
     chrono_job_id: str = "",
 ) -> dict[str, Any] | None:
@@ -5950,6 +6011,7 @@ def run_one_backtest(
                     regime_ctx=regime_ctx,
                     chrono_balance=chrono_balance,
                     chrono_compounding_base=chrono_compounding_base,
+                    chrono_peak_capital=chrono_peak_capital,
                     chrono_day_pnl=chrono_day_pnl,
                     period_mode=period_mode,
                     atr_ref=float(ind.get("atr", 0) or 0) or None,
@@ -6125,6 +6187,7 @@ def run_one_backtest(
                 ai,
                 current_capital=float(chrono_balance or STARTING_CAPITAL),
                 compounding_base=float(chrono_compounding_base or STARTING_CAPITAL),
+                peak_capital=float(chrono_peak_capital or chrono_balance or STARTING_CAPITAL),
             )
 
         if macro_bt is not None:
@@ -6527,6 +6590,8 @@ def run_one_backtest(
             "leveraged_exposure": round(leveraged_exposure, 2),
             "max_risk_dollars": max_risk_dollars,
             "account_risk_pct": sizing_risk_pct,
+            "sizing_base": round(float(ai.get("_sizing_base", 0) or 0), 2),
+            "drawdown_scale_applied": round(float(ai.get("_drawdown_scale_applied", 1.0) or 1.0), 2),
             "risk_pct_of_price": risk_pct_display,
             "hit_tp1": hit_tp1,
             "hit_tp2": hit_tp2,
@@ -7840,6 +7905,7 @@ def run_chronological_backtest(
             "current_date": start_date,
             "capital": STARTING_CAPITAL,
             "compounding_base_capital": STARTING_CAPITAL,
+            "peak_capital": STARTING_CAPITAL,
             "account_type": ACCOUNT_TYPE,
             "daily_pnl": [],
             "all_trades": [],
@@ -7875,6 +7941,7 @@ def run_chronological_backtest(
             ("skipped", []),
             ("capital", STARTING_CAPITAL),
             ("compounding_base_capital", STARTING_CAPITAL),
+            ("peak_capital", STARTING_CAPITAL),
             ("account_type", ACCOUNT_TYPE),
             ("days_processed", 0),
         ):
@@ -7985,6 +8052,10 @@ def run_chronological_backtest(
             compounding_base = float(
                 chrono_data.get("compounding_base_capital", STARTING_CAPITAL) or STARTING_CAPITAL
             )
+            peak_capital = _update_run_peak_capital(
+                capital,
+                float(chrono_data.get("peak_capital", STARTING_CAPITAL) or STARTING_CAPITAL),
+            )
             open_positions: dict[str, dict[str, Any]] = {}
 
             if isinstance(intra, dict) and str(intra.get("date", "")) == date_str:
@@ -8005,6 +8076,10 @@ def run_chronological_backtest(
                     icb = intra.get("compounding_base_capital")
                     if icb is not None:
                         compounding_base = float(icb)
+                    ipeak = intra.get("peak_capital")
+                    if ipeak is not None:
+                        peak_capital = float(ipeak)
+                    peak_capital = _update_run_peak_capital(capital, peak_capital)
                 else:
                     resume_idx = max(0, nidx)
                     if intra.get("v71_phase_idx") is not None:
@@ -8027,6 +8102,10 @@ def run_chronological_backtest(
                     icb = intra.get("compounding_base_capital")
                     if icb is not None:
                         compounding_base = float(icb)
+                    ipeak = intra.get("peak_capital")
+                    if ipeak is not None:
+                        peak_capital = float(ipeak)
+                    peak_capital = _update_run_peak_capital(capital, peak_capital)
 
             scan_date = datetime.strptime(date_str, "%Y-%m-%d").date()
             global CHRONO_DAILY_PNL_FOR_CB, CHRONO_CIRCUIT_HALT_UNTIL, CHRONO_PENDING_HALT_UNTIL
@@ -8121,6 +8200,7 @@ def run_chronological_backtest(
                     "trades_today": len(day_trades),
                     "capital": round(capital, 2),
                     "compounding_base_capital": round(compounding_base, 2),
+                    "peak_capital": round(peak_capital, 2),
                     "days_processed": int(chrono_data.get("days_processed", 0) or 0),
                     "ticker_position": 0,
                     "total_tickers": len(CHRONO_TICKERS),
@@ -8144,10 +8224,12 @@ def run_chronological_backtest(
                     compounding_base,
                     period_mode=day_period_mode,
                 )
+                peak_capital = _update_run_peak_capital(capital, peak_capital)
                 _persist_chrono_capital_state(
                     chrono_data,
                     capital=capital,
                     compounding_base=compounding_base,
+                    peak_capital=peak_capital,
                 )
                 log(
                     f"[REGIME] {day_regime['regime']} — WR10={day_regime['wr_10']:.0%} "
@@ -8226,11 +8308,13 @@ def run_chronological_backtest(
                                     "day_pnl": round(day_pnl, 2),
                                     "capital": round(capital, 2),
                                     "compounding_base_capital": round(compounding_base, 2),
+                                    "peak_capital": round(peak_capital, 2),
                                 }
                                 _persist_chrono_capital_state(
                                     chrono_data,
                                     capital=capital,
                                     compounding_base=compounding_base,
+                                    peak_capital=peak_capital,
                                 )
                                 chrono_data["current_date"] = date_str
                                 chrono_data["status"] = "running"
@@ -8270,11 +8354,13 @@ def run_chronological_backtest(
                                     "day_pnl": round(day_pnl, 2),
                                     "capital": round(capital, 2),
                                     "compounding_base_capital": round(compounding_base, 2),
+                                    "peak_capital": round(peak_capital, 2),
                                 }
                                 _persist_chrono_capital_state(
                                     chrono_data,
                                     capital=capital,
                                     compounding_base=compounding_base,
+                                    peak_capital=peak_capital,
                                 )
                                 chrono_data["current_date"] = date_str
                                 chrono_data["status"] = "running"
@@ -8310,11 +8396,13 @@ def run_chronological_backtest(
                                     "day_pnl": round(day_pnl, 2),
                                     "capital": round(capital, 2),
                                     "compounding_base_capital": round(compounding_base, 2),
+                                    "peak_capital": round(peak_capital, 2),
                                 }
                                 _persist_chrono_capital_state(
                                     chrono_data,
                                     capital=capital,
                                     compounding_base=compounding_base,
+                                    peak_capital=peak_capital,
                                 )
                                 chrono_data["current_date"] = date_str
                                 chrono_data["status"] = "running"
@@ -8350,17 +8438,20 @@ def run_chronological_backtest(
                                     "day_pnl": round(day_pnl, 2),
                                     "capital": round(capital, 2),
                                     "compounding_base_capital": round(compounding_base, 2),
+                                    "peak_capital": round(peak_capital, 2),
                                 }
                                 _persist_chrono_capital_state(
                                     chrono_data,
                                     capital=capital,
                                     compounding_base=compounding_base,
+                                    peak_capital=peak_capital,
                                 )
                                 chrono_data["current_date"] = date_str
                                 chrono_data["status"] = "running"
                                 save_json(chrono_path, chrono_data)
                                 continue
 
+                            peak_capital = _update_run_peak_capital(capital, peak_capital)
                             try:
                                 res = run_one_backtest(
                                     ticker,
@@ -8373,6 +8464,7 @@ def run_chronological_backtest(
                                     chrono_regime=day_regime,
                                     chrono_balance=capital,
                                     chrono_compounding_base=compounding_base,
+                                    chrono_peak_capital=peak_capital,
                                     chrono_day_pnl=day_pnl,
                                     chrono_job_id=job_id,
                                 )
@@ -8393,11 +8485,13 @@ def run_chronological_backtest(
                                     "day_pnl": round(day_pnl, 2),
                                     "capital": round(capital, 2),
                                     "compounding_base_capital": round(compounding_base, 2),
+                                    "peak_capital": round(peak_capital, 2),
                                 }
                                 _persist_chrono_capital_state(
                                     chrono_data,
                                     capital=capital,
                                     compounding_base=compounding_base,
+                                    peak_capital=peak_capital,
                                 )
                                 chrono_data["current_date"] = date_str
                                 chrono_data["status"] = "running"
@@ -8432,11 +8526,13 @@ def run_chronological_backtest(
                                     "day_pnl": round(day_pnl, 2),
                                     "capital": round(capital, 2),
                                     "compounding_base_capital": round(compounding_base, 2),
+                                    "peak_capital": round(peak_capital, 2),
                                 }
                                 _persist_chrono_capital_state(
                                     chrono_data,
                                     capital=capital,
                                     compounding_base=compounding_base,
+                                    peak_capital=peak_capital,
                                 )
                                 chrono_data["current_date"] = date_str
                                 chrono_data["status"] = "running"
@@ -8480,11 +8576,13 @@ def run_chronological_backtest(
                                     "day_pnl": round(day_pnl, 2),
                                     "capital": round(capital, 2),
                                     "compounding_base_capital": round(compounding_base, 2),
+                                    "peak_capital": round(peak_capital, 2),
                                 }
                                 _persist_chrono_capital_state(
                                     chrono_data,
                                     capital=capital,
                                     compounding_base=compounding_base,
+                                    peak_capital=peak_capital,
                                 )
                                 chrono_data["current_date"] = date_str
                                 chrono_data["status"] = "running"
@@ -8505,11 +8603,13 @@ def run_chronological_backtest(
                                     "day_pnl": round(day_pnl, 2),
                                     "capital": round(capital, 2),
                                     "compounding_base_capital": round(compounding_base, 2),
+                                    "peak_capital": round(peak_capital, 2),
                                 }
                                 _persist_chrono_capital_state(
                                     chrono_data,
                                     capital=capital,
                                     compounding_base=compounding_base,
+                                    peak_capital=peak_capital,
                                 )
                                 chrono_data["current_date"] = date_str
                                 chrono_data["status"] = "running"
@@ -8548,11 +8648,13 @@ def run_chronological_backtest(
                                     "day_pnl": round(day_pnl, 2),
                                     "capital": round(capital, 2),
                                     "compounding_base_capital": round(compounding_base, 2),
+                                    "peak_capital": round(peak_capital, 2),
                                 }
                                 _persist_chrono_capital_state(
                                     chrono_data,
                                     capital=capital,
                                     compounding_base=compounding_base,
+                                    peak_capital=peak_capital,
                                 )
                                 chrono_data["current_date"] = date_str
                                 chrono_data["status"] = "running"
@@ -8567,6 +8669,7 @@ def run_chronological_backtest(
                             day_trades.append(row)
                             day_pnl += pnl
                             capital += pnl
+                            peak_capital = _update_run_peak_capital(capital, peak_capital)
                             compounding_base = _maybe_bump_compounding_base(
                                 capital,
                                 compounding_base,
@@ -8616,11 +8719,13 @@ def run_chronological_backtest(
                                 "day_pnl": round(day_pnl, 2),
                                 "capital": round(capital, 2),
                                 "compounding_base_capital": round(compounding_base, 2),
+                                "peak_capital": round(peak_capital, 2),
                             }
                             _persist_chrono_capital_state(
                                 chrono_data,
                                 capital=capital,
                                 compounding_base=compounding_base,
+                                peak_capital=peak_capital,
                             )
                             chrono_data["current_date"] = date_str
                             chrono_data["status"] = "running"
@@ -8651,6 +8756,7 @@ def run_chronological_backtest(
                 compounding_base,
                 period_mode=eod_period_mode,
             )
+            peak_capital = _update_run_peak_capital(capital, peak_capital)
 
             daily_summary = {
                 "date": date_str,
@@ -8659,6 +8765,7 @@ def run_chronological_backtest(
                 "skipped": len(day_skipped),
                 "capital": round(capital, 2),
                 "compounding_base_capital": round(compounding_base, 2),
+                "peak_capital": round(peak_capital, 2),
                 "wins": sum(1 for t in day_trades if t.get("outcome") == "WIN"),
                 "losses": sum(1 for t in day_trades if t.get("outcome") == "LOSS"),
                 "halt_active": False,
@@ -8672,6 +8779,7 @@ def run_chronological_backtest(
                 chrono_data,
                 capital=capital,
                 compounding_base=compounding_base,
+                peak_capital=peak_capital,
             )
             chrono_data["current_date"] = date_str
             chrono_data["status"] = "running"
