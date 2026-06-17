@@ -228,11 +228,25 @@ STRATEGY_STATUS_FILE = DATA_DIR / "strategy_status.json"
 
 STARTING_CAPITAL = 10000.0
 BLOCKED_PAIRS: frozenset[str] = frozenset(
-    {"EURAUD", "QQQ", "EURNZD", "GBPNZD", "USDCAD", "USDMXN"},
+    {
+        "EURAUD",
+        "QQQ",
+        "EURNZD",
+        "GBPNZD",
+        "USDCAD",
+        "USDMXN",
+        "AUDUSD",  # 183 trades, 37.2% WR, -$1,049 — consistent underperformer across all regimes
+    },
 )
 # Group 1 forensic blocks (union with strategy_status.json ``blocked`` at evaluation time)
 BLOCKED_STRATEGIES_GROUP1: frozenset[str] = frozenset(
-    {"Q03_MONTHLY_SEASONALITY", "R08_MONTHLY_LEVEL_REJECTION"},
+    {
+        "Q03_MONTHLY_SEASONALITY",
+        "R08_MONTHLY_LEVEL_REJECTION",
+        "Q04_CARRY_TRADE_MOMENTUM",  # 36.4% WR, -$311, W/L 1.34
+        "Q05_CORRELATION_DIVERGENCE",  # 27.3% WR, -$538 — worst WR in entire dataset
+        "B06_TRIANGLE_BREAKOUT",  # 37.5% WR, -$546, W/L 1.27 — below threshold
+    },
 )
 COMPOUNDING_ENABLED = False
 # Backtest-only: "private" enables stepped compounding; "funded" keeps fixed $10k sizing base.
@@ -494,9 +508,10 @@ _BLOCKED_STRATEGY_LOGGED: set[str] = set()
 
 
 def _log_group1_startup_blocks() -> None:
-    log(f"[STARTUP] BLOCKED_PAIRS active: {sorted(BLOCKED_PAIRS)}", level="info")
+    log(f"[STARTUP] BLOCKED_PAIRS ({len(BLOCKED_PAIRS)}): {sorted(BLOCKED_PAIRS)}", level="info")
     log(
-        f"[STARTUP] BLOCKED_STRATEGIES active: {sorted(BLOCKED_STRATEGIES_GROUP1)}",
+        f"[STARTUP] BLOCKED_STRATEGIES ({len(BLOCKED_STRATEGIES_GROUP1)}): "
+        f"{sorted(BLOCKED_STRATEGIES_GROUP1)}",
         level="info",
     )
 
@@ -509,6 +524,18 @@ def _reset_group1_skip_log_state() -> None:
 
 def _is_group1_blocked_strategy(strategy_id: str) -> bool:
     return str(strategy_id or "").strip().upper() in BLOCKED_STRATEGIES_GROUP1
+
+
+def _hard_block_skip_reason(sym: str, strategy_id: str) -> str | None:
+    """Return skip reason when pair/strategy is hard-blocked; None if trade may proceed."""
+    sym_u = str(sym or "").strip().upper()
+    if sym_u in BLOCKED_PAIRS:
+        return f"[BLOCKED PAIR] {sym_u} in BLOCKED_PAIRS list"
+    sid_u = str(strategy_id or "").strip().upper()
+    if _is_group1_blocked_strategy(sid_u):
+        _log_group1_blocked_strategy_once(sid_u)
+        return f"[BLOCKED STRATEGY] {sid_u} in BLOCKED_STRATEGIES_GROUP1 list"
+    return None
 
 
 def _log_group1_blocked_strategy_once(strategy_id: str) -> None:
@@ -818,8 +845,6 @@ _V7_STALE_FALLBACK_IDS: frozenset[str] = frozenset(
         "B04_NY_OPEN_BREAKOUT",
         "Q01_DAY_OF_WEEK_EDGE",
         "Q02_TIME_OF_DAY_MOMENTUM",
-        "Q04_CARRY_TRADE_MOMENTUM",
-        "Q05_CORRELATION_DIVERGENCE",
         "Q06_REGIME_DETECTION",
     }
 )
@@ -5263,6 +5288,38 @@ def _python_forced_layer2_trade(
     if ai.get("_trail_regime_st") == "CHOPPY":
         trail_reg = "CHOPPY"
 
+    pre_exec_block = _hard_block_skip_reason(sym, strat_id)
+    if pre_exec_block:
+        if chrono_job:
+            return _chrono_scan_skip_row(
+                sym=sym,
+                timeframe=timeframe,
+                analysis_date=analysis_date,
+                tf_key=tf_key,
+                skip_reason=pre_exec_block,
+                price=float(price),
+                is_exotic=is_exotic,
+            )
+        return _skipped_backtest_row(
+            sym=sym,
+            timeframe=timeframe,
+            analysis_date=analysis_date,
+            price=float(price),
+            zone_pct=zone_pct,
+            zone_label=zone_label,
+            skip_reason=pre_exec_block,
+            ai={
+                "skip_trade": True,
+                "strategy_id": strat_id,
+                "strategy_met": False,
+                "skip_reason": pre_exec_block,
+                "direction": "NONE",
+                "conviction_score": 0,
+            },
+            tf_key=tf_key,
+            is_exotic=is_exotic,
+        )
+
     exit_data = evaluate_forward_candles(
         direction,
         entry,
@@ -7333,6 +7390,19 @@ def continuous_backtest_loop() -> None:
 
                         if isinstance(result, dict):
                             result["session"] = batch_session
+                            exec_block = _hard_block_skip_reason(
+                                str(result.get("ticker", ticker)),
+                                str(result.get("strategy_id", "")),
+                            )
+                            if exec_block and str(result.get("outcome", "")).upper() in ("WIN", "LOSS"):
+                                result = {
+                                    **result,
+                                    "skipped": True,
+                                    "skip_trade": True,
+                                    "outcome": "SKIPPED",
+                                    "pnl_dollars": 0.0,
+                                    "skip_reason": exec_block,
+                                }
 
                         with _loop_counters_lock:
                             loop_completed_tests += 1
@@ -8423,6 +8493,49 @@ def run_chronological_backtest(
 
                             oc = str(res.get("outcome", "") or "")
                             if oc not in ("WIN", "LOSS"):
+                                npi, nti, ntj = _v71_next_step(pi, ti, tj)
+                                chrono_data["chrono_intraday"] = {
+                                    "date": date_str,
+                                    "v71_phase_idx": npi,
+                                    "v71_ticker_i": nti,
+                                    "v71_tf_j": ntj,
+                                    "next_ticker_idx": nti,
+                                    "day_trades": day_trades,
+                                    "day_skipped": day_skipped,
+                                    "day_pnl": round(day_pnl, 2),
+                                    "capital": round(capital, 2),
+                                    "compounding_base_capital": round(compounding_base, 2),
+                                }
+                                _persist_chrono_capital_state(
+                                    chrono_data,
+                                    capital=capital,
+                                    compounding_base=compounding_base,
+                                )
+                                chrono_data["current_date"] = date_str
+                                chrono_data["status"] = "running"
+                                save_json(chrono_path, chrono_data)
+                                continue
+
+                            exec_block = _hard_block_skip_reason(
+                                str(res.get("ticker", ticker)),
+                                str(res.get("strategy_id", "")),
+                            )
+                            if exec_block:
+                                row = {
+                                    "date": date_str,
+                                    "ticker": str(res.get("ticker", ticker)),
+                                    "timeframe": str(res.get("timeframe", timeframe)),
+                                    "session": session,
+                                    "job_id": job_id,
+                                    "skipped": True,
+                                    "outcome": "SKIPPED",
+                                    "pnl_dollars": 0.0,
+                                    "skip_reason": exec_block,
+                                    "strategy_id": str(res.get("strategy_id", "")),
+                                    "verdict": res.get("verdict"),
+                                }
+                                day_skipped.append(row)
+                                append_result(row)
                                 npi, nti, ntj = _v71_next_step(pi, ti, tj)
                                 chrono_data["chrono_intraday"] = {
                                     "date": date_str,
