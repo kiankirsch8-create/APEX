@@ -173,22 +173,22 @@ _v76_logic = _import_local_module("apex_v76_decision_logic", _APEX_ROOT)
 at = _import_local_module("apex_trader", _APEX_ROOT)
 
 # ---------------------------------------------------------------------------
-# v7.6 live configuration
+# v7.6 private-account live configuration
 # ---------------------------------------------------------------------------
 
-STRATEGY_VERSION = "v7.6-live-mirror"
-APEX_V76_MAGIC = int(os.environ.get("APEX_V76_MAGIC", "760760"))
-ORDER_COMMENT_V76 = os.environ.get("APEX_V76_ORDER_COMMENT", "APEX76")
-DRY_RUN = os.environ.get("APEX_DRY_RUN", "true").strip().lower() in ("1", "true", "yes")
+STRATEGY_VERSION = "v7.6-private-mirror"
+APEX_V76_MAGIC = int(os.environ.get("APEX_V76_PRIVATE_MAGIC", "760761"))
+ORDER_COMMENT_V76 = os.environ.get("APEX_V76_PRIVATE_ORDER_COMMENT", "APEX76P")
+DRY_RUN = os.environ.get("APEX_V76_PRIVATE_DRY_RUN", "true").strip().lower() in ("1", "true", "yes")
 
 SCAN_HOURS = at.SCAN_HOURS
 TIMEFRAMES: tuple[str, ...] = ("1w", "1d", "4h")
 TICKERS: list[str] = list(at.TICKERS)
 
-V76_STATE_FILE = at.BASE_DIR / "apex_v76_live_state.json"
-V76_TICKET_META = at.BASE_DIR / "apex_trader_v76_tickets.json"
-V76_DECISION_LOG = at.BASE_DIR / "apex_v76_decisions.jsonl"
-LIVE_TRADES_FORENSIC = at.BASE_DIR / "live_trades_forensic.json"
+V76_STATE_FILE = at.BASE_DIR / "apex_v76_private_state.json"
+V76_TICKET_META = at.BASE_DIR / "apex_trader_v76_private_tickets.json"
+V76_DECISION_LOG = at.BASE_DIR / "apex_v76_private_decisions.jsonl"
+LIVE_TRADES_FORENSIC = at.BASE_DIR / "live_trades_forensic_private.json"
 
 # Deep live log + remote API snapshot (VPS: ``APEX_DATA_DIR`` / ``C:\Apex``; Railway: set ``APEX_LIVE_V76_DIR``).
 _LOG_RING_MAX = 8000
@@ -214,17 +214,17 @@ LIVE_V76_STATUS: dict[str, Any] = {
 
 
 def live_v76_data_dir() -> Path:
-    """Directory for ``apex_v76_live.log`` and ``apex_v76_live_status.json``."""
+    """Directory for ``apex_v76_private.log`` and ``apex_v76_private_status.json``."""
     raw = os.environ.get("APEX_LIVE_V76_DIR") or os.environ.get("APEX_DATA_DIR") or str(at.BASE_DIR)
     return Path(raw).resolve()
 
 
 def live_v76_log_path() -> Path:
-    return live_v76_data_dir() / "apex_v76_live.log"
+    return live_v76_data_dir() / "apex_v76_private.log"
 
 
 def live_v76_status_path() -> Path:
-    return live_v76_data_dir() / "apex_v76_live_status.json"
+    return live_v76_data_dir() / "apex_v76_private_status.json"
 
 
 def _fmt_fields(fields: dict[str, Any]) -> str:
@@ -237,7 +237,7 @@ def _fmt_fields(fields: dict[str, Any]) -> str:
 
 
 def live_log(level: str, msg: str, **fields: Any) -> None:
-    """Append to ``apex_v76_live.log``, in-memory ring, and ``apex_log.txt``."""
+    """Append to ``apex_v76_private.log``, in-memory ring, and ``apex_log.txt``."""
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     extra = _fmt_fields(fields) if fields else ""
     line = f"{ts} | {level.upper():7} | {msg}" + (f" | {extra}" if extra else "")
@@ -251,11 +251,11 @@ def live_log(level: str, msg: str, **fields: Any) -> None:
         with open(live_v76_log_path(), "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except OSError as e:
-        at.log_msg(f"[v76-live] log file write failed: {e}", "warning")
+        at.log_msg(f"[v76-private] log file write failed: {e}", "warning")
     lvl = level.lower()
     if lvl not in ("info", "warning", "error", "critical"):
         lvl = "info"
-    at.log_msg(f"[v76-live] {msg}" + (f" | {extra}" if extra else ""), lvl)
+    at.log_msg(f"[v76-private] {msg}" + (f" | {extra}" if extra else ""), lvl)
 
 
 def publish_live_status(mt5: Any | None = None, **extra: Any) -> None:
