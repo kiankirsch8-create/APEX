@@ -1,12 +1,53 @@
 """
-APEX v7.6 Live Trader (private account) — mirrors backtest v7.6 decision logic.
+APEX v7.6 PRIVATE Trader — runs alongside the funded demo trader on the same VPS.
 
-- Decision stack in ``apex_v76_decision_logic.py`` (no ``pandas_ta`` / numba / llvmlite).
-- MT5 execution via ``apex_trader.py`` only (OHLC, indicators, orders, trailing).
-- Allowed third-party: MetaTrader5, pandas, numpy, yfinance, requests, anthropic (via managers).
+This file is structurally identical to ``apex_trader_v76.py`` (the funded-mode demo trader).
+It shares the same decision logic (``apex_v76_decision_logic.py``), the same MT5 execution
+layer (``apex_trader.py``), the same prefilter, macro, regime, calendar, trend, and trailing
+managers. The backtester (``continuous_backtester.py``) and this private trader call into
+the same Python functions; the live trader is the closest possible mirror of the backtest run.
 
-Deploy: copy ``apex_trader_v76_private.py``, ``apex_v76_decision_logic.py``, ``apex_trader.py``,
-``macro_manager.py``, ``prefilter_v6.py``, etc. into ``C:\\Apex``. Set ``APEX_MT5_PASSWORD``.
+WHAT IS DIFFERENT FROM apex_trader_v76.py (the funded-mode trader):
+- Magic number: 760761 (vs 760760 funded demo) — keeps positions / tickets fully separate
+- Order comment: APEX76P (vs APEX76) — distinguishable in MT5 trade history
+- State file: apex_v76_private_state.json
+- Ticket meta: apex_trader_v76_private_tickets.json
+- Decision log: apex_v76_private_decisions.jsonl
+- Forensic log: live_trades_forensic_private.json
+- Live log: apex_v76_private.log
+- Status file: apex_v76_private_status.json
+- Env vars: APEX_V76_PRIVATE_MAGIC, APEX_V76_PRIVATE_DRY_RUN, APEX_V76_PRIVATE_ORDER_COMMENT,
+            APEX_LIVE_V76_PRIVATE_DIR
+
+WHAT IS THE SAME:
+- All decision logic (prefilter, layer1/layer2 selection, macro, trend, regime, calendar,
+  STRONG_TAILWIND tiers, JPY recipes, PYRAMID-IN, TREND-CONTINUATION, VOL-SCALE)
+- Sizing math (compounds from live MT5 balance via ai[_balance_for_sizing])
+- Position adoption on startup, trailing, forensic close logging
+- 15-position sanity cap (kept as runaway-protection, not a funded rule)
+
+WHAT IS INTENTIONALLY ABSENT FROM PRIVATE MODE:
+- 3.5% emergency daily close (FTMO funded rule)
+- 5% daily loss equity guard (FTMO funded rule)
+- Static drawdown floor (FTMO funded rule)
+- Per-pair stacking cap (stacking on correlated JPY pairs is intentional for private capital)
+
+Private capital takes drawdowns as designed — the backtester showed -$2,500 drawdown
+Jun-Aug 2021 recovering with the DRAWDOWN-SCALE auto-throttle. This is normal, not a bug.
+
+DEPLOY ON VPS:
+1. Copy this file plus apex_v76_decision_logic.py, apex_trader.py, macro_manager.py,
+   prefilter_v6.py, regime_manager.py, trend_manager.py, calendar_manager.py,
+   strategies_v5_data.py, intelligence_fetch_cached.py, utils.py, market_intelligence.py
+   into C:\Apex
+2. Set env vars: APEX_MT5_PASSWORD (same as funded demo), APEX_V76_PRIVATE_DRY_RUN=false
+   when ready to trade live, APEX_V76_PRIVATE_MAGIC=760761
+3. Install as a separate nssm service: ApexTraderPrivate (not ApexTraderV76)
+4. Logs will land in C:\Apex\apex_v76_private.log and apex_v76_private_status.json
+
+Both services run independently, both read live MT5 balance from the connected account.
+For 500 EUR IC Markets, point this service at the IC Markets account; funded demo stays on
+the MetaQuotes-Demo account.
 """
 
 from __future__ import annotations
@@ -173,7 +214,7 @@ _v76_logic = _import_local_module("apex_v76_decision_logic", _APEX_ROOT)
 at = _import_local_module("apex_trader", _APEX_ROOT)
 
 # ---------------------------------------------------------------------------
-# v7.6 private-account live configuration
+# v7.6 live configuration
 # ---------------------------------------------------------------------------
 
 STRATEGY_VERSION = "v7.6-private-mirror"
@@ -214,8 +255,8 @@ LIVE_V76_STATUS: dict[str, Any] = {
 
 
 def live_v76_data_dir() -> Path:
-    """Directory for ``apex_v76_private.log`` and ``apex_v76_private_status.json``."""
-    raw = os.environ.get("APEX_LIVE_V76_DIR") or os.environ.get("APEX_DATA_DIR") or str(at.BASE_DIR)
+    """Directory for ``apex_v76_live.log`` and ``apex_v76_live_status.json``."""
+    raw = os.environ.get("APEX_LIVE_V76_PRIVATE_DIR") or os.environ.get("APEX_DATA_DIR") or str(at.BASE_DIR)
     return Path(raw).resolve()
 
 
@@ -237,7 +278,7 @@ def _fmt_fields(fields: dict[str, Any]) -> str:
 
 
 def live_log(level: str, msg: str, **fields: Any) -> None:
-    """Append to ``apex_v76_private.log``, in-memory ring, and ``apex_log.txt``."""
+    """Append to ``apex_v76_live.log``, in-memory ring, and ``apex_log.txt``."""
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     extra = _fmt_fields(fields) if fields else ""
     line = f"{ts} | {level.upper():7} | {msg}" + (f" | {extra}" if extra else "")
@@ -1912,7 +1953,7 @@ def main_loop_v76() -> None:
     last_slot = str(st.get("last_scan_slot") or "")
     live_log(
         "info",
-        "APEX v76 live trader starting",
+        "APEX v76 PRIVATE trader starting",
         version=STRATEGY_VERSION,
         magic=APEX_V76_MAGIC,
         dry_run=DRY_RUN,
