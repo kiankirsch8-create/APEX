@@ -923,9 +923,9 @@ def fill_mode(mt5: Any, sym: str) -> int:
     if info is None:
         return mt5.ORDER_FILLING_IOC
     fm = int(info.filling_mode)
-    if fm & mt5.ORDER_FILLING_FOK:
+    if fm & 1:
         return mt5.ORDER_FILLING_FOK
-    if fm & mt5.ORDER_FILLING_IOC:
+    if fm & 2:
         return mt5.ORDER_FILLING_IOC
     return mt5.ORDER_FILLING_RETURN
 
