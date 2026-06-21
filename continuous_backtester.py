@@ -252,6 +252,7 @@ BLOCKED_STRATEGIES_GROUP1: frozenset[str] = frozenset(
     },
 )
 COMPOUNDING_ENABLED = True
+BLOCK_CONTINUATION_LONGS_IN_STRONG_TAILWIND = True
 # Backtest-only: "private" enables stepped compounding; "funded" keeps fixed $10k sizing base.
 _acct_raw = (os.environ.get("APEX_ACCOUNT_TYPE") or "private").strip().lower()
 ACCOUNT_TYPE = _acct_raw if _acct_raw in ("private", "funded") else "private"
@@ -3570,6 +3571,23 @@ def enforce_rules(
         ai["skip_trade"] = True
         ai["skip_reason"] = "strategy_met is False"
         return ai
+
+    if BLOCK_CONTINUATION_LONGS_IN_STRONG_TAILWIND:
+        macro_bias = str(ai.get("macro_bias", "")).strip().upper()
+        if (
+            strategy_id in ("T03_HH_HL_CONTINUATION", "B10_WEEKLY_RANGE_BREAK")
+            and direction == "LONG"
+            and macro_bias == "STRONG_TAILWIND"
+        ):
+            ai["skip_trade"] = True
+            ai["skip_reason"] = (
+                f"[ST_LONG_BLOCK] {strategy_id} {ticker} LONG — STRONG_TAILWIND filter"
+            )
+            log(
+                f"[ST_LONG_BLOCK] skipped {strategy_id} {ticker} LONG — STRONG_TAILWIND filter",
+                level="info",
+            )
+            return ai
 
     if strategy_id == "R01_EXTREME_ZONE_REVERSION":
         if tf in ("4h", "1h", "30m", "15m"):
