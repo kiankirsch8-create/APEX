@@ -253,6 +253,7 @@ BLOCKED_STRATEGIES_GROUP1: frozenset[str] = frozenset(
 )
 COMPOUNDING_ENABLED = True
 BLOCK_CONTINUATION_LONGS_IN_STRONG_TAILWIND = True
+BLOCK_LONGS_IN_STRONG_TAILWIND_BAD_PERIOD = True
 # Backtest-only: "private" enables stepped compounding; "funded" keeps fixed $10k sizing base.
 _acct_raw = (os.environ.get("APEX_ACCOUNT_TYPE") or "private").strip().lower()
 ACCOUNT_TYPE = _acct_raw if _acct_raw in ("private", "funded") else "private"
@@ -1203,6 +1204,27 @@ def _fragile_bad_period_skip(strat_id: str, period_mode: str) -> tuple[bool, str
     log(msg, level="info")
     return True, msg
 
+
+def _st_strong_tailwind_bad_long_skip(
+    strat_id: str,
+    direction: str,
+    macro_bias: str,
+    period_mode: str,
+    ticker: str = "",
+) -> tuple[bool, str]:
+    # ST_BAD_LONG_BLOCK_v1
+    if not BLOCK_LONGS_IN_STRONG_TAILWIND_BAD_PERIOD:
+        return False, ""
+    sid = str(strat_id or "").strip().upper()
+    sym = str(ticker or "").strip().upper() or "?"
+    d = str(direction or "").strip().upper()
+    mb = str(macro_bias or "").strip().upper()
+    pm = str(period_mode or "NEUTRAL").strip().upper()
+    if d == "LONG" and mb == "STRONG_TAILWIND" and pm == "BAD":
+        msg = f"[ST_BAD_LONG_BLOCK] skipped {sid} {sym} LONG — STRONG_TAILWIND in BAD period"
+        log(msg, level="info")
+        return True, msg
+    return False, ""
 
 
 def _add_trading_days(start: date, n: int) -> date:
@@ -5534,6 +5556,30 @@ def _python_forced_layer2_trade(
             tf_key=tf_key,
             is_exotic=is_exotic,
         )
+    ok_st_bad, rs_st_bad = _st_strong_tailwind_bad_long_skip(
+        strat_id,
+        direction,
+        str(ai.get("macro_bias", "")),
+        period_mode,
+        sym,
+    )
+    if ok_st_bad:
+        ai2 = dict(ai)
+        ai2["calendar_action"] = str(cal.get("action", "CLEAR"))
+        ai2["calendar_reason"] = str(cal.get("reason", ""))
+        ai2.update(_v73_regime_row_fields(regime_ctx))
+        return _skipped_backtest_row(
+            sym=sym,
+            timeframe=timeframe,
+            analysis_date=analysis_date,
+            price=float(price),
+            zone_pct=zone_pct,
+            zone_label=zone_label,
+            skip_reason=rs_st_bad,
+            ai=ai2,
+            tf_key=tf_key,
+            is_exotic=is_exotic,
+        )
     ok_mom, rs_mom = _momentum_neutral_ranging_skip(
         sym=sym,
         strat_id=strat_id,
@@ -6618,6 +6664,15 @@ def run_one_backtest(
         ok_frag, rs_frag = _fragile_bad_period_skip(strategy_id_norm, period_mode)
         if ok_frag:
             return _skip_out(rs_frag, ai)
+        ok_st_bad, rs_st_bad = _st_strong_tailwind_bad_long_skip(
+            strategy_id_norm,
+            direction,
+            str(ai.get("macro_bias", "")),
+            period_mode,
+            sym,
+        )
+        if ok_st_bad:
+            return _skip_out(rs_st_bad, ai)
         ok_mom, rs_mom = _momentum_neutral_ranging_skip(
             sym=sym,
             strat_id=strategy_id_norm,
