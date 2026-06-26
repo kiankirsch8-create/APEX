@@ -253,7 +253,7 @@ BLOCKED_STRATEGIES_GROUP1: frozenset[str] = frozenset(
 )
 COMPOUNDING_ENABLED = True
 BLOCK_CONTINUATION_LONGS_IN_STRONG_TAILWIND = True
-BLOCK_LONGS_IN_STRONG_TAILWIND_BAD_PERIOD = True
+BLOCK_STRONG_TAILWIND_LONGS_IN_BAD_PERIOD = True
 # Backtest-only: "private" enables stepped compounding; "funded" keeps fixed $10k sizing base.
 _acct_raw = (os.environ.get("APEX_ACCOUNT_TYPE") or "private").strip().lower()
 ACCOUNT_TYPE = _acct_raw if _acct_raw in ("private", "funded") else "private"
@@ -1211,17 +1211,19 @@ def _st_strong_tailwind_bad_long_skip(
     macro_bias: str,
     period_mode: str,
     ticker: str = "",
+    analysis_date: str = "",
 ) -> tuple[bool, str]:
     # ST_BAD_LONG_BLOCK_v1
-    if not BLOCK_LONGS_IN_STRONG_TAILWIND_BAD_PERIOD:
+    if not BLOCK_STRONG_TAILWIND_LONGS_IN_BAD_PERIOD:
         return False, ""
     sid = str(strat_id or "").strip().upper()
     sym = str(ticker or "").strip().upper() or "?"
+    dt = str(analysis_date or "").strip()[:10] or "?"
     d = str(direction or "").strip().upper()
     mb = str(macro_bias or "").strip().upper()
     pm = str(period_mode or "NEUTRAL").strip().upper()
     if d == "LONG" and mb == "STRONG_TAILWIND" and pm == "BAD":
-        msg = f"[ST_BAD_LONG_BLOCK] skipped {sid} {sym} LONG — STRONG_TAILWIND in BAD period"
+        msg = f"[ST_BAD_LONG_BLOCK] skipped {sym} {sid} {dt}"
         log(msg, level="info")
         return True, msg
     return False, ""
@@ -5562,6 +5564,7 @@ def _python_forced_layer2_trade(
         str(ai.get("macro_bias", "")),
         period_mode,
         sym,
+        analysis_date,
     )
     if ok_st_bad:
         ai2 = dict(ai)
@@ -6670,6 +6673,7 @@ def run_one_backtest(
             str(ai.get("macro_bias", "")),
             period_mode,
             sym,
+            analysis_date,
         )
         if ok_st_bad:
             return _skip_out(rs_st_bad, ai)
