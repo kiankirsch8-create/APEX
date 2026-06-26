@@ -8324,6 +8324,7 @@ def run_chronological_backtest(
             merge_hist.extend(x for x in load_all_results() if isinstance(x, dict))
         except Exception:  # noqa: BLE001
             pass
+        LAST_TRADE_DATES.clear()
         _rebuild_strategy_trade_counts_from_rows(merge_hist)
         _rebuild_combo_trade_stats_from_rows(merge_hist)
         _rebuild_consecutive_losses_from_rows(merge_hist)
