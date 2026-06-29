@@ -506,7 +506,12 @@ def get_currencies(ticker: str) -> list[str]:
 STRATEGY_STATUS: dict[str, Any] = {}
 LOCKED_STRATEGY_IDS: frozenset[str] = frozenset()
 UNTESTED_STRATEGIES_V72: frozenset[str] = frozenset()
-BLOCKED_STRATEGIES: frozenset[str] = frozenset()
+BLOCKED_STRATEGIES_FIXED: frozenset[str] = frozenset(
+    {
+        "T08_DONCHIAN_BREAKOUT",  # ~33–37% WR, ~1.1–1.2 W/L; net loser at scale
+    },
+)
+BLOCKED_STRATEGIES: frozenset[str] = BLOCKED_STRATEGIES_FIXED
 
 _BLOCKED_PAIR_LOGGED: set[str] = set()
 _BLOCKED_STRATEGY_LOGGED: set[str] = set()
@@ -540,6 +545,8 @@ def _hard_block_skip_reason(sym: str, strategy_id: str) -> str | None:
     if _is_group1_blocked_strategy(sid_u):
         _log_group1_blocked_strategy_once(sid_u)
         return f"[BLOCKED STRATEGY] {sid_u} in BLOCKED_STRATEGIES_GROUP1 list"
+    if sid_u in BLOCKED_STRATEGIES:
+        return f"[BLOCKED STRATEGY] {sid_u} in BLOCKED_STRATEGIES list"
     return None
 
 
@@ -705,7 +712,7 @@ def _v72_load_strategy_status(*, log_startup: bool = False) -> None:
         blk = list(_v72_blocked_ids_default())
         raw["blocked"] = blk
         save_json(STRATEGY_STATUS_FILE, raw)
-    BLOCKED_STRATEGIES = frozenset(str(x).strip().upper() for x in blk if x)
+    BLOCKED_STRATEGIES = frozenset(str(x).strip().upper() for x in blk if x) | BLOCKED_STRATEGIES_FIXED
     if log_startup:
         log(
             f"[v7.2] strategy_status locked={len(LOCKED_STRATEGY_IDS)} "
@@ -879,6 +886,8 @@ def _v7_filter_layer2_qualifiers(
         sid_u = str(sid).strip().upper()
         if _is_group1_blocked_strategy(sid_u):
             _log_group1_blocked_strategy_once(sid_u)
+            continue
+        if sid_u in BLOCKED_STRATEGIES:
             continue
         if sid_u in LAYER1_STRATEGY_IDS:
             out.append((sid, direction, score, None))
@@ -1553,6 +1562,8 @@ def _layer2_tuple_for_deterministic_pick(
             continue
         if _is_group1_blocked_strategy(sid):
             continue
+        if sid in BLOCKED_STRATEGIES:
+            continue
         if sid in by_sid:
             return by_sid[sid][0]
     # Pass 2 — stale / no-conditions strategies on their deterministic turn
@@ -1560,6 +1571,8 @@ def _layer2_tuple_for_deterministic_pick(
         if _sort_key(sid)[0] >= 9_000_000:
             continue
         if _is_group1_blocked_strategy(sid):
+            continue
+        if sid in BLOCKED_STRATEGIES:
             continue
         if sid in _V7_STALE_FALLBACK_IDS:
             dire = "LONG" if float(zone_pct) < 50.0 else "SHORT"
@@ -5284,6 +5297,11 @@ def _python_forced_layer2_trade(
     if _is_group1_blocked_strategy(strat_id):
         _log_group1_blocked_strategy_once(strat_id)
         blocked_reason = f"[BLOCKED STRATEGY] {strat_id} in BLOCKED_STRATEGIES_GROUP1 list"
+    elif strat_id in BLOCKED_STRATEGIES:
+        blocked_reason = f"[BLOCKED STRATEGY] {strat_id} in BLOCKED_STRATEGIES list"
+    else:
+        blocked_reason = None
+    if blocked_reason:
         if chrono_job:
             return _chrono_scan_skip_row(
                 sym=sym,
