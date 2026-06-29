@@ -254,6 +254,10 @@ BLOCKED_STRATEGIES_GROUP1: frozenset[str] = frozenset(
 COMPOUNDING_ENABLED = True
 BLOCK_CONTINUATION_LONGS_IN_STRONG_TAILWIND = True
 BLOCK_STRONG_TAILWIND_LONGS_IN_BAD_PERIOD = True
+STALE_TAILWIND_LONG_VETO = True
+STALE_TAILWIND_VETO_INCLUDE_TAILWIND = True
+STALE_TAILWIND_MIN_UPTREND_STRENGTH = 0.40
+STALE_TAILWIND_MIN_RANGING_LONG_STRENGTH = 0.45
 # Backtest-only: "private" enables stepped compounding; "funded" keeps fixed $10k sizing base.
 _acct_raw = (os.environ.get("APEX_ACCOUNT_TYPE") or "private").strip().lower()
 ACCOUNT_TYPE = _acct_raw if _acct_raw in ("private", "funded") else "private"
@@ -1236,6 +1240,61 @@ def _st_strong_tailwind_bad_long_skip(
         log(msg, level="info")
         return True, msg
     return False, ""
+
+
+def _price_trend_confirms_long(trend_snap: dict[str, Any]) -> bool:
+    """True when repaired weekly trend supports a macro tailwind LONG."""
+    trend = str(trend_snap.get("trend", "RANGING")).strip().upper()
+    bias = str(trend_snap.get("direction_bias", "NEUTRAL")).strip().upper()
+    ts = float(trend_snap.get("strength", 0) or 0)
+    if trend == "DOWNTREND" or bias == "SHORT":
+        return False
+    if trend == "UPTREND" and bias == "LONG" and ts >= STALE_TAILWIND_MIN_UPTREND_STRENGTH:
+        return True
+    if (
+        trend == "RANGING"
+        and bias == "LONG"
+        and ts >= STALE_TAILWIND_MIN_RANGING_LONG_STRENGTH
+    ):
+        return True
+    return False
+
+
+def _stale_tailwind_long_veto_skip(
+    direction: str,
+    macro_bias: str,
+    trend_snap: dict[str, Any],
+    ticker: str = "",
+    strategy_id: str = "",
+    analysis_date: str = "",
+) -> tuple[bool, str]:
+    # STALE_TAILWIND_VETO_v1
+    if not STALE_TAILWIND_LONG_VETO:
+        return False, ""
+    d = str(direction or "").strip().upper()
+    if d != "LONG":
+        return False, ""
+    mb = str(macro_bias or "").strip().upper()
+    allowed_mb = ("STRONG_TAILWIND", "TAILWIND") if STALE_TAILWIND_VETO_INCLUDE_TAILWIND else (
+        "STRONG_TAILWIND",
+    )
+    if mb not in allowed_mb:
+        return False, ""
+    snap = trend_snap if isinstance(trend_snap, dict) else {}
+    if _price_trend_confirms_long(snap):
+        return False, ""
+    sym = str(ticker or "").strip().upper() or "?"
+    sid = str(strategy_id or "").strip().upper() or "?"
+    dt = str(analysis_date or "").strip()[:10] or "?"
+    trend = str(snap.get("trend", "RANGING")).strip().upper()
+    bias = str(snap.get("direction_bias", "NEUTRAL")).strip().upper()
+    ts = float(snap.get("strength", 0) or 0)
+    msg = (
+        f"[STALE_TAILWIND_VETO] skipped {sym} {sid} {dt} LONG — {mb} unconfirmed "
+        f"(trend={trend} bias={bias} str={ts:.2f})"
+    )
+    log(msg, level="info")
+    return True, msg
 
 
 def _add_trading_days(start: date, n: int) -> date:
@@ -5652,6 +5711,34 @@ def _python_forced_layer2_trade(
             tf_key=tf_key,
             is_exotic=is_exotic,
         )
+    tr_snap_veto = trend_result.get("trend") or {}
+    if not isinstance(tr_snap_veto, dict):
+        tr_snap_veto = {}
+    ok_st_veto, rs_st_veto = _stale_tailwind_long_veto_skip(
+        str(ai.get("direction", direction)).strip().upper(),
+        str(ai.get("macro_bias", "")),
+        tr_snap_veto,
+        sym,
+        strat_id,
+        analysis_date,
+    )
+    if ok_st_veto:
+        ai2 = dict(ai)
+        ai2["calendar_action"] = str(cal.get("action", "CLEAR"))
+        ai2["calendar_reason"] = str(cal.get("reason", ""))
+        ai2.update(_v73_regime_row_fields(regime_ctx))
+        return _skipped_backtest_row(
+            sym=sym,
+            timeframe=timeframe,
+            analysis_date=analysis_date,
+            price=float(price),
+            zone_pct=zone_pct,
+            zone_label=zone_label,
+            skip_reason=rs_st_veto,
+            ai=ai2,
+            tf_key=tf_key,
+            is_exotic=is_exotic,
+        )
     trend_mult = float(trend_result.get("size_multiplier", 1.0) or 1.0)
 
     sym_u = sym.upper()
@@ -6715,6 +6802,19 @@ def run_one_backtest(
         if trend_result.get("action") == "BLOCK":
             log(f"[TREND BLOCK] {sym} {direction} — {trend_result.get('reason', '')}", level="info")
             return _skip_out(str(trend_result.get("reason") or "trend block"), ai)
+        tr_snap_veto = trend_result.get("trend") or {}
+        if not isinstance(tr_snap_veto, dict):
+            tr_snap_veto = {}
+        ok_st_veto, rs_st_veto = _stale_tailwind_long_veto_skip(
+            direction,
+            str(ai.get("macro_bias", "")),
+            tr_snap_veto,
+            sym,
+            strategy_id_norm,
+            analysis_date,
+        )
+        if ok_st_veto:
+            return _skip_out(rs_st_veto, ai)
         trend_mult = float(trend_result.get("size_multiplier", 1.0) or 1.0)
 
         if chrono_yfinance and sym.upper() in JPY_STORM_PAIRS and macro_bt is not None:
