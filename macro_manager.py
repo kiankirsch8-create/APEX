@@ -535,6 +535,21 @@ def compute_st_layer2_score(
     }
 
 
+def _yf_close_series(df: pd.DataFrame, *, column: str = "Close") -> pd.Series:
+    """Normalize yfinance OHLC (flat or MultiIndex columns) to a float close series."""
+    if df is None or getattr(df, "empty", True) or column not in df.columns:
+        raise ValueError(f"missing {column}")
+    close = df[column].squeeze()
+    if isinstance(close, pd.DataFrame):
+        close = close.iloc[:, 0]
+    if hasattr(close, "droplevel") and getattr(close.index, "nlevels", 1) > 1:
+        close = close.droplevel(0)
+    out = pd.Series(close, dtype=float).dropna()
+    if out.empty:
+        raise ValueError(f"empty {column}")
+    return out
+
+
 def get_price_trend(
     ticker: str,
     lookback_days: int = 60,
@@ -571,9 +586,7 @@ def get_price_trend(
             _trend_cache_time[ck] = now
         return trend
     try:
-        if "Close" not in df.columns:
-            raise ValueError("no Close")
-        s = df["Close"].astype(float).dropna()
+        s = _yf_close_series(df, column="Close")
         if len(s) < 55:
             raise ValueError("short series")
         s = s.loc[: str(end_d)]
@@ -583,8 +596,8 @@ def get_price_trend(
         ago = float(s.iloc[0]) if len(s) > 0 else cur
         if len(s) >= 60:
             ago = float(s.iloc[-60])
-        ema20 = s.ewm(span=20, adjust=False).mean().iloc[-1]
-        ema50 = s.ewm(span=50, adjust=False).mean().iloc[-1]
+        ema20 = float(s.ewm(span=20, adjust=False).mean().iloc[-1])
+        ema50 = float(s.ewm(span=50, adjust=False).mean().iloc[-1])
         if cur > ago * 1.02 and ema20 > ema50:
             trend = "UPTREND"
         elif cur < ago * 0.98 and ema20 < ema50:

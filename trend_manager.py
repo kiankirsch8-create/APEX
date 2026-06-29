@@ -28,6 +28,95 @@ def _neutral() -> dict[str, Any]:
     }
 
 
+def _yf_close_series(df: pd.DataFrame, *, column: str = "Close") -> pd.Series:
+    """Normalize yfinance OHLC (flat or MultiIndex columns) to a float close series."""
+    if df is None or getattr(df, "empty", True) or column not in df.columns:
+        raise ValueError(f"missing {column}")
+    close = df[column].squeeze()
+    if isinstance(close, pd.DataFrame):
+        close = close.iloc[:, 0]
+    if hasattr(close, "droplevel") and getattr(close.index, "nlevels", 1) > 1:
+        close = close.droplevel(0)
+    out = pd.Series(close, dtype=float).dropna()
+    if out.empty:
+        raise ValueError(f"empty {column}")
+    return out
+
+
+def _classify_weekly_trend(
+    up_score: float,
+    down_score: float,
+    *,
+    ema_bull: bool,
+    ema_bear: bool,
+    ema20: float,
+    ema50: float,
+) -> dict[str, Any]:
+    """Map weekly structure + EMA stack to trend/strength (FIX 28 repair)."""
+    ema_stack = "BULLISH" if ema_bull else ("BEARISH" if ema_bear else "MIXED")
+    margin = 0.08
+
+    if up_score >= 0.65 and ema_bull:
+        strength = round(min(float(up_score), 1.0), 3)
+        return {
+            "trend": "UPTREND",
+            "strength": strength,
+            "direction_bias": "LONG",
+            "size_multiplier": 1.15 if strength >= 0.75 else 1.05,
+            "block_counter_trend": strength >= 0.75,
+            "ema_stack": ema_stack,
+        }
+    if down_score >= 0.65 and ema_bear:
+        strength = round(min(float(down_score), 1.0), 3)
+        return {
+            "trend": "DOWNTREND",
+            "strength": strength,
+            "direction_bias": "SHORT",
+            "size_multiplier": 1.15 if strength >= 0.75 else 1.05,
+            "block_counter_trend": strength >= 0.75,
+            "ema_stack": ema_stack,
+        }
+
+    if up_score >= 0.55 and up_score >= down_score + margin:
+        ema_confirm = ema_bull or ema20 > ema50
+        strength = round(min(float(up_score) * (1.0 if ema_confirm else 0.85), 0.95), 3)
+        return {
+            "trend": "UPTREND",
+            "strength": max(strength, 0.45),
+            "direction_bias": "LONG",
+            "size_multiplier": 1.05 if ema_confirm else 1.0,
+            "block_counter_trend": False,
+            "ema_stack": ema_stack,
+        }
+    if down_score >= 0.55 and down_score >= up_score + margin:
+        ema_confirm = ema_bear or ema20 < ema50
+        strength = round(min(float(down_score) * (1.0 if ema_confirm else 0.85), 0.95), 3)
+        return {
+            "trend": "DOWNTREND",
+            "strength": max(strength, 0.45),
+            "direction_bias": "SHORT",
+            "size_multiplier": 1.05 if ema_confirm else 1.0,
+            "block_counter_trend": False,
+            "ema_stack": ema_stack,
+        }
+
+    dom = max(float(up_score), float(down_score))
+    strength = round(max(0.35, dom * 0.70), 3)
+    bias = "NEUTRAL"
+    if up_score > down_score + 0.05:
+        bias = "LONG"
+    elif down_score > up_score + 0.05:
+        bias = "SHORT"
+    return {
+        "trend": "RANGING",
+        "strength": strength,
+        "direction_bias": bias,
+        "size_multiplier": 1.0,
+        "block_counter_trend": False,
+        "ema_stack": ema_stack,
+    }
+
+
 def get_weekly_trend(ticker: str, as_of_date: str | None = None) -> dict[str, Any]:
     """
     Weekly HH/HL vs LH/LL counts + EMA20/50/200 stack vs spot close.
@@ -68,22 +157,13 @@ def get_weekly_trend(ticker: str, as_of_date: str | None = None) -> dict[str, An
         if df is None or getattr(df, "empty", True) or len(df) < 12:
             return _neutral()
 
-        close = df["Close"].squeeze()
-        if hasattr(close, "droplevel"):
-            close = close.droplevel(0) if close.index.nlevels > 1 else close
-        close = pd.Series(close).astype(float).dropna()
-        highs = df["High"].squeeze()
-        lows = df["Low"].squeeze()
-        if hasattr(highs, "droplevel"):
-            highs = highs.droplevel(0) if highs.index.nlevels > 1 else highs
-        if hasattr(lows, "droplevel"):
-            lows = lows.droplevel(0) if lows.index.nlevels > 1 else lows
-        highs = pd.Series(highs).astype(float).dropna().tail(12)
-        lows = pd.Series(lows).astype(float).dropna().tail(12)
+        close = _yf_close_series(df, column="Close")
+        highs = _yf_close_series(df, column="High").tail(12)
+        lows = _yf_close_series(df, column="Low").tail(12)
         if len(close) < 12 or len(highs) < 2 or len(lows) < 2:
             return _neutral()
 
-        close = close.loc[: str(end.date())] if len(close) else close
+        close = close.loc[: str(end.date())]
         if close.empty:
             return _neutral()
 
@@ -110,27 +190,14 @@ def get_weekly_trend(ticker: str, as_of_date: str | None = None) -> dict[str, An
         ema_bull = ema20 > ema50 > ema200 and current > ema200
         ema_bear = ema20 < ema50 < ema200 and current < ema200
 
-        if up_score >= 0.65 and ema_bull:
-            strength = min(float(up_score), 1.0)
-            return {
-                "trend": "UPTREND",
-                "strength": round(strength, 3),
-                "direction_bias": "LONG",
-                "size_multiplier": 1.15 if strength >= 0.75 else 1.05,
-                "block_counter_trend": strength >= 0.75,
-                "ema_stack": "BULLISH",
-            }
-        if down_score >= 0.65 and ema_bear:
-            strength = min(float(down_score), 1.0)
-            return {
-                "trend": "DOWNTREND",
-                "strength": round(strength, 3),
-                "direction_bias": "SHORT",
-                "size_multiplier": 1.15 if strength >= 0.75 else 1.05,
-                "block_counter_trend": strength >= 0.75,
-                "ema_stack": "BEARISH",
-            }
-        return _neutral()
+        return _classify_weekly_trend(
+            up_score,
+            down_score,
+            ema_bull=ema_bull,
+            ema_bear=ema_bear,
+            ema20=ema20,
+            ema50=ema50,
+        )
     except Exception as e:  # noqa: BLE001
         logger.warning("trend_manager error %s: %s", ticker, e)
         return _neutral()
