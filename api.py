@@ -97,12 +97,6 @@ async def on_startup_resume_backtester() -> None:
             f"(APEX_PARALLEL_WORKERS)",
             level="info",
         )
-        if os.getenv("BENZINGA_API_KEY"):
-            try:
-                news_stream.start_news_stream_thread()
-                log("[Startup] Benzinga news stream started")
-            except Exception as e:  # noqa: BLE001
-                log(f"[Startup] Benzinga stream not started: {e}")
     except Exception as e:  # noqa: BLE001
         log(f"[Startup] Backtester error: {e}")
 
@@ -1584,7 +1578,7 @@ async def stop_funded_job(job_id: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Intraday backtester (15m / 30m) + Benzinga news alerts
+# Intraday backtester (15m / 30m) + news alerts
 # ---------------------------------------------------------------------------
 
 

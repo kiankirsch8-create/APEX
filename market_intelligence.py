@@ -227,15 +227,9 @@ def _get_macro_stub() -> dict[str, Any]:
     return out
 
 
-def _benzinga_news(ticker: str, date_str: str) -> dict[str, Any]:
-    sym = (ticker or "").strip().upper()
-    key = f"news:{sym}:{date_str}"
-    hit = _cache_get(key)
-    if hit is not None:
-        return hit
-    out: dict[str, Any] = {"net_sentiment": 0.0, "headlines": []}
-    _cache_set(key, out, CACHE_HOURS_NEWS)
-    return out
+def _benzinga_news(ticker: str, date_str: str) -> dict[str, Any]:  # noqa: ARG001
+    """No-op — Benzinga removed; Finnhub/NewsAPI used via macro_manager for live FX."""
+    return {}
 
 
 def get_complete_briefing(
