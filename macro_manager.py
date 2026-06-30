@@ -652,7 +652,7 @@ def _score_articles(
 
 def get_news_sentiment(base: str, quote: str) -> float:
     """
-    Sentiment -1..+1 for base vs quote from Finnhub + NewsAPI + Benzinga (FIX 30).
+    Sentiment -1..+1 for base vs quote from Finnhub + NewsAPI (FIX 30).
     Returns 0.0 in backtest or when no usable scores.
     """
     if IS_BACKTEST:
@@ -707,24 +707,6 @@ def get_news_sentiment(base: str, quote: str) -> float:
                     scores.append(float(s))
     except Exception as e:  # noqa: BLE001
         logger.warning("NewsAPI sentiment: %s", e)
-
-    # Benzinga
-    try:
-        bz_key = (os.environ.get("BENZINGA_API_KEY") or "").strip()
-        if bz_key:
-            r = requests.get(
-                "https://api.benzinga.com/api/v2/news",
-                params={"token": bz_key, "topics": "forex", "pageSize": 20},
-                timeout=5,
-            )
-            if r.status_code == 200:
-                data = r.json()
-                arts = data if isinstance(data, list) else []
-                s = _score_articles(arts, b, q, "title", "body")
-                if s is not None:
-                    scores.append(float(s))
-    except Exception as e:  # noqa: BLE001
-        logger.warning("Benzinga sentiment: %s", e)
 
     out = round(float(np.mean(scores)), 3) if scores else 0.0
     out = max(-1.0, min(1.0, out))
