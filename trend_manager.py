@@ -228,6 +228,21 @@ def apply_trend_filter(
     trend = get_trend_cached(ticker, as_of_date)
     bias = str(trend.get("direction_bias") or "NEUTRAL")
 
+    # FIX A — three strategies bleed when the weekly trend is a confirmed UPTREND.
+    # Historically −0.128%/trade at 31% WR in UPTREND. Block them there only.
+    _UPTREND_MISFIT = (
+        "M02_MACD_ZERO_CROSS",
+        "B01_RANGE_BREAKOUT",
+        "B10_WEEKLY_RANGE_BREAK",
+    )
+    if sid in _UPTREND_MISFIT and str(trend.get("trend")) == "UPTREND":
+        return {
+            "action": "BLOCK",
+            "size_multiplier": 0.0,
+            "reason": f"Uptrend misfit blocked: {sid} in weekly UPTREND ({ticker})",
+            "trend": trend,
+        }
+
     if sid in ("T01_EMA_PULLBACK", "R01_EXTREME_ZONE_REVERSION"):
         mult = float(trend.get("size_multiplier", 1.0) or 1.0) if bias == d else 1.0
         return {"action": "PROCEED", "size_multiplier": mult, "trend": trend, "reason": ""}
