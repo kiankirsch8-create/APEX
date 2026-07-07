@@ -837,21 +837,12 @@ def _detect_period_mode(
     return "NEUTRAL", wr_pct, pnl5d
 
 
-# M03's NEUTRAL bucket is net-positive (rare big JPY-momentum winners that
-# fuel compounding), so pause it in BAD periods only — not NEUTRAL. All other
-# fragile strategies stay paused in both BAD and NEUTRAL.
-FRAGILE_BAD_ONLY: frozenset[str] = frozenset({"M03_RSI_MOMENTUM_CONTINUATION"})
-
-
 def _fragile_bad_period_skip(strat_id: str, period_mode: str) -> tuple[bool, str]:
     sid = str(strat_id or "").strip().upper()
     pm = str(period_mode or "NEUTRAL").strip().upper()
-    if sid not in FRAGILE_STRATEGIES:
+    if pm != "BAD" or sid not in FRAGILE_STRATEGIES:
         return False, ""
-    allowed_modes = ("BAD",) if sid in FRAGILE_BAD_ONLY else ("BAD", "NEUTRAL")
-    if pm not in allowed_modes:
-        return False, ""
-    return True, f"[{pm} PERIOD] FRAGILE strategy {sid} paused — {pm.lower()} period mode active"
+    return True, f"[BAD PERIOD] FRAGILE strategy {sid} paused — bad period mode active"
 
 
 def detect_trailing_regime(macro_bias_adjusted: str, trend_strength: float, macro_rate_diff: float) -> str:
