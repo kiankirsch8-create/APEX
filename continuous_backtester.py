@@ -264,7 +264,9 @@ STALE_TAILWIND_MIN_RANGING_LONG_STRENGTH = 0.45
 _acct_raw = (os.environ.get("APEX_ACCOUNT_TYPE") or "private").strip().lower()
 ACCOUNT_TYPE = _acct_raw if _acct_raw in ("private", "funded") else "private"
 COMPOUNDING_THRESHOLD_MULTIPLIERS = (2.0, 3.0, 5.0, 10.0, 20.0, 50.0)
-COMPOUNDING_UPDATE_FACTOR = 2.0
+# Tunable knob: fraction of (capital - base) gap closed per eligible compounding update.
+# Increase for faster catch-up toward capital; decrease for slower/smoother glide.
+GLIDE_FRACTION = 0.10
 SINGLE_TRADE_MAX_PCT_OF_CURRENT = 0.08
 LEVERAGE = 50
 IMPROVE_EVERY = 100
@@ -1421,16 +1423,23 @@ def _maybe_bump_compounding_base(
     *,
     period_mode: str = "NEUTRAL",
 ) -> float:
-    """Step compounding base upward when capital doubles; freeze during BAD period; funded stays fixed."""
+    """Glide compounding base upward toward capital; freeze during BAD period; funded stays fixed."""
     if not COMPOUNDING_ENABLED or ACCOUNT_TYPE == "funded":
         return float(STARTING_CAPITAL)
     base = max(float(STARTING_CAPITAL), float(compounding_base or STARTING_CAPITAL))
     cur = max(0.0, float(current_capital or STARTING_CAPITAL))
     if str(period_mode or "NEUTRAL").strip().upper() == "BAD":
         return base
-    if cur >= base * COMPOUNDING_UPDATE_FACTOR:
-        log(f"[COMPOUNDING] Base capital updated to {cur:.2f}", level="info")
-        return cur
+    gap = cur - base
+    if gap > 0:
+        new_base = round(base + GLIDE_FRACTION * gap, 2)
+        if new_base > base:
+            log(
+                f"[COMPOUNDING] base glide {base:.0f} -> {new_base:.0f} "
+                f"(capital {cur:.0f}, frac {GLIDE_FRACTION:.2f})",
+                level="info",
+            )
+            return new_base
     return base
 
 
