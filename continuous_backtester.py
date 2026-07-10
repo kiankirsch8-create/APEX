@@ -200,10 +200,12 @@ CHRONO_DAILY_PNL_FOR_CB: list[dict[str, Any]] = []
 CHRONO_PENDING_HALT_UNTIL: str | None = None
 # Global completed-trade counts by strategy_id (hydrated at chrono job start from results + job file).
 STRATEGY_TRADE_COUNT: dict[str, int] = {}
-# Extended loss streak (FIX 16): key TICKER_tf_DIRECTION → consecutive loss count.
-CONSECUTIVE_LOSSES: dict[str, int] = {}
-# Last completed trade date per directional combo (for 21-day extended gate).
-LAST_COMBO_TRADE_DATE: dict[str, str] = {}
+# Rolling combo P&L restriction (replaces FIX 16 consecutive-loss cooldown):
+# key TICKER_tf_DIRECTION → list of (date_str, pnl_dollars) for completed trades.
+COMBO_ROLLING_TRADES: dict[str, list[tuple[str, float]]] = {}
+ROLLING_COMBO_RESTRICTION_WINDOW_DAYS = 14
+ROLLING_COMBO_RESTRICTION_MIN_TRADES = 2
+ROLLING_COMBO_RESTRICTION_PNL_THRESHOLD = -0.025
 # v7.18: strategies with zero trades get sort priority next scan day.
 ZERO_TRADE_STRATEGIES: set[str] = set()
 TRADE_COOLDOWN_DAYS: dict[str, int] = {
@@ -1539,16 +1541,13 @@ def _chrono_scan_skip_row(
     )
 
 
-def _rebuild_consecutive_losses_from_rows(rows: list[dict[str, Any]]) -> None:
-    CONSECUTIVE_LOSSES.clear()
-    LAST_COMBO_TRADE_DATE.clear()
+def _rebuild_combo_rolling_trades_from_rows(rows: list[dict[str, Any]]) -> None:
+    COMBO_ROLLING_TRADES.clear()
     completed = [
         r
         for r in rows
         if isinstance(r, dict) and not r.get("skipped") and r.get("outcome") in ("WIN", "LOSS")
     ]
-    completed.sort(key=lambda r: str(r.get("date", ""))[:10])
-    running: dict[str, int] = {}
     for r in completed:
         k = _chrono_combo_key(
             str(r.get("ticker", "")),
@@ -1556,13 +1555,47 @@ def _rebuild_consecutive_losses_from_rows(rows: list[dict[str, Any]]) -> None:
             str(r.get("direction", "")),
         )
         d0 = str(r.get("date", ""))[:10]
-        if d0:
-            LAST_COMBO_TRADE_DATE[k] = d0
-        if r.get("outcome") == "LOSS":
-            running[k] = running.get(k, 0) + 1
-        else:
-            running[k] = 0
-    CONSECUTIVE_LOSSES.update(running)
+        if not d0:
+            continue
+        pnl = float(r.get("pnl_dollars", 0) or 0)
+        COMBO_ROLLING_TRADES.setdefault(k, []).append((d0, pnl))
+    for trades in COMBO_ROLLING_TRADES.values():
+        trades.sort(key=lambda x: x[0])
+
+
+def _combo_trades_in_rolling_window(
+    combo_key: str,
+    date_str: str,
+    window_days: int = ROLLING_COMBO_RESTRICTION_WINDOW_DAYS,
+) -> list[tuple[str, float]]:
+    try:
+        curr_dt = datetime.strptime(date_str.strip()[:10], "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return []
+    out: list[tuple[str, float]] = []
+    for d0, pnl in COMBO_ROLLING_TRADES.get(combo_key, ()):
+        try:
+            trade_dt = datetime.strptime(d0[:10], "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            continue
+        delta = (curr_dt - trade_dt).days
+        if 0 <= delta < window_days:
+            out.append((d0, pnl))
+    return out
+
+
+def _record_combo_rolling_trade(
+    ticker: str,
+    timeframe: str,
+    direction: str,
+    date_str: str,
+    pnl_dollars: float,
+) -> None:
+    k = _chrono_combo_key(ticker, timeframe, direction)
+    d0 = str(date_str or "")[:10]
+    if not d0:
+        return
+    COMBO_ROLLING_TRADES.setdefault(k, []).append((d0, float(pnl_dollars or 0)))
 
 
 def _chrono_extended_loss_cooldown_block(
@@ -1570,27 +1603,25 @@ def _chrono_extended_loss_cooldown_block(
     timeframe: str,
     direction: str,
     date_str: str,
+    macro_bias: str = "",
 ) -> tuple[bool, str]:
-    """FIX 16 — block same ticker+tf+direction for 21d after 3+ consecutive losses."""
+    """Rolling 14d combo P&L restriction with macro tailwind override (replaces FIX 16)."""
     key = _chrono_combo_key(ticker, timeframe, direction)
-    if CONSECUTIVE_LOSSES.get(key, 0) < 3:
+    window_trades = _combo_trades_in_rolling_window(key, date_str)
+    if len(window_trades) < ROLLING_COMBO_RESTRICTION_MIN_TRADES:
         return True, ""
-    last = LAST_COMBO_TRADE_DATE.get(key)
-    if not last:
+    net_pnl = sum(p for _, p in window_trades)
+    net_pct = net_pnl / STARTING_CAPITAL
+    if net_pct >= ROLLING_COMBO_RESTRICTION_PNL_THRESHOLD:
         return True, ""
-    try:
-        last_dt = datetime.strptime(last, "%Y-%m-%d")
-        curr_dt = datetime.strptime(date_str.strip()[:10], "%Y-%m-%d")
-        days_since = (curr_dt - last_dt).days
-    except (TypeError, ValueError):
+    mb = str(macro_bias or "NEUTRAL").strip().upper()
+    if mb in ("TAILWIND", "STRONG_TAILWIND"):
         return True, ""
-    if days_since < 21:
-        return (
-            False,
-            f"Extended cooldown: {key} has 3+ consecutive losses, waiting 21 days "
-            f"(day {days_since}/21)",
-        )
-    return True, ""
+    return (
+        False,
+        f"Rolling restriction: {key} trailing-14d net {net_pct * 100:.2f}% < -2.5%, "
+        f"non-tailwind trade blocked (macro={mb})",
+    )
 
 
 def _layer2_tuple_for_deterministic_pick(
@@ -6521,7 +6552,24 @@ def run_one_backtest(
                 if d_pick == "BOTH":
                     d_pick = "LONG" if float(zone_pct) < 50.0 else "SHORT"
                 if chrono_enforce_extended_cooldown:
-                    ok_e, rs_e = _chrono_extended_loss_cooldown_block(sym, timeframe, d_pick, analysis_date)
+                    l2_macro = ""
+                    if scan_d is not None:
+                        try:
+                            l2_mb = cached_macro_bias(sym, d_pick, scan_d)
+                            l2_mb = align_macro_bias_with_price(
+                                sym,
+                                d_pick,
+                                l2_mb,
+                                as_of_date=scan_d,
+                                price_df=past if past is not None and not getattr(past, "empty", True) else None,
+                                log_fn=log,
+                            )
+                            l2_macro = str(l2_mb.get("bias", "") or "").strip().upper()
+                        except Exception:  # noqa: BLE001
+                            l2_macro = ""
+                    ok_e, rs_e = _chrono_extended_loss_cooldown_block(
+                        sym, timeframe, d_pick, analysis_date, macro_bias=l2_macro
+                    )
                     if not ok_e:
                         return _skipped_backtest_row(
                             sym=sym,
@@ -6749,7 +6797,13 @@ def run_one_backtest(
         if chrono_enforce_extended_cooldown:
             d_pre = str(ai.get("direction", "")).strip().upper()
             if d_pre in ("LONG", "SHORT"):
-                ok_e2, rs_e2 = _chrono_extended_loss_cooldown_block(sym, timeframe, d_pre, analysis_date)
+                ok_e2, rs_e2 = _chrono_extended_loss_cooldown_block(
+                    sym,
+                    timeframe,
+                    d_pre,
+                    analysis_date,
+                    macro_bias=str(ai.get("macro_bias", "") or "").strip().upper(),
+                )
                 if not ok_e2:
                     return _skip_out(rs_e2, ai)
 
@@ -8504,7 +8558,7 @@ def run_chronological_backtest(
         LAST_TRADE_DATES.clear()
         _rebuild_strategy_trade_counts_from_rows(merge_hist)
         _rebuild_combo_trade_stats_from_rows(merge_hist)
-        _rebuild_consecutive_losses_from_rows(merge_hist)
+        _rebuild_combo_rolling_trades_from_rows(merge_hist)
         _v72_load_strategy_status(log_startup=True)
         # FIX 18 — restore zero-trade priority after restart (same rule as end-of-day)
         for _z0 in ALL_STRATEGY_IDS:
@@ -9276,12 +9330,13 @@ def run_chronological_backtest(
                                     _record_combo_trade_outcome(ticker, _rsid2, oc)
                                 CHRONO_COMPLETED_TRADES_BUFFER.append(dict(row))
                                 drow = str(row.get("direction", "")).strip().upper()
-                                lk = _chrono_combo_key(ticker, timeframe, drow)
-                                if oc == "LOSS":
-                                    CONSECUTIVE_LOSSES[lk] = CONSECUTIVE_LOSSES.get(lk, 0) + 1
-                                else:
-                                    CONSECUTIVE_LOSSES[lk] = 0
-                                LAST_COMBO_TRADE_DATE[lk] = date_str
+                                _record_combo_rolling_trade(
+                                    ticker,
+                                    timeframe,
+                                    drow,
+                                    date_str,
+                                    float(row.get("pnl_dollars", 0) or 0),
+                                )
 
                             npi, nti, ntj = _v71_next_step(pi, ti, tj)
                             chrono_data["chrono_intraday"] = {
