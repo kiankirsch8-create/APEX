@@ -271,6 +271,33 @@ GLIDE_FRACTION = 0.10
 DIAGNOSTIC_ALLOW_MULTI_TF_PER_DAY = True  # DIAGNOSTIC — REMOVE BEFORE LIVE
 SINGLE_TRADE_MAX_PCT_OF_CURRENT = 0.08
 LEVERAGE = 50
+
+# ── REALISTIC CONDITIONS (v1: spread + slippage + commission; swap wired but OFF) ──
+REALISTIC_COSTS_ENABLED = True
+SWAP_ENABLED = False              # flip True only after pasting real Capital.com per-pair swap values
+COMMISSION_PER_LOT_ROUNDTURN = 0.0   # Capital.com forex is spread-only
+SLIPPAGE_PIPS_ROUNDTURN = 1.0        # conservative execution haircut (~0.5 pip/side)
+SPREAD_DEFAULT_PIPS = 2.5            # fallback for any pair not in SPREAD_PIPS (logs a warning)
+
+# Representative Capital.com retail spreads (pips). REPLACE with live platform values for max accuracy.
+SPREAD_PIPS: dict[str, float] = {
+    "EURUSD": 0.6, "USDJPY": 1.2, "GBPUSD": 1.4, "USDCHF": 1.5, "AUDUSD": 1.0,
+    "USDCAD": 1.5, "NZDUSD": 1.8,
+    "EURJPY": 1.5, "GBPJPY": 2.5, "AUDJPY": 1.8, "CADJPY": 2.2, "CHFJPY": 2.5, "NZDJPY": 2.5,
+    "EURGBP": 1.0, "EURCHF": 1.8, "EURAUD": 2.5, "EURCAD": 2.5, "EURNZD": 3.5,
+    "GBPCHF": 3.0, "GBPAUD": 3.5, "GBPCAD": 3.5, "GBPNZD": 5.0,
+    "AUDNZD": 2.5, "AUDCAD": 2.5, "AUDCHF": 3.0, "NZDCAD": 3.0, "NZDCHF": 3.5, "CADCHF": 3.0,
+    "USDSEK": 20.0, "USDNOK": 20.0, "USDMXN": 60.0, "USDZAR": 50.0,
+}
+# Signed swap, % of notional PER NIGHT. Negative = pay, positive = receive (carry credit).
+# Time-varying in reality — keep SWAP_ENABLED=False until real per-pair/direction values are pasted.
+SWAP_DAILY_PCT: dict[str, dict[str, float]] = {
+    "USDJPY": {"LONG": 0.0010, "SHORT": -0.0015},
+    "CADJPY": {"LONG": 0.0008, "SHORT": -0.0013},
+    "CHFJPY": {"LONG": 0.0006, "SHORT": -0.0011},
+}
+SWAP_DEFAULT_PCT = 0.0
+
 IMPROVE_EVERY = 100
 
 # Parallel rolling batch (I/O-bound jobs). Chrono stays sequential: same-day capital,
@@ -1083,6 +1110,75 @@ def _chrono_combo_key(ticker: str, timeframe: str, direction: str) -> str:
         f"{(timeframe or '').strip().lower()}_"
         f"{(direction or '').strip().upper()}"
     )
+
+
+def _pip_size(ticker: str) -> float:
+    return 0.01 if str(ticker).upper().endswith("JPY") else 0.0001
+
+
+def _tf_days(timeframe: str) -> float:
+    tf = str(timeframe).strip().lower()
+    return {"1w": 7.0, "1d": 1.0, "4h": 4 / 24, "1h": 1 / 24, "30m": 0.5 / 24, "15m": 0.25 / 24}.get(tf, 1.0)
+
+
+def _apply_realistic_costs(
+    *,
+    ticker: str,
+    direction: str,
+    timeframe: str,
+    position_size: float,
+    entry: float,
+    leveraged_exposure: float,
+    raw_pct: float,
+    candles_to_exit: int,
+) -> tuple[float, float, float, dict[str, float]]:
+    """Return (net_pnl_dollars, net_pnl_pct, gross_pnl_pct, cost_fields).
+
+    Costs are expressed as a fraction of notional so they stay unit-consistent with
+    pnl_dollars = leveraged_exposure * raw_pct.
+    """
+    gross = leveraged_exposure * raw_pct
+    gross_pct = raw_pct * 100.0
+    if not REALISTIC_COSTS_ENABLED or leveraged_exposure <= 0 or entry <= 0:
+        return (
+            round(gross, 2),
+            round(gross_pct, 2),
+            round(gross_pct, 2),
+            {
+                "gross_pnl_dollars": round(gross, 2),
+                "spread_cost": 0.0,
+                "slippage_cost": 0.0,
+                "commission_cost": 0.0,
+                "swap_amount": 0.0,
+                "total_cost_dollars": 0.0,
+                "nights_held": 0.0,
+            },
+        )
+    tkr = str(ticker).upper()
+    pip = _pip_size(tkr)
+    spr = SPREAD_PIPS.get(tkr, SPREAD_DEFAULT_PIPS)
+    if tkr not in SPREAD_PIPS:
+        log(f"[COST] no spread entry for {tkr}, using default {SPREAD_DEFAULT_PIPS}p", level="warn")
+    spread_cost = leveraged_exposure * ((spr * pip) / entry)
+    slip_cost = leveraged_exposure * ((SLIPPAGE_PIPS_ROUNDTURN * pip) / entry)
+    comm_cost = COMMISSION_PER_LOT_ROUNDTURN * (position_size / 100000.0)
+    nights = max(0.0, float(candles_to_exit) * _tf_days(timeframe))
+    swap_amt = 0.0
+    if SWAP_ENABLED:
+        swap_pct = SWAP_DAILY_PCT.get(tkr, {}).get(str(direction).upper(), SWAP_DEFAULT_PCT)
+        swap_amt = leveraged_exposure * swap_pct * nights
+    net = gross - spread_cost - slip_cost - comm_cost + swap_amt
+    net_pct = (net / leveraged_exposure) * 100.0
+    fields = {
+        "gross_pnl_dollars": round(gross, 2),
+        "spread_cost": round(spread_cost, 2),
+        "slippage_cost": round(slip_cost, 2),
+        "commission_cost": round(comm_cost, 2),
+        "swap_amount": round(swap_amt, 2),
+        "total_cost_dollars": round(gross - net, 2),
+        "nights_held": round(nights, 2),
+    }
+    return round(net, 2), round(net_pct, 2), round(gross_pct, 2), fields
 
 
 def _rebuild_strategy_trade_counts_from_rows(rows: list[dict[str, Any]]) -> None:
@@ -6055,8 +6151,16 @@ def _python_forced_layer2_trade(
     if outcome not in ("WIN", "LOSS"):
         outcome = "WIN" if raw_pct > 0 else "LOSS"
     correct = outcome == "WIN"
-    pnl_dollars = round(leveraged_exposure * raw_pct, 2)
-    pnl_pct_display = round(raw_pct * 100, 2)
+    pnl_dollars, pnl_pct_display, gross_pnl_pct, _cost_fields = _apply_realistic_costs(
+        ticker=sym,
+        direction=direction,
+        timeframe=timeframe,
+        position_size=position_size,
+        entry=entry,
+        leveraged_exposure=leveraged_exposure,
+        raw_pct=raw_pct,
+        candles_to_exit=candles_to_exit,
+    )
     confidence = str(ai.get("confidence", "LOW")).strip().upper()
     td = trend_result.get("trend") or {}
     if not isinstance(td, dict):
@@ -6106,6 +6210,8 @@ def _python_forced_layer2_trade(
         "correct": correct,
         "pnl_pct": pnl_pct_display,
         "pnl_dollars": pnl_dollars,
+        "gross_pnl_pct": gross_pnl_pct,
+        **_cost_fields,
         "leverage": LEVERAGE,
         "position_size": round(position_size, 2),
         "leveraged_exposure": round(leveraged_exposure, 2),
@@ -7109,8 +7215,16 @@ def run_one_backtest(
             outcome = "WIN" if raw_pct > 0 else "LOSS"
         correct = outcome == "WIN"
 
-        pnl_dollars = round(leveraged_exposure * raw_pct, 2)
-        pnl_pct_display = round(raw_pct * 100, 2)
+        pnl_dollars, pnl_pct_display, gross_pnl_pct, _cost_fields = _apply_realistic_costs(
+            ticker=sym,
+            direction=direction,
+            timeframe=tf_key,
+            position_size=position_size,
+            entry=entry,
+            leveraged_exposure=leveraged_exposure,
+            raw_pct=raw_pct,
+            candles_to_exit=candles_to_exit,
+        )
 
         cond_snap = (
             _trade_condition_snapshot_fields(analysis_date, past, ind)
@@ -7232,6 +7346,8 @@ def run_one_backtest(
             "correct": correct,
             "pnl_pct": pnl_pct_display,
             "pnl_dollars": pnl_dollars,
+            "gross_pnl_pct": gross_pnl_pct,
+            **_cost_fields,
             "leverage": LEVERAGE,
             "position_size": round(position_size, 2),
             "leveraged_exposure": round(leveraged_exposure, 2),
