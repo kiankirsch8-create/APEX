@@ -340,7 +340,12 @@ CHRONO_JPY_PAIRS_SIGNALLED: set[str] = set()
 STRATEGY_STATUS: dict[str, Any] = {}
 LOCKED_STRATEGY_IDS: frozenset[str] = frozenset()
 UNTESTED_STRATEGIES_V72: frozenset[str] = frozenset()
-BLOCKED_STRATEGIES: frozenset[str] = frozenset()
+BLOCKED_STRATEGIES_FIXED: frozenset[str] = frozenset(
+    {
+        "T08_DONCHIAN_BREAKOUT",  # ~33–37% WR, ~1.1–1.2 W/L; net loser at scale
+    },
+)
+BLOCKED_STRATEGIES: frozenset[str] = BLOCKED_STRATEGIES_FIXED
 STRATEGY_TRADE_COUNT: dict[str, int] = {}
 ZERO_TRADE_STRATEGIES: set[str] = set()
 COMBO_TRADE_STATS: dict[tuple[str, str], dict[str, int]] = {}
@@ -530,7 +535,7 @@ def v72_load_strategy_status(data_dir: Path, *, log_fn: LogFn | None = None) -> 
         blk = list(_v72_blocked_ids_default())
         raw["blocked"] = blk
         _save_json(status_file, raw)
-    BLOCKED_STRATEGIES = frozenset(str(x).strip().upper() for x in blk if x)
+    BLOCKED_STRATEGIES = frozenset(str(x).strip().upper() for x in blk if x) | BLOCKED_STRATEGIES_FIXED
     if log_fn:
         log_fn(
             f"[v76] strategy_status locked={len(LOCKED_STRATEGY_IDS)} "
@@ -743,10 +748,14 @@ def _layer2_tuple_for_deterministic_pick(
     for sid in l2_sorted:
         if _sort_key(sid)[0] >= 9_000_000:
             continue
+        if sid in BLOCKED_STRATEGIES:
+            continue
         if sid in by_sid:
             return by_sid[sid][0]
     for sid in l2_sorted:
         if _sort_key(sid)[0] >= 9_000_000:
+            continue
+        if sid in BLOCKED_STRATEGIES:
             continue
         if sid in _V7_STALE_FALLBACK_IDS:
             dire = "LONG" if float(zone_pct) < 50.0 else "SHORT"

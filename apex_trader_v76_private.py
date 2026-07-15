@@ -794,13 +794,20 @@ def _locked_layer2_only(
     layer2: list[tuple[str, str, int] | tuple[str, str, int, dict[str, Any] | None]],
     *,
     tf_key: str,
+    past: Any = None,
+    ind: dict[str, Any] | None = None,
 ) -> list[tuple[str, str, int] | tuple[str, str, int, dict[str, Any] | None]]:
     """Live executes LOCKED strategies only (per design)."""
     tf_l = tf_key.strip().lower()
+    ind_safe: dict[str, Any] = ind if isinstance(ind, dict) else {}
     out: list[tuple[str, str, int] | tuple[str, str, int, dict[str, Any] | None]] = []
     for row in layer2:
         sid = str(row[0]).strip().upper()
-        if sid not in _v76_logic.LOCKED_STRATEGY_IDS or not _v76_logic._v75_backtest_strategy_allowed(sid):
+        if sid in _v76_logic.BLOCKED_STRATEGIES:
+            continue
+        if sid not in _v76_logic.LOCKED_STRATEGY_IDS or not _v76_logic._v75_backtest_strategy_allowed(
+            sid, past=past, ind=ind_safe
+        ):
             continue
         if tf_l == "4h" and sid == "M02_MACD_ZERO_CROSS":
             continue
@@ -1051,7 +1058,7 @@ def evaluate_cell_v76(
         )
 
     layer2 = [q for q in qualifying if str(q[0]).strip().upper() not in _v76_logic.LAYER1_STRATEGY_IDS]
-    layer2_locked = _locked_layer2_only(layer2, tf_key=tf_key)
+    layer2_locked = _locked_layer2_only(layer2, tf_key=tf_key, past=past, ind=ind)
     locked_ids = [str(r[0]).strip().upper() for r in layer2_locked]
     live_log(
         "info",
