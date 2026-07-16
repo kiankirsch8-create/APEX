@@ -1935,8 +1935,6 @@ def run_full_scan_v76() -> None:
     live_log(
         "info",
         "[SCAN CYCLE] complete",
-        placed=placed,
-        skipped=skipped,
         dry_run=DRY_RUN,
         **summary,
     )
