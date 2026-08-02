@@ -5127,8 +5127,35 @@ _SHADOW_FIELD_KEYS: tuple[str, ...] = (
     "shadow_days_in_state",
     "shadow_changed",
     "shadow_bias",
-    "shadow_mult",
+    "shadow_mult_current",
+    "shadow_mult_flat",
+    "shadow_mult_edge",
+    "shadow_mult_stheavy",
+    "shadow_mult_conf",
 )
+
+# Candidate sizing ladders keyed by shadow_bias label (write-only logging).
+_SHADOW_LADDER_CURRENT: dict[str, float] = {
+    "STRONG_TAILWIND": 1.20,
+    "TAILWIND": 1.10,
+    "NEUTRAL": 1.00,
+    "HEADWIND": 0.85,
+    "STRONG_HEADWIND": 0.70,
+}
+_SHADOW_LADDER_EDGE: dict[str, float] = {
+    "STRONG_TAILWIND": 1.50,
+    "TAILWIND": 1.00,
+    "NEUTRAL": 0.85,
+    "HEADWIND": 0.75,
+    "STRONG_HEADWIND": 0.90,
+}
+_SHADOW_LADDER_STHEAVY: dict[str, float] = {
+    "STRONG_TAILWIND": 1.60,
+    "TAILWIND": 1.10,
+    "NEUTRAL": 0.90,
+    "HEADWIND": 0.80,
+    "STRONG_HEADWIND": 0.90,
+}
 
 
 def _shadow_null_fields() -> dict[str, Any]:
@@ -5204,20 +5231,38 @@ def _shadow_bias_from_state(state: str | None, direction: str | None) -> str | N
     }[st]
 
 
-def _shadow_mult_from_bias(bias: str | None) -> float | None:
-    """Size multiplier shadow_bias WOULD imply (same tiers as macro_manager._macro_tier_economics)."""
+def _shadow_ladder_mults(
+    bias: str | None,
+    confidence: Any,
+) -> dict[str, float | None]:
+    """
+    Size multipliers each candidate ladder WOULD assign from shadow_bias.
+    Write-only — never fed into live sizing.
+    """
     b = str(bias or "").strip().upper()
-    if b == "STRONG_TAILWIND":
-        return 1.20
-    if b == "TAILWIND":
-        return 1.10
-    if b == "NEUTRAL":
-        return 1.0
-    if b == "HEADWIND":
-        return 0.85
-    if b == "STRONG_HEADWIND":
-        return 0.70
-    return None
+    if b not in _SHADOW_LADDER_CURRENT:
+        return {
+            "shadow_mult_current": None,
+            "shadow_mult_flat": None,
+            "shadow_mult_edge": None,
+            "shadow_mult_stheavy": None,
+            "shadow_mult_conf": None,
+        }
+    conf_mult: float | None
+    try:
+        if confidence is None:
+            conf_mult = None
+        else:
+            conf_mult = round(0.70 + 0.90 * float(confidence), 6)
+    except (TypeError, ValueError):
+        conf_mult = None
+    return {
+        "shadow_mult_current": _SHADOW_LADDER_CURRENT[b],
+        "shadow_mult_flat": 1.00,
+        "shadow_mult_edge": _SHADOW_LADDER_EDGE[b],
+        "shadow_mult_stheavy": _SHADOW_LADDER_STHEAVY[b],
+        "shadow_mult_conf": conf_mult,
+    }
 
 
 def _ensure_shadow_regime_for_day(
@@ -5321,7 +5366,7 @@ def _shadow_regime_row_fields(
             "shadow_days_in_state": regime.get("days_in_state"),
             "shadow_changed": regime.get("changed_this_scan"),
             "shadow_bias": bias,
-            "shadow_mult": _shadow_mult_from_bias(bias),
+            **_shadow_ladder_mults(bias, regime.get("confidence")),
         }
     except Exception as e:  # noqa: BLE001
         tku = (sym or "").strip().upper()
