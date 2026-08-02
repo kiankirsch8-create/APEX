@@ -315,6 +315,7 @@ CHRONO_START_DATE = "2024-01-01"
 CHRONO_END_DATE = "2026-05-17"
 # Permanently drop 4h at scan level: yfinance only serves ~730d of intraday, so 4h
 # silently activates mid-run and has been the only losing timeframe. Keep strategies.
+# (PR #103 — reaffirmed on main for Railway redeploy)
 EXCLUDED_TIMEFRAMES: frozenset[str] = frozenset({"4h"})
 CHRONO_TIMEFRAMES: list[str] = [
     tf for tf in ("4h", "1d", "1w", "1h") if tf not in EXCLUDED_TIMEFRAMES
@@ -5113,6 +5114,7 @@ def _v73_regime_row_fields(reg: dict[str, Any] | None) -> dict[str, Any]:
 
 
 # ── Shadow regime engine (write-only logging — never read by decision paths) ──
+# (PR #105/#106 — reaffirmed on main for Railway redeploy)
 # Per-ticker previous {state, days_in_state, ...} across scan days.
 _SHADOW_REGIME_PREV: dict[str, dict[str, Any]] = {}
 # (ticker, YYYY-MM-DD) → compute_pair_regime result (once per scan day per ticker).

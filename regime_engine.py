@@ -3,6 +3,8 @@ Pair-level regime engine (directionless).
 
 Standalone module — not wired into macro_manager / backtester / live yet.
 Describes the PAIR state with hysteresis + minimum dwell; never labels a trade.
+
+(PR #104 — reaffirmed on main for Railway redeploy)
 """
 from __future__ import annotations
 
