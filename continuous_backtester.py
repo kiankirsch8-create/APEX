@@ -60,10 +60,12 @@ from intelligence_fetch_cached import (
 from macro_manager import (
     align_macro_bias_with_price,
     apply_macro_confidence_adjustment,
+    get_rate_differential,
     macro_result_fields,
     merged_macro_result_fields,
     set_backtest_mode,
 )
+from regime_engine import compute_pair_regime
 from utils import DATA_DIR, env, load_json, log, save_json, utcnow_iso
 
 set_backtest_mode(True)
@@ -5097,6 +5099,278 @@ def _v73_regime_row_fields(reg: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
+# ── Shadow regime engine (write-only logging — never read by decision paths) ──
+# Per-ticker previous {state, days_in_state, ...} across scan days.
+_SHADOW_REGIME_PREV: dict[str, dict[str, Any]] = {}
+# (ticker, YYYY-MM-DD) → compute_pair_regime result (once per scan day per ticker).
+_SHADOW_REGIME_DAY: dict[tuple[str, str], dict[str, Any] | None] = {}
+_SHADOW_REGIME_WARNED: set[tuple[str, str]] = set()
+
+_SHADOW_FIELD_KEYS: tuple[str, ...] = (
+    "shadow_state",
+    "shadow_raw_score",
+    "shadow_er",
+    "shadow_confidence",
+    "shadow_days_in_state",
+    "shadow_changed",
+    "shadow_bias",
+    "shadow_mult",
+)
+
+
+def _shadow_null_fields() -> dict[str, Any]:
+    return {k: None for k in _SHADOW_FIELD_KEYS}
+
+
+def _reset_shadow_regime_state(*, clear_prev: bool = True) -> None:
+    """Clear day cache; optionally reset per-ticker prev (new chrono job)."""
+    _SHADOW_REGIME_DAY.clear()
+    _SHADOW_REGIME_WARNED.clear()
+    if clear_prev:
+        _SHADOW_REGIME_PREV.clear()
+
+
+def _closes_from_past(past: Any) -> list[float]:
+    if past is None or getattr(past, "empty", True):
+        return []
+    try:
+        if "Close" not in getattr(past, "columns", []):
+            return []
+        series = pd.to_numeric(past["Close"], errors="coerce").dropna()
+        return [float(x) for x in series.tolist()]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _peek_chrono_cached_closes(sym: str, date_str: str) -> list[float]:
+    """Reuse already-prefetched OHLC closes without a new download (get, not pop)."""
+    s = (sym or "").strip().upper()
+    if not s:
+        return []
+    yf_t = f"{s}=X" if len(s) == 6 and s.isalpha() else s
+    ds = str(date_str or "").strip()[:10]
+    if not ds:
+        return []
+    try:
+        with _chrono_ohlc_cache_lock:
+            for tf in ("1d", "1w", "4h", "1h", "30m", "15m"):
+                hit = _chrono_ohlc_cache.get((yf_t.strip().upper(), tf, ds))
+                if hit is None:
+                    continue
+                past_f = hit[0] if isinstance(hit, tuple) and hit else None
+                closes = _closes_from_past(past_f)
+                if closes:
+                    return closes
+    except Exception:  # noqa: BLE001
+        return []
+    return []
+
+
+def _shadow_bias_from_state(state: str | None, direction: str | None) -> str | None:
+    """Map directionless pair state × trade direction → same 5 labels as macro_bias."""
+    st = str(state or "").strip().upper()
+    d = str(direction or "").strip().upper()
+    if st not in ("STRONG_UP", "UP", "NEUTRAL", "DOWN", "STRONG_DOWN"):
+        return None
+    if d not in ("LONG", "SHORT"):
+        return "NEUTRAL"
+    if st == "NEUTRAL":
+        return "NEUTRAL"
+    if d == "LONG":
+        return {
+            "STRONG_UP": "STRONG_TAILWIND",
+            "UP": "TAILWIND",
+            "DOWN": "HEADWIND",
+            "STRONG_DOWN": "STRONG_HEADWIND",
+        }[st]
+    return {
+        "STRONG_UP": "STRONG_HEADWIND",
+        "UP": "HEADWIND",
+        "DOWN": "TAILWIND",
+        "STRONG_DOWN": "STRONG_TAILWIND",
+    }[st]
+
+
+def _shadow_mult_from_bias(bias: str | None) -> float | None:
+    """Size multiplier shadow_bias WOULD imply (same tiers as macro_manager._macro_tier_economics)."""
+    b = str(bias or "").strip().upper()
+    if b == "STRONG_TAILWIND":
+        return 1.20
+    if b == "TAILWIND":
+        return 1.10
+    if b == "NEUTRAL":
+        return 1.0
+    if b == "HEADWIND":
+        return 0.85
+    if b == "STRONG_HEADWIND":
+        return 0.70
+    return None
+
+
+def _ensure_shadow_regime_for_day(
+    sym: str,
+    analysis_date: str,
+    *,
+    past: Any = None,
+    rate_diff: float | None = None,
+    rate_diff_4w: float | None = None,
+    as_of_date: date | None = None,
+) -> dict[str, Any] | None:
+    """
+    Once per scan day per ticker: compute_pair_regime and store prev state.
+    Write-only side channel — return value is only for populating shadow_* row fields.
+    """
+    tku = (sym or "").strip().upper()
+    ds = str(analysis_date or "").strip()[:10]
+    if not tku or not ds:
+        return None
+    key = (tku, ds)
+    if key in _SHADOW_REGIME_DAY:
+        return _SHADOW_REGIME_DAY[key]
+
+    try:
+        closes = _closes_from_past(past)
+        if not closes:
+            closes = _peek_chrono_cached_closes(tku, ds)
+
+        scan_d = as_of_date
+        if scan_d is None:
+            try:
+                scan_d = date.fromisoformat(ds)
+            except ValueError:
+                scan_d = None
+
+        rd = rate_diff
+        rd4 = rate_diff_4w
+        if rd is None or rd4 is None:
+            if len(tku) == 6 and tku.isalpha():
+                base, quote = tku[:3], tku[3:6]
+                if rd is None:
+                    rd = float(get_rate_differential(base, quote, weeks_ago=0, as_of_date=scan_d))
+                if rd4 is None:
+                    rd4 = float(get_rate_differential(base, quote, weeks_ago=4, as_of_date=scan_d))
+            else:
+                if rd is None:
+                    rd = 0.0
+                # Non-FX: no 4w differential
+                if rd4 is None:
+                    rd4 = None
+
+        prev = _SHADOW_REGIME_PREV.get(tku)
+        result = compute_pair_regime(tku, closes, float(rd), rd4, prev)
+        # Only lock the day + advance prev once we have a real close series.
+        # Early gate skips without OHLC may still attach a provisional result.
+        if closes:
+            _SHADOW_REGIME_DAY[key] = result
+            if isinstance(result, dict):
+                _SHADOW_REGIME_PREV[tku] = {
+                    "state": result.get("state"),
+                    "days_in_state": result.get("days_in_state"),
+                    "price_direction": result.get("price_direction"),
+                }
+        return result
+    except Exception as e:  # noqa: BLE001
+        _SHADOW_REGIME_DAY[key] = None
+        if key not in _SHADOW_REGIME_WARNED:
+            _SHADOW_REGIME_WARNED.add(key)
+            log(f"[SHADOW REGIME] {tku} {ds}: {e}", level="warning")
+        return None
+
+
+def _shadow_regime_row_fields(
+    sym: str,
+    direction: str | None,
+    analysis_date: str,
+    *,
+    past: Any = None,
+    rate_diff: float | None = None,
+    rate_diff_4w: float | None = None,
+    as_of_date: date | None = None,
+) -> dict[str, Any]:
+    """Build shadow_* fields for a trade/skip row. Never used for decisions."""
+    try:
+        regime = _ensure_shadow_regime_for_day(
+            sym,
+            analysis_date,
+            past=past,
+            rate_diff=rate_diff,
+            rate_diff_4w=rate_diff_4w,
+            as_of_date=as_of_date,
+        )
+        if not isinstance(regime, dict):
+            return _shadow_null_fields()
+        bias = _shadow_bias_from_state(str(regime.get("state") or ""), direction)
+        return {
+            "shadow_state": regime.get("state"),
+            "shadow_raw_score": regime.get("raw_score"),
+            "shadow_er": regime.get("er"),
+            "shadow_confidence": regime.get("confidence"),
+            "shadow_days_in_state": regime.get("days_in_state"),
+            "shadow_changed": regime.get("changed_this_scan"),
+            "shadow_bias": bias,
+            "shadow_mult": _shadow_mult_from_bias(bias),
+        }
+    except Exception as e:  # noqa: BLE001
+        tku = (sym or "").strip().upper()
+        ds = str(analysis_date or "").strip()[:10]
+        key = (tku, ds)
+        if key not in _SHADOW_REGIME_WARNED:
+            _SHADOW_REGIME_WARNED.add(key)
+            log(f"[SHADOW REGIME] {tku} {ds}: {e}", level="warning")
+        return _shadow_null_fields()
+
+
+def _copy_shadow_fields(src: dict[str, Any] | None) -> dict[str, Any]:
+    """Copy shadow_* keys from an existing row (write-only passthrough)."""
+    if not isinstance(src, dict):
+        return _shadow_null_fields()
+    out: dict[str, Any] = {}
+    for k in _SHADOW_FIELD_KEYS:
+        if k in src:
+            out[k] = src.get(k)
+    if len(out) == len(_SHADOW_FIELD_KEYS):
+        return out
+    return _shadow_null_fields() if not out else {**_shadow_null_fields(), **out}
+
+
+def _chrono_gate_skip_row(
+    *,
+    date_str: str,
+    ticker: str,
+    timeframe: str,
+    session: str,
+    job_id: str,
+    skip_reason: str,
+    verdict: str = "SKIP",
+    direction: str = "NONE",
+    strategy_id: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Minimal chrono gate skip with shadow_* fields attached (write-only)."""
+    row: dict[str, Any] = {
+        "date": date_str,
+        "ticker": ticker,
+        "timeframe": timeframe,
+        "session": session,
+        "job_id": job_id,
+        "skipped": True,
+        "skip_trade": True,
+        "outcome": "SKIPPED",
+        "pnl_dollars": 0.0,
+        "skip_reason": skip_reason,
+        "verdict": verdict,
+        "direction": direction,
+    }
+    if strategy_id is not None:
+        row["strategy_id"] = strategy_id
+    if extra:
+        row.update(extra)
+    row.update(
+        _shadow_regime_row_fields(str(ticker), direction, date_str),
+    )
+    return row
+
+
 def _v74_apply_recipe_and_monday_boosts(
     ai: dict[str, Any],
     *,
@@ -5454,6 +5728,16 @@ def _skipped_backtest_row(
         "strategies_agreed": ai.get("strategies_agreed")
         if isinstance(ai.get("strategies_agreed"), list)
         else [],
+        **_shadow_regime_row_fields(
+            sym,
+            str(ai.get("direction") or "NONE"),
+            analysis_date,
+            rate_diff=(
+                float(ai["macro_rate_diff"])
+                if ai.get("macro_rate_diff") is not None
+                else None
+            ),
+        ),
     }
 
 
@@ -6281,6 +6565,17 @@ def _python_forced_layer2_trade(
             if chrono_job
             else {}
         ),
+        **_shadow_regime_row_fields(
+            sym,
+            direction,
+            analysis_date,
+            past=past,
+            rate_diff=(
+                float(ai["macro_rate_diff"])
+                if ai.get("macro_rate_diff") is not None
+                else None
+            ),
+        ),
     }
 
 
@@ -6453,6 +6748,14 @@ def run_one_backtest(
                     is_exotic=sym in EXOTIC_REDUCE,
                 )
             return None
+
+        # Shadow regime (write-only): once per ticker per scan day from existing closes.
+        _ensure_shadow_regime_for_day(
+            sym,
+            analysis_date.strip()[:10],
+            past=past,
+            as_of_date=scan_d,
+        )
 
         bbl, bbm, bbu = _pick_bb_cols(past)
 
@@ -7425,6 +7728,17 @@ def run_one_backtest(
             "vol_scale_applied": float(ai.get("vol_scale_applied", 1.0) or 1.0),
             **v75_meta,
             **cond_snap,
+            **_shadow_regime_row_fields(
+                sym,
+                direction,
+                analysis_date,
+                past=past,
+                rate_diff=(
+                    float(ai["macro_rate_diff"])
+                    if ai.get("macro_rate_diff") is not None
+                    else None
+                ),
+            ),
         }
 
     except Exception as e:  # noqa: BLE001
@@ -8653,6 +8967,7 @@ def run_chronological_backtest(
     )
     _log_group1_startup_blocks()
     _reset_group1_skip_log_state()
+    _reset_shadow_regime_state(clear_prev=True)
 
     chrono_data: dict[str, Any]
     if chrono_path.is_file():
@@ -8801,6 +9116,8 @@ def run_chronological_backtest(
             with _chrono_ohlc_cache_lock:
                 _chrono_ohlc_cache.clear()
                 _chrono_ohlc_prefetch_done.clear()
+            # New scan day: clear day cache only; keep per-ticker prev across days.
+            _reset_shadow_regime_state(clear_prev=False)
 
             cin = chrono_data.get("chrono_intraday")
             if isinstance(cin, dict) and str(cin.get("date", "")) and str(cin.get("date", "")) < date_str:
@@ -8903,6 +9220,7 @@ def run_chronological_backtest(
                     "skip_reason": (cb_reason or "circuit breaker halt")[:500],
                     "verdict": "HALT",
                     "halt_active": True,
+                    **_shadow_null_fields(),
                 }
                 day_skipped.append(halt_row)
                 append_result(halt_row)
@@ -9046,19 +9364,14 @@ def run_chronological_backtest(
                             )
                             pos_key = f"{ticker}_{timeframe}"
                             if pos_key in open_positions:
-                                result = {
-                                    "date": date_str,
-                                    "ticker": ticker,
-                                    "timeframe": timeframe,
-                                    "session": session,
-                                    "job_id": job_id,
-                                    "skipped": True,
-                                    "skip_trade": True,
-                                    "outcome": "SKIPPED",
-                                    "pnl_dollars": 0.0,
-                                    "skip_reason": f"Already in open position: {pos_key}",
-                                    "verdict": "SKIP",
-                                }
+                                result = _chrono_gate_skip_row(
+                                    date_str=date_str,
+                                    ticker=ticker,
+                                    timeframe=timeframe,
+                                    session=session,
+                                    job_id=job_id,
+                                    skip_reason=f"Already in open position: {pos_key}",
+                                )
                                 append_result(result)
                                 day_skipped.append(result)
                                 npi, nti, ntj = _v71_next_step(pi, ti, tj)
@@ -9092,19 +9405,15 @@ def run_chronological_backtest(
                                     f"[COOLDOWN] {ticker} {timeframe} {date_str}: {cd_reason}",
                                     level="info",
                                 )
-                                result = {
-                                    "date": date_str,
-                                    "ticker": ticker,
-                                    "timeframe": timeframe,
-                                    "session": session,
-                                    "job_id": job_id,
-                                    "skipped": True,
-                                    "skip_trade": True,
-                                    "outcome": "SKIPPED",
-                                    "pnl_dollars": 0.0,
-                                    "skip_reason": cd_reason,
-                                    "verdict": "COOLDOWN",
-                                }
+                                result = _chrono_gate_skip_row(
+                                    date_str=date_str,
+                                    ticker=ticker,
+                                    timeframe=timeframe,
+                                    session=session,
+                                    job_id=job_id,
+                                    skip_reason=cd_reason,
+                                    verdict="COOLDOWN",
+                                )
                                 append_result(result)
                                 day_skipped.append(result)
                                 npi, nti, ntj = _v71_next_step(pi, ti, tj)
@@ -9134,19 +9443,14 @@ def run_chronological_backtest(
 
                             tkr_u = str(ticker).strip().upper()
                             if (not DIAGNOSTIC_ALLOW_MULTI_TF_PER_DAY) and tkr_u in TRADED_TICKERS_TODAY:
-                                result = {
-                                    "date": date_str,
-                                    "ticker": ticker,
-                                    "timeframe": timeframe,
-                                    "session": session,
-                                    "job_id": job_id,
-                                    "skipped": True,
-                                    "skip_trade": True,
-                                    "outcome": "SKIPPED",
-                                    "pnl_dollars": 0.0,
-                                    "skip_reason": "Ticker already traded today on another timeframe",
-                                    "verdict": "SKIP",
-                                }
+                                result = _chrono_gate_skip_row(
+                                    date_str=date_str,
+                                    ticker=ticker,
+                                    timeframe=timeframe,
+                                    session=session,
+                                    job_id=job_id,
+                                    skip_reason="Ticker already traded today on another timeframe",
+                                )
                                 append_result(result)
                                 day_skipped.append(result)
                                 npi, nti, ntj = _v71_next_step(pi, ti, tj)
@@ -9176,19 +9480,14 @@ def run_chronological_backtest(
 
                             cap_blocked, cap_ccy = _chrono_currency_cap_blocks(ticker, use_4h_pool=use4h_pool)
                             if cap_blocked:
-                                result = {
-                                    "date": date_str,
-                                    "ticker": ticker,
-                                    "timeframe": timeframe,
-                                    "session": session,
-                                    "job_id": job_id,
-                                    "skipped": True,
-                                    "skip_trade": True,
-                                    "outcome": "SKIPPED",
-                                    "pnl_dollars": 0.0,
-                                    "skip_reason": f"Currency cap: {cap_ccy} already has 2 open trades",
-                                    "verdict": "SKIP",
-                                }
+                                result = _chrono_gate_skip_row(
+                                    date_str=date_str,
+                                    ticker=ticker,
+                                    timeframe=timeframe,
+                                    session=session,
+                                    job_id=job_id,
+                                    skip_reason=f"Currency cap: {cap_ccy} already has 2 open trades",
+                                )
                                 append_result(result)
                                 day_skipped.append(result)
                                 npi, nti, ntj = _v71_next_step(pi, ti, tj)
@@ -9264,19 +9563,14 @@ def run_chronological_backtest(
                                 continue
 
                             if res is None:
-                                row_none = {
-                                    "date": date_str,
-                                    "ticker": ticker,
-                                    "timeframe": timeframe,
-                                    "session": session,
-                                    "job_id": job_id,
-                                    "skipped": True,
-                                    "skip_trade": True,
-                                    "outcome": "SKIPPED",
-                                    "pnl_dollars": 0.0,
-                                    "skip_reason": "Scan produced no result (data or execution abort)",
-                                    "verdict": "SKIP",
-                                }
+                                row_none = _chrono_gate_skip_row(
+                                    date_str=date_str,
+                                    ticker=ticker,
+                                    timeframe=timeframe,
+                                    session=session,
+                                    job_id=job_id,
+                                    skip_reason="Scan produced no result (data or execution abort)",
+                                )
                                 append_result(row_none)
                                 day_skipped.append(row_none)
                                 npi, nti, ntj = _v71_next_step(pi, ti, tj)
@@ -9316,6 +9610,7 @@ def run_chronological_backtest(
                                     "pnl_dollars": 0.0,
                                     "skip_reason": str(res.get("skip_reason", "") or ""),
                                     "verdict": res.get("verdict"),
+                                    "direction": str(res.get("direction") or "NONE"),
                                 }
                                 row.update(
                                     _v73_regime_row_fields(
@@ -9327,6 +9622,17 @@ def run_chronological_backtest(
                                         }
                                     )
                                 )
+                                # Prefer shadow_* already on the full skip row; else day-cache / compute.
+                                if any(k in res for k in _SHADOW_FIELD_KEYS):
+                                    row.update({k: res.get(k) for k in _SHADOW_FIELD_KEYS})
+                                else:
+                                    row.update(
+                                        _shadow_regime_row_fields(
+                                            str(res.get("ticker", ticker)),
+                                            str(res.get("direction") or "NONE"),
+                                            date_str,
+                                        )
+                                    )
                                 day_skipped.append(row)
                                 append_result(row)
                                 npi, nti, ntj = _v71_next_step(pi, ti, tj)
@@ -9386,19 +9692,19 @@ def run_chronological_backtest(
                                 str(res.get("strategy_id", "")),
                             )
                             if exec_block:
-                                row = {
-                                    "date": date_str,
-                                    "ticker": str(res.get("ticker", ticker)),
-                                    "timeframe": str(res.get("timeframe", timeframe)),
-                                    "session": session,
-                                    "job_id": job_id,
-                                    "skipped": True,
-                                    "outcome": "SKIPPED",
-                                    "pnl_dollars": 0.0,
-                                    "skip_reason": exec_block,
-                                    "strategy_id": str(res.get("strategy_id", "")),
-                                    "verdict": res.get("verdict"),
-                                }
+                                row = _chrono_gate_skip_row(
+                                    date_str=date_str,
+                                    ticker=str(res.get("ticker", ticker)),
+                                    timeframe=str(res.get("timeframe", timeframe)),
+                                    session=session,
+                                    job_id=job_id,
+                                    skip_reason=exec_block,
+                                    direction=str(res.get("direction") or "NONE"),
+                                    strategy_id=str(res.get("strategy_id", "")),
+                                    extra={"verdict": res.get("verdict")},
+                                )
+                                if any(k in res for k in _SHADOW_FIELD_KEYS):
+                                    row.update({k: res.get(k) for k in _SHADOW_FIELD_KEYS})
                                 day_skipped.append(row)
                                 append_result(row)
                                 npi, nti, ntj = _v71_next_step(pi, ti, tj)
