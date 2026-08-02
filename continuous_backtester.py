@@ -311,7 +311,12 @@ CLAUDE_HTTP_TIMEOUT_SEC = 25.0
 # Chronological walk-forward backtest (API-triggered; separate from rolling loop)
 CHRONO_START_DATE = "2024-01-01"
 CHRONO_END_DATE = "2026-05-17"
-CHRONO_TIMEFRAMES: list[str] = ["4h", "1d", "1w", "1h"]  # 15m/30m appended in chrono loop when scan date is recent
+# Permanently drop 4h at scan level: yfinance only serves ~730d of intraday, so 4h
+# silently activates mid-run and has been the only losing timeframe. Keep strategies.
+EXCLUDED_TIMEFRAMES: frozenset[str] = frozenset({"4h"})
+CHRONO_TIMEFRAMES: list[str] = [
+    tf for tf in ("4h", "1d", "1w", "1h") if tf not in EXCLUDED_TIMEFRAMES
+]  # 15m/30m appended in chrono loop when scan date is recent
 CHRONO_TICKERS = [
     # Majors (USD)
     "EURUSD",
@@ -445,7 +450,9 @@ ALLOWED_1H_STRATEGIES: frozenset[str] = frozenset(
     }
 )
 
-TIMEFRAMES: list[str] = ["15m", "30m", "4h", "1d", "1w"]
+TIMEFRAMES: list[str] = [
+    tf for tf in ("15m", "30m", "4h", "1d", "1w") if tf not in EXCLUDED_TIMEFRAMES
+]
 
 TF_FORWARD_CANDLES: dict[str, int] = {
     "15m": 96,
@@ -1860,7 +1867,13 @@ def _chrono_v71_phases(days_ago: int, *, scan_date: date) -> list[tuple[str, lis
                 )
     if days_ago <= 55:
         phases.append(("PHASE 4 INTRADAY SCAN", ["15m", "30m"], 0.70, 0.70, True))
-    return phases
+    # Apply EXCLUDED_TIMEFRAMES in every phase; drop phases left with no timeframes.
+    out: list[tuple[str, list[str], float, float, bool]] = []
+    for label, tf_list, risk_m, tp_m, use4h_pool in phases:
+        tfs = [tf for tf in tf_list if str(tf).strip().lower() not in EXCLUDED_TIMEFRAMES]
+        if tfs:
+            out.append((label, tfs, risk_m, tp_m, use4h_pool))
+    return out
 
 OANDA_API_TOKEN = os.getenv("OANDA_API_TOKEN", "")
 OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID", "")
