@@ -23,9 +23,10 @@ STRATEGY_VERSION = "v7.5-emergency-trade-volume"
 #
 # DO NOT CHANGE (contract):
 #   RISK_BY_CONFIDENCE numeric dict entries (v7.4 only adds optional M03 JPY perfect-storm override)
-#   append_result / load_all_results implementations
 #   calculate_stats function
 #   File I/O and storage paths (DATA_DIR results)
+# NOTE: append_result / load_all_results intentionally use append-only JSONL
+#   (backtest_results.jsonl) to avoid O(n) full-file rewrite OOMs — record fields unchanged.
 
 import gc
 import json
@@ -222,7 +223,8 @@ TRADE_COOLDOWN_DAYS: dict[str, int] = {
 MODEL = "claude-sonnet-4-5-20250929"
 CLAUDE_MODEL = MODEL
 
-RESULTS_FILE = DATA_DIR / "backtest_results.json"
+RESULTS_FILE = DATA_DIR / "backtest_results.jsonl"
+RESULTS_FILE_LEGACY_JSON = DATA_DIR / "backtest_results.json"
 STATS_FILE = DATA_DIR / "backtest_stats.json"
 LEARNED_FILE = DATA_DIR / "learned_weights.json"
 STATE_FILE = DATA_DIR / "backtest_state.json"
@@ -2112,6 +2114,9 @@ def analyse_one_backtest(ticker: str, timeframe: str, analysis_date: str) -> dic
 _backtest_thread: threading.Thread | None = None
 _stop_flag = threading.Event()
 _results_lock = threading.Lock()
+# Process-lifetime dedupe index for RESULTS_FILE (JSONL). None = not built yet.
+_seen_result_keys: set[str] | None = None
+_results_count: int = 0
 _loop_counters_lock = threading.Lock()
 CHRONO_RUNNING = False
 _yf_lock = threading.Semaphore(1)
@@ -2163,7 +2168,12 @@ def reset_learned_rules() -> None:
 
 def reset_backtest_stats_files() -> None:
     """Clear continuous backtest results, rolling stats JSON, and learned weights (atomic writes)."""
-    save_json(RESULTS_FILE, [])
+    global _seen_result_keys, _results_count
+    with _results_lock:
+        RESULTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        RESULTS_FILE.write_text("", encoding="utf-8")
+        _seen_result_keys = set()
+        _results_count = 0
     empty_stats: dict[str, Any] = {
         "generated_at": datetime.now().isoformat(),
         "total_trades": 0,
@@ -2292,18 +2302,108 @@ def _result_dedup_key(row: Any) -> str:
     return f"{row.get('ticker')}_{row.get('date')}_{row.get('timeframe')}"
 
 
-def _read_backtest_results_file() -> list[dict[str, Any]]:
-    """Read ``RESULTS_FILE`` into a list of dicts. Callers must hold ``_results_lock`` when used with writes."""
-    if not RESULTS_FILE.exists():
-        return []
+def _iter_results_jsonl(path: Path):
+    """Stream dict rows from a JSONL file (one JSON object per line)."""
+    if not path.exists():
+        return
+    with open(path, encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                obj = json.loads(s)
+            except json.JSONDecodeError as e:
+                log(
+                    f"[IO] skip bad JSONL line {line_no} in {path.name}: {e}",
+                    level="warning",
+                )
+                continue
+            if isinstance(obj, dict):
+                yield obj
+
+
+def _migrate_legacy_results_json_locked() -> None:
+    """
+    One-time convert of legacy ``backtest_results.json`` (JSON array) → ``RESULTS_FILE`` JSONL.
+    Caller must hold ``_results_lock``.
+    """
+    legacy = RESULTS_FILE_LEGACY_JSON
+    if not legacy.exists():
+        return
+    if RESULTS_FILE.exists() and RESULTS_FILE.stat().st_size > 0:
+        log(
+            f"[IO] Legacy {legacy.name} present but {RESULTS_FILE.name} already exists — "
+            "skipping migration (leaving legacy file untouched)",
+            level="info",
+        )
+        return
     try:
-        with open(RESULTS_FILE, encoding="utf-8") as f:
+        with open(legacy, encoding="utf-8") as f:
             data = json.load(f)
-        if isinstance(data, list):
-            return [r for r in data if isinstance(r, dict)]
+        if not isinstance(data, list):
+            log(
+                f"[IO] Legacy {legacy.name} is not a JSON list — migration skipped",
+                level="warning",
+            )
+            return
+        tmp = str(RESULTS_FILE) + ".migrate.tmp"
+        n = 0
+        with open(tmp, "w", encoding="utf-8") as out:
+            for row in data:
+                if isinstance(row, dict):
+                    out.write(json.dumps(row, default=str, separators=(",", ":")) + "\n")
+                    n += 1
+        os.replace(tmp, str(RESULTS_FILE))
+        bak = legacy.with_name(legacy.name + ".bak")
+        try:
+            os.replace(str(legacy), str(bak))
+            bak_note = f"; legacy renamed to {bak.name}"
+        except OSError:
+            bak_note = "; legacy file left in place (rename failed)"
+        log(
+            f"[IO] MIGRATED {n} records from {legacy.name} → {RESULTS_FILE.name}{bak_note}",
+            level="info",
+        )
     except Exception as e:  # noqa: BLE001
-        log(f"[IO] read backtest_results.json: {e}", level="warning")
-    return []
+        log(f"[IO] legacy results migration failed: {e}", level="warning")
+        log(traceback.format_exc(), level="warning")
+
+
+def _ensure_results_index_locked() -> None:
+    """Build process-lifetime dedupe set + count by streaming JSONL once. Holds ``_results_lock``."""
+    global _seen_result_keys, _results_count
+    if _seen_result_keys is not None:
+        return
+    _migrate_legacy_results_json_locked()
+    keys: set[str] = set()
+    count = 0
+    for row in _iter_results_jsonl(RESULTS_FILE):
+        k = _result_dedup_key(row)
+        if k:
+            keys.add(k)
+        count += 1
+    _seen_result_keys = keys
+    _results_count = count
+    log(
+        f"[IO] Results index ready: {_results_count} rows, {len(_seen_result_keys)} unique keys "
+        f"({RESULTS_FILE.name})",
+        level="info",
+    )
+
+
+def _read_backtest_results_file() -> list[dict[str, Any]]:
+    """
+    Read ``RESULTS_FILE`` (JSONL) into a list of dicts.
+    Callers must hold ``_results_lock`` when used with writes.
+    Streams line-by-line; migrates legacy JSON array once if needed.
+    """
+    try:
+        _ensure_results_index_locked()
+        return list(_iter_results_jsonl(RESULTS_FILE))
+    except Exception as e:  # noqa: BLE001
+        log(f"[IO] read {RESULTS_FILE.name}: {e}", level="warning")
+        return []
 
 
 def _load_results_list() -> list[dict[str, Any]]:
@@ -2316,29 +2416,45 @@ def load_all_results() -> list[dict[str, Any]]:
     return _load_results_list()
 
 
+def export_results_json_array(dest: Path | None = None) -> Path:
+    """
+    Explicit one-shot export of all results as a pretty-printed JSON array.
+    Not called from append_result — use only when a full array file is needed.
+    """
+    out = dest if dest is not None else (DATA_DIR / "backtest_results.export.json")
+    rows = load_all_results()
+    tmp = str(out) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(rows, f, indent=2, default=str)
+    os.replace(tmp, str(out))
+    log(f"[IO] Exported {len(rows)} results → {out}", level="info")
+    return out
+
+
 def append_result(result: dict[str, Any]) -> int:
-    """Append one backtest row if (ticker, date, timeframe) is new. Sole writer to ``RESULTS_FILE``. Returns new length or prior length if duplicate; 0 on hard failure."""
+    """
+    Append one backtest row if (ticker, date, timeframe) is new.
+    Sole writer to ``RESULTS_FILE`` (append-only JSONL — O(1) per call).
+    Returns new length or prior length if duplicate; 0 on hard failure.
+    """
+    global _seen_result_keys, _results_count
     try:
         with _results_lock:
-            existing = _read_backtest_results_file()
+            _ensure_results_index_locked()
+            assert _seen_result_keys is not None
 
-            key = f"{result.get('ticker')}_{result.get('date')}_{result.get('timeframe')}"
-            existing_keys: set[str] = set()
-            for r in existing:
-                k = f"{r.get('ticker')}_{r.get('date')}_{r.get('timeframe')}"
-                existing_keys.add(k)
+            key = _result_dedup_key(result)
+            if key and key in _seen_result_keys:
+                return _results_count
 
-            if key in existing_keys:
-                return len(existing)
+            line = json.dumps(result, default=str, separators=(",", ":")) + "\n"
+            with open(RESULTS_FILE, "a", encoding="utf-8") as f:
+                f.write(line)
 
-            existing.append(result)
-
-            tmp = str(RESULTS_FILE) + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(existing, f, indent=2, default=str)
-            os.replace(tmp, str(RESULTS_FILE))
-
-            n = len(existing)
+            if key:
+                _seen_result_keys.add(key)
+            _results_count += 1
+            n = _results_count
             log(
                 f"[IO] Appended result #{n}: {result.get('ticker')} "
                 f"{result.get('outcome', 'SKIP')}",
