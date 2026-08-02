@@ -901,12 +901,10 @@ async def get_stats_alias() -> dict[str, Any]:
 
 @app.get("/api/backtest/results")
 async def backtest_results(limit: int = Query(50, ge=1, le=5000)) -> dict[str, Any]:
-    """Backtest rows from ``backtest_results.json``, newest by date first."""
+    """Backtest rows from ``backtest_results.jsonl``, newest by date first."""
     try:
-        data = load_json(continuous_backtester.RESULTS_FILE, default=None)
+        data = continuous_backtester.load_all_results()
         if not data:
-            return {"limit": limit, "total": 0, "results": []}
-        if not isinstance(data, list):
             return {"limit": limit, "total": 0, "results": []}
         sorted_data = sorted(data, key=lambda x: str(x.get("date", "")), reverse=True)
         return {
@@ -949,9 +947,7 @@ async def backtest_toggle(body: BacktestContinuousToggleIn) -> dict[str, Any]:
 async def backtest_improve_now() -> dict[str, Any]:
     """Run self-improvement on accumulated results in a worker thread (blocks that thread only)."""
     try:
-        results = load_json(continuous_backtester.RESULTS_FILE, default=[]) or []
-        if not isinstance(results, list):
-            results = []
+        results = continuous_backtester.load_all_results()
         trades = [r for r in results if isinstance(r, dict) and not r.get("skipped")]
         completed = [
             r
