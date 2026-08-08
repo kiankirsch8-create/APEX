@@ -54,6 +54,8 @@ _er_history: dict[str, deque[float | None]] = {}
 _confidence_history: dict[str, deque[float | None]] = {}
 # ATR(14) snapshot at the start of the current regime episode.
 _atr_at_regime_entry: dict[str, float | None] = {}
+# Last session date that appended score/ER/confidence for a ticker.
+_last_history_session: dict[str, str] = {}
 
 
 def _hist_deque(store: dict[str, deque[float | None]], ticker: str) -> deque[float | None]:
@@ -94,12 +96,14 @@ def _record_histories(
     changed: bool,
     atr: float | None,
     prev_atr_entry: float | None,
+    append_series: bool = True,
 ) -> float | None:
-    """Update histories + atr_at_regime_entry; return episode ATR snapshot."""
+    """Update atr_at_regime_entry; optionally append score/ER/confidence series."""
     tku = (ticker or "").strip().upper()
-    _hist_deque(_raw_score_history, tku).append(float(raw_score))
-    _hist_deque(_er_history, tku).append(None if er is None else float(er))
-    _hist_deque(_confidence_history, tku).append(float(confidence))
+    if append_series:
+        _hist_deque(_raw_score_history, tku).append(float(raw_score))
+        _hist_deque(_er_history, tku).append(None if er is None else float(er))
+        _hist_deque(_confidence_history, tku).append(float(confidence))
 
     atr_f: float | None
     try:
@@ -228,6 +232,7 @@ def compute_pair_regime(
     rate_diff_4w: float | None,
     prev_state: dict[str, Any] | None,
     atr: float | None = None,
+    session_date: str | None = None,
 ) -> dict[str, Any]:
     """
     Directionless pair regime. Describes the PAIR, never a trade direction.
@@ -235,6 +240,9 @@ def compute_pair_regime(
     ``prev_state`` is the previous return dict (or None on first scan).
     Optional ``atr`` (ATR14 as of this scan) seeds ``atr_at_regime_entry``
     when the state changes.
+    Optional ``session_date`` (YYYY-MM-DD): append score/ER/confidence at most
+    once per ticker per session day. When None, append on every successful call
+    (unit tests / ad-hoc). Provisional no-closes (er=None) never appends.
     """
     prev = prev_state if isinstance(prev_state, dict) else {}
     prev_label = str(prev.get("state") or STATE_NEUTRAL).strip().upper()
@@ -254,6 +262,7 @@ def compute_pair_regime(
 
     if er is None:
         # Insufficient price history — hold prior label, zero score contribution.
+        # Never append score/ER/confidence histories on provisional no-closes.
         state = prev_label
         raw_score = 0.0
         price_direction = str(prev.get("price_direction") or "DOWN")
@@ -274,6 +283,7 @@ def compute_pair_regime(
             changed=changed,
             atr=atr,
             prev_atr_entry=float(prev_atr_entry) if prev_atr_entry is not None else None,
+            append_series=False,
         )
         return {
             "ticker": tku,
@@ -327,6 +337,11 @@ def compute_pair_regime(
         1.0,
     )
 
+    append_series = True
+    ds = str(session_date or "").strip()[:10]
+    if ds and _last_history_session.get(tku) == ds:
+        append_series = False
+
     atr_entry = _record_histories(
         tku,
         raw_score=raw_score,
@@ -335,7 +350,10 @@ def compute_pair_regime(
         changed=changed,
         atr=atr,
         prev_atr_entry=float(prev_atr_entry) if prev_atr_entry is not None else None,
+        append_series=append_series,
     )
+    if append_series and ds:
+        _last_history_session[tku] = ds
 
     return {
         "ticker": tku,

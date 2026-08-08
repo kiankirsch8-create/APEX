@@ -5465,8 +5465,19 @@ def _ensure_shadow_regime_for_day(
 
         prev = _SHADOW_REGIME_PREV.get(tku)
         result = compute_pair_regime(
-            tku, closes, float(rd), rd4, prev, atr=atr_for_regime,
+            tku,
+            closes,
+            float(rd),
+            rd4,
+            prev,
+            atr=atr_for_regime,
+            session_date=ds,
         )
+        if isinstance(result, dict):
+            try:
+                result["rate_diff"] = float(rd) if rd is not None else 0.0
+            except (TypeError, ValueError):
+                result["rate_diff"] = 0.0
         # Only lock the day + advance prev once we have a real close series.
         # Early gate skips without OHLC may still attach a provisional result.
         if closes:
@@ -6833,6 +6844,7 @@ def run_one_backtest(
     chrono_job_id: str = "",
 ) -> dict[str, Any] | None:
     _shadow_hook: dict[str, Any] | None = None
+    _shadow_past_ref: Any = None
     try:
         sym = (ticker or "").strip().upper()
         if sym in BLOCKED_PAIRS:
@@ -7030,6 +7042,8 @@ def run_one_backtest(
             "future": future,
             "ind": ind,
         }
+        # Keep a live ref for trade-row shadow_* fields after ``del past`` below.
+        _shadow_past_ref = _shadow_hook["past"]
 
         try:
             if "MACD_12_26_9" in past.columns and "MACDs_12_26_9" in past.columns:
@@ -7981,8 +7995,8 @@ def run_one_backtest(
                 sym,
                 direction,
                 analysis_date,
-                # past/future may already be deleted above; day-cache is warm.
-                past=None,
+                # ``del past`` runs above; hook keeps the scanned frame alive.
+                past=_shadow_past_ref,
                 rate_diff=(
                     float(ai["macro_rate_diff"])
                     if ai.get("macro_rate_diff") is not None

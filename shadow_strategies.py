@@ -278,6 +278,23 @@ class ShadowStrategyContext:
         except (TypeError, ValueError):
             return None
 
+    @property
+    def rate_diff(self) -> float:
+        """Pair rate differential from the shadow regime day entry (0.0 if missing)."""
+        try:
+            v = self._regime.get("rate_diff")
+            return float(v) if v is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    @property
+    def trend_strength(self) -> float:
+        try:
+            v = self._ind.get("trend_strength")
+            return float(v) if v is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
     def score_history(self) -> list[float | None]:
         from regime_engine import get_score_history
 
@@ -456,12 +473,43 @@ def _custom_exit_hit(
     return False, None, ""
 
 
+def _resolve_shadow_trail_inputs(
+    *,
+    regime_state: str,
+    direction: str,
+    timeframe: str,
+    trend_strength: float,
+    rate_diff: float,
+) -> tuple[str, str, float, float]:
+    """
+    Mirror the real path: bias from shadow regime × direction, then
+    ``_resolve_trailing_regime``. Returns (bias, trail_regime, trend_strength, rate_diff).
+    """
+    from continuous_backtester import _resolve_trailing_regime, _shadow_bias_from_state
+
+    bias_raw = _shadow_bias_from_state(regime_state, direction)
+    bias = str(bias_raw or "NEUTRAL")
+    try:
+        ts = float(trend_strength)
+    except (TypeError, ValueError):
+        ts = 0.0
+    try:
+        rd = float(rate_diff)
+    except (TypeError, ValueError):
+        rd = 0.0
+    trail_regime = _resolve_trailing_regime(bias, ts, rd, timeframe=timeframe)
+    return bias, str(trail_regime or "CHOPPY"), ts, rd
+
+
 def _simulate_shadow_trade(
     signal: Mapping[str, Any],
     *,
     forward_df: pd.DataFrame,
     past_df: pd.DataFrame,
     atr: float | None,
+    regime_state: str = "NEUTRAL",
+    rate_diff: float = 0.0,
+    trend_strength: float = 0.0,
 ) -> dict[str, Any] | None:
     """
     Simulate a shadow signal with the real exit engine (+ optional custom_exit).
@@ -502,7 +550,16 @@ def _simulate_shadow_trade(
     if ps <= 0:
         return None
 
-    # Default ladder levels (engine recomputes from risk × regime multiples).
+    bias, trail_regime, ts_use, rd_use = _resolve_shadow_trail_inputs(
+        regime_state=regime_state,
+        direction=direction,
+        timeframe=tf,
+        trend_strength=trend_strength,
+        rate_diff=rate_diff,
+    )
+
+    # Placeholder ladder levels — evaluate_forward_candles recomputes from risk
+    # × regime multiples (2/4/7 TRENDING or 1.5/3/5 CHOPPY); passed tp* ignored.
     risk = abs(entry - stop)
     sign = 1.0 if direction == "LONG" else -1.0
     tp1 = entry + sign * risk * 2.0
@@ -522,11 +579,11 @@ def _simulate_shadow_trade(
             position_size=ps,
             leverage=LEVERAGE,
             timeframe=tf,
-            macro_bias="NEUTRAL",
-            macro_bias_adjusted="NEUTRAL",
-            trail_regime="TRENDING",
-            trend_strength=0.0,
-            rate_differential=0.0,
+            macro_bias=bias,
+            macro_bias_adjusted=bias,
+            trail_regime=trail_regime,
+            trend_strength=ts_use,
+            rate_differential=rd_use,
             atr=float(atr or 0) or risk,
             buffer_stop_price=stop,
             ticker=str(signal.get("ticker") or ""),
@@ -548,6 +605,10 @@ def _simulate_shadow_trade(
             ticker=str(signal.get("ticker") or ""),
             strategy_id=sid,
             custom_exit=custom_exit,
+            macro_bias=bias,
+            trail_regime=trail_regime,
+            trend_strength=ts_use,
+            rate_differential=rd_use,
         )
 
     if not exit_data or exit_data.get("outcome") in ("NO_DATA", "INVALID"):
@@ -611,14 +672,19 @@ def _simulate_with_custom_exit(
     ticker: str,
     strategy_id: str,
     custom_exit: Mapping[str, Any],
+    macro_bias: str = "NEUTRAL",
+    trail_regime: str = "CHOPPY",
+    trend_strength: float = 0.0,
+    rate_differential: float = 0.0,
 ) -> dict[str, Any]:
     """
     Candle walk: normal stop/ladder/trail vs custom_exit — first trigger wins.
     Reuses the real forward engine per-prefix would be O(n²); instead walk once
-    mirroring evaluate_forward_candles TRENDING path + custom checks.
+    with custom checks against the normal exit bar.
     """
     from continuous_backtester import _evaluate_forward_with_trend_continuation
 
+    bias = str(macro_bias or "NEUTRAL")
     # Run the standard engine first to get the "normal" exit bar index / result.
     normal = _evaluate_forward_with_trend_continuation(
         direction,
@@ -631,9 +697,11 @@ def _simulate_with_custom_exit(
         strategy_id,
         position_size=position_size,
         timeframe=timeframe,
-        macro_bias="NEUTRAL",
-        macro_bias_adjusted="NEUTRAL",
-        trail_regime="TRENDING",
+        macro_bias=bias,
+        macro_bias_adjusted=bias,
+        trail_regime=trail_regime,
+        trend_strength=float(trend_strength or 0.0),
+        rate_differential=float(rate_differential or 0.0),
         atr=atr,
         buffer_stop_price=stop,
         ticker=ticker,
@@ -714,6 +782,9 @@ def evaluate_shadow_strategies(
                 forward_df=forward_df,
                 past_df=context.ohlc(),
                 atr=context.atr,
+                regime_state=context.regime_state,
+                rate_diff=context.rate_diff,
+                trend_strength=context.trend_strength,
             )
             if trade is None:
                 continue
@@ -793,13 +864,9 @@ def run_shadow_strategies_safe(
         )
 
 
-# ── PART F — validation dummy (remove in a later prompt) ─────────────────────
-@register_shadow_strategy("PDUMMY01_VALIDATION")
-def pdummy01_validation(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
-    """
-    Trivial long on EURUSD 1d every Monday open, stop = entry − 1×ATR.
-    Proves signal → sim → JSONL end-to-end. No custom exit.
-    """
+# ── PART F — validation dummies (remove in a later prompt) ───────────────────
+def _pdummy_eurusd_monday_long(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    """Shared entry for PDUMMY01/02: EURUSD 1d Monday open, 1×ATR stop."""
     if ctx.ticker != "EURUSD":
         return None
     if ctx.timeframe != "1d":
@@ -821,5 +888,30 @@ def pdummy01_validation(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
         "entry_price": float(entry),
         "stop_price": float(entry) - float(atr),
         "timeframe": "1d",
-        "strategy_id": "PDUMMY01_VALIDATION",
     }
+
+
+@register_shadow_strategy("PDUMMY01_VALIDATION")
+def pdummy01_validation(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    """
+    Trivial long on EURUSD 1d every Monday open, stop = entry − 1×ATR.
+    Proves signal → sim → JSONL end-to-end. No custom exit.
+    """
+    sig = _pdummy_eurusd_monday_long(ctx)
+    if sig is None:
+        return None
+    sig["strategy_id"] = "PDUMMY01_VALIDATION"
+    return sig
+
+
+@register_shadow_strategy("PDUMMY02_TIMEEXIT")
+def pdummy02_timeexit(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    """
+    Same as PDUMMY01 but with time_exit after 5 sessions — proves custom_exit path.
+    """
+    sig = _pdummy_eurusd_monday_long(ctx)
+    if sig is None:
+        return None
+    sig["strategy_id"] = "PDUMMY02_TIMEEXIT"
+    sig["custom_exit"] = {"type": "time_exit", "max_sessions": 5}
+    return sig
