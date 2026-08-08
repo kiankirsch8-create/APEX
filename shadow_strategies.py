@@ -9,11 +9,9 @@ Live trading modules must NOT import this file.
 from __future__ import annotations
 
 import json
-import math
 import threading
-import traceback
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
