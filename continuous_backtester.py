@@ -5274,6 +5274,7 @@ _SHADOW_FIELD_KEYS: tuple[str, ...] = (
     "shadow_mult_edge",
     "shadow_mult_stheavy",
     "shadow_mult_conf",
+    "shadow_mult_conf_capped",
 )
 
 # Candidate sizing ladders keyed by shadow_bias label (write-only logging).
@@ -5481,21 +5482,28 @@ def _shadow_ladder_mults(
             "shadow_mult_edge": None,
             "shadow_mult_stheavy": None,
             "shadow_mult_conf": None,
+            "shadow_mult_conf_capped": None,
         }
     conf_mult: float | None
+    conf_capped: float | None
     try:
         if confidence is None:
             conf_mult = None
+            conf_capped = None
         else:
             conf_mult = round(0.70 + 0.90 * float(confidence), 6)
+            # Same formula, hard-clamped to [0.70, 1.51] (write-only).
+            conf_capped = round(max(0.70, min(1.51, conf_mult)), 6)
     except (TypeError, ValueError):
         conf_mult = None
+        conf_capped = None
     return {
         "shadow_mult_current": _SHADOW_LADDER_CURRENT[b],
         "shadow_mult_flat": 1.00,
         "shadow_mult_edge": _SHADOW_LADDER_EDGE[b],
         "shadow_mult_stheavy": _SHADOW_LADDER_STHEAVY[b],
         "shadow_mult_conf": conf_mult,
+        "shadow_mult_conf_capped": conf_capped,
     }
 
 
