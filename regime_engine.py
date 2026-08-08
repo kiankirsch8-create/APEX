@@ -9,10 +9,12 @@ Describes the PAIR state with hysteresis + minimum dwell; never labels a trade.
 from __future__ import annotations
 
 import math
+from collections import deque
 from typing import Any, Sequence
 
 # ── Tunable constants (single place) ─────────────────────────────────────────
 ER_WINDOW = 20
+HISTORY_MAX = 60
 
 WEIGHT_RATE = 0.60
 WEIGHT_ER = 0.40
@@ -45,6 +47,81 @@ STATE_STRONG_DOWN = "STRONG_DOWN"
 VALID_STATES = frozenset(
     {STATE_STRONG_UP, STATE_UP, STATE_NEUTRAL, STATE_DOWN, STATE_STRONG_DOWN}
 )
+
+# Bounded per-ticker histories (read-only to strategies via accessors).
+_raw_score_history: dict[str, deque[float | None]] = {}
+_er_history: dict[str, deque[float | None]] = {}
+_confidence_history: dict[str, deque[float | None]] = {}
+# ATR(14) snapshot at the start of the current regime episode.
+_atr_at_regime_entry: dict[str, float | None] = {}
+
+
+def _hist_deque(store: dict[str, deque[float | None]], ticker: str) -> deque[float | None]:
+    tku = (ticker or "").strip().upper()
+    dq = store.get(tku)
+    if dq is None:
+        dq = deque(maxlen=HISTORY_MAX)
+        store[tku] = dq
+    return dq
+
+
+def get_score_history(ticker: str) -> list[float | None]:
+    """Last ≤60 raw_score values for ticker (oldest→newest)."""
+    return list(_hist_deque(_raw_score_history, ticker))
+
+
+def get_er_history(ticker: str) -> list[float | None]:
+    """Last ≤60 efficiency-ratio values for ticker (oldest→newest)."""
+    return list(_hist_deque(_er_history, ticker))
+
+
+def get_confidence_history(ticker: str) -> list[float | None]:
+    """Last ≤60 confidence values for ticker (oldest→newest)."""
+    return list(_hist_deque(_confidence_history, ticker))
+
+
+def get_atr_at_regime_entry(ticker: str) -> float | None:
+    """ATR(14) captured when the current regime episode began."""
+    return _atr_at_regime_entry.get((ticker or "").strip().upper())
+
+
+def _record_histories(
+    ticker: str,
+    *,
+    raw_score: float,
+    er: float | None,
+    confidence: float,
+    changed: bool,
+    atr: float | None,
+    prev_atr_entry: float | None,
+) -> float | None:
+    """Update histories + atr_at_regime_entry; return episode ATR snapshot."""
+    tku = (ticker or "").strip().upper()
+    _hist_deque(_raw_score_history, tku).append(float(raw_score))
+    _hist_deque(_er_history, tku).append(None if er is None else float(er))
+    _hist_deque(_confidence_history, tku).append(float(confidence))
+
+    atr_f: float | None
+    try:
+        atr_f = float(atr) if atr is not None else None
+        if atr_f is not None and (math.isnan(atr_f) or math.isinf(atr_f) or atr_f <= 0):
+            atr_f = None
+    except (TypeError, ValueError):
+        atr_f = None
+
+    if changed:
+        atr_entry = atr_f
+    elif prev_atr_entry is not None:
+        try:
+            atr_entry = float(prev_atr_entry)
+        except (TypeError, ValueError):
+            atr_entry = atr_f if atr_f is not None else _atr_at_regime_entry.get(tku)
+    else:
+        # First observation of an episode — seed with current ATR when available.
+        atr_entry = atr_f if atr_f is not None else _atr_at_regime_entry.get(tku)
+
+    _atr_at_regime_entry[tku] = atr_entry
+    return atr_entry
 
 
 def _clamp(x: float, lo: float, hi: float) -> float:
@@ -150,11 +227,14 @@ def compute_pair_regime(
     rate_diff: float,
     rate_diff_4w: float | None,
     prev_state: dict[str, Any] | None,
+    atr: float | None = None,
 ) -> dict[str, Any]:
     """
     Directionless pair regime. Describes the PAIR, never a trade direction.
 
     ``prev_state`` is the previous return dict (or None on first scan).
+    Optional ``atr`` (ATR14 as of this scan) seeds ``atr_at_regime_entry``
+    when the state changes.
     """
     prev = prev_state if isinstance(prev_state, dict) else {}
     prev_label = str(prev.get("state") or STATE_NEUTRAL).strip().upper()
@@ -164,9 +244,13 @@ def compute_pair_regime(
         prev_days = int(prev.get("days_in_state", 0) or 0)
     except (TypeError, ValueError):
         prev_days = 0
+    prev_atr_entry = prev.get("atr_at_regime_entry")
+    if prev_atr_entry is None:
+        prev_atr_entry = get_atr_at_regime_entry(ticker)
 
     er = efficiency_ratio(closes, n=ER_WINDOW)
     rate_c, rate_change_available = rate_component(rate_diff, rate_diff_4w)
+    tku = str(ticker or "").strip().upper()
 
     if er is None:
         # Insufficient price history — hold prior label, zero score contribution.
@@ -182,8 +266,17 @@ def compute_pair_regime(
             0.0,
             1.0,
         )
+        atr_entry = _record_histories(
+            tku,
+            raw_score=raw_score,
+            er=None,
+            confidence=confidence,
+            changed=changed,
+            atr=atr,
+            prev_atr_entry=float(prev_atr_entry) if prev_atr_entry is not None else None,
+        )
         return {
-            "ticker": str(ticker or "").strip().upper(),
+            "ticker": tku,
             "state": state,
             "raw_score": round(raw_score, 6),
             "er": None,
@@ -193,6 +286,7 @@ def compute_pair_regime(
             "changed_this_scan": changed,
             "rate_component": round(rate_c, 6),
             "rate_change_available": rate_change_available,
+            "atr_at_regime_entry": atr_entry,
         }
 
     try:
@@ -233,8 +327,18 @@ def compute_pair_regime(
         1.0,
     )
 
+    atr_entry = _record_histories(
+        tku,
+        raw_score=raw_score,
+        er=float(er),
+        confidence=confidence,
+        changed=changed,
+        atr=atr,
+        prev_atr_entry=float(prev_atr_entry) if prev_atr_entry is not None else None,
+    )
+
     return {
-        "ticker": str(ticker or "").strip().upper(),
+        "ticker": tku,
         "state": state,
         "raw_score": round(raw_score, 6),
         "er": round(float(er), 6),
@@ -244,6 +348,7 @@ def compute_pair_regime(
         "changed_this_scan": changed,
         "rate_component": round(rate_c, 6),
         "rate_change_available": rate_change_available,
+        "atr_at_regime_entry": atr_entry,
     }
 
 
