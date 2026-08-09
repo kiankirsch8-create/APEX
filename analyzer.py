@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import traceback
 from datetime import datetime
 from typing import Any
 
@@ -23,11 +24,42 @@ MAX_TOKENS = 5500
 
 
 _CLIENT: Anthropic | None = None
+_KEY_LOGGED_ONCE = False
+
+
+def _log_api_key_status() -> None:
+    """Log a masked preview of ANTHROPIC_API_KEY exactly once.
+
+    We print the first 8 characters plus the total length so the operator
+    can verify that the key is being read from the environment correctly
+    (e.g. Railway secret injection). We never log the rest of the key.
+    """
+    global _KEY_LOGGED_ONCE
+    if _KEY_LOGGED_ONCE:
+        return
+    _KEY_LOGGED_ONCE = True
+
+    key = env("ANTHROPIC_API_KEY") or ""
+    if not key:
+        log(
+            "[Analyzer] ANTHROPIC_API_KEY is MISSING — set it in your "
+            ".env or Railway secrets. Claude calls will fail.",
+            "error",
+        )
+        return
+
+    prefix = key[:8]
+    length = len(key)
+    log(
+        f"[Analyzer] ANTHROPIC_API_KEY loaded — prefix='{prefix}…' "
+        f"length={length} (expected ~108 chars, starts with 'sk-ant-')"
+    )
 
 
 def _client() -> Anthropic:
     global _CLIENT
     if _CLIENT is None:
+        _log_api_key_status()
         _CLIENT = Anthropic(api_key=env("ANTHROPIC_API_KEY"))
     return _CLIENT
 
@@ -410,7 +442,13 @@ def _macro_snapshot() -> dict[str, Any]:
 
 # ---------------------------------------------------------------------------
 async def _call_claude(user_message: str) -> str:
-    """Call Anthropic Messages API in a thread (SDK is sync)."""
+    """Call Anthropic Messages API in a thread (SDK is sync).
+
+    On failure we log the full exception class, message, response body
+    when present, and traceback. This is intentionally verbose so the
+    operator can diagnose why APEX is falling back to the local report
+    (auth failures, rate limits, invalid model name, network, etc.).
+    """
     def _do_call() -> str:
         client = _client()
         msg = client.messages.create(
@@ -419,7 +457,6 @@ async def _call_claude(user_message: str) -> str:
             system=MASTER_ANALYST_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_message}],
         )
-        # extract text block
         if not msg.content:
             return ""
         out = []
@@ -431,7 +468,19 @@ async def _call_claude(user_message: str) -> str:
     try:
         return await asyncio.to_thread(_do_call)
     except Exception as e:  # noqa: BLE001 — surface any provider error to retry path
-        log(f"[Analyzer] Claude call failed: {e}", "error")
+        err_class = type(e).__name__
+        err_msg = str(e) or "<no message>"
+        # Anthropic SDK exceptions carry status_code + body for HTTP failures
+        status = getattr(e, "status_code", None)
+        body = getattr(e, "body", None) or getattr(e, "response", None)
+        request_id = getattr(e, "request_id", None)
+        log(
+            f"[Analyzer] Claude call FAILED — model='{CLAUDE_MODEL}' "
+            f"exc={err_class} status={status} request_id={request_id} "
+            f"message={err_msg!r} body={body!r}",
+            "error",
+        )
+        log(f"[Analyzer] Claude traceback:\n{traceback.format_exc()}", "error")
         return ""
 
 
