@@ -4333,9 +4333,7 @@ def ptw05_higher_low_ladder(ctx: ShadowStrategyContext) -> dict[str, Any] | None
         r1, r2, r3 = swings[-3], swings[-2], swings[-1]
         if not (r1[1] < r2[1] < r3[1]):
             return None
-        idx_r2, idx_r3 = r1[0], r3[0]
-        # interm over (idx_r2, idx_r3] where r2 is middle
-        idx_r2 = r2[0]
+        idx_r2, idx_r3 = r2[0], r3[0]
         if idx_r3 <= idx_r2:
             return None
         interm = float(h.iloc[idx_r2 + 1 : idx_r3 + 1].max())
