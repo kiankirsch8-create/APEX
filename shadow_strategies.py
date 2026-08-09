@@ -8,6 +8,7 @@ Live trading modules must NOT import this file.
 """
 from __future__ import annotations
 
+import calendar
 import json
 import threading
 from dataclasses import dataclass, field
@@ -309,6 +310,11 @@ class ShadowStrategyContext:
         from regime_engine import get_confidence_history
 
         return get_confidence_history(self.ticker)
+
+    def rate_component_history(self) -> list[float | None]:
+        from regime_engine import get_rate_component_history
+
+        return get_rate_component_history(self.ticker)
 
     # ── Cross-pair (PART E) ──────────────────────────────────────────────
     def get_pair_history(self, ticker: str) -> pd.DataFrame | None:
@@ -777,6 +783,37 @@ def evaluate_shadow_strategies(
             sig.setdefault("strategy_id", sid)
             sig.setdefault("ticker", context.ticker)
             sig.setdefault("timeframe", context.timeframe)
+            entry_ds = str(analysis_date).strip()[:10]
+            # Next-open entries: fill from first forward bar open (signal used ≤ close).
+            if sig.pop("entry_at_next_open", False):
+                try:
+                    nxt = float(pd.to_numeric(forward_df["Open"], errors="coerce").iloc[0])
+                except Exception:  # noqa: BLE001
+                    continue
+                if nxt <= 0 or nxt != nxt:  # noqa: PLR0124 — NaN check
+                    continue
+                sig["entry_price"] = nxt
+                try:
+                    entry_ds = str(pd.Timestamp(forward_df.index[0]).date())
+                except Exception:  # noqa: BLE001
+                    entry_ds = str(analysis_date).strip()[:10]
+            stop_atr_mult = sig.pop("stop_atr_mult", None)
+            if stop_atr_mult is not None:
+                try:
+                    atr_use = float(context.atr or 0)
+                    mult = float(stop_atr_mult)
+                    ep = float(sig["entry_price"]) if sig.get("entry_price") is not None else 0.0
+                    dirc = str(sig.get("direction") or "").upper()
+                    if atr_use <= 0 or ep <= 0 or ep != ep or dirc not in ("LONG", "SHORT"):
+                        continue
+                    if dirc == "LONG":
+                        sig["stop_price"] = ep - mult * atr_use
+                    else:
+                        sig["stop_price"] = ep + mult * atr_use
+                except (TypeError, ValueError):
+                    continue
+            if sig.get("entry_price") is None or sig.get("stop_price") is None:
+                continue
             trade = _simulate_shadow_trade(
                 sig,
                 forward_df=forward_df,
@@ -789,7 +826,6 @@ def evaluate_shadow_strategies(
             if trade is None:
                 continue
             # Regime / shadow fields (write-only mirrors of existing shadow_*).
-            entry_ds = str(analysis_date).strip()[:10]
             row = {
                 "date": entry_ds,
                 "entry_date": entry_ds,
@@ -862,6 +898,1097 @@ def run_shadow_strategies_safe(
             f"{ticker} {timeframe} {analysis_date}: {e}",
             level="warning",
         )
+
+
+
+# ── PSH FAMILY — helpers + 15 STRONG_HEADWIND fade strategies ────────────────
+# Shadow-only. Universal gate: STRONG_* regime and trade against score sign.
+
+# Pending stop-order setups: (strategy_id, ticker, timeframe) -> state dict
+_PSH_PENDING: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+
+def _psh_gate(ctx: ShadowStrategyContext) -> str | None:
+    """
+    Universal PSH gate. Returns trade direction (countertrend) or None.
+    Requires STRONG_UP / STRONG_DOWN; trade AGAINST composite score sign.
+    """
+    state = str(ctx.regime_state or "").strip().upper()
+    if state not in ("STRONG_UP", "STRONG_DOWN"):
+        return None
+    score = ctx.regime_raw_score
+    if score is None:
+        return None
+    try:
+        s = float(score)
+    except (TypeError, ValueError):
+        return None
+    if s > 0:
+        return "SHORT"
+    if s < 0:
+        return "LONG"
+    return None
+
+
+def _psh_ohlc_arrays(df: pd.DataFrame) -> tuple[Any, Any, Any, Any] | None:
+    if df is None or getattr(df, "empty", True):
+        return None
+    need = ("Open", "High", "Low", "Close")
+    if any(c not in df.columns for c in need):
+        return None
+    o = pd.to_numeric(df["Open"], errors="coerce")
+    h = pd.to_numeric(df["High"], errors="coerce")
+    l = pd.to_numeric(df["Low"], errors="coerce")
+    c = pd.to_numeric(df["Close"], errors="coerce")
+    return o, h, l, c
+
+
+def _psh_atr_series(h: pd.Series, l: pd.Series, c: pd.Series, n: int = 14) -> pd.Series:
+    prev_c = c.shift(1)
+    tr = pd.concat([(h - l).abs(), (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
+    return tr.rolling(n, min_periods=n).mean()
+
+
+def _psh_sma(s: pd.Series, n: int) -> pd.Series:
+    return s.rolling(n, min_periods=n).mean()
+
+
+def _psh_ema(s: pd.Series, n: int) -> pd.Series:
+    return s.ewm(span=n, adjust=False, min_periods=n).mean()
+
+
+def _psh_rsi(closes: pd.Series, n: int = 14) -> pd.Series:
+    delta = closes.diff()
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+    avg_gain = gain.ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
+    avg_loss = loss.ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
+    rs = avg_gain / avg_loss.replace(0.0, float("nan"))
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def _psh_er_at(closes: list[float], end_i: int, n: int) -> float | None:
+    """Kaufman ER on closes[end_i-n : end_i] inclusive end (n steps)."""
+    if n <= 0 or end_i < n:
+        return None
+    window = closes[end_i - n : end_i + 1]
+    if len(window) < n + 1:
+        return None
+    net = abs(window[-1] - window[0])
+    path = 0.0
+    for i in range(1, len(window)):
+        path += abs(window[i] - window[i - 1])
+    if path <= 0:
+        return 0.0
+    return float(net / path)
+
+
+def _psh_bbands(closes: pd.Series, n: int = 20, n_sigma: float = 2.0) -> tuple[pd.Series, pd.Series, pd.Series]:
+    mid = closes.rolling(n, min_periods=n).mean()
+    sd = closes.rolling(n, min_periods=n).std(ddof=0)
+    return mid + n_sigma * sd, mid, mid - n_sigma * sd
+
+
+def _psh_fractal_swings(
+    highs: list[float],
+    lows: list[float],
+) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
+    """2-bar-each-side fractal swing highs / lows. Confirmed only (needs +2 bars)."""
+    hi: list[tuple[int, float]] = []
+    lo: list[tuple[int, float]] = []
+    n = min(len(highs), len(lows))
+    for i in range(2, n - 2):
+        h = highs[i]
+        l = lows[i]
+        if h > highs[i - 1] and h > highs[i - 2] and h > highs[i + 1] and h > highs[i + 2]:
+            hi.append((i, float(h)))
+        if l < lows[i - 1] and l < lows[i - 2] and l < lows[i + 1] and l < lows[i + 2]:
+            lo.append((i, float(l)))
+    return hi, lo
+
+
+def _psh_is_inside_day(o: pd.Series, h: pd.Series, l: pd.Series, c: pd.Series, i: int) -> bool:
+    if i < 1:
+        return False
+    return float(h.iloc[i]) < float(h.iloc[i - 1]) and float(l.iloc[i]) > float(l.iloc[i - 1])
+
+
+def _psh_is_nr7(h: pd.Series, l: pd.Series, i: int) -> bool:
+    if i < 6:
+        return False
+    ranges = [(float(h.iloc[j]) - float(l.iloc[j])) for j in range(i - 6, i + 1)]
+    return ranges[-1] <= min(ranges) + 1e-12
+
+
+def _psh_weekday_trading_days(year: int, month: int) -> list[date]:
+    """Mon–Fri calendar days in month (no holiday calendar available)."""
+    out: list[date] = []
+    for d in range(1, calendar.monthrange(year, month)[1] + 1):
+        dt = date(year, month, d)
+        if dt.weekday() < 5:
+            out.append(dt)
+    return out
+
+
+def _psh_signal(
+    *,
+    direction: str,
+    stop_price: float,
+    timeframe: str,
+    strategy_id: str,
+    custom_exit: dict[str, Any] | None = None,
+    entry_at_next_open: bool = True,
+    entry_price: float | None = None,
+) -> dict[str, Any]:
+    sig: dict[str, Any] = {
+        "direction": direction,
+        "stop_price": float(stop_price),
+        "timeframe": timeframe,
+        "strategy_id": strategy_id,
+        "shadow_mult_flat": 1.0,
+    }
+    if custom_exit is not None:
+        sig["custom_exit"] = custom_exit
+    if entry_at_next_open:
+        sig["entry_at_next_open"] = True
+    else:
+        if entry_price is None:
+            raise ValueError("entry_price required when not entry_at_next_open")
+        sig["entry_price"] = float(entry_price)
+    return sig
+
+
+def _psh_pending_key(sid: str, ctx: ShadowStrategyContext) -> tuple[str, str, str]:
+    return (sid, ctx.ticker, ctx.timeframe)
+
+
+def _psh_check_pending_stop(
+    ctx: ShadowStrategyContext,
+    sid: str,
+) -> dict[str, Any] | None:
+    """
+    Check / age a pending stop-order. Trigger on the latest closed bar's range.
+    Expire after 5 sessions or invalidate if close beyond stop side.
+    Age is anchored on setup_date (not a brittle absolute bar index).
+    """
+    key = _psh_pending_key(sid, ctx)
+    pend = _PSH_PENDING.get(key)
+    if not pend:
+        return None
+    df = ctx.ohlc()
+    arr = _psh_ohlc_arrays(df)
+    if arr is None:
+        return None
+    o, h, l, c = arr
+    i = len(c) - 1
+    if i < 0:
+        return None
+    setup_ds = str(pend.get("setup_date") or "").strip()[:10]
+    if not setup_ds:
+        _PSH_PENDING.pop(key, None)
+        return None
+    # Locate setup_date in current OHLC; missing → stale pending (cross-job leak).
+    setup_i: int | None = None
+    for k in range(len(df)):
+        try:
+            dk = str(pd.Timestamp(df.index[k]).date())
+        except Exception:  # noqa: BLE001
+            continue
+        if dk == setup_ds:
+            setup_i = k
+    if setup_i is None:
+        _PSH_PENDING.pop(key, None)
+        return None
+    age = i - setup_i  # bars strictly after setup when age > 0
+    if age <= 0:
+        return None  # same bar as setup — wait for later sessions
+    if age > 5:
+        _PSH_PENDING.pop(key, None)
+        return None
+    # Drop pending if regime is no longer STRONG.
+    state = str(ctx.regime_state or "").strip().upper()
+    if state not in ("STRONG_UP", "STRONG_DOWN"):
+        _PSH_PENDING.pop(key, None)
+        return None
+    direction = str(pend["direction"])
+    trigger = float(pend["trigger"])
+    stop_px = float(pend["stop"])
+    open_i = float(o.iloc[i])
+    high_i = float(h.iloc[i])
+    low_i = float(l.iloc[i])
+    close_i = float(c.iloc[i])
+    # Invalidate if close beyond stop side
+    if direction == "LONG" and close_i < stop_px:
+        _PSH_PENDING.pop(key, None)
+        return None
+    if direction == "SHORT" and close_i > stop_px:
+        _PSH_PENDING.pop(key, None)
+        return None
+    # LONG = buy-stop above; SHORT = sell-stop below.
+    filled = False
+    fill_px = trigger
+    if direction == "LONG":
+        if high_i >= trigger:
+            filled = True
+            fill_px = open_i if open_i > trigger else trigger
+    else:
+        if low_i <= trigger:
+            filled = True
+            fill_px = open_i if open_i < trigger else trigger
+    if not filled:
+        return None
+    _PSH_PENDING.pop(key, None)
+    return _psh_signal(
+        direction=direction,
+        stop_price=stop_px,
+        timeframe=ctx.timeframe,
+        strategy_id=sid,
+        entry_at_next_open=False,
+        entry_price=fill_px,
+    )
+
+
+def _psh_set_pending(
+    ctx: ShadowStrategyContext,
+    sid: str,
+    *,
+    direction: str,
+    trigger: float,
+    stop: float,
+) -> None:
+    _PSH_PENDING[_psh_pending_key(sid, ctx)] = {
+        "direction": direction,
+        "trigger": float(trigger),
+        "stop": float(stop),
+        "setup_date": ctx.session_date,
+    }
+
+
+def _psh_macro_up(direction: str) -> bool:
+    """True when macro trend is up (we are fading with SHORT)."""
+    return direction == "SHORT"
+
+
+def _psh_build_weekly_from_daily(df: pd.DataFrame) -> pd.DataFrame | None:
+    """Resample daily OHLC to weekly (W-FRI). Only completed weeks used by callers."""
+    if df is None or df.empty:
+        return None
+    x = df.copy()
+    if not isinstance(x.index, pd.DatetimeIndex):
+        try:
+            x.index = pd.to_datetime(x.index)
+        except Exception:  # noqa: BLE001
+            return None
+    o = x["Open"].resample("W-FRI").first()
+    h = x["High"].resample("W-FRI").max()
+    l = x["Low"].resample("W-FRI").min()
+    c = x["Close"].resample("W-FRI").last()
+    out = pd.DataFrame({"Open": o, "High": h, "Low": l, "Close": c}).dropna()
+    return out if len(out) else None
+
+
+# ── PSH01 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PSH01_EFFICIENCY_STALL_FADE")
+def psh01_efficiency_stall_fade(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    direction = _psh_gate(ctx)
+    if direction is None:
+        return None
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    o, h, l, c = arr
+    if len(c) < 40:
+        return None
+    atr_s = _psh_atr_series(h, l, c, 14)
+    rsi_s = _psh_rsi(c, 14)
+    i = len(c) - 1
+    atr = float(atr_s.iloc[i]) if pd.notna(atr_s.iloc[i]) else None
+    if atr is None or atr <= 0:
+        return None
+    closes = [float(x) for x in c.tolist()]
+    # 20-day extreme in macro direction (including today)
+    window = closes[i - 19 : i + 1]
+    if len(window) < 20:
+        return None
+    macro_up = _psh_macro_up(direction)
+    if macro_up:
+        if closes[i] < max(window) - 1e-12:
+            return None
+        extreme = closes[i]
+        # prior 20-day extreme day (before today)
+        prior = closes[i - 20 : i]
+        if not prior:
+            return None
+        prev_ext_i = i - 20 + int(max(range(len(prior)), key=lambda k: prior[k]))
+    else:
+        if closes[i] > min(window) + 1e-12:
+            return None
+        extreme = closes[i]
+        prior = closes[i - 20 : i]
+        if not prior:
+            return None
+        prev_ext_i = i - 20 + int(min(range(len(prior)), key=lambda k: prior[k]))
+    # ER(10) declined ≥0.15 from its own 20-day peak
+    er_now = _psh_er_at(closes, i, 10)
+    if er_now is None:
+        return None
+    er_peak = None
+    for j in range(i - 19, i + 1):
+        ej = _psh_er_at(closes, j, 10)
+        if ej is None:
+            continue
+        er_peak = ej if er_peak is None else max(er_peak, ej)
+    if er_peak is None or (er_peak - er_now) < 0.15:
+        return None
+    rsi_now = float(rsi_s.iloc[i]) if pd.notna(rsi_s.iloc[i]) else None
+    rsi_prev = float(rsi_s.iloc[prev_ext_i]) if pd.notna(rsi_s.iloc[prev_ext_i]) else None
+    if rsi_now is None or rsi_prev is None:
+        return None
+    if direction == "LONG" and not (rsi_now > rsi_prev):
+        return None
+    if direction == "SHORT" and not (rsi_now < rsi_prev):
+        return None
+    stop = extreme - atr if direction == "LONG" else extreme + atr
+    return _psh_signal(
+        direction=direction, stop_price=stop, timeframe="1d",
+        strategy_id="PSH01_EFFICIENCY_STALL_FADE",
+    )
+
+
+# ── PSH02 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PSH02_STRETCH_BAND_REVERSION")
+def psh02_stretch_band_reversion(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    sid = "PSH02_STRETCH_BAND_REVERSION"
+    hit = _psh_check_pending_stop(ctx, sid)
+    if hit is not None:
+        return hit
+    direction = _psh_gate(ctx)
+    if direction is None:
+        return None
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    o, h, l, c = arr
+    if len(c) < 30:
+        return None
+    atr_s = _psh_atr_series(h, l, c, 14)
+    sma20 = _psh_sma(c, 20)
+    i = len(c) - 1
+    # Setup: stretch day then inside day — check if today is inside day after stretch
+    if not _psh_is_inside_day(o, h, l, c, i):
+        return None
+    j = i - 1  # stretch candidate
+    if j < 20:
+        return None
+    atr_j = float(atr_s.iloc[j]) if pd.notna(atr_s.iloc[j]) else None
+    sma_j = float(sma20.iloc[j]) if pd.notna(sma20.iloc[j]) else None
+    if atr_j is None or atr_j <= 0 or sma_j is None:
+        return None
+    close_j = float(c.iloc[j])
+    macro_up = _psh_macro_up(direction)
+    if macro_up:
+        if close_j < sma_j + 2.5 * atr_j:
+            return None
+        ext_extreme = float(h.iloc[j])
+        # countertrend extreme of inside day = its low (for SHORT entry break below)
+        trigger = float(l.iloc[i])
+        stop = ext_extreme
+    else:
+        if close_j > sma_j - 2.5 * atr_j:
+            return None
+        ext_extreme = float(l.iloc[j])
+        trigger = float(h.iloc[i])
+        stop = ext_extreme
+    _psh_set_pending(ctx, sid, direction=direction, trigger=trigger, stop=stop)
+    return None
+
+
+# ── PSH03 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PSH03_WEEKLY_EXHAUSTION_WICK")
+def psh03_weekly_exhaustion_wick(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1w":
+        return None
+    direction = _psh_gate(ctx)
+    if direction is None:
+        return None
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    o, h, l, c = arr
+    if len(c) < 12:
+        return None
+    i = len(c) - 1
+    ranges = [(float(h.iloc[k]) - float(l.iloc[k])) for k in range(i - 9, i + 1)]
+    if len(ranges) < 10:
+        return None
+    avg10 = sum(ranges[:-1]) / 9.0
+    rng = ranges[-1]
+    if avg10 <= 0 or rng < 1.5 * avg10:
+        return None
+    open_i, high_i, low_i, close_i = float(o.iloc[i]), float(h.iloc[i]), float(l.iloc[i]), float(c.iloc[i])
+    macro_up = _psh_macro_up(direction)
+    # Closing against macro direction
+    if macro_up and not (close_i < open_i):
+        return None
+    if (not macro_up) and not (close_i > open_i):
+        return None
+    if macro_up:
+        wick = high_i - max(open_i, close_i)
+        extreme = high_i
+    else:
+        wick = min(open_i, close_i) - low_i
+        extreme = low_i
+    if rng <= 0 or wick / rng < 0.60:
+        return None
+    return _psh_signal(
+        direction=direction, stop_price=extreme, timeframe="1w",
+        strategy_id="PSH03_WEEKLY_EXHAUSTION_WICK",
+    )
+
+
+# ── PSH04 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PSH04_BREAKOUT_FAILURE_SNAP")
+def psh04_breakout_failure_snap(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    direction = _psh_gate(ctx)
+    if direction is None:
+        return None
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    o, h, l, c = arr
+    if len(c) < 30:
+        return None
+    atr_s = _psh_atr_series(h, l, c, 14)
+    i = len(c) - 1
+    closes = [float(x) for x in c.tolist()]
+    highs = [float(x) for x in h.tolist()]
+    lows = [float(x) for x in l.tolist()]
+    macro_up = _psh_macro_up(direction)
+    # Find a breakout close within last 3 sessions (before today) beyond then-20d extreme
+    found = None
+    for b in range(max(20, i - 3), i):
+        prior = closes[b - 20 : b]
+        if len(prior) < 20:
+            continue
+        atr_b = float(atr_s.iloc[b]) if pd.notna(atr_s.iloc[b]) else None
+        if atr_b is None or atr_b <= 0:
+            continue
+        if macro_up:
+            if closes[b] > max(prior):
+                found = (b, max(prior), highs[b], atr_b)
+                break
+        else:
+            if closes[b] < min(prior):
+                found = (b, min(prior), lows[b], atr_b)
+                break
+    if found is None:
+        return None
+    b, prior_ext, bo_extreme, atr_b = found
+    # Today close back inside prior range by ≥0.5×ATR
+    atr_i = float(atr_s.iloc[i]) if pd.notna(atr_s.iloc[i]) else atr_b
+    if macro_up:
+        if not (closes[i] <= prior_ext - 0.5 * atr_i):
+            return None
+        stop = max(highs[b : i + 1])
+    else:
+        if not (closes[i] >= prior_ext + 0.5 * atr_i):
+            return None
+        stop = min(lows[b : i + 1])
+    return _psh_signal(
+        direction=direction, stop_price=float(stop), timeframe="1d",
+        strategy_id="PSH04_BREAKOUT_FAILURE_SNAP",
+    )
+
+
+# ── PSH05 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PSH05_THREE_PUSH_TERMINAL")
+def psh05_three_push_terminal(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    direction = _psh_gate(ctx)
+    if direction is None:
+        return None
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    o, h, l, c = arr
+    if len(c) < 50:
+        return None
+    atr_s = _psh_atr_series(h, l, c, 14)
+    i = len(c) - 1
+    atr = float(atr_s.iloc[i]) if pd.notna(atr_s.iloc[i]) else None
+    if atr is None or atr <= 0:
+        return None
+    highs = [float(x) for x in h.tolist()]
+    lows = [float(x) for x in l.tolist()]
+    closes = [float(x) for x in c.tolist()]
+    f_hi, f_lo = _psh_fractal_swings(highs, lows)
+    macro_up = _psh_macro_up(direction)
+    swings = f_hi if macro_up else f_lo
+    if len(swings) < 4:
+        return None
+    s0, s1, s2, s3 = swings[-4], swings[-3], swings[-2], swings[-1]
+    if macro_up:
+        e1 = (s1[1] - s0[1]) / atr
+        e2 = (s2[1] - s1[1]) / atr
+        e3 = (s3[1] - s2[1]) / atr
+    else:
+        e1 = (s0[1] - s1[1]) / atr
+        e2 = (s1[1] - s2[1]) / atr
+        e3 = (s2[1] - s3[1]) / atr
+    if not (e3 < e2 < e1 and e1 > 0 and e2 > 0 and e3 > 0):
+        return None
+    # Trigger: close beyond most recent countertrend fractal
+    ctr = f_lo if macro_up else f_hi
+    if not ctr:
+        return None
+    last_ctr_i, last_ctr_px = ctr[-1]
+    if last_ctr_i < s3[0]:
+        # need a countertrend swing after/near pushes — use most recent overall
+        pass
+    if macro_up:
+        if closes[i] >= last_ctr_px:
+            return None
+    else:
+        if closes[i] <= last_ctr_px:
+            return None
+    stop = s3[1]
+    return _psh_signal(
+        direction=direction, stop_price=float(stop), timeframe="1d",
+        strategy_id="PSH05_THREE_PUSH_TERMINAL",
+    )
+
+
+# ── PSH06 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PSH06_SWEEP_RECLAIM")
+def psh06_sweep_reclaim(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    direction = _psh_gate(ctx)
+    if direction is None:
+        return None
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    o, h, l, c = arr
+    if len(c) < 40:
+        return None
+    atr_s = _psh_atr_series(h, l, c, 14)
+    i = len(c) - 1
+    atr = float(atr_s.iloc[i]) if pd.notna(atr_s.iloc[i]) else None
+    if atr is None or atr <= 0:
+        return None
+    highs = [float(x) for x in h.tolist()]
+    lows = [float(x) for x in l.tolist()]
+    f_hi, f_lo = _psh_fractal_swings(highs, lows)
+    macro_up = _psh_macro_up(direction)
+    swings = f_hi if macro_up else f_lo
+    if len(swings) < 2:
+        return None
+    # find pair within 0.25 ATR, ≥5 sessions apart
+    pair = None
+    for a in range(len(swings) - 1):
+        for b in range(a + 1, len(swings)):
+            ia, pa = swings[a]
+            ib, pb = swings[b]
+            if ib - ia < 5:
+                continue
+            if abs(pa - pb) <= 0.25 * atr:
+                pair = (ia, pa, ib, pb)
+    if pair is None:
+        return None
+    _, p1, _, p2 = pair
+    level = (p1 + p2) / 2.0
+    high_i, low_i, close_i = highs[i], lows[i], float(c.iloc[i])
+    if macro_up:
+        # Sweep above equal highs by ≤0.5×ATR, same bar closes back through level.
+        beyond = high_i - level
+        if beyond <= 0 or beyond > 0.5 * atr:
+            return None
+        if close_i >= level:
+            return None
+        stop = high_i
+    else:
+        beyond = level - low_i
+        if beyond <= 0 or beyond > 0.5 * atr:
+            return None
+        if close_i <= level:
+            return None
+        stop = low_i
+    return _psh_signal(
+        direction=direction, stop_price=float(stop), timeframe="1d",
+        strategy_id="PSH06_SWEEP_RECLAIM",
+    )
+
+
+# ── PSH07 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PSH07_COMPRESSION_SPRING")
+def psh07_compression_spring(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    sid = "PSH07_COMPRESSION_SPRING"
+    hit = _psh_check_pending_stop(ctx, sid)
+    if hit is not None:
+        return hit
+    direction = _psh_gate(ctx)
+    if direction is None:
+        return None
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    o, h, l, c = arr
+    if len(c) < 45:
+        return None
+    atr_s = _psh_atr_series(h, l, c, 14)
+    i = len(c) - 1
+    if not _psh_is_nr7(h, l, i):
+        return None
+    atr_i = float(atr_s.iloc[i]) if pd.notna(atr_s.iloc[i]) else None
+    if atr_i is None or atr_i <= 0:
+        return None
+    atr_window = atr_s.iloc[i - 39 : i + 1].dropna()
+    if len(atr_window) < 40 or float(atr_i) > float(atr_window.min()) + 1e-12:
+        return None
+    closes = [float(x) for x in c.tolist()]
+    macro_up = _psh_macro_up(direction)
+    win = closes[i - 19 : i + 1]
+    if len(win) < 20:
+        return None
+    if macro_up:
+        ext = max(win)
+        if abs(closes[i] - ext) > atr_i:
+            return None
+        trigger = float(l.iloc[i])  # break NR7 countertrend side
+        stop = float(h.iloc[i])
+    else:
+        ext = min(win)
+        if abs(closes[i] - ext) > atr_i:
+            return None
+        trigger = float(h.iloc[i])
+        stop = float(l.iloc[i])
+    _psh_set_pending(ctx, sid, direction=direction, trigger=trigger, stop=stop)
+    return None
+
+
+# ── PSH08 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PSH08_BB_WALK_BREAK")
+def psh08_bb_walk_break(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    direction = _psh_gate(ctx)
+    if direction is None:
+        return None
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    o, h, l, c = arr
+    if len(c) < 30:
+        return None
+    upper2, mid, lower2 = _psh_bbands(c, 20, 2.0)
+    upper1, _, lower1 = _psh_bbands(c, 20, 1.0)
+    i = len(c) - 1
+    macro_up = _psh_macro_up(direction)
+    beyond = 0
+    for j in range(i - 5, i + 1):
+        cj = float(c.iloc[j])
+        if macro_up:
+            u = upper2.iloc[j]
+            if pd.notna(u) and cj > float(u):
+                beyond += 1
+        else:
+            lo = lower2.iloc[j]
+            if pd.notna(lo) and cj < float(lo):
+                beyond += 1
+    if beyond < 4:
+        return None
+    ci = float(c.iloc[i])
+    if macro_up:
+        u1 = upper1.iloc[i]
+        if not (pd.notna(u1) and ci <= float(u1)):
+            return None
+        stop = float(h.iloc[i - 5 : i + 1].max())
+    else:
+        l1 = lower1.iloc[i]
+        if not (pd.notna(l1) and ci >= float(l1)):
+            return None
+        stop = float(l.iloc[i - 5 : i + 1].min())
+    return _psh_signal(
+        direction=direction, stop_price=stop, timeframe="1d",
+        strategy_id="PSH08_BB_WALK_BREAK",
+    )
+
+
+# ── PSH09 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PSH09_RATE_IMPULSE_FADE")
+def psh09_rate_impulse_fade(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    direction = _psh_gate(ctx)
+    if direction is None:
+        return None
+    hist = [x for x in ctx.rate_component_history() if x is not None]
+    if len(hist) < 6:
+        return None
+    older = float(hist[-6])
+    newer = float(hist[-1])
+    delta = newer - older
+    # Move ≥0.10 against the level's sign (level = older reading)
+    if older < 0 and not (delta >= 0.10):
+        return None
+    if older > 0 and not (delta <= -0.10):
+        return None
+    if older == 0:
+        return None
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    o, h, l, c = arr
+    if len(c) < 15:
+        return None
+    ema10 = _psh_ema(c, 10)
+    i = len(c) - 1
+    if pd.isna(ema10.iloc[i]) or pd.isna(ema10.iloc[i - 1]):
+        return None
+    ci, cprev = float(c.iloc[i]), float(c.iloc[i - 1])
+    ei, eprev = float(ema10.iloc[i]), float(ema10.iloc[i - 1])
+    # Daily close crosses 10-EMA in the trade direction
+    if direction == "LONG":
+        if not (cprev <= eprev and ci > ei):
+            return None
+    else:
+        if not (cprev >= eprev and ci < ei):
+            return None
+    atr_s = _psh_atr_series(h, l, c, 14)
+    atr = float(atr_s.iloc[i]) if pd.notna(atr_s.iloc[i]) else None
+    if atr is None or atr <= 0:
+        return None
+    sig = _psh_signal(
+        direction=direction, stop_price=ci, timeframe="1d",
+        strategy_id="PSH09_RATE_IMPULSE_FADE",
+    )
+    sig["stop_atr_mult"] = 1.25  # applied from next-open entry in evaluate
+    return sig
+
+
+# ── PSH10 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PSH10_CONFIDENCE_DECAY_TURN")
+def psh10_confidence_decay_turn(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    direction = _psh_gate(ctx)
+    if direction is None:
+        return None
+    conf = [x for x in ctx.confidence_history() if x is not None]
+    if len(conf) < 5:
+        return None
+    last5 = [float(x) for x in conf[-5:]]
+    if last5[0] < 0.80 or last5[-1] > 0.55:
+        return None
+    if not all(last5[k] >= last5[k + 1] for k in range(4)):
+        return None
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    o, h, l, c = arr
+    if len(c) < 30:
+        return None
+    # 2 consecutive countertrend daily closes
+    if direction == "LONG":
+        if not (float(c.iloc[-1]) > float(o.iloc[-1]) and float(c.iloc[-2]) > float(o.iloc[-2])):
+            return None
+    else:
+        if not (float(c.iloc[-1]) < float(o.iloc[-1]) and float(c.iloc[-2]) < float(o.iloc[-2])):
+            return None
+    atr_s = _psh_atr_series(h, l, c, 14)
+    i = len(c) - 1
+    atr = float(atr_s.iloc[i]) if pd.notna(atr_s.iloc[i]) else None
+    if atr is None or atr <= 0:
+        return None
+    highs = [float(x) for x in h.tolist()]
+    lows = [float(x) for x in l.tolist()]
+    f_hi, f_lo = _psh_fractal_swings(highs, lows)
+    macro_up = _psh_macro_up(direction)
+    swings = f_hi if macro_up else f_lo
+    if not swings:
+        return None
+    _, ext = swings[-1]
+    stop = ext + atr if macro_up else ext - atr
+    return _psh_signal(
+        direction=direction, stop_price=float(stop), timeframe="1d",
+        strategy_id="PSH10_CONFIDENCE_DECAY_TURN",
+    )
+
+
+# ── PSH11 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PSH11_MONTH_END_REBALANCE")
+def psh11_month_end_rebalance(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    """
+    Signal on close of the day BEFORE the penultimate weekday of the month;
+    entry next open = penultimate day open.
+    Custom time_exit max_sessions=5: penultimate(1), month-end(2), 1st(3), 2nd(4),
+    3rd(5) → exit at close of 3rd trading day of the new month (weekday calendar).
+    """
+    if ctx.timeframe != "1d":
+        return None
+    direction = _psh_gate(ctx)
+    if direction is None:
+        return None
+    try:
+        d = date.fromisoformat(ctx.session_date)
+    except ValueError:
+        return None
+    tdays = _psh_weekday_trading_days(d.year, d.month)
+    if len(tdays) < 3:
+        return None
+    penult = tdays[-2]
+    # Prior trading day before penultimate
+    prior = tdays[-3]
+    if d != prior:
+        return None
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    o, h, l, c = arr
+    if len(c) < 25:
+        return None
+    atr_s = _psh_atr_series(h, l, c, 14)
+    i = len(c) - 1
+    atr = float(atr_s.iloc[i]) if pd.notna(atr_s.iloc[i]) else None
+    if atr is None or atr <= 0:
+        return None
+    # Month-to-date move through prior close
+    month_mask = []
+    idx = ctx.ohlc().index
+    for k in range(len(c)):
+        try:
+            dk = pd.Timestamp(idx[k]).date()
+        except Exception:  # noqa: BLE001
+            continue
+        if dk.year == d.year and dk.month == d.month:
+            month_mask.append(k)
+    if len(month_mask) < 2:
+        return None
+    first_i, last_i = month_mask[0], month_mask[-1]
+    mtd = float(c.iloc[last_i]) - float(c.iloc[first_i])
+    macro_up = _psh_macro_up(direction)
+    if macro_up and mtd < 2.0 * atr:
+        return None
+    if (not macro_up) and mtd > -2.0 * atr:
+        return None
+    sig = _psh_signal(
+        direction=direction,
+        stop_price=float(c.iloc[i]),
+        timeframe="1d",
+        strategy_id="PSH11_MONTH_END_REBALANCE",
+        custom_exit={"type": "time_exit", "max_sessions": 5},
+    )
+    sig["stop_atr_mult"] = 1.5  # fixed 1.5×ATR from next-open entry
+    return sig
+
+
+# ── PSH12 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PSH12_FRIDAY_UNWIND")
+def psh12_friday_unwind(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    """
+    Thursday close signal; entry Friday open.
+    Custom time_exit max_sessions=2: Fri(1), Mon(2) → exit at Monday's close.
+    """
+    if ctx.timeframe != "1d":
+        return None
+    if ctx.day_of_week != 3:  # Thursday
+        return None
+    direction = _psh_gate(ctx)
+    if direction is None:
+        return None
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    o, h, l, c = arr
+    if len(c) < 10:
+        return None
+    atr_s = _psh_atr_series(h, l, c, 14)
+    i = len(c) - 1
+    atr = float(atr_s.iloc[i]) if pd.notna(atr_s.iloc[i]) else None
+    if atr is None or atr <= 0:
+        return None
+    # Week-to-date: from most recent Monday through Thursday
+    idx = ctx.ohlc().index
+    mon_i = None
+    for k in range(i, -1, -1):
+        try:
+            dk = pd.Timestamp(idx[k]).date()
+        except Exception:  # noqa: BLE001
+            continue
+        if dk.weekday() == 0:
+            mon_i = k
+            break
+    if mon_i is None:
+        return None
+    wtd = float(c.iloc[i]) - float(c.iloc[mon_i])
+    macro_up = _psh_macro_up(direction)
+    if macro_up and wtd < 1.5 * atr:
+        return None
+    if (not macro_up) and wtd > -1.5 * atr:
+        return None
+    sig = _psh_signal(
+        direction=direction,
+        stop_price=float(c.iloc[i]),
+        timeframe="1d",
+        strategy_id="PSH12_FRIDAY_UNWIND",
+        custom_exit={"type": "time_exit", "max_sessions": 2},
+    )
+    sig["stop_atr_mult"] = 1.0  # 1.0×ATR from Friday open entry
+    return sig
+
+
+# ── PSH13 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PSH13_WEEKLY_RECLAIM_ROTATION")
+def psh13_weekly_reclaim_rotation(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    """
+    Weekly pattern detected from daily OHLC (completed W-FRI weeks).
+    Runs on 1d so next daily open entry is available via entry_at_next_open.
+    """
+    if ctx.timeframe != "1d":
+        return None
+    direction = _psh_gate(ctx)
+    if direction is None:
+        return None
+    daily = ctx.ohlc()
+    weekly = _psh_build_weekly_from_daily(daily)
+    if weekly is None or len(weekly) < 6:
+        return None
+    # Only evaluate on the daily session that completes a week (Friday)
+    if ctx.day_of_week != 4:
+        return None
+    w_o = pd.to_numeric(weekly["Open"], errors="coerce")
+    w_h = pd.to_numeric(weekly["High"], errors="coerce")
+    w_l = pd.to_numeric(weekly["Low"], errors="coerce")
+    w_c = pd.to_numeric(weekly["Close"], errors="coerce")
+    wi = len(w_c) - 1
+    macro_up = _psh_macro_up(direction)
+    # ≥4 consecutive weekly closes in macro direction, then reclaim week
+    if wi < 4:
+        return None
+    for k in range(wi - 4, wi):
+        # weeks wi-4 .. wi-1 are the streak; wi is reversal week
+        ok = float(w_c.iloc[k]) > float(w_o.iloc[k]) if macro_up else float(w_c.iloc[k]) < float(w_o.iloc[k])
+        if not ok:
+            return None
+    prev_rng = float(w_h.iloc[wi - 1]) - float(w_l.iloc[wi - 1])
+    if prev_rng <= 0:
+        return None
+    # Reversal week closes against macro, reclaiming ≥50% of prior week's range
+    if macro_up:
+        if not (float(w_c.iloc[wi]) < float(w_o.iloc[wi])):
+            return None
+        reclaim = float(w_h.iloc[wi - 1]) - float(w_c.iloc[wi])
+        if reclaim < 0.5 * prev_rng:
+            return None
+        stop = float(w_h.iloc[wi - 1])
+    else:
+        if not (float(w_c.iloc[wi]) > float(w_o.iloc[wi])):
+            return None
+        reclaim = float(w_c.iloc[wi]) - float(w_l.iloc[wi - 1])
+        if reclaim < 0.5 * prev_rng:
+            return None
+        stop = float(w_l.iloc[wi - 1])
+    return _psh_signal(
+        direction=direction, stop_price=stop, timeframe="1d",
+        strategy_id="PSH13_WEEKLY_RECLAIM_ROTATION",
+    )
+
+
+# ── PSH14 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PSH14_GAP_AGAINST_TREND")
+def psh14_gap_against_trend(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    direction = _psh_gate(ctx)
+    if direction is None:
+        return None
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    o, h, l, c = arr
+    if len(c) < 20:
+        return None
+    atr_s = _psh_atr_series(h, l, c, 14)
+    i = len(c) - 1
+    atr = float(atr_s.iloc[i]) if pd.notna(atr_s.iloc[i]) else None
+    if atr is None or atr <= 0:
+        return None
+    prev_c = float(c.iloc[i - 1])
+    open_i = float(o.iloc[i])
+    close_i = float(c.iloc[i])
+    gap = open_i - prev_c
+    # Gap countertrend ≥0.3 ATR and day closes in gap direction
+    if direction == "LONG":
+        # countertrend gap is up from bearish macro? trade LONG against down macro
+        # gap against trend = gap up when macro down
+        if gap < 0.3 * atr:
+            return None
+        if close_i < open_i:  # must close in gap direction (up)
+            return None
+        stop = float(l.iloc[i - 1])  # pre-gap extreme
+    else:
+        if gap > -0.3 * atr:
+            return None
+        if close_i > open_i:
+            return None
+        stop = float(h.iloc[i - 1])
+    return _psh_signal(
+        direction=direction, stop_price=stop, timeframe="1d",
+        strategy_id="PSH14_GAP_AGAINST_TREND",
+    )
+
+
+# ── PSH15 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PSH15_ASYM_LOTTERY_REVERSAL")
+def psh15_asym_lottery_reversal(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    direction = _psh_gate(ctx)
+    if direction is None:
+        return None
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    o, h, l, c = arr
+    if len(c) < 55:
+        return None
+    atr_s = _psh_atr_series(h, l, c, 14)
+    sma50 = _psh_sma(c, 50)
+    i = len(c) - 1
+    atr = float(atr_s.iloc[i]) if pd.notna(atr_s.iloc[i]) else None
+    s50 = float(sma50.iloc[i]) if pd.notna(sma50.iloc[i]) else None
+    if atr is None or atr <= 0 or s50 is None:
+        return None
+    closes = [float(x) for x in c.tolist()]
+    er10 = _psh_er_at(closes, i, 10)
+    if er10 is None or er10 < 0.70:
+        return None
+    ci = closes[i]
+    macro_up = _psh_macro_up(direction)
+    if macro_up:
+        if ci < s50 + 3.0 * atr:
+            return None
+        day_ext = float(h.iloc[i])
+        stop = day_ext + 0.5 * atr
+    else:
+        if ci > s50 - 3.0 * atr:
+            return None
+        day_ext = float(l.iloc[i])
+        stop = day_ext - 0.5 * atr
+    return _psh_signal(
+        direction=direction, stop_price=stop, timeframe="1d",
+        strategy_id="PSH15_ASYM_LOTTERY_REVERSAL",
+    )
 
 
 # ── PART F — validation dummies (remove in a later prompt) ───────────────────

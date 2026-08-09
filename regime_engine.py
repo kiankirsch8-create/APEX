@@ -52,6 +52,7 @@ VALID_STATES = frozenset(
 _raw_score_history: dict[str, deque[float | None]] = {}
 _er_history: dict[str, deque[float | None]] = {}
 _confidence_history: dict[str, deque[float | None]] = {}
+_rate_component_history: dict[str, deque[float | None]] = {}
 # ATR(14) snapshot at the start of the current regime episode.
 _atr_at_regime_entry: dict[str, float | None] = {}
 # Last session date that appended score/ER/confidence for a ticker.
@@ -82,6 +83,11 @@ def get_confidence_history(ticker: str) -> list[float | None]:
     return list(_hist_deque(_confidence_history, ticker))
 
 
+def get_rate_component_history(ticker: str) -> list[float | None]:
+    """Last ≤60 tanh-squashed rate-component values (oldest→newest)."""
+    return list(_hist_deque(_rate_component_history, ticker))
+
+
 def get_atr_at_regime_entry(ticker: str) -> float | None:
     """ATR(14) captured when the current regime episode began."""
     return _atr_at_regime_entry.get((ticker or "").strip().upper())
@@ -97,13 +103,21 @@ def _record_histories(
     atr: float | None,
     prev_atr_entry: float | None,
     append_series: bool = True,
+    rate_component_val: float | None = None,
 ) -> float | None:
-    """Update atr_at_regime_entry; optionally append score/ER/confidence series."""
+    """Update atr_at_regime_entry; optionally append score/ER/confidence/rate series."""
     tku = (ticker or "").strip().upper()
     if append_series:
         _hist_deque(_raw_score_history, tku).append(float(raw_score))
         _hist_deque(_er_history, tku).append(None if er is None else float(er))
         _hist_deque(_confidence_history, tku).append(float(confidence))
+        if rate_component_val is None:
+            _hist_deque(_rate_component_history, tku).append(None)
+        else:
+            try:
+                _hist_deque(_rate_component_history, tku).append(float(rate_component_val))
+            except (TypeError, ValueError):
+                _hist_deque(_rate_component_history, tku).append(None)
 
     atr_f: float | None
     try:
@@ -284,6 +298,7 @@ def compute_pair_regime(
             atr=atr,
             prev_atr_entry=float(prev_atr_entry) if prev_atr_entry is not None else None,
             append_series=False,
+            rate_component_val=float(rate_c),
         )
         return {
             "ticker": tku,
@@ -351,6 +366,7 @@ def compute_pair_regime(
         atr=atr,
         prev_atr_entry=float(prev_atr_entry) if prev_atr_entry is not None else None,
         append_series=append_series,
+        rate_component_val=float(rate_c),
     )
     if append_series and ds:
         _last_history_session[tku] = ds
