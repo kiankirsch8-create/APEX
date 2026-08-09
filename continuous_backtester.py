@@ -4523,12 +4523,15 @@ def _trend_continuation_forward_sim(
     atr: float = 0.0,
     buffer_stop_price: float | None = None,
     ticker: str = "",
+    trail_activate_r: float | None = None,
 ) -> dict[str, Any]:
     """
     Forward sim for TREND-CONTINUATION trades (evaluate_forward_candles unchanged).
     At TP3: close 75% of remainder, keep 25% runner with 5R floor + H4 swing trail.
+    ``trail_activate_r`` (shadow only): substitute TP1/trail-activation R for the default 2.0.
     """
     d = str(direction or "").strip().upper()
+    quiet = trail_activate_r is not None
     if forward_df is None or forward_df.empty or d not in ("LONG", "SHORT"):
         return evaluate_forward_candles(
             direction,
@@ -4547,6 +4550,7 @@ def _trend_continuation_forward_sim(
             atr=atr,
             buffer_stop_price=buffer_stop_price,
             ticker=ticker,
+            trail_activate_r=trail_activate_r,
         )
 
     entry_price = float(entry)
@@ -4569,10 +4573,12 @@ def _trend_continuation_forward_sim(
             atr=atr,
             buffer_stop_price=buffer_stop_price,
             ticker=ticker,
+            trail_activate_r=trail_activate_r,
         )
 
     sign = 1.0 if d == "LONG" else -1.0
-    tp1p = entry_price + sign * risk * 2.0
+    act_r = float(trail_activate_r) if trail_activate_r is not None else 2.0
+    tp1p = entry_price + sign * risk * act_r
     tp2p = entry_price + sign * risk * 4.0
     tp3p = entry_price + sign * risk * 7.0
     ps = float(position_size or 0.0)
@@ -4633,10 +4639,11 @@ def _trend_continuation_forward_sim(
                 if sh > last_swing_high and sl_sw > 0 and sl_sw > continuation_sl:
                     continuation_sl = sl_sw
                     last_swing_high = sh
-                    log(
-                        f"[TREND-CONTINUATION] {ticker}: SL→{continuation_sl:.5f}",
-                        level="info",
-                    )
+                    if not quiet:
+                        log(
+                            f"[TREND-CONTINUATION] {ticker}: SL→{continuation_sl:.5f}",
+                            level="info",
+                        )
                 if low <= continuation_sl:
                     hit_stop = True
                     q = ps * rem
@@ -4650,10 +4657,11 @@ def _trend_continuation_forward_sim(
                     if sh > 0 and sh < continuation_sl:
                         continuation_sl = sh
                         last_swing_low = sl_sw
-                        log(
-                            f"[TREND-CONTINUATION] {ticker}: SL→{continuation_sl:.5f}",
-                            level="info",
-                        )
+                        if not quiet:
+                            log(
+                                f"[TREND-CONTINUATION] {ticker}: SL→{continuation_sl:.5f}",
+                                level="info",
+                            )
                 if high >= continuation_sl:
                     hit_stop = True
                     q = ps * rem
@@ -4694,10 +4702,11 @@ def _trend_continuation_forward_sim(
                 continuation_sl = entry_price + risk * 5.0
                 continuation_active = True
                 last_swing_high = high
-                log(
-                    f"[TREND-CONTINUATION] {ticker}: TP3 runner 25% rem, floor SL={continuation_sl:.5f}",
-                    level="info",
-                )
+                if not quiet:
+                    log(
+                        f"[TREND-CONTINUATION] {ticker}: TP3 runner 25% rem, floor SL={continuation_sl:.5f}",
+                        level="info",
+                    )
         else:
             if high >= current_stop and rem > 0:
                 hit_stop = True
@@ -4728,10 +4737,11 @@ def _trend_continuation_forward_sim(
                 continuation_sl = entry_price - risk * 5.0
                 continuation_active = True
                 last_swing_low = low
-                log(
-                    f"[TREND-CONTINUATION] {ticker}: TP3 runner 25% rem, floor SL={continuation_sl:.5f}",
-                    level="info",
-                )
+                if not quiet:
+                    log(
+                        f"[TREND-CONTINUATION] {ticker}: TP3 runner 25% rem, floor SL={continuation_sl:.5f}",
+                        level="info",
+                    )
 
     if not hit_stop and rem > 0 and not forward_df.empty:
         try:
@@ -4793,6 +4803,7 @@ def _evaluate_forward_with_trend_continuation(
     buffer_stop_price: float | None = None,
     ticker: str = "",
     period_mode: str = "NEUTRAL",
+    trail_activate_r: float | None = None,
 ) -> dict[str, Any]:
     """Position-management wrapper — leaves ``evaluate_forward_candles`` untouched."""
     mb = str(macro_bias_adjusted or macro_bias or "").strip().upper()
@@ -4811,6 +4822,7 @@ def _evaluate_forward_with_trend_continuation(
             atr=atr,
             buffer_stop_price=buffer_stop_price,
             ticker=ticker,
+            trail_activate_r=trail_activate_r,
         )
     return evaluate_forward_candles(
         direction,
@@ -4832,6 +4844,7 @@ def _evaluate_forward_with_trend_continuation(
         atr=atr,
         buffer_stop_price=buffer_stop_price,
         ticker=ticker,
+        trail_activate_r=trail_activate_r,
     )
 
 
@@ -4856,13 +4869,19 @@ def evaluate_forward_candles(
     atr: float = 0.0,
     buffer_stop_price: float | None = None,
     ticker: str = "",
+    trail_activate_r: float | None = None,
 ) -> dict[str, Any]:
-    """v7.5 — first-candle buffer stop; v7.4+ regime TP ladders and trailing (TRENDING vs CHOPPY)."""
+    """v7.5 — first-candle buffer stop; v7.4+ regime TP ladders and trailing (TRENDING vs CHOPPY).
+
+    ``trail_activate_r`` (shadow only): substitute TP1/trail-activation R for the
+    regime default (2.0 TRENDING / 1.5 CHOPPY). Live callers leave this None.
+    """
     _ = strategy_id
     _ = leverage
     _ = tp1
     _ = tp2
     _ = tp3
+    quiet = trail_activate_r is not None
     if forward_df is None or forward_df.empty:
         return {
             "outcome": "NO_DATA",
@@ -4928,13 +4947,16 @@ def evaluate_forward_candles(
     if tf_lc == "4h":
         regime = "CHOPPY"
     sym_l = (ticker or "").strip().upper() or "?"
-    log(
-        f"[TRAIL REGIME] {sym_l} {tf_lc or '?'}: {regime} "
-        f"(macro_adj={str(macro_bias_adjusted or macro_bias or '').strip().upper()} "
-        f"trend={trend_strength:.2f} rate_diff={rate_differential:.2f})",
-        level="info",
-    )
+    if not quiet:
+        log(
+            f"[TRAIL REGIME] {sym_l} {tf_lc or '?'}: {regime} "
+            f"(macro_adj={str(macro_bias_adjusted or macro_bias or '').strip().upper()} "
+            f"trend={trend_strength:.2f} rate_diff={rate_differential:.2f})",
+            level="info",
+        )
     mult1, mult2, mult3 = (2.0, 4.0, 7.0) if regime == "TRENDING" else (1.5, 3.0, 5.0)
+    if trail_activate_r is not None:
+        mult1 = float(trail_activate_r)
     sign = 1.0 if d == "LONG" else -1.0
     tp1p = entry_price + sign * risk * mult1
     tp2p = entry_price + sign * risk * mult2
@@ -5036,11 +5058,12 @@ def evaluate_forward_candles(
                 )
                 if regime == "CHOPPY":
                     _close_frac(0.25, tp1p)
-                    log(
-                        f"[TRAIL] TP1 hit CHOPPY — stop breakeven, closed 25%, trailing started",
-                        level="info",
-                    )
-                else:
+                    if not quiet:
+                        log(
+                            f"[TRAIL] TP1 hit CHOPPY — stop breakeven, closed 25%, trailing started",
+                            level="info",
+                        )
+                elif not quiet:
                     log(f"[TRAIL] TP1 hit — stop moved to breakeven, full position kept", level="info")
 
             if high >= tp2p and not hit_tp2 and hit_tp1:
@@ -5099,11 +5122,12 @@ def evaluate_forward_candles(
                 )
                 if regime == "CHOPPY":
                     _close_frac(0.25, tp1p)
-                    log(
-                        f"[TRAIL] TP1 hit CHOPPY — stop breakeven, closed 25%, trailing started",
-                        level="info",
-                    )
-                else:
+                    if not quiet:
+                        log(
+                            f"[TRAIL] TP1 hit CHOPPY — stop breakeven, closed 25%, trailing started",
+                            level="info",
+                        )
+                elif not quiet:
                     log(f"[TRAIL] TP1 hit — stop moved to breakeven, full position kept", level="info")
 
             if low <= tp2p and not hit_tp2 and hit_tp1:
@@ -5271,6 +5295,7 @@ _SHADOW_FIELD_KEYS: tuple[str, ...] = (
     "shadow_mult_edge",
     "shadow_mult_stheavy",
     "shadow_mult_conf",
+    "shadow_mult_conf_capped",
 )
 
 # Candidate sizing ladders keyed by shadow_bias label (write-only logging).
@@ -5295,6 +5320,98 @@ _SHADOW_LADDER_STHEAVY: dict[str, float] = {
     "HEADWIND": 0.80,
     "STRONG_HEADWIND": 0.90,
 }
+
+# Shadow-only trail activation R multiples (write-only; never drive live exits).
+_SHADOW_TRAIL_ACTIVATE_RS: tuple[tuple[str, float], ...] = (
+    ("shadow_trail_at_0_50r", 0.50),
+    ("shadow_trail_at_1_00r", 1.00),
+    ("shadow_trail_at_1_50r", 1.50),
+    ("shadow_trail_at_2_50r", 2.50),
+)
+
+
+def _shadow_trail_null_fields() -> dict[str, Any]:
+    return {name: None for name, _ in _SHADOW_TRAIL_ACTIVATE_RS}
+
+
+def _shadow_trail_activation_fields(
+    *,
+    direction: str,
+    entry: float,
+    stop_loss: float,
+    tp1: float,
+    tp2: float,
+    tp3: float,
+    forward_df: pd.DataFrame,
+    strategy_id: str = "",
+    position_size: float = 0.0,
+    leveraged_exposure: float = 0.0,
+    timeframe: str = "",
+    macro_bias: str = "",
+    macro_bias_adjusted: str = "",
+    trail_regime: str = "",
+    trend_strength: float = 0.0,
+    rate_differential: float = 0.0,
+    atr: float = 0.0,
+    buffer_stop_price: float | None = None,
+    ticker: str = "",
+    period_mode: str = "NEUTRAL",
+) -> dict[str, Any]:
+    """
+    Replay the same forward path with alternate trail-activation R levels.
+    Write-only — results never feed entry/exit/sizing/gating.
+    """
+    try:
+        out: dict[str, Any] = {}
+        for field_name, act_r in _SHADOW_TRAIL_ACTIVATE_RS:
+            sim = _evaluate_forward_with_trend_continuation(
+                direction,
+                entry,
+                stop_loss,
+                tp1,
+                tp2,
+                tp3,
+                forward_df,
+                strategy_id,
+                position_size=position_size,
+                leverage=LEVERAGE,
+                timeframe=timeframe,
+                macro_bias=macro_bias,
+                macro_bias_adjusted=macro_bias_adjusted,
+                trail_regime=trail_regime,
+                trend_strength=trend_strength,
+                rate_differential=rate_differential,
+                atr=atr,
+                buffer_stop_price=buffer_stop_price,
+                ticker=ticker,
+                period_mode=period_mode,
+                trail_activate_r=float(act_r),
+            )
+            raw_pct = float(sim.get("pnl_pct", 0) or 0)
+            candles = int(sim.get("candles_to_exit", 0) or 0)
+            pnl_d, pnl_pct, _gross, _cf = _apply_realistic_costs(
+                ticker=ticker,
+                direction=direction,
+                timeframe=timeframe,
+                position_size=position_size,
+                entry=entry,
+                leveraged_exposure=leveraged_exposure,
+                raw_pct=raw_pct,
+                candles_to_exit=candles,
+            )
+            out[field_name] = {
+                "exit_price": sim.get("exit_price"),
+                "exit_reason": sim.get("exit_reason"),
+                "pnl_dollars": pnl_d,
+                "pnl_pct": pnl_pct,
+            }
+        return out
+    except Exception as e:  # noqa: BLE001
+        log(
+            f"[SHADOW TRAIL] {str(ticker or '').strip().upper()}: {e}",
+            level="warning",
+        )
+        return _shadow_trail_null_fields()
 
 
 def _shadow_null_fields() -> dict[str, Any]:
@@ -5386,21 +5503,28 @@ def _shadow_ladder_mults(
             "shadow_mult_edge": None,
             "shadow_mult_stheavy": None,
             "shadow_mult_conf": None,
+            "shadow_mult_conf_capped": None,
         }
     conf_mult: float | None
+    conf_capped: float | None
     try:
         if confidence is None:
             conf_mult = None
+            conf_capped = None
         else:
             conf_mult = round(0.70 + 0.90 * float(confidence), 6)
+            # Same formula, hard-clamped to [0.70, 1.51] (write-only).
+            conf_capped = round(max(0.70, min(1.51, conf_mult)), 6)
     except (TypeError, ValueError):
         conf_mult = None
+        conf_capped = None
     return {
         "shadow_mult_current": _SHADOW_LADDER_CURRENT[b],
         "shadow_mult_flat": 1.00,
         "shadow_mult_edge": _SHADOW_LADDER_EDGE[b],
         "shadow_mult_stheavy": _SHADOW_LADDER_STHEAVY[b],
         "shadow_mult_conf": conf_mult,
+        "shadow_mult_conf_capped": conf_capped,
     }
 
 
@@ -6797,6 +6921,28 @@ def _python_forced_layer2_trade(
                 else None
             ),
         ),
+        **_shadow_trail_activation_fields(
+            direction=direction,
+            entry=entry,
+            stop_loss=normal_stop_v75,
+            tp1=tp1,
+            tp2=tp2,
+            tp3=tp3,
+            forward_df=fut,
+            strategy_id=strat_id,
+            position_size=position_size,
+            leveraged_exposure=leveraged_exposure,
+            timeframe=tf_key,
+            macro_bias=str(ai.get("macro_bias", "") or ""),
+            macro_bias_adjusted=mb_adj,
+            trail_regime=trail_reg,
+            trend_strength=ts_ev,
+            rate_differential=float(ai.get("macro_rate_diff", 0) or 0),
+            atr=float(atr_ref or v75_meta.get("entry_atr", 0) or 0),
+            buffer_stop_price=buffer_stop_v75,
+            ticker=sym,
+            period_mode=str(ai.get("period_mode") or period_mode),
+        ),
     }
 
 
@@ -7792,6 +7938,30 @@ def run_one_backtest(
             candles_to_exit=candles_to_exit,
         )
 
+        # Shadow trail sims need the forward path — run before del fut.
+        _shadow_trail_fields = _shadow_trail_activation_fields(
+            direction=direction,
+            entry=entry,
+            stop_loss=normal_stop_v75,
+            tp1=tp1,
+            tp2=tp2,
+            tp3=tp3,
+            forward_df=fut,
+            strategy_id=strategy_id_norm,
+            position_size=position_size,
+            leveraged_exposure=leveraged_exposure,
+            timeframe=tf_key,
+            macro_bias=str(ai.get("macro_bias", "") or ""),
+            macro_bias_adjusted=mb_adj,
+            trail_regime=trail_reg,
+            trend_strength=ts_cl,
+            rate_differential=float(ai.get("macro_rate_diff", 0) or 0),
+            atr=float(ind.get("atr", 0) or v75_meta.get("entry_atr", 0) or 0),
+            buffer_stop_price=buffer_stop_v75,
+            ticker=sym,
+            period_mode=str(ai.get("period_mode") or period_mode),
+        )
+
         cond_snap = (
             _trade_condition_snapshot_fields(analysis_date, past, ind)
             if chrono_yfinance
@@ -8003,6 +8173,7 @@ def run_one_backtest(
                     else None
                 ),
             ),
+            **_shadow_trail_fields,
         }
 
     except Exception as e:  # noqa: BLE001
