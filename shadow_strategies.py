@@ -3016,6 +3016,1005 @@ def phw15_midweek_reversion_harvest(ctx: ShadowStrategyContext) -> dict[str, Any
     return sig
 
 
+# ── PART PNT — NEUTRAL-regime shadow family (15 strategies) ───────────────────
+
+_PNT04_PARTNERS = {
+    "EURUSD": "GBPUSD", "GBPUSD": "EURUSD",
+    "AUDUSD": "NZDUSD", "NZDUSD": "AUDUSD",
+    "EURJPY": "GBPJPY", "GBPJPY": "EURJPY",
+    "AUDJPY": "NZDJPY", "NZDJPY": "AUDJPY",
+}
+
+_PNT05_TRIANGLES = {
+    "EURGBP": ("EURUSD", "GBPUSD", "ratio"),
+    "EURAUD": ("EURUSD", "AUDUSD", "ratio"),
+    "GBPAUD": ("GBPUSD", "AUDUSD", "ratio"),
+    "EURJPY": ("EURUSD", "USDJPY", "product"),
+    "GBPJPY": ("GBPUSD", "USDJPY", "product"),
+    "AUDJPY": ("AUDUSD", "USDJPY", "product"),
+    "NZDJPY": ("NZDUSD", "USDJPY", "product"),
+    "CADJPY": ("USDJPY", "USDCAD", "quotient"),
+}
+
+
+def _pnt_gate(ctx: ShadowStrategyContext) -> bool:
+    """True only when both LONG and SHORT map to NEUTRAL for the pair state."""
+    from continuous_backtester import _shadow_bias_from_state
+
+    return (
+        _shadow_bias_from_state(ctx.regime_state, "LONG") == "NEUTRAL"
+        and _shadow_bias_from_state(ctx.regime_state, "SHORT") == "NEUTRAL"
+    )
+
+
+def _pnt_partner_score_neutral(ticker: str) -> bool:
+    """True if partner's latest raw score is inside the mild band (|s| < 0.25)."""
+    from regime_engine import get_score_history
+
+    hist = get_score_history(ticker)
+    val = None
+    for x in reversed(hist):
+        if x is not None:
+            val = float(x)
+            break
+    if val is None:
+        return False
+    return abs(val) < 0.25
+
+
+def _pnt_normalize_close_index(s: pd.Series) -> pd.Series:
+    out = pd.to_numeric(s, errors="coerce").copy()
+    try:
+        out.index = pd.to_datetime(out.index).normalize()
+    except Exception:  # noqa: BLE001
+        return out
+    # Keep last value if duplicate calendar dates appear.
+    out = out[~out.index.duplicated(keep="last")]
+    return out
+
+
+def _pnt_aligned_closes(
+    ctx: ShadowStrategyContext, partner: str, min_rows: int,
+) -> tuple[pd.Series, pd.Series] | None:
+    a = ctx.ohlc()
+    if a is None or a.empty or "Close" not in a.columns:
+        return None
+    b = ctx.get_pair_history(partner)
+    if b is None or b.empty or "Close" not in b.columns:
+        return None
+    ca = _pnt_normalize_close_index(a["Close"])
+    cb = _pnt_normalize_close_index(b["Close"])
+    joined = pd.concat([ca.rename("a"), cb.rename("b")], axis=1, join="inner")
+    joined = joined.dropna().sort_index()
+    if len(joined) < int(min_rows):
+        return None
+    return joined["a"], joined["b"]
+
+
+def _pnt_r20(closes: pd.Series) -> pd.Series:
+    prev = closes.shift(20)
+    return (closes - prev) / prev
+
+
+def _pnt_price_target_sane(direction: str, level: float, close: float) -> bool:
+    if direction == "SHORT":
+        return level < close
+    if direction == "LONG":
+        return level > close
+    return False
+
+
+# ── PNT01 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PNT01_DUAL_BOUNDARY_ROTATION")
+def pnt01_dual_boundary_rotation(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    if not _pnt_gate(ctx):
+        return None
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    _o, h, l, c = arr
+    i = len(c) - 1
+    atr = _phw_atr_at(h, l, c, i)
+    rng = _phw_range_prior_20(h, l, i)
+    if atr is None or rng is None:
+        return None
+    hi, lo, _mid, width = rng
+    if width < 2.5 * atr:
+        return None
+    # Prefer LONG if both sides somehow pass.
+    long_ok = False
+    short_ok = False
+    long_stop = short_stop = None
+    touches_lo = _phw_boundary_touches(
+        h, l, c, i, lo, "lower", atr, lookback=50, tol_mult=0.2,
+    )
+    if touches_lo != -1 and touches_lo >= 3:
+        if float(l.iloc[i]) < lo and float(c.iloc[i]) >= lo + 0.3 * atr:
+            long_ok = True
+            long_stop = lo - 0.75 * atr
+    touches_hi = _phw_boundary_touches(
+        h, l, c, i, hi, "upper", atr, lookback=50, tol_mult=0.2,
+    )
+    if touches_hi != -1 and touches_hi >= 3:
+        if float(h.iloc[i]) > hi and float(c.iloc[i]) <= hi - 0.3 * atr:
+            short_ok = True
+            short_stop = hi + 0.75 * atr
+    if long_ok and long_stop is not None:
+        return _psh_signal(
+            direction="LONG", stop_price=float(long_stop), timeframe="1d",
+            strategy_id="PNT01_DUAL_BOUNDARY_ROTATION",
+        )
+    if short_ok and short_stop is not None:
+        return _psh_signal(
+            direction="SHORT", stop_price=float(short_stop), timeframe="1d",
+            strategy_id="PNT01_DUAL_BOUNDARY_ROTATION",
+        )
+    return None
+
+
+# ── PNT02 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PNT02_UNDERSHOOT_FAILURE_SWING")
+def pnt02_undershoot_failure_swing(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    if not _pnt_gate(ctx):
+        return None
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    _o, h, l, c = arr
+    i = len(c) - 1
+    if i < 20:
+        return None
+    atr = _phw_atr_at(h, l, c, i)
+    if atr is None:
+        return None
+    prior_hi = float(h.iloc[i - 20 : i].max())
+    prior_lo = float(l.iloc[i - 20 : i].min())
+    if prior_hi != prior_hi or prior_lo != prior_lo:
+        return None
+    highs = [float(x) for x in h.tolist()]
+    lows = [float(x) for x in l.tolist()]
+    f_hi, f_lo = _psh_fractal_swings(highs, lows)
+    close_i = float(c.iloc[i])
+    long_sig = None
+    short_sig = None
+    # SHORT: failure at upper extreme
+    for idx_f in range(len(f_hi) - 1, -1, -1):
+        fi, fp = f_hi[idx_f]
+        if not (prior_hi - 1.0 * atr <= fp <= prior_hi - 0.3 * atr):
+            continue
+        P = None
+        for lj, lp in reversed(f_lo):
+            if lj < fi:
+                P = (lj, lp)
+                break
+        if P is None:
+            continue
+        mid = (fp + P[1]) / 2.0
+        if close_i < mid:
+            short_sig = _psh_signal(
+                direction="SHORT", stop_price=float(fp), timeframe="1d",
+                strategy_id="PNT02_UNDERSHOOT_FAILURE_SWING",
+            )
+        break
+    # LONG: mirror at lower extreme
+    for idx_f in range(len(f_lo) - 1, -1, -1):
+        fi, fp = f_lo[idx_f]
+        if not (prior_lo + 0.3 * atr <= fp <= prior_lo + 1.0 * atr):
+            continue
+        P = None
+        for hj, hp in reversed(f_hi):
+            if hj < fi:
+                P = (hj, hp)
+                break
+        if P is None:
+            continue
+        mid = (fp + P[1]) / 2.0
+        if close_i > mid:
+            long_sig = _psh_signal(
+                direction="LONG", stop_price=float(fp), timeframe="1d",
+                strategy_id="PNT02_UNDERSHOOT_FAILURE_SWING",
+            )
+        break
+    if long_sig is not None:
+        return long_sig
+    return short_sig
+
+
+# ── PNT03 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PNT03_COMPRESSION_BOX_STRADDLE")
+def pnt03_compression_box_straddle(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    if not _pnt_gate(ctx):
+        return None
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    _o, h, l, c = arr
+    i = len(c) - 1
+    # Need enough bars for BB(20) + 60-width window ending at i-2
+    if i < 20 + 59:
+        return None
+    atr = _phw_atr_at(h, l, c, i)
+    if atr is None:
+        return None
+    upper, _mid, lower = _psh_bbands(c, 20, 2.0)
+    width = upper - lower
+    for j in (i - 2, i - 1, i):
+        if j < 59:
+            return None
+        wj = float(width.iloc[j]) if pd.notna(width.iloc[j]) else None
+        if wj is None:
+            return None
+        window = width.iloc[j - 59 : j + 1]
+        if window.isna().any() or len(window) < 60:
+            return None
+        wmin = float(window.min())
+        if wj > wmin + 1e-12:
+            return None
+    if i < 10:
+        return None
+    box_hi = float(h.iloc[i - 10 : i].max())
+    box_lo = float(l.iloc[i - 10 : i].min())
+    if box_hi != box_hi or box_lo != box_lo:
+        return None
+    close_i = float(c.iloc[i])
+    if close_i > box_hi:
+        return _psh_signal(
+            direction="LONG", stop_price=float(box_lo), timeframe="1d",
+            strategy_id="PNT03_COMPRESSION_BOX_STRADDLE",
+        )
+    if close_i < box_lo:
+        return _psh_signal(
+            direction="SHORT", stop_price=float(box_hi), timeframe="1d",
+            strategy_id="PNT03_COMPRESSION_BOX_STRADDLE",
+        )
+    return None
+
+
+# ── PNT04 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PNT04_CORRELATED_PAIR_DIVERGENCE")
+def pnt04_correlated_pair_divergence(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    if not _pnt_gate(ctx):
+        return None
+    partner = _PNT04_PARTNERS.get(str(ctx.ticker).upper())
+    if partner is None:
+        return None
+    if not _pnt_partner_score_neutral(partner):
+        return None
+    pair_data = _pnt_aligned_closes(ctx, partner, min_rows=81)
+    if pair_data is None:
+        return None
+    traded, partner_c = pair_data
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    _o, h, l, c = arr
+    i = len(c) - 1
+    atr = _phw_atr_at(h, l, c, i)
+    if atr is None:
+        return None
+    ra = _pnt_r20(traded)
+    rb = _pnt_r20(partner_c)
+    spread = ra - rb
+    sp = spread.dropna()
+    if len(sp) < 60:
+        return None
+    window = sp.iloc[-60:]
+    mu = float(window.mean())
+    sigma = float(window.std(ddof=0))
+    if sigma <= 0 or sigma != sigma or mu != mu:
+        return None
+    # Pearson corr of last 60 aligned 1-day pct returns
+    r1a = traded.pct_change()
+    r1b = partner_c.pct_change()
+    rjoin = pd.concat([r1a.rename("a"), r1b.rename("b")], axis=1).dropna()
+    if len(rjoin) < 60:
+        return None
+    rtail = rjoin.iloc[-60:]
+    corr = float(rtail["a"].corr(rtail["b"]))
+    if corr != corr or corr < 0.70:
+        return None
+    spread_now = float(sp.iloc[-1])
+    z = (spread_now - mu) / sigma
+    if abs(z) < 2.0:
+        return None
+    direction = "SHORT" if z > 0 else "LONG"
+    sign_z = 1.0 if z > 0 else -1.0
+    last_dt = sp.index[-1]
+    try:
+        rb_now = float(rb.loc[last_dt])
+    except Exception:  # noqa: BLE001
+        return None
+    if rb_now != rb_now:
+        return None
+    spread_star = mu + 0.5 * sigma * sign_z
+    r20_star = spread_star + rb_now
+    # Anchor = traded aligned close 20 rows back (R20 denominator).
+    try:
+        pos = traded.index.get_loc(last_dt)
+    except Exception:  # noqa: BLE001
+        return None
+    if isinstance(pos, slice):
+        return None
+    if not isinstance(pos, (int,)):
+        try:
+            pos = int(pos[-1])  # type: ignore[index]
+        except Exception:  # noqa: BLE001
+            return None
+    pos = int(pos)
+    if pos < 20:
+        return None
+    anchor = float(traded.iloc[pos - 20])
+    if anchor != anchor or anchor == 0:
+        return None
+    level = anchor * (1.0 + r20_star)
+    close_now = float(traded.iloc[pos])
+    if not _pnt_price_target_sane(direction, level, close_now):
+        return None
+    sig = _psh_signal(
+        direction=direction,
+        stop_price=float(close_now),
+        timeframe="1d",
+        strategy_id="PNT04_CORRELATED_PAIR_DIVERGENCE",
+        custom_exit={"type": "price_target", "level": float(level)},
+    )
+    sig["stop_atr_mult"] = 1.25
+    return sig
+
+
+# ── PNT05 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PNT05_TRIANGLE_CONSISTENCY_SNAP")
+def pnt05_triangle_consistency_snap(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    if not _pnt_gate(ctx):
+        return None
+    tri = _PNT05_TRIANGLES.get(str(ctx.ticker).upper())
+    if tri is None:
+        return None
+    legA, legB, kind = tri
+    if not _pnt_partner_score_neutral(legA):
+        return None
+    if not _pnt_partner_score_neutral(legB):
+        return None
+    a = _pnt_aligned_closes(ctx, legA, 61)
+    b = _pnt_aligned_closes(ctx, legB, 61)
+    if a is None or b is None:
+        return None
+    traded_a, legA_c = a
+    traded_b, legB_c = b
+    joined = pd.concat(
+        [
+            traded_a.rename("cross"),
+            legA_c.rename("legA"),
+            legB_c.rename("legB"),
+        ],
+        axis=1,
+        join="inner",
+    ).dropna().sort_index()
+    if len(joined) < 61:
+        return None
+    kind_u = str(kind).strip().lower()
+    if kind_u in ("ratio", "quotient"):
+        implied = joined["legA"] / joined["legB"]
+    elif kind_u == "product":
+        implied = joined["legA"] * joined["legB"]
+    else:
+        return None
+    dev = joined["cross"] - implied
+    if len(dev) < 61:
+        return None
+    last60 = dev.iloc[-60:]
+    if last60.isna().any():
+        return None
+    sigma = float(last60.std(ddof=0))
+    if sigma <= 0 or sigma != sigma:
+        return None
+    # sigma from last 60; abs(dev_now) vs that sigma — prompt: std of last 60
+    # (does not include requiring 61 for sigma window beyond the series length)
+    # Use last60 as specified.
+    # Actually re-read: "sigma = std (ddof=0) of the last 60 dev values"
+    # and we have >= 61 rows so current + 60 prior exists; last 60 of full series
+    # includes current. That's fine / matches "last 60".
+    dev_now = float(dev.iloc[-1])
+    if abs(dev_now) < 1.5 * sigma:
+        return None
+    direction = "SHORT" if dev_now > 0 else "LONG"
+    sign_d = 1.0 if dev_now > 0 else -1.0
+    implied_now = float(implied.iloc[-1])
+    level = implied_now + 0.5 * sigma * sign_d
+    close_now = float(joined["cross"].iloc[-1])
+    if not _pnt_price_target_sane(direction, level, close_now):
+        return None
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    _o, h, l, c = arr
+    i = len(c) - 1
+    atr = _phw_atr_at(h, l, c, i)
+    if atr is None:
+        return None
+    stop_px = close_now - 1.0 * atr if direction == "LONG" else close_now + 1.0 * atr
+    sig = _psh_signal(
+        direction=direction,
+        stop_price=float(stop_px),
+        timeframe="1d",
+        strategy_id="PNT05_TRIANGLE_CONSISTENCY_SNAP",
+        custom_exit={"type": "price_target", "level": float(level)},
+    )
+    sig["stop_atr_mult"] = 1.0
+    return sig
+
+
+# ── PNT06 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PNT06_STRENGTH_LADDER_FADE")
+def pnt06_strength_ladder_fade(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    if not _pnt_gate(ctx):
+        return None
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    o, h, l, c = arr
+    i = len(c) - 1
+    atr = _phw_atr_at(h, l, c, i)
+    if atr is None:
+        return None
+    rets = ctx.get_universe_returns(10)
+    strength: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    for pair, ret in rets.items():
+        p = str(pair).strip().upper()
+        if len(p) != 6 or not p.isalpha():
+            continue
+        try:
+            r = float(ret)
+        except (TypeError, ValueError):
+            continue
+        if r != r:
+            continue
+        base, quote = p[:3], p[3:]
+        strength[base] = strength.get(base, 0.0) + r
+        counts[base] = counts.get(base, 0) + 1
+        strength[quote] = strength.get(quote, 0.0) - r
+        counts[quote] = counts.get(quote, 0) + 1
+    if len(strength) < 6:
+        return None
+    avgs = {k: strength[k] / counts[k] for k in strength if counts.get(k, 0) > 0}
+    if len(avgs) < 6:
+        return None
+    vals = list(avgs.values())
+    mu = float(sum(vals) / len(vals))
+    var = float(sum((v - mu) ** 2 for v in vals) / len(vals))
+    sigma = var ** 0.5
+    if sigma <= 0:
+        return None
+    zmap = {k: (avgs[k] - mu) / sigma for k in avgs}
+    tku = str(ctx.ticker).strip().upper()
+    if len(tku) != 6:
+        return None
+    base, quote = tku[:3], tku[3:]
+    if base not in zmap or quote not in zmap:
+        return None
+    bz = float(zmap[base])
+    qz = float(zmap[quote])
+    if abs(bz) >= abs(qz):
+        extreme_z = bz
+        if abs(extreme_z) < 1.5:
+            return None
+        direction = "SHORT" if extreme_z > 0 else "LONG"
+    else:
+        extreme_z = qz
+        if abs(extreme_z) < 1.5:
+            return None
+        direction = "LONG" if extreme_z > 0 else "SHORT"
+    open_i = float(o.iloc[i])
+    close_i = float(c.iloc[i])
+    if direction == "SHORT" and not (close_i < open_i):
+        return None
+    if direction == "LONG" and not (close_i > open_i):
+        return None
+    highs = [float(x) for x in h.tolist()]
+    lows = [float(x) for x in l.tolist()]
+    f_hi, f_lo = _psh_fractal_swings(highs, lows)
+    if direction == "LONG":
+        if not f_lo:
+            return None
+        _fi, fp = f_lo[-1]
+        stop = float(fp) - 1.25 * atr
+    else:
+        if not f_hi:
+            return None
+        _fi, fp = f_hi[-1]
+        stop = float(fp) + 1.25 * atr
+    return _psh_signal(
+        direction=direction, stop_price=float(stop), timeframe="1d",
+        strategy_id="PNT06_STRENGTH_LADDER_FADE",
+    )
+
+
+# ── PNT07 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PNT07_DOUBLE_SIDED_SWEEP")
+def pnt07_double_sided_sweep(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    if not _pnt_gate(ctx):
+        return None
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    _o, h, l, c = arr
+    i = len(c) - 1
+    atr = _phw_atr_at(h, l, c, i)
+    if atr is None:
+        return None
+    highs = [float(x) for x in h.tolist()]
+    lows = [float(x) for x in l.tolist()]
+    f_hi, f_lo = _psh_fractal_swings(highs, lows)
+
+    def _equal_pair(swings: list[tuple[int, float]]) -> float | None:
+        best = None  # (end_idx, mean_level)
+        for a in range(len(swings) - 1):
+            for b in range(a + 1, len(swings)):
+                ia, pa = swings[a]
+                ib, pb = swings[b]
+                if ib - ia < 5:
+                    continue
+                if abs(pa - pb) <= 0.2 * atr:
+                    mean_lvl = (pa + pb) / 2.0
+                    if best is None or ib >= best[0]:
+                        best = (ib, mean_lvl)
+        return None if best is None else float(best[1])
+
+    lower_level = _equal_pair(f_lo)
+    upper_level = _equal_pair(f_hi)
+    if lower_level is None or upper_level is None:
+        return None
+    low_i = float(l.iloc[i])
+    high_i = float(h.iloc[i])
+    close_i = float(c.iloc[i])
+    long_ok = False
+    short_ok = False
+    beyond_lo = lower_level - low_i
+    if 0 < beyond_lo <= 0.5 * atr and close_i > lower_level:
+        long_ok = True
+    beyond_hi = high_i - upper_level
+    if 0 < beyond_hi <= 0.5 * atr and close_i < upper_level:
+        short_ok = True
+    if long_ok and short_ok:
+        return None
+    if long_ok:
+        return _psh_signal(
+            direction="LONG", stop_price=float(low_i), timeframe="1d",
+            strategy_id="PNT07_DOUBLE_SIDED_SWEEP",
+            custom_exit={"type": "price_target", "level": float(upper_level)},
+        )
+    if short_ok:
+        return _psh_signal(
+            direction="SHORT", stop_price=float(high_i), timeframe="1d",
+            strategy_id="PNT07_DOUBLE_SIDED_SWEEP",
+            custom_exit={"type": "price_target", "level": float(lower_level)},
+        )
+    return None
+
+
+# ── PNT08 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PNT08_INSIDE_CLUSTER_TRAP")
+def pnt08_inside_cluster_trap(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    if not _pnt_gate(ctx):
+        return None
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    o, h, l, c = arr
+    i = len(c) - 1
+    if i < 23:
+        return None
+    atr = _phw_atr_at(h, l, c, i)
+    if atr is None:
+        return None
+    # Maximal consecutive inside days ending at i-2, k in [3, 6]
+    k = 0
+    j = i - 2
+    while j >= 1 and k < 6:
+        if _psh_is_inside_day(o, h, l, c, j):
+            k += 1
+            j -= 1
+        else:
+            break
+    if k < 3:
+        return None
+    start = i - 2 - k + 1
+    cluster_hi = float(h.iloc[start : i - 1].max())  # [start, i-2]
+    cluster_lo = float(l.iloc[start : i - 1].min())
+    if cluster_hi != cluster_hi or cluster_lo != cluster_lo:
+        return None
+    # Position range over [i-21, i-2] — excludes break bar (i-1) and today
+    prior_hi = float(h.iloc[i - 21 : i - 1].max())
+    prior_lo = float(l.iloc[i - 21 : i - 1].min())
+    if prior_hi != prior_hi or prior_lo != prior_lo:
+        return None
+    span = prior_hi - prior_lo
+    if span <= 0:
+        return None
+    mid_c = (cluster_hi + cluster_lo) / 2.0
+    third = span / 3.0
+    if not (prior_lo + third <= mid_c <= prior_hi - third):
+        return None
+    close_break = float(c.iloc[i - 1])
+    break_above = close_break > cluster_hi
+    break_below = close_break < cluster_lo
+    if break_above == break_below:
+        return None
+    close_i = float(c.iloc[i])
+    if not (cluster_lo <= close_i <= cluster_hi):
+        return None
+    if break_above:
+        direction = "SHORT"
+        stop = float(h.iloc[i - 1])
+    else:
+        direction = "LONG"
+        stop = float(l.iloc[i - 1])
+    return _psh_signal(
+        direction=direction, stop_price=float(stop), timeframe="1d",
+        strategy_id="PNT08_INSIDE_CLUSTER_TRAP",
+    )
+
+
+# ── PNT09 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PNT09_EQUILIBRIUM_CRACK")
+def pnt09_equilibrium_crack(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    if not _pnt_gate(ctx):
+        return None
+    hist = [float(x) for x in ctx.score_history() if x is not None]
+    if len(hist) < 11:
+        return None
+    s0 = hist[-11]
+    s_now = hist[-1]
+    if abs(s0) > 0.05:
+        return None
+    if abs(s_now) - abs(s0) < 0.12:
+        return None
+    if s_now == 0:
+        return None
+    sign_now = 1.0 if s_now > 0 else -1.0
+    for v in hist[-11:]:
+        if v == 0:
+            continue
+        if (1.0 if v > 0 else -1.0) != sign_now:
+            return None
+    direction = "LONG" if s_now > 0 else "SHORT"
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    _o, h, l, c = arr
+    i = len(c) - 1
+    if i < 20:
+        return None
+    atr = _phw_atr_at(h, l, c, i)
+    if atr is None:
+        return None
+    prior_hi = float(h.iloc[i - 20 : i].max())
+    prior_lo = float(l.iloc[i - 20 : i].min())
+    close_i = float(c.iloc[i])
+    if direction == "LONG":
+        if close_i <= prior_hi:
+            return None
+        stop_px = close_i - 1.25 * atr
+    else:
+        if close_i >= prior_lo:
+            return None
+        stop_px = close_i + 1.25 * atr
+    sig = _psh_signal(
+        direction=direction, stop_price=float(stop_px), timeframe="1d",
+        strategy_id="PNT09_EQUILIBRIUM_CRACK",
+    )
+    sig["stop_atr_mult"] = 1.25
+    return sig
+
+
+# ── PNT10 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PNT10_ER_AWAKENING")
+def pnt10_er_awakening(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    if not _pnt_gate(ctx):
+        return None
+    eh = [float(x) for x in ctx.er_history() if x is not None]
+    if len(eh) < 11:
+        return None
+    er_now = eh[-1]
+    if er_now < 0.35:
+        return None
+    if min(eh[-11:-1]) > 0.15:
+        return None
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    _o, h, l, c = arr
+    i = len(c) - 1
+    if i < 20:
+        return None
+    atr = _phw_atr_at(h, l, c, i)
+    if atr is None:
+        return None
+    close_i = float(c.iloc[i])
+    close_prev20 = float(c.iloc[i - 20])
+    direction = "LONG" if close_i > close_prev20 else "SHORT"
+    prior_hi = float(h.iloc[i - 20 : i].max())
+    prior_lo = float(l.iloc[i - 20 : i].min())
+    if direction == "LONG":
+        if close_i <= prior_hi:
+            return None
+        stop_px = close_i - 1.25 * atr
+    else:
+        if close_i >= prior_lo:
+            return None
+        stop_px = close_i + 1.25 * atr
+    sig = _psh_signal(
+        direction=direction, stop_price=float(stop_px), timeframe="1d",
+        strategy_id="PNT10_ER_AWAKENING",
+    )
+    sig["stop_atr_mult"] = 1.25
+    return sig
+
+
+# ── PNT11 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PNT11_DWELL_MATURITY_BREAK")
+def pnt11_dwell_maturity_break(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    if not _pnt_gate(ctx):
+        return None
+    if int(ctx.regime_days_in_state) < 60:
+        return None
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    _o, h, l, c = arr
+    i = len(c) - 1
+    if i < 30:
+        return None
+    atr = _phw_atr_at(h, l, c, i)
+    if atr is None:
+        return None
+    atr_s = _psh_atr_series(h, l, c, 14)
+    atr_now = float(atr_s.iloc[i]) if pd.notna(atr_s.iloc[i]) else None
+    if atr_now is None:
+        return None
+    window = atr_s.iloc[max(0, i - 59) : i + 1].dropna()
+    if len(window) < 60:
+        return None
+    if atr_now > float(window.min()) + 1e-12:
+        return None
+    prior_hi = float(h.iloc[i - 30 : i].max())
+    prior_lo = float(l.iloc[i - 30 : i].min())
+    close_i = float(c.iloc[i])
+    if close_i > prior_hi:
+        direction = "LONG"
+        stop = float(l.iloc[i]) - 1.0 * atr
+    elif close_i < prior_lo:
+        direction = "SHORT"
+        stop = float(h.iloc[i]) + 1.0 * atr
+    else:
+        return None
+    return _psh_signal(
+        direction=direction, stop_price=float(stop), timeframe="1d",
+        strategy_id="PNT11_DWELL_MATURITY_BREAK",
+    )
+
+
+# ── PNT12 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PNT12_AUTOCORR_FADE")
+def pnt12_autocorr_fade(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    if not _pnt_gate(ctx):
+        return None
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    o, h, l, c = arr
+    i = len(c) - 1
+    if i < 22:
+        return None
+    atr = _phw_atr_at(h, l, c, i)
+    if atr is None:
+        return None
+    o1, c1 = float(o.iloc[i - 1]), float(c.iloc[i - 1])
+    o0, c0 = float(o.iloc[i]), float(c.iloc[i])
+    up1 = c1 > o1
+    dn1 = c1 < o1
+    up0 = c0 > o0
+    dn0 = c0 < o0
+    if not ((up1 and up0) or (dn1 and dn0)):
+        return None
+    if abs(c0 - float(c.iloc[i - 2])) < 1.2 * atr:
+        return None
+    prior_hi = float(h.iloc[i - 22 : i - 1].max())  # [i-22, i-2]
+    prior_lo = float(l.iloc[i - 22 : i - 1].min())
+    hi_pair = max(float(h.iloc[i - 1]), float(h.iloc[i]))
+    lo_pair = min(float(l.iloc[i - 1]), float(l.iloc[i]))
+    if hi_pair > prior_hi or lo_pair < prior_lo:
+        return None
+    direction = "SHORT" if (up1 and up0) else "LONG"
+    stop_px = c0 - 1.0 * atr if direction == "LONG" else c0 + 1.0 * atr
+    sig = _psh_signal(
+        direction=direction,
+        stop_price=float(stop_px),
+        timeframe="1d",
+        strategy_id="PNT12_AUTOCORR_FADE",
+        custom_exit={"type": "time_exit", "max_sessions": 3},
+    )
+    sig["stop_atr_mult"] = 1.0
+    return sig
+
+
+# ── PNT13 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PNT13_GAP_FILL_HARVEST")
+def pnt13_gap_fill_harvest(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    if not _pnt_gate(ctx):
+        return None
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    o, h, l, c = arr
+    i = len(c) - 1
+    if i < 21:
+        return None
+    atr = _phw_atr_at(h, l, c, i)
+    if atr is None:
+        return None
+    open_i = float(o.iloc[i])
+    close_prev = float(c.iloc[i - 1])
+    if abs(open_i - close_prev) < 0.25 * atr:
+        return None
+    prior_hi = float(h.iloc[i - 21 : i].max())  # [i-21, i-1]
+    prior_lo = float(l.iloc[i - 21 : i].min())
+    if not (prior_lo < open_i < prior_hi):
+        return None
+    low_i = float(l.iloc[i])
+    high_i = float(h.iloc[i])
+    gap_up = open_i > close_prev
+    gap_down = open_i < close_prev
+    if gap_up:
+        if low_i <= close_prev:
+            return None
+        direction = "SHORT"
+        stop = high_i + 1.0 * atr
+    elif gap_down:
+        if high_i >= close_prev:
+            return None
+        direction = "LONG"
+        stop = low_i - 1.0 * atr
+    else:
+        return None
+    return _psh_signal(
+        direction=direction,
+        stop_price=float(stop),
+        timeframe="1d",
+        strategy_id="PNT13_GAP_FILL_HARVEST",
+        custom_exit={"type": "price_target", "level": float(close_prev)},
+    )
+
+
+# ── PNT14 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PNT14_MONTH_OPEN_REVERSION")
+def pnt14_month_open_reversion(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    if not _pnt_gate(ctx):
+        return None
+    try:
+        today = date.fromisoformat(ctx.session_date)
+    except ValueError:
+        return None
+    tdays = _psh_weekday_trading_days(today.year, today.month)
+    if not tdays or today != tdays[-1]:
+        return None
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    _o, h, l, c = arr
+    i = len(c) - 1
+    if i < 2:
+        return None
+    atr = _phw_atr_at(h, l, c, i)
+    if atr is None:
+        return None
+    move = float(c.iloc[i]) - float(c.iloc[i - 2])
+    if abs(move) < 1.2 * atr:
+        return None
+    direction = "SHORT" if move > 0 else "LONG"
+    close_i = float(c.iloc[i])
+    stop_px = close_i - 1.0 * atr if direction == "LONG" else close_i + 1.0 * atr
+    sig = _psh_signal(
+        direction=direction,
+        stop_price=float(stop_px),
+        timeframe="1d",
+        strategy_id="PNT14_MONTH_OPEN_REVERSION",
+        custom_exit={"type": "time_exit", "max_sessions": 5},
+    )
+    sig["stop_atr_mult"] = 1.0
+    return sig
+
+
+# ── PNT15 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PNT15_WEEKLY_COMPRESSION_ROTATION")
+def pnt15_weekly_compression_rotation(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    if not _pnt_gate(ctx):
+        return None
+    if ctx.day_of_week != 4:
+        return None
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    _o, h, l, c = arr
+    i = len(c) - 1
+    atr = _phw_atr_at(h, l, c, i)
+    if atr is None:
+        return None
+    weekly = _psh_build_weekly_from_daily(ctx.ohlc())
+    if weekly is None or len(weekly) < 19:
+        return None
+    wi = len(weekly) - 1  # last completed week (W-FRI includes today on Friday)
+    # Compression: for each k in [wi-3, wi]: range_k < mean(ranges [k-10, k-1])
+    wh = weekly["High"]
+    wl = weekly["Low"]
+    wc = weekly["Close"]
+    for k in range(wi - 3, wi + 1):
+        if k < 10:
+            return None
+        rk = float(wh.iloc[k]) - float(wl.iloc[k])
+        prior = [(float(wh.iloc[j]) - float(wl.iloc[j])) for j in range(k - 10, k)]
+        if len(prior) < 10:
+            return None
+        mean_prior = sum(prior) / 10.0
+        if rk >= mean_prior:
+            return None
+    if wi < 7:
+        return None
+    r_hi = float(wh.iloc[wi - 7 : wi + 1].max())
+    r_lo = float(wl.iloc[wi - 7 : wi + 1].min())
+    mid = (r_hi + r_lo) / 2.0
+    span = r_hi - r_lo
+    if span <= 0:
+        return None
+    close_w = float(wc.iloc[wi])
+    if close_w <= r_lo + span / 3.0:
+        direction = "LONG"
+        stop = r_lo
+    elif close_w >= r_hi - span / 3.0:
+        direction = "SHORT"
+        stop = r_hi
+    else:
+        return None
+    return _psh_signal(
+        direction=direction,
+        stop_price=float(stop),
+        timeframe="1d",
+        strategy_id="PNT15_WEEKLY_COMPRESSION_ROTATION",
+        custom_exit={"type": "price_target", "level": float(mid)},
+    )
+
+
+
 # ── PART F — validation dummies (remove in a later prompt) ───────────────────
 def _pdummy_eurusd_monday_long(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
     """Shared entry for PDUMMY01/02: EURUSD 1d Monday open, 1×ATR stop."""
