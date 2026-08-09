@@ -4901,6 +4901,974 @@ def ptw15_stale_trend_fade(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
 
 
 
+# ── PART PST — STRONG_TAILWIND-regime shadow family (15 strategies) ───────────
+
+def _pst_gate(ctx: ShadowStrategyContext) -> str | None:
+    """Return the unique trade direction that maps to STRONG_TAILWIND, or None."""
+    from continuous_backtester import _shadow_bias_from_state
+
+    for direction in ("LONG", "SHORT"):
+        if _shadow_bias_from_state(ctx.regime_state, direction) == "STRONG_TAILWIND":
+            return direction
+    return None
+
+
+def _pst_fade(direction: str) -> str:
+    return "SHORT" if str(direction).upper() == "LONG" else "LONG"
+
+
+def _pst_bar_range(h: pd.Series, l: pd.Series, j: int) -> float | None:
+    try:
+        r = float(h.iloc[j]) - float(l.iloc[j])
+    except Exception:  # noqa: BLE001
+        return None
+    if r != r or r < 0:
+        return None
+    return r
+
+
+def _pst_close_in_trend_third(
+    *, trend: str, open_j: float, high_j: float, low_j: float, close_j: float,
+    bottom_for_long_fade: bool,
+) -> bool:
+    """
+    For T==LONG fades, rejection close sits in the bottom third of the bar.
+    For T==SHORT fades, rejection close sits in the top third.
+    """
+    rng = high_j - low_j
+    if rng <= 0:
+        return False
+    if trend == "LONG":
+        # fade SHORT — close in bottom third
+        return close_j <= low_j + rng / 3.0
+    # trend SHORT — fade LONG — close in top third
+    return close_j >= high_j - rng / 3.0
+
+
+# ── PST01 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PST01_PARABOLIC_BLOWOFF_FADE")
+def pst01_parabolic_blowoff_fade(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    trend = _pst_gate(ctx)
+    if trend is None:
+        return None
+    fade = _pst_fade(trend)
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    o, h, l, c = arr
+    i = len(c) - 1
+    if i < 23:
+        return None
+    atr = _phw_atr_at(h, l, c, i)
+    if atr is None:
+        return None
+    atr_prev = _phw_atr_at(h, l, c, i - 1)
+    if atr_prev is None:
+        return None
+    sma20 = _psh_sma(c, 20)
+    if pd.isna(sma20.iloc[i - 1]):
+        return None
+    r3 = _pst_bar_range(h, l, i - 3)
+    r2 = _pst_bar_range(h, l, i - 2)
+    r1 = _pst_bar_range(h, l, i - 1)
+    ri = _pst_bar_range(h, l, i)
+    if None in (r3, r2, r1, ri):
+        return None
+    if not (r3 < r2 < r1):
+        return None
+    # Three impulse bars in trend direction
+    for j in (i - 3, i - 2, i - 1):
+        oj, cj = float(o.iloc[j]), float(c.iloc[j])
+        if trend == "LONG":
+            if not (cj > oj):
+                return None
+        else:
+            if not (cj < oj):
+                return None
+    close_prev = float(c.iloc[i - 1])
+    sma_prev = float(sma20.iloc[i - 1])
+    if trend == "LONG":
+        if close_prev < sma_prev + 2.5 * atr_prev:
+            return None
+    else:
+        if close_prev > sma_prev - 2.5 * atr_prev:
+            return None
+    open_i = float(o.iloc[i])
+    close_i = float(c.iloc[i])
+    high_i = float(h.iloc[i])
+    low_i = float(l.iloc[i])
+    if trend == "LONG":
+        if not (close_i < open_i):
+            return None
+    else:
+        if not (close_i > open_i):
+            return None
+    if not _pst_close_in_trend_third(
+        trend=trend, open_j=open_i, high_j=high_i, low_j=low_i, close_j=close_i,
+        bottom_for_long_fade=True,
+    ):
+        return None
+    if ri < 1.0 * atr:
+        return None
+    if trend == "LONG":
+        stop = float(h.iloc[i - 3 : i + 1].max()) + 1.25 * atr
+    else:
+        stop = float(l.iloc[i - 3 : i + 1].min()) - 1.25 * atr
+    return _psh_signal(
+        direction=fade, stop_price=float(stop), timeframe="1d",
+        strategy_id="PST01_PARABOLIC_BLOWOFF_FADE",
+    )
+
+
+# ── PST02 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PST02_CLIMAX_RANGE_REJECTION")
+def pst02_climax_range_rejection(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    trend = _pst_gate(ctx)
+    if trend is None:
+        return None
+    fade = _pst_fade(trend)
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    o, h, l, c = arr
+    i = len(c) - 1
+    if i < 20:
+        return None
+    atr = _phw_atr_at(h, l, c, i)
+    if atr is None:
+        return None
+    prior_rngs = []
+    for j in range(i - 20, i):
+        rj = _pst_bar_range(h, l, j)
+        if rj is None:
+            return None
+        prior_rngs.append(rj)
+    mean_prior = sum(prior_rngs) / len(prior_rngs)
+    ri = _pst_bar_range(h, l, i)
+    if ri is None:
+        return None
+    if ri < 1.5 * mean_prior:
+        return None
+    last20 = []
+    for j in range(i - 19, i + 1):
+        rj = _pst_bar_range(h, l, j)
+        if rj is None:
+            return None
+        last20.append(rj)
+    if ri < max(last20) - 1e-12:
+        return None
+    open_i = float(o.iloc[i])
+    close_i = float(c.iloc[i])
+    high_i = float(h.iloc[i])
+    low_i = float(l.iloc[i])
+    if trend == "LONG":
+        prior_hi = float(h.iloc[i - 19 : i].max())
+        if high_i < prior_hi:
+            return None
+        if not _pst_close_in_trend_third(
+            trend=trend, open_j=open_i, high_j=high_i, low_j=low_i, close_j=close_i,
+            bottom_for_long_fade=True,
+        ):
+            return None
+        stop = high_i + 0.75 * atr
+    else:
+        prior_lo = float(l.iloc[i - 19 : i].min())
+        if low_i > prior_lo:
+            return None
+        if not _pst_close_in_trend_third(
+            trend=trend, open_j=open_i, high_j=high_i, low_j=low_i, close_j=close_i,
+            bottom_for_long_fade=True,
+        ):
+            return None
+        stop = low_i - 0.75 * atr
+    return _psh_signal(
+        direction=fade, stop_price=float(stop), timeframe="1d",
+        strategy_id="PST02_CLIMAX_RANGE_REJECTION",
+    )
+
+
+# ── PST03 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PST03_ATR_SPIKE_REVERSION")
+def pst03_atr_spike_reversion(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    trend = _pst_gate(ctx)
+    if trend is None:
+        return None
+    fade = _pst_fade(trend)
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    o, h, l, c = arr
+    i = len(c) - 1
+    if i < 20:
+        return None
+    atr = _phw_atr_at(h, l, c, i)
+    if atr is None:
+        return None
+    atr5_s = _psh_atr_series(h, l, c, 5)
+    atr20_s = _psh_atr_series(h, l, c, 20)
+    try:
+        atr5 = float(atr5_s.iloc[i])
+        atr20 = float(atr20_s.iloc[i])
+    except Exception:  # noqa: BLE001
+        return None
+    if atr5 != atr5 or atr20 != atr20 or atr20 <= 0 or atr5 / atr20 < 1.5:
+        return None
+    open_i = float(o.iloc[i])
+    close_i = float(c.iloc[i])
+    open_p = float(o.iloc[i - 1])
+    close_p = float(c.iloc[i - 1])
+    if trend == "LONG":
+        hi20 = float(h.iloc[i - 19 : i + 1].max())
+        if hi20 != hi20:
+            return None
+        x = None
+        for j in range(i, i - 20, -1):
+            if abs(float(h.iloc[j]) - hi20) <= 1e-12:
+                x = j
+                break
+        if x is None or x < i - 2:
+            return None
+        if not (close_i < open_i and close_p >= open_p):
+            return None
+        stop = hi20 + 1.0 * atr
+    else:
+        lo20 = float(l.iloc[i - 19 : i + 1].min())
+        if lo20 != lo20:
+            return None
+        x = None
+        for j in range(i, i - 20, -1):
+            if abs(float(l.iloc[j]) - lo20) <= 1e-12:
+                x = j
+                break
+        if x is None or x < i - 2:
+            return None
+        if not (close_i > open_i and close_p <= open_p):
+            return None
+        stop = lo20 - 1.0 * atr
+    return _psh_signal(
+        direction=fade, stop_price=float(stop), timeframe="1d",
+        strategy_id="PST03_ATR_SPIKE_REVERSION",
+    )
+
+
+# ── PST04 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PST04_FAILED_CONTINUATION_TRAP")
+def pst04_failed_continuation_trap(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    trend = _pst_gate(ctx)
+    if trend is None:
+        return None
+    fade = _pst_fade(trend)
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    o, h, l, c = arr
+    i = len(c) - 1
+    if i < 22:
+        return None
+    atr = _phw_atr_at(h, l, c, i)
+    if atr is None:
+        return None
+    found = None  # (b, prior_extreme)
+    for b in (i - 2, i - 1):
+        if b < 20:
+            continue
+        if trend == "LONG":
+            prior = float(h.iloc[b - 20 : b].max())
+            if float(c.iloc[b]) >= prior + 0.3 * atr:
+                found = (b, prior)
+                break
+        else:
+            prior = float(l.iloc[b - 20 : b].min())
+            if float(c.iloc[b]) <= prior - 0.3 * atr:
+                found = (b, prior)
+                break
+    if found is None:
+        return None
+    b, prior = found
+    close_i = float(c.iloc[i])
+    if trend == "LONG":
+        if close_i > prior - 0.5 * atr:
+            return None
+        stop = float(h.iloc[b : i + 1].max()) + 1.0 * atr
+    else:
+        if close_i < prior + 0.5 * atr:
+            return None
+        stop = float(l.iloc[b : i + 1].min()) - 1.0 * atr
+    return _psh_signal(
+        direction=fade, stop_price=float(stop), timeframe="1d",
+        strategy_id="PST04_FAILED_CONTINUATION_TRAP",
+    )
+
+
+# ── PST05 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PST05_WEEKLY_CLIMAX_REVERSAL")
+def pst05_weekly_climax_reversal(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    trend = _pst_gate(ctx)
+    if trend is None:
+        return None
+    fade = _pst_fade(trend)
+    if ctx.day_of_week != 4:
+        return None
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    _o, h, l, c = arr
+    i = len(c) - 1
+    atr = _phw_atr_at(h, l, c, i)
+    if atr is None:
+        return None
+    weekly = _psh_build_weekly_from_daily(ctx.ohlc())
+    if weekly is None or len(weekly) < 16:
+        return None
+    wi = len(weekly) - 1
+    if wi < 10:
+        return None
+    wo = weekly["Open"]
+    wh = weekly["High"]
+    wl = weekly["Low"]
+    wc = weekly["Close"]
+    # Five prior weeks in trend direction
+    for k in range(wi - 5, wi):
+        if k < 0:
+            return None
+        if trend == "LONG":
+            if not (float(wc.iloc[k]) > float(wo.iloc[k])):
+                return None
+        else:
+            if not (float(wc.iloc[k]) < float(wo.iloc[k])):
+                return None
+    open_w = float(wo.iloc[wi])
+    high_w = float(wh.iloc[wi])
+    low_w = float(wl.iloc[wi])
+    close_w = float(wc.iloc[wi])
+    rng_w = high_w - low_w
+    if rng_w <= 0:
+        return None
+    prior_rngs = []
+    for k in range(wi - 10, wi):
+        rk = float(wh.iloc[k]) - float(wl.iloc[k])
+        if rk != rk or rk < 0:
+            return None
+        prior_rngs.append(rk)
+    if len(prior_rngs) < 10:
+        return None
+    mean_rng = sum(prior_rngs) / 10.0
+    if rng_w < 1.5 * mean_rng:
+        return None
+    if trend == "LONG":
+        if not (close_w < open_w):
+            return None
+        wick = high_w - max(open_w, close_w)
+        if wick < 0.60 * rng_w:
+            return None
+        stop = high_w
+    else:
+        if not (close_w > open_w):
+            return None
+        wick = min(open_w, close_w) - low_w
+        if wick < 0.60 * rng_w:
+            return None
+        stop = low_w
+    return _psh_signal(
+        direction=fade, stop_price=float(stop), timeframe="1d",
+        strategy_id="PST05_WEEKLY_CLIMAX_REVERSAL",
+    )
+
+
+# ── PST06 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PST06_TRIPLE_DIVERGENCE_FADE")
+def pst06_triple_divergence_fade(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    trend = _pst_gate(ctx)
+    if trend is None:
+        return None
+    fade = _pst_fade(trend)
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    o, h, l, c = arr
+    i = len(c) - 1
+    if i < 19:
+        return None
+    atr = _phw_atr_at(h, l, c, i)
+    if atr is None:
+        return None
+    if trend == "LONG":
+        prior_hi = float(h.iloc[i - 19 : i].max())
+        if float(h.iloc[i]) < prior_hi:
+            return None
+    else:
+        prior_lo = float(l.iloc[i - 19 : i].min())
+        if float(l.iloc[i]) > prior_lo:
+            return None
+    eh = [float(x) for x in ctx.er_history() if x is not None]
+    sh = [float(x) for x in ctx.score_history() if x is not None]
+    if len(eh) < 21 or len(sh) < 21:
+        return None
+    if max(eh[-21:]) - eh[-1] < 0.10:
+        return None
+    peak = max(abs(x) for x in sh[-21:])
+    now = abs(sh[-1])
+    if peak - now < 0.08 or now < 0.40:
+        return None
+    open_i = float(o.iloc[i])
+    close_i = float(c.iloc[i])
+    open_p = float(o.iloc[i - 1])
+    close_p = float(c.iloc[i - 1])
+    if trend == "LONG":
+        if not (close_i < open_i and close_p >= open_p):
+            return None
+        stop = float(h.iloc[i]) + 1.0 * atr
+    else:
+        if not (close_i > open_i and close_p <= open_p):
+            return None
+        stop = float(l.iloc[i]) - 1.0 * atr
+    return _psh_signal(
+        direction=fade, stop_price=float(stop), timeframe="1d",
+        strategy_id="PST06_TRIPLE_DIVERGENCE_FADE",
+    )
+
+
+# ── PST07 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PST07_SCORE_ROLLOVER_ANTICIPATOR")
+def pst07_score_rollover_anticipator(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    trend = _pst_gate(ctx)
+    if trend is None:
+        return None
+    fade = _pst_fade(trend)
+    sh = [float(x) for x in ctx.score_history() if x is not None]
+    if len(sh) < 31:
+        return None
+    peak = max(abs(x) for x in sh[-31:])
+    now = abs(sh[-1])
+    if peak < 0.75 or peak - now < 0.10 or now < 0.40:
+        return None
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    o, h, l, c = arr
+    i = len(c) - 1
+    if i < 1:
+        return None
+    atr = _phw_atr_at(h, l, c, i)
+    if atr is None:
+        return None
+    for j in (i - 1, i):
+        oj, cj = float(o.iloc[j]), float(c.iloc[j])
+        if trend == "LONG":
+            if not (cj < oj):
+                return None
+        else:
+            if not (cj > oj):
+                return None
+    highs = [float(x) for x in h.tolist()]
+    lows = [float(x) for x in l.tolist()]
+    f_hi, f_lo = _psh_fractal_swings(highs, lows)
+    if trend == "LONG":
+        if not f_hi:
+            return None
+        stop = float(f_hi[-1][1]) + 1.0 * atr
+    else:
+        if not f_lo:
+            return None
+        stop = float(f_lo[-1][1]) - 1.0 * atr
+    return _psh_signal(
+        direction=fade, stop_price=float(stop), timeframe="1d",
+        strategy_id="PST07_SCORE_ROLLOVER_ANTICIPATOR",
+    )
+
+
+# ── PST08 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PST08_EXHAUSTION_GAP_FAILURE")
+def pst08_exhaustion_gap_failure(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    trend = _pst_gate(ctx)
+    if trend is None:
+        return None
+    fade = _pst_fade(trend)
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    o, h, l, c = arr
+    i = len(c) - 1
+    if i < 20:
+        return None
+    atr = _phw_atr_at(h, l, c, i)
+    if atr is None:
+        return None
+    atr_prev = _phw_atr_at(h, l, c, i - 1)
+    if atr_prev is None:
+        return None
+    sma20 = _psh_sma(c, 20)
+    if pd.isna(sma20.iloc[i - 1]):
+        return None
+    open_i = float(o.iloc[i])
+    close_prev = float(c.iloc[i - 1])
+    close_i = float(c.iloc[i])
+    gap = open_i - close_prev
+    sma_prev = float(sma20.iloc[i - 1])
+    if trend == "LONG":
+        if gap < 0.3 * atr:
+            return None
+        if close_prev < sma_prev + 2.0 * atr_prev:
+            return None
+        if not (close_i < open_i):
+            return None
+        stop = float(h.iloc[i]) + 0.75 * atr
+    else:
+        if gap > -0.3 * atr:
+            return None
+        if close_prev > sma_prev - 2.0 * atr_prev:
+            return None
+        if not (close_i > open_i):
+            return None
+        stop = float(l.iloc[i]) - 0.75 * atr
+    return _psh_signal(
+        direction=fade, stop_price=float(stop), timeframe="1d",
+        strategy_id="PST08_EXHAUSTION_GAP_FAILURE",
+    )
+
+
+# ── PST09 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PST09_STALL_DECAY_FADE")
+def pst09_stall_decay_fade(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    trend = _pst_gate(ctx)
+    if trend is None:
+        return None
+    fade = _pst_fade(trend)
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    o, h, l, c = arr
+    i = len(c) - 1
+    if i < 34:
+        return None
+    atr = _phw_atr_at(h, l, c, i)
+    if atr is None:
+        return None
+    open_i = float(o.iloc[i])
+    close_i = float(c.iloc[i])
+    if trend == "LONG":
+        hi20 = float(h.iloc[i - 19 : i + 1].max())
+        x = None
+        for j in range(i, i - 20, -1):
+            if abs(float(h.iloc[j]) - hi20) <= 1e-12:
+                x = j
+                break
+        if x is None or x > i - 5:
+            return None
+        count = 0
+        for j in range(i - 14, i - 4):  # [i-14, i-5]
+            if j - 19 < 0:
+                return None
+            prior = float(h.iloc[j - 19 : j].max())
+            if float(h.iloc[j]) >= prior:
+                count += 1
+        if count < 3:
+            return None
+        if hi20 - close_i > 1.0 * atr:
+            return None
+        if not (close_i < open_i):
+            return None
+        stop = hi20 + 0.75 * atr
+    else:
+        lo20 = float(l.iloc[i - 19 : i + 1].min())
+        x = None
+        for j in range(i, i - 20, -1):
+            if abs(float(l.iloc[j]) - lo20) <= 1e-12:
+                x = j
+                break
+        if x is None or x > i - 5:
+            return None
+        count = 0
+        for j in range(i - 14, i - 4):
+            if j - 19 < 0:
+                return None
+            prior = float(l.iloc[j - 19 : j].min())
+            if float(l.iloc[j]) <= prior:
+                count += 1
+        if count < 3:
+            return None
+        if close_i - lo20 > 1.0 * atr:
+            return None
+        if not (close_i > open_i):
+            return None
+        stop = lo20 - 0.75 * atr
+    return _psh_signal(
+        direction=fade,
+        stop_price=float(stop),
+        timeframe="1d",
+        strategy_id="PST09_STALL_DECAY_FADE",
+        custom_exit={"type": "time_exit", "max_sessions": 7},
+    )
+
+
+# ── PST10 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PST10_STRUCTURAL_DISCOUNT_ENTRY")
+def pst10_structural_discount_entry(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    trend = _pst_gate(ctx)
+    if trend is None:
+        return None
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    o, h, l, c = arr
+    i = len(c) - 1
+    atr = _phw_atr_at(h, l, c, i)
+    if atr is None:
+        return None
+    entry_idx = _ptw_entry_idx(ctx, i)
+    pb = _ptw_pullback(h, l, c, i, atr, trend, entry_idx, min_depth_mult=1.5)
+    if pb is None:
+        return None
+    E, e_idx, P, mid = pb
+    shelf = None
+    start_b = e_idx
+    end_b = max(entry_idx, 21)
+    for b in range(start_b, end_b - 1, -1):
+        if b < 20:
+            break
+        if trend == "LONG":
+            prior20 = float(h.iloc[b - 20 : b].max())
+            if float(h.iloc[b]) > prior20 and prior20 <= E - 1.0 * atr:
+                shelf = prior20
+                break
+        else:
+            prior20 = float(l.iloc[b - 20 : b].min())
+            if float(l.iloc[b]) < prior20 and prior20 >= E + 1.0 * atr:
+                shelf = prior20
+                break
+    if shelf is None:
+        return None
+    if abs(P - shelf) > 0.3 * atr:
+        return None
+    open_i = float(o.iloc[i])
+    close_i = float(c.iloc[i])
+    if trend == "LONG":
+        if not (close_i > open_i and close_i > mid):
+            return None
+        stop = shelf - 0.4 * atr
+    else:
+        if not (close_i < open_i and close_i < mid):
+            return None
+        stop = shelf + 0.4 * atr
+    return _psh_signal(
+        direction=trend, stop_price=float(stop), timeframe="1d",
+        strategy_id="PST10_STRUCTURAL_DISCOUNT_ENTRY",
+    )
+
+
+# ── PST11 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PST11_VOL_CONTAINED_CONTINUATION")
+def pst11_vol_contained_continuation(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    trend = _pst_gate(ctx)
+    if trend is None:
+        return None
+    a0 = ctx.atr_at_regime_entry
+    if a0 is None or float(a0) <= 0:
+        return None
+    a0 = float(a0)
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    o, h, l, c = arr
+    i = len(c) - 1
+    atr = _phw_atr_at(h, l, c, i)
+    if atr is None:
+        return None
+    if atr > 1.15 * a0:
+        return None
+    entry_idx = _ptw_entry_idx(ctx, i)
+    pb = _ptw_pullback(h, l, c, i, atr, trend, entry_idx, min_depth_mult=0.75)
+    if pb is None:
+        return None
+    _E, _e_idx, P, mid = pb
+    open_i = float(o.iloc[i])
+    close_i = float(c.iloc[i])
+    if trend == "LONG":
+        if not (close_i > open_i and close_i > mid):
+            return None
+        stop = P - 0.75 * atr
+    else:
+        if not (close_i < open_i and close_i < mid):
+            return None
+        stop = P + 0.75 * atr
+    return _psh_signal(
+        direction=trend, stop_price=float(stop), timeframe="1d",
+        strategy_id="PST11_VOL_CONTAINED_CONTINUATION",
+    )
+
+
+# ── PST12 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PST12_JPY_BASKET_CONFIRMED_RIDE")
+def pst12_jpy_basket_confirmed_ride(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    trend = _pst_gate(ctx)
+    if trend is None:
+        return None
+    tku = str(ctx.ticker).strip().upper()
+    if not tku.endswith("JPY"):
+        return None
+    rets = ctx.get_universe_returns(10)
+    basket: dict[str, float] = {}
+    for pair, ret in rets.items():
+        p = str(pair).strip().upper()
+        if len(p) != 6 or not p.isalpha() or not p.endswith("JPY"):
+            continue
+        try:
+            r = float(ret)
+        except (TypeError, ValueError):
+            continue
+        if r != r:
+            continue
+        basket[p] = r
+    if len(basket) < 3:
+        return None
+    vals = list(basket.values())
+    avg = sum(vals) / len(vals)
+    if trend == "LONG":
+        if not (avg > 0):
+            return None
+        agree = sum(1 for r in vals if r > 0) / len(vals)
+    else:
+        if not (avg < 0):
+            return None
+        agree = sum(1 for r in vals if r < 0) / len(vals)
+    if agree < 0.75:
+        return None
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    o, h, l, c = arr
+    i = len(c) - 1
+    atr = _phw_atr_at(h, l, c, i)
+    if atr is None:
+        return None
+    entry_idx = _ptw_entry_idx(ctx, i)
+    pb = _ptw_pullback(h, l, c, i, atr, trend, entry_idx, min_depth_mult=0.75)
+    if pb is None:
+        return None
+    _E, _e_idx, P, mid = pb
+    open_i = float(o.iloc[i])
+    close_i = float(c.iloc[i])
+    if trend == "LONG":
+        if not (close_i > open_i and close_i > mid):
+            return None
+        stop = P - 1.0 * atr
+    else:
+        if not (close_i < open_i and close_i < mid):
+            return None
+        stop = P + 1.0 * atr
+    return _psh_signal(
+        direction=trend, stop_price=float(stop), timeframe="1d",
+        strategy_id="PST12_JPY_BASKET_CONFIRMED_RIDE",
+    )
+
+
+# ── PST13 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PST13_SECOND_TEST_UNDERSHOOT")
+def pst13_second_test_undershoot(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    trend = _pst_gate(ctx)
+    if trend is None:
+        return None
+    fade = _pst_fade(trend)
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    o, h, l, c = arr
+    i = len(c) - 1
+    if i < 22:
+        return None
+    atr = _phw_atr_at(h, l, c, i)
+    if atr is None:
+        return None
+    highs = [float(x) for x in h.tolist()]
+    lows = [float(x) for x in l.tolist()]
+    f_hi, f_lo = _psh_fractal_swings(highs, lows)
+    close_i = float(c.iloc[i])
+    if trend == "LONG":
+        hi20 = float(h.iloc[i - 19 : i + 1].max())
+        x = None
+        for j in range(i, i - 20, -1):
+            if abs(float(h.iloc[j]) - hi20) <= 1e-12:
+                x = j
+                break
+        if x is None or x > i - 2:
+            return None
+        found = None
+        for fi, fp in reversed(f_hi):
+            if fi > x:
+                found = (fi, float(fp))
+                break
+        if found is None:
+            return None
+        fi, fp = found
+        if not (hi20 - 1.5 * atr <= fp <= hi20 - 0.5 * atr):
+            return None
+        if fi <= x:
+            return None
+        P = float(l.iloc[x + 1 : fi + 1].min())
+        if hi20 - P < 1.0 * atr:
+            return None
+        mid = (P + fp) / 2.0
+        if close_i >= mid:
+            return None
+        stop = hi20
+    else:
+        lo20 = float(l.iloc[i - 19 : i + 1].min())
+        x = None
+        for j in range(i, i - 20, -1):
+            if abs(float(l.iloc[j]) - lo20) <= 1e-12:
+                x = j
+                break
+        if x is None or x > i - 2:
+            return None
+        found = None
+        for fi, fp in reversed(f_lo):
+            if fi > x:
+                found = (fi, float(fp))
+                break
+        if found is None:
+            return None
+        fi, fp = found
+        if not (lo20 + 0.5 * atr <= fp <= lo20 + 1.5 * atr):
+            return None
+        P = float(h.iloc[x + 1 : fi + 1].max())
+        if P - lo20 < 1.0 * atr:
+            return None
+        mid = (P + fp) / 2.0
+        if close_i <= mid:
+            return None
+        stop = lo20
+    return _psh_signal(
+        direction=fade, stop_price=float(stop), timeframe="1d",
+        strategy_id="PST13_SECOND_TEST_UNDERSHOOT",
+    )
+
+
+# ── PST14 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PST14_MAJOR_LEVEL_SWEEP_FADE")
+def pst14_major_level_sweep_fade(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    trend = _pst_gate(ctx)
+    if trend is None:
+        return None
+    fade = _pst_fade(trend)
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    o, h, l, c = arr
+    i = len(c) - 1
+    atr = _phw_atr_at(h, l, c, i)
+    if atr is None:
+        return None
+    weekly = _psh_build_weekly_from_daily(ctx.ohlc())
+    if weekly is None or weekly.empty:
+        return None
+    if ctx.day_of_week != 4:
+        weekly = weekly.iloc[:-1]
+    if len(weekly) < 30:
+        return None
+    wi = len(weekly) - 1
+    # level over [wi-29, wi-4] inclusive = 26 weeks
+    if wi - 4 < wi - 29 or wi - 29 < 0:
+        return None
+    wh = weekly["High"]
+    wl = weekly["Low"]
+    high_i = float(h.iloc[i])
+    low_i = float(l.iloc[i])
+    close_i = float(c.iloc[i])
+    if trend == "LONG":
+        level = float(wh.iloc[wi - 29 : wi - 3].max())  # [wi-29, wi-4]
+        beyond = high_i - level
+        if not (0 < beyond <= 0.75 * atr and close_i < level):
+            return None
+        stop = high_i + 1.0 * atr
+    else:
+        level = float(wl.iloc[wi - 29 : wi - 3].min())
+        beyond = level - low_i
+        if not (0 < beyond <= 0.75 * atr and close_i > level):
+            return None
+        stop = low_i - 1.0 * atr
+    return _psh_signal(
+        direction=fade, stop_price=float(stop), timeframe="1d",
+        strategy_id="PST14_MAJOR_LEVEL_SWEEP_FADE",
+    )
+
+
+# ── PST15 ────────────────────────────────────────────────────────────────────
+@register_shadow_strategy("PST15_CAPITULATION_SPIKE_LOTTERY")
+def pst15_capitulation_spike_lottery(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    if ctx.timeframe != "1d":
+        return None
+    trend = _pst_gate(ctx)
+    if trend is None:
+        return None
+    fade = _pst_fade(trend)
+    arr = _psh_ohlc_arrays(ctx.ohlc())
+    if arr is None:
+        return None
+    o, h, l, c = arr
+    i = len(c) - 1
+    if i < 50:
+        return None
+    atr = _phw_atr_at(h, l, c, i)
+    if atr is None:
+        return None
+    sma50 = _psh_sma(c, 50)
+    if pd.isna(sma50.iloc[i]):
+        return None
+    sma = float(sma50.iloc[i])
+    open_i = float(o.iloc[i])
+    close_i = float(c.iloc[i])
+    high_i = float(h.iloc[i])
+    low_i = float(l.iloc[i])
+    ri = high_i - low_i
+    if ri < 1.5 * atr:
+        return None
+    if trend == "LONG":
+        if high_i < sma + 3.5 * atr:
+            return None
+        if not (close_i < open_i):
+            return None
+        stop = high_i + 1.5 * atr
+    else:
+        if low_i > sma - 3.5 * atr:
+            return None
+        if not (close_i > open_i):
+            return None
+        stop = low_i - 1.5 * atr
+    return _psh_signal(
+        direction=fade, stop_price=float(stop), timeframe="1d",
+        strategy_id="PST15_CAPITULATION_SPIKE_LOTTERY",
+    )
+
+
+
 # ── PART F — validation dummies (remove in a later prompt) ───────────────────
 def _pdummy_eurusd_monday_long(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
     """Shared entry for PDUMMY01/02: EURUSD 1d Monday open, 1×ATR stop."""
