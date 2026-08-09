@@ -4419,6 +4419,8 @@ def ptw06_measured_leg_repeat(ctx: ShadowStrategyContext) -> dict[str, Any] | No
             return None
         stop = P
         level = P + A
+        if level <= close_i:
+            return None
     else:
         P = float(h.iloc[e + 1 : i + 1].max())
         if P != P or not (P < O) or (P - X) > 0.5 * A:
@@ -4427,6 +4429,8 @@ def ptw06_measured_leg_repeat(ctx: ShadowStrategyContext) -> dict[str, Any] | No
             return None
         stop = P
         level = P - A
+        if level >= close_i:
+            return None
     return _psh_signal(
         direction=direction,
         stop_price=float(stop),
