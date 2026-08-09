@@ -798,19 +798,20 @@ def evaluate_shadow_strategies(
                 except Exception:  # noqa: BLE001
                     entry_ds = str(analysis_date).strip()[:10]
             stop_atr_mult = sig.pop("stop_atr_mult", None)
-            if stop_atr_mult is not None and sig.get("entry_price") is not None:
+            if stop_atr_mult is not None:
                 try:
                     atr_use = float(context.atr or 0)
                     mult = float(stop_atr_mult)
-                    ep = float(sig["entry_price"])
+                    ep = float(sig["entry_price"]) if sig.get("entry_price") is not None else 0.0
                     dirc = str(sig.get("direction") or "").upper()
-                    if atr_use > 0 and ep > 0:
-                        if dirc == "LONG":
-                            sig["stop_price"] = ep - mult * atr_use
-                        elif dirc == "SHORT":
-                            sig["stop_price"] = ep + mult * atr_use
+                    if atr_use <= 0 or ep <= 0 or ep != ep or dirc not in ("LONG", "SHORT"):
+                        continue
+                    if dirc == "LONG":
+                        sig["stop_price"] = ep - mult * atr_use
+                    else:
+                        sig["stop_price"] = ep + mult * atr_use
                 except (TypeError, ValueError):
-                    pass
+                    continue
             if sig.get("entry_price") is None or sig.get("stop_price") is None:
                 continue
             trade = _simulate_shadow_trade(
@@ -1068,24 +1069,45 @@ def _psh_check_pending_stop(
     """
     Check / age a pending stop-order. Trigger on the latest closed bar's range.
     Expire after 5 sessions or invalidate if close beyond stop side.
+    Age is anchored on setup_date (not a brittle absolute bar index).
     """
     key = _psh_pending_key(sid, ctx)
     pend = _PSH_PENDING.get(key)
     if not pend:
         return None
-    arr = _psh_ohlc_arrays(ctx.ohlc())
+    df = ctx.ohlc()
+    arr = _psh_ohlc_arrays(df)
     if arr is None:
         return None
     o, h, l, c = arr
     i = len(c) - 1
     if i < 0:
         return None
-    # Age by session: count bars since setup index
-    setup_i = int(pend["setup_i"])
-    age = i - setup_i
+    setup_ds = str(pend.get("setup_date") or "").strip()[:10]
+    if not setup_ds:
+        _PSH_PENDING.pop(key, None)
+        return None
+    # Locate setup_date in current OHLC; missing → stale pending (cross-job leak).
+    setup_i: int | None = None
+    for k in range(len(df)):
+        try:
+            dk = str(pd.Timestamp(df.index[k]).date())
+        except Exception:  # noqa: BLE001
+            continue
+        if dk == setup_ds:
+            setup_i = k
+    if setup_i is None:
+        _PSH_PENDING.pop(key, None)
+        return None
+    age = i - setup_i  # bars strictly after setup when age > 0
     if age <= 0:
         return None  # same bar as setup — wait for later sessions
     if age > 5:
+        _PSH_PENDING.pop(key, None)
+        return None
+    # Drop pending if regime is no longer STRONG.
+    state = str(ctx.regime_state or "").strip().upper()
+    if state not in ("STRONG_UP", "STRONG_DOWN"):
         _PSH_PENDING.pop(key, None)
         return None
     direction = str(pend["direction"])
@@ -1102,16 +1124,17 @@ def _psh_check_pending_stop(
     if direction == "SHORT" and close_i > stop_px:
         _PSH_PENDING.pop(key, None)
         return None
+    # LONG = buy-stop above; SHORT = sell-stop below.
     filled = False
     fill_px = trigger
     if direction == "LONG":
-        if low_i <= trigger:
-            filled = True
-            fill_px = open_i if open_i < trigger else trigger
-    else:
         if high_i >= trigger:
             filled = True
             fill_px = open_i if open_i > trigger else trigger
+    else:
+        if low_i <= trigger:
+            filled = True
+            fill_px = open_i if open_i < trigger else trigger
     if not filled:
         return None
     _PSH_PENDING.pop(key, None)
@@ -1132,13 +1155,11 @@ def _psh_set_pending(
     direction: str,
     trigger: float,
     stop: float,
-    setup_i: int,
 ) -> None:
     _PSH_PENDING[_psh_pending_key(sid, ctx)] = {
         "direction": direction,
         "trigger": float(trigger),
         "stop": float(stop),
-        "setup_i": int(setup_i),
         "setup_date": ctx.session_date,
     }
 
@@ -1282,7 +1303,7 @@ def psh02_stretch_band_reversion(ctx: ShadowStrategyContext) -> dict[str, Any] |
         ext_extreme = float(l.iloc[j])
         trigger = float(h.iloc[i])
         stop = ext_extreme
-    _psh_set_pending(ctx, sid, direction=direction, trigger=trigger, stop=stop, setup_i=i)
+    _psh_set_pending(ctx, sid, direction=direction, trigger=trigger, stop=stop)
     return None
 
 
@@ -1551,7 +1572,7 @@ def psh07_compression_spring(ctx: ShadowStrategyContext) -> dict[str, Any] | Non
             return None
         trigger = float(h.iloc[i])
         stop = float(l.iloc[i])
-    _psh_set_pending(ctx, sid, direction=direction, trigger=trigger, stop=stop, setup_i=i)
+    _psh_set_pending(ctx, sid, direction=direction, trigger=trigger, stop=stop)
     return None
 
 
