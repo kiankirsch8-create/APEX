@@ -2032,6 +2032,25 @@ def _phw_range_20(
     return hi, lo, (hi + lo) / 2.0, width
 
 
+def _phw_range_prior_20(
+    h: pd.Series, l: pd.Series, i: int,
+) -> tuple[float, float, float, float] | None:
+    """20-bar High/Low range over [i-20, i-1] — EXCLUDES bar i."""
+    if i < 20:
+        return None
+    try:
+        hi = float(h.iloc[i - 20 : i].max())
+        lo = float(l.iloc[i - 20 : i].min())
+    except Exception:  # noqa: BLE001
+        return None
+    if hi != hi or lo != lo:  # NaN
+        return None
+    width = hi - lo
+    if width < 0:
+        return None
+    return hi, lo, (hi + lo) / 2.0, width
+
+
 def _phw_boundary_touches(
     h: pd.Series,
     l: pd.Series,
@@ -2210,7 +2229,7 @@ def phw01_validated_range_fade(ctx: ShadowStrategyContext) -> dict[str, Any] | N
     o, h, l, c = arr
     i = len(c) - 1
     atr = _phw_atr_at(h, l, c, i)
-    rng = _phw_range_20(h, l, i)
+    rng = _phw_range_prior_20(h, l, i)
     if atr is None or rng is None:
         return None
     hi, lo, _mid, width = rng
@@ -2310,7 +2329,7 @@ def phw03_boundary_compression_coil(ctx: ShadowStrategyContext) -> dict[str, Any
     if not _psh_is_nr7(h, l, i):
         return None
     atr = _phw_atr_at(h, l, c, i)
-    rng = _phw_range_20(h, l, i)
+    rng = _phw_range_prior_20(h, l, i)
     if atr is None or rng is None:
         return None
     hi, lo, _mid, _w = rng
@@ -2378,13 +2397,15 @@ def phw04_zscore_snapback(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
     if direction == "LONG":
         if not (ci > oi):
             return None
-        if ci > li + bar_rng / 3.0:
+        # Trade-side third = top third of the bar's range.
+        if ci < hi_i - bar_rng / 3.0:
             return None
         stop = float(l.iloc[i - 1 : i + 1].min())
     else:
         if not (ci < oi):
             return None
-        if ci < hi_i - bar_rng / 3.0:
+        # Trade-side third = bottom third of the bar's range.
+        if ci > li + bar_rng / 3.0:
             return None
         stop = float(h.iloc[i - 1 : i + 1].max())
     return _psh_signal(
@@ -2801,12 +2822,12 @@ def phw12_confidence_slip_entry(ctx: ShadowStrategyContext) -> dict[str, Any] | 
     highs = [float(x) for x in h.tolist()]
     lows = [float(x) for x in l.tolist()]
     f_hi, f_lo = _psh_fractal_swings(highs, lows)
-    # Opposing fractal: high for LONG / low for SHORT
-    swings = f_hi if direction == "LONG" else f_lo
+    # Trade-side fractal for stop: lows for LONG / highs for SHORT (PSH10 geometry).
+    swings = f_lo if direction == "LONG" else f_hi
     if not swings:
         return None
     _, ext = swings[-1]
-    stop = float(ext) + atr if direction == "LONG" else float(ext) - atr
+    stop = float(ext) - atr if direction == "LONG" else float(ext) + atr
     return _psh_signal(
         direction=direction, stop_price=stop, timeframe="1d",
         strategy_id="PHW12_CONFIDENCE_SLIP_ENTRY",
