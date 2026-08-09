@@ -3110,9 +3110,23 @@ def get_ohlcv(
             return None, None
     if chrono_yfinance:
         ck = (yf_ticker.strip().upper(), tf_key, ds)
+        hit: tuple[Any, Any] | None = None
         with _chrono_ohlc_cache_lock:
             if ck in _chrono_ohlc_cache:
-                return _chrono_ohlc_cache.pop(ck)
+                hit = _chrono_ohlc_cache.pop(ck)
+        if hit is not None:
+            past_hit, fut_hit = hit
+            # Non-popping shadow day cache for cross-pair context (PART E).
+            try:
+                from shadow_strategies import remember_shadow_ohlc
+
+                raw_sym = yf_ticker.strip().upper()
+                if raw_sym.endswith("=X"):
+                    raw_sym = raw_sym[:-2]
+                remember_shadow_ohlc(raw_sym, tf_key, ds, past_hit)
+            except Exception:  # noqa: BLE001
+                pass
+            return past_hit, fut_hit
     return _get_ohlcv_download_impl(yf_ticker, timeframe, analysis_date, chrono_yfinance=chrono_yfinance)
 
 
@@ -3156,6 +3170,13 @@ def _chrono_prefetch_ohlc_for_phase_matrix(
                     past_f, fut_f = None, None
                 with _chrono_ohlc_cache_lock:
                     _chrono_ohlc_cache[ck] = (past_f, fut_f)
+                # Shadow cross-pair cache (non-popping) — same past bars, no lookahead.
+                try:
+                    from shadow_strategies import remember_shadow_ohlc
+
+                    remember_shadow_ohlc(s, tf_key_pf, date_str.strip()[:10], past_f)
+                except Exception:  # noqa: BLE001
+                    pass
 
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 list(ex.map(_warm_one, tickers))
@@ -5432,8 +5453,31 @@ def _ensure_shadow_regime_for_day(
                 if rd4 is None:
                     rd4 = None
 
+        atr_for_regime: float | None = None
+        if past is not None and not getattr(past, "empty", True):
+            try:
+                if "ATRr_14" in past.columns:
+                    atr_for_regime = float(pd.to_numeric(past["ATRr_14"], errors="coerce").iloc[-1])
+                elif "ATR_14" in past.columns:
+                    atr_for_regime = float(pd.to_numeric(past["ATR_14"], errors="coerce").iloc[-1])
+            except Exception:  # noqa: BLE001
+                atr_for_regime = None
+
         prev = _SHADOW_REGIME_PREV.get(tku)
-        result = compute_pair_regime(tku, closes, float(rd), rd4, prev)
+        result = compute_pair_regime(
+            tku,
+            closes,
+            float(rd),
+            rd4,
+            prev,
+            atr=atr_for_regime,
+            session_date=ds,
+        )
+        if isinstance(result, dict):
+            try:
+                result["rate_diff"] = float(rd) if rd is not None else 0.0
+            except (TypeError, ValueError):
+                result["rate_diff"] = 0.0
         # Only lock the day + advance prev once we have a real close series.
         # Early gate skips without OHLC may still attach a provisional result.
         if closes:
@@ -5443,6 +5487,7 @@ def _ensure_shadow_regime_for_day(
                     "state": result.get("state"),
                     "days_in_state": result.get("days_in_state"),
                     "price_direction": result.get("price_direction"),
+                    "atr_at_regime_entry": result.get("atr_at_regime_entry"),
                 }
         return result
     except Exception as e:  # noqa: BLE001
@@ -6755,6 +6800,33 @@ def _python_forced_layer2_trade(
     }
 
 
+def _invoke_shadow_strategies_hook(hook: dict[str, Any]) -> None:
+    """Write-only shadow strategy pass — never raises into the real scan."""
+    try:
+        from shadow_strategies import run_shadow_strategies_safe
+
+        sym = str(hook.get("ticker") or "")
+        ds = str(hook.get("analysis_date") or "")[:10]
+        regime = _SHADOW_REGIME_DAY.get((sym.strip().upper(), ds))
+        if not isinstance(regime, dict):
+            regime = {}
+        run_shadow_strategies_safe(
+            ticker=sym,
+            timeframe=str(hook.get("timeframe") or ""),
+            analysis_date=ds,
+            past=hook.get("past"),
+            future=hook.get("future"),
+            ind=hook.get("ind") if isinstance(hook.get("ind"), dict) else {},
+            regime=regime,
+            universe=list(CHRONO_TICKERS),
+        )
+    except Exception as e:  # noqa: BLE001
+        log(
+            f"[SHADOW STRAT] hook failed {hook.get('ticker')} {hook.get('timeframe')}: {e}",
+            level="warning",
+        )
+
+
 def run_one_backtest(
     ticker: str,
     timeframe: str,
@@ -6771,6 +6843,8 @@ def run_one_backtest(
     chrono_day_pnl: float = 0.0,
     chrono_job_id: str = "",
 ) -> dict[str, Any] | None:
+    _shadow_hook: dict[str, Any] | None = None
+    _shadow_past_ref: Any = None
     try:
         sym = (ticker or "").strip().upper()
         if sym in BLOCKED_PAIRS:
@@ -6957,6 +7031,19 @@ def run_one_backtest(
             "bb_upper": safe(bbu, price) if bbu else price,
             "bb_lower": safe(bbl, price) if bbl else price,
         }
+
+        # Shadow strategies hook payload — evaluated in ``finally`` after the real
+        # scan result is decided, so it cannot affect entry/skip/sizing.
+        _shadow_hook = {
+            "ticker": sym,
+            "timeframe": tf_key,
+            "analysis_date": analysis_date.strip()[:10],
+            "past": past,
+            "future": future,
+            "ind": ind,
+        }
+        # Keep a live ref for trade-row shadow_* fields after ``del past`` below.
+        _shadow_past_ref = _shadow_hook["past"]
 
         try:
             if "MACD_12_26_9" in past.columns and "MACDs_12_26_9" in past.columns:
@@ -7908,7 +7995,8 @@ def run_one_backtest(
                 sym,
                 direction,
                 analysis_date,
-                past=past,
+                # ``del past`` runs above; hook keeps the scanned frame alive.
+                past=_shadow_past_ref,
                 rate_diff=(
                     float(ai["macro_rate_diff"])
                     if ai.get("macro_rate_diff") is not None
@@ -7929,6 +8017,9 @@ def run_one_backtest(
                 is_exotic=(ticker or "").strip().upper() in EXOTIC_REDUCE,
             )
         return None
+    finally:
+        if _shadow_hook is not None:
+            _invoke_shadow_strategies_hook(_shadow_hook)
 
 
 def _parse_rr_ratio_numeric(rr: Any) -> float | None:
@@ -9499,6 +9590,13 @@ def run_chronological_backtest(
                 _utc_today = datetime.now(timezone.utc).date()
                 days_ago = (_utc_today - scan_date).days
                 phases = _chrono_v71_phases(days_ago, scan_date=scan_date)
+                # Bound shadow cross-pair OHLC cache to the current chrono day.
+                try:
+                    from shadow_strategies import clear_shadow_ohlc_day
+
+                    clear_shadow_ohlc_day(date_str)
+                except Exception:  # noqa: BLE001
+                    pass
                 _chrono_prefetch_ohlc_for_phase_matrix(date_str, phases, tickers, v71_pi_s, v71_tj_s)
 
                 def _v71_next_step(pi: int, ti: int, tj: int) -> tuple[int, int, int]:
