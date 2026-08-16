@@ -42,7 +42,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import traceback
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import pandas as pd
 import yfinance as yf
@@ -209,6 +209,8 @@ COMBO_ROLLING_TRADES: dict[str, list[tuple[str, float]]] = {}
 ROLLING_COMBO_RESTRICTION_WINDOW_DAYS = 14
 ROLLING_COMBO_RESTRICTION_MIN_TRADES = 2
 ROLLING_COMBO_RESTRICTION_PNL_THRESHOLD = -0.025
+# Write-only ST-MEDIUM sizing-health history: (pnl_dollars, won) in run order.
+_ST_MEDIUM_HISTORY: list[tuple[float, bool]] = []
 # v7.18: strategies with zero trades get sort priority next scan day.
 ZERO_TRADE_STRATEGIES: set[str] = set()
 TRADE_COOLDOWN_DAYS: dict[str, int] = {
@@ -1680,6 +1682,161 @@ def _rebuild_combo_rolling_trades_from_rows(rows: list[dict[str, Any]]) -> None:
         COMBO_ROLLING_TRADES.setdefault(k, []).append((d0, pnl))
     for trades in COMBO_ROLLING_TRADES.values():
         trades.sort(key=lambda x: x[0])
+
+
+def _reset_st_medium_history() -> None:
+    """Clear write-only ST-MEDIUM sizing-health rolling history."""
+    _ST_MEDIUM_HISTORY.clear()
+
+
+def _rebuild_st_medium_history_from_rows(rows: list[dict[str, Any]]) -> None:
+    """
+    Rebuild ST-MEDIUM history from prior closed REAL trades (resume / job start).
+    Only MEDIUM + STRONG_TAILWIND; chronological by date then ticker/tf/strategy.
+    """
+    _ST_MEDIUM_HISTORY.clear()
+    completed = [
+        r
+        for r in rows
+        if isinstance(r, dict)
+        and not r.get("skipped")
+        and str(r.get("outcome", "")).strip().upper() in ("WIN", "LOSS")
+        and str(r.get("confidence", "")).strip().upper() == "MEDIUM"
+        and str(r.get("macro_bias", "")).strip().upper() == "STRONG_TAILWIND"
+    ]
+    completed.sort(
+        key=lambda r: (
+            str(r.get("date", ""))[:10],
+            str(r.get("ticker", "")).strip().upper(),
+            str(r.get("timeframe", "")).strip().lower(),
+            str(r.get("strategy_id", "")).strip().upper(),
+        )
+    )
+    for r in completed:
+        pnl = float(r.get("pnl_dollars", 0) or 0)
+        won = str(r.get("outcome", "")).strip().upper() == "WIN"
+        _ST_MEDIUM_HISTORY.append((pnl, won))
+
+
+def _record_st_medium_trade(
+    *,
+    confidence: str,
+    macro_bias: str,
+    pnl_dollars: float,
+    outcome: str,
+) -> None:
+    """Append one closed ST-MEDIUM trade AFTER its what-if fields were logged."""
+    if str(outcome or "").strip().upper() not in ("WIN", "LOSS"):
+        return
+    if str(confidence or "").strip().upper() != "MEDIUM":
+        return
+    if str(macro_bias or "").strip().upper() != "STRONG_TAILWIND":
+        return
+    _ST_MEDIUM_HISTORY.append(
+        (float(pnl_dollars or 0), str(outcome).strip().upper() == "WIN")
+    )
+
+
+def _record_st_medium_from_row(row: Mapping[str, Any] | None) -> None:
+    if not isinstance(row, Mapping):
+        return
+    if row.get("skipped"):
+        return
+    _record_st_medium_trade(
+        confidence=str(row.get("confidence", "") or ""),
+        macro_bias=str(row.get("macro_bias", "") or ""),
+        pnl_dollars=float(row.get("pnl_dollars", 0) or 0),
+        outcome=str(row.get("outcome", "") or ""),
+    )
+
+
+def _sizing_health_shadow_fields(
+    *,
+    confidence: str,
+    macro_bias: str,
+    pnl_dollars: float,
+    st_boost_tier: str,
+    strategy_confluence_count: int,
+    strategy_confluence_mult: float,
+) -> dict[str, Any]:
+    """
+    Write-only sizing what-ifs from ST-MEDIUM rolling history.
+    Reads history ONLY for trades already recorded (prior to this trade).
+    Never changes live size / risk / capital.
+    """
+    hist = _ST_MEDIUM_HISTORY
+    n = len(hist)
+    last3 = sum(p for p, _ in hist[-3:]) if n >= 3 else None
+    last5 = sum(p for p, _ in hist[-5:]) if n >= 5 else None
+    last10 = sum(p for p, _ in hist[-10:]) if n >= 10 else None
+    out: dict[str, Any] = {
+        "st_health_last3": None if last3 is None else round(float(last3), 2),
+        "st_health_last5": None if last5 is None else round(float(last5), 2),
+        "st_health_last10": None if last10 is None else round(float(last10), 2),
+        "st_health_n": int(n),
+    }
+
+    conf = str(confidence or "").strip().upper()
+    mb = str(macro_bias or "").strip().upper()
+    pnl = float(pnl_dollars or 0)
+    is_st_med = conf == "MEDIUM" and mb == "STRONG_TAILWIND"
+
+    window_sums = {3: last3, 5: last5, 10: last10}
+    for w in (3, 5, 10):
+        mult_k = f"st_throttle_hard_w{w}_mult"
+        pnl_k = f"st_throttle_hard_w{w}_pnl"
+        if not is_st_med:
+            out[mult_k] = None
+            out[pnl_k] = None
+            continue
+        s = window_sums[w]
+        healthy = (n < w) or (s is not None and float(s) > 0)
+        mult = 1.0 if healthy else 0.18
+        out[mult_k] = float(mult)
+        out[pnl_k] = round(pnl * mult, 2)
+
+    if (not is_st_med) or n < 5:
+        out["st_throttle_graded_mult"] = None
+        out["st_throttle_graded_pnl"] = None
+    else:
+        wins = sum(1 for _, won in hist[-5:] if won)
+        if wins >= 4:
+            gmult = 1.00
+        elif wins >= 2:
+            gmult = 0.60
+        elif wins == 1:
+            gmult = 0.35
+        else:
+            gmult = 0.18
+        out["st_throttle_graded_mult"] = float(gmult)
+        out["st_throttle_graded_pnl"] = round(pnl * gmult, 2)
+
+    if conf != "LOW":
+        out["low_upsize_1_5x_pnl"] = None
+        out["low_upsize_2_0x_pnl"] = None
+    else:
+        healthy5 = last5 is not None and float(last5) > 0
+        out["low_upsize_1_5x_pnl"] = round(pnl * (1.5 if healthy5 else 1.0), 2)
+        out["low_upsize_2_0x_pnl"] = round(pnl * (2.0 if healthy5 else 1.0), 2)
+
+    tier = str(st_boost_tier or "").strip().upper()
+    if tier not in ("STANDARD", "ENHANCED", "FULL_GOLDEN"):
+        out["boost_gated_pnl"] = None
+    else:
+        healthy5 = last5 is not None and float(last5) > 0
+        out["boost_gated_pnl"] = round(pnl if healthy5 else pnl * 0.18, 2)
+
+    scount = int(strategy_confluence_count or 0)
+    try:
+        cm = float(strategy_confluence_mult)
+    except (TypeError, ValueError):
+        cm = 1.0
+    if scount >= 5 and cm > 0:
+        out["confluence_cap_pnl"] = round(pnl * (1.0 / cm), 2)
+    else:
+        out["confluence_cap_pnl"] = round(pnl, 2)
+
+    return out
 
 
 def _combo_trades_in_rolling_window(
@@ -6943,6 +7100,14 @@ def _python_forced_layer2_trade(
             ticker=sym,
             period_mode=str(ai.get("period_mode") or period_mode),
         ),
+        **_sizing_health_shadow_fields(
+            confidence=confidence,
+            macro_bias=str(ai.get("macro_bias", "") or ""),
+            pnl_dollars=float(pnl_dollars or 0),
+            st_boost_tier=str(ai.get("st_boost_tier") or "NONE"),
+            strategy_confluence_count=int(scount),
+            strategy_confluence_mult=float(cf_mult),
+        ),
     }
 
 
@@ -8174,6 +8339,14 @@ def run_one_backtest(
                 ),
             ),
             **_shadow_trail_fields,
+            **_sizing_health_shadow_fields(
+                confidence=str(ai.get("confidence", confidence) or ""),
+                macro_bias=str(ai.get("macro_bias", "") or ""),
+                pnl_dollars=float(pnl_dollars or 0),
+                st_boost_tier=str(ai.get("st_boost_tier") or "NONE"),
+                strategy_confluence_count=int(scount),
+                strategy_confluence_mult=float(cf_mult),
+            ),
         }
 
     except Exception as e:  # noqa: BLE001
@@ -9013,6 +9186,8 @@ def continuous_backtest_loop() -> None:
                                     f"[Loop] #{count} {ticker} {tf} {date}: {outcome} ${pnl:.2f}",
                                     level="info",
                                 )
+                                if str(outcome).upper() in ("WIN", "LOSS"):
+                                    _record_st_medium_from_row(result)
 
                         should_improve = False
                         with _loop_counters_lock:
@@ -9447,6 +9622,7 @@ def run_chronological_backtest(
         _rebuild_strategy_trade_counts_from_rows(merge_hist)
         _rebuild_combo_trade_stats_from_rows(merge_hist)
         _rebuild_combo_rolling_trades_from_rows(merge_hist)
+        _rebuild_st_medium_history_from_rows(merge_hist)
         _v72_load_strategy_status(log_startup=True)
         # FIX 18 — restore zero-trade priority after restart (same rule as end-of-day)
         for _z0 in ALL_STRATEGY_IDS:
@@ -10223,6 +10399,7 @@ def run_chronological_backtest(
                                     date_str,
                                     float(row.get("pnl_dollars", 0) or 0),
                                 )
+                                _record_st_medium_from_row(row)
 
                             npi, nti, ntj = _v71_next_step(pi, ti, tj)
                             chrono_data["chrono_intraday"] = {
