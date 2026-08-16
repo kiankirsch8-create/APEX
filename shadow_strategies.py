@@ -11,10 +11,11 @@ from __future__ import annotations
 import calendar
 import json
 import threading
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 import pandas as pd
 
@@ -5324,15 +5325,81 @@ def ptw15_stale_trend_fade(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
 
 
 # ── PART PST — STRONG_TAILWIND-regime shadow family (15 strategies) ───────────
+# Gate is parameterised. Originals keep the default (STRONG_TAILWIND only).
+# _TW twins set the ContextVar to also allow TAILWIND — no body copies.
 
-def _pst_gate(ctx: ShadowStrategyContext) -> str | None:
-    """Return the unique trade direction that maps to STRONG_TAILWIND, or None."""
+_PST_GATE_BIASES: ContextVar[tuple[str, ...]] = ContextVar(
+    "pst_gate_biases",
+    default=("STRONG_TAILWIND",),
+)
+
+_PST_BASE_IDS: tuple[str, ...] = (
+    "PST01_PARABOLIC_BLOWOFF_FADE",
+    "PST02_CLIMAX_RANGE_REJECTION",
+    "PST03_ATR_SPIKE_REVERSION",
+    "PST04_FAILED_CONTINUATION_TRAP",
+    "PST05_WEEKLY_CLIMAX_REVERSAL",
+    "PST06_TRIPLE_DIVERGENCE_FADE",
+    "PST07_SCORE_ROLLOVER_ANTICIPATOR",
+    "PST08_EXHAUSTION_GAP_FAILURE",
+    "PST09_STALL_DECAY_FADE",
+    "PST10_STRUCTURAL_DISCOUNT_ENTRY",
+    "PST11_VOL_CONTAINED_CONTINUATION",
+    "PST12_JPY_BASKET_CONFIRMED_RIDE",
+    "PST13_SECOND_TEST_UNDERSHOOT",
+    "PST14_MAJOR_LEVEL_SWEEP_FADE",
+    "PST15_CAPITULATION_SPIKE_LOTTERY",
+)
+
+
+def _pst_gate(
+    ctx: ShadowStrategyContext,
+    allowed_biases: Sequence[str] | None = None,
+) -> str | None:
+    """
+    Return the unique trade direction that maps to an allowed bias, or None.
+
+    Default (``allowed_biases=None``): uses ``_PST_GATE_BIASES`` ContextVar,
+    which defaults to ``("STRONG_TAILWIND",)`` — original PST behaviour.
+    Pass an explicit sequence to override (e.g. for tests).
+    """
     from continuous_backtester import _shadow_bias_from_state
 
+    if allowed_biases is None:
+        biases = _PST_GATE_BIASES.get()
+    else:
+        biases = tuple(allowed_biases)
+    allowed = {str(b).strip().upper() for b in biases}
     for direction in ("LONG", "SHORT"):
-        if _shadow_bias_from_state(ctx.regime_state, direction) == "STRONG_TAILWIND":
+        if _shadow_bias_from_state(ctx.regime_state, direction) in allowed:
             return direction
     return None
+
+
+def _register_pst_tw_twins() -> None:
+    """Register <PST*_TW> shadows that fire on STRONG_TAILWIND or TAILWIND."""
+    tw_biases = ("STRONG_TAILWIND", "TAILWIND")
+    for base_id in _PST_BASE_IDS:
+        base_fn = SHADOW_STRATEGIES[base_id]
+        tw_id = f"{base_id}_TW"
+
+        def _make(fn: SignalFn = base_fn, sid: str = tw_id) -> SignalFn:
+            @register_shadow_strategy(sid)
+            def _tw(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+                token = _PST_GATE_BIASES.set(tw_biases)
+                try:
+                    sig = fn(ctx)
+                finally:
+                    _PST_GATE_BIASES.reset(token)
+                if sig is None:
+                    return None
+                out = dict(sig)
+                out["strategy_id"] = sid
+                return out
+
+            return _tw
+
+        _make()
 
 
 def _pst_fade(direction: str) -> str:
@@ -6289,6 +6356,128 @@ def pst15_capitulation_spike_lottery(ctx: ShadowStrategyContext) -> dict[str, An
         strategy_id="PST15_CAPITULATION_SPIKE_LOTTERY",
     )
 
+
+_register_pst_tw_twins()
+
+
+# ── PART PR01 — R01 unblocked shadow twin ─────────────────────────────────────
+# Mirrors live R01_EXTREME_ZONE_REVERSION entry non-negotiables (Layer-1 prompt +
+# post-validation RSI/TF gates). Shadow-harness only: no bad-period pause,
+# cooldown, or per-day / per-currency caps.
+
+def _pr01_zone_pct(ctx: ShadowStrategyContext) -> float | None:
+    """52w zone% — same formula as continuous_backtester / apex_trader."""
+    price = ctx.last_close()
+    if price is None or price != price or price <= 0:  # noqa: PLR0124
+        return None
+    ind = ctx.indicators
+    high_52w: float | None = None
+    low_52w: float | None = None
+    try:
+        hi = ind.get("high_52w")
+        lo = ind.get("low_52w")
+        if hi is not None:
+            high_52w = float(hi)
+        if lo is not None:
+            low_52w = float(lo)
+    except (TypeError, ValueError):
+        high_52w, low_52w = None, None
+    if high_52w is None or low_52w is None or high_52w != high_52w or low_52w != low_52w:
+        df = ctx.ohlc()
+        arr = _psh_ohlc_arrays(df)
+        if arr is None:
+            return None
+        _o, h, l, _c = arr
+        try:
+            high_52w = float(h.max())
+            low_52w = float(l.min())
+        except Exception:  # noqa: BLE001
+            return None
+    if high_52w > low_52w:
+        return round((float(price) - low_52w) / (high_52w - low_52w) * 100, 1)
+    return 50.0
+
+
+def _pr01_rsi_adx(ctx: ShadowStrategyContext) -> tuple[float | None, float | None]:
+    """Prefer scan indicators; RSI falls back to OHLC calc if missing."""
+    ind = ctx.indicators
+    rsi: float | None = None
+    adx: float | None = None
+    try:
+        if ind.get("rsi") is not None:
+            rsi = float(ind["rsi"])
+    except (TypeError, ValueError):
+        rsi = None
+    try:
+        if ind.get("adx") is not None:
+            adx = float(ind["adx"])
+    except (TypeError, ValueError):
+        adx = None
+    if rsi is None or rsi != rsi:  # noqa: PLR0124
+        arr = _psh_ohlc_arrays(ctx.ohlc())
+        if arr is not None:
+            _o, _h, _l, c = arr
+            rsi_s = _psh_rsi(c, 14)
+            if len(rsi_s) and pd.notna(rsi_s.iloc[-1]):
+                rsi = float(rsi_s.iloc[-1])
+            else:
+                rsi = None
+    if adx is not None and adx != adx:  # noqa: PLR0124
+        adx = None
+    return rsi, adx
+
+
+@register_shadow_strategy("PR01_EXTREME_ZONE_UNBLOCKED")
+def pr01_extreme_zone_unblocked(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
+    """
+    Shadow twin of live R01_EXTREME_ZONE_REVERSION.
+
+    Live non-negotiables (ALL required — Layer-1 prompt):
+      SHORT: zone_pct >= 80, RSI >= 60, ADX <= 45, TF in {1d, 1w}
+      LONG:  zone_pct <= 20, RSI <= 40, ADX <= 45, TF in {1d, 1w}
+    Stop: 2.0×ATR from entry (apex_trader.stop_tp_bundle for R01).
+
+    Not reproduced in shadow (commented, not silently dropped):
+      - Live AI structural stop selection beyond the 2.0×ATR default;
+        MIN_STOP_PCT / MAX_STOP_PCT clamp after AI stop — shadow uses
+        harness stop_atr_mult=2.0 + standard 11 exit variants.
+      - Live DIAGNOSTIC skip: SHORT when macro_bias == STRONG_HEADWIND
+        (slot-stealer test in continuous_backtester) — omitted so this
+        twin measures upstream-blocked entries, not that diagnostic.
+      - Live bad-period pause / cooldowns / day & currency caps — intentional;
+        those are the upstream blocks this twin is meant to bypass.
+    """
+    tf = str(ctx.timeframe or "").strip().lower()
+    if tf not in ("1d", "1w"):
+        return None
+    zone = _pr01_zone_pct(ctx)
+    if zone is None:
+        return None
+    rsi, adx = _pr01_rsi_adx(ctx)
+    if rsi is None or adx is None:
+        # Live always has RSI/ADX on the scan ind; without them we cannot
+        # faithfully mirror the required RSI+ADX non-negotiables.
+        return None
+
+    direction: str | None = None
+    if zone <= 20.0 and rsi <= 40.0 and adx <= 45.0:
+        direction = "LONG"
+    elif zone >= 80.0 and rsi >= 60.0 and adx <= 45.0:
+        direction = "SHORT"
+    if direction is None:
+        return None
+
+    # Placeholder stop; evaluate_shadow_strategies recomputes from next-open
+    # entry via stop_atr_mult (same path as other ATR-stop shadow strategies).
+    sig = _psh_signal(
+        direction=direction,
+        stop_price=0.0,
+        timeframe=tf,
+        strategy_id="PR01_EXTREME_ZONE_UNBLOCKED",
+        entry_at_next_open=True,
+    )
+    sig["stop_atr_mult"] = 2.0
+    return sig
 
 
 # ── PART F — validation dummies (remove in a later prompt) ───────────────────
