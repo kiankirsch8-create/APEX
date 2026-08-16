@@ -392,6 +392,16 @@ def build_shadow_context(
 
 
 # ── Shadow trade simulation (PART A + B) ─────────────────────────────────────
+def _shadow_target_ok(level: float, close_i: float, direction: str) -> bool:
+    """True iff a frozen price_target lies beyond close_i in the trade direction."""
+    d = str(direction).strip().upper()
+    if d == "LONG":
+        return float(level) > float(close_i)
+    if d == "SHORT":
+        return float(level) < float(close_i)
+    return False
+
+
 def _flat_sizing(
     entry: float,
     stop: float,
@@ -3096,14 +3106,6 @@ def _pnt_r20(closes: pd.Series) -> pd.Series:
     return (closes - prev) / prev
 
 
-def _pnt_price_target_sane(direction: str, level: float, close: float) -> bool:
-    if direction == "SHORT":
-        return level < close
-    if direction == "LONG":
-        return level > close
-    return False
-
-
 # ── PNT01 ────────────────────────────────────────────────────────────────────
 @register_shadow_strategy("PNT01_DUAL_BOUNDARY_ROTATION")
 def pnt01_dual_boundary_rotation(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
@@ -3356,7 +3358,7 @@ def pnt04_correlated_pair_divergence(ctx: ShadowStrategyContext) -> dict[str, An
         return None
     level = anchor * (1.0 + r20_star)
     close_now = float(traded.iloc[pos])
-    if not _pnt_price_target_sane(direction, level, close_now):
+    if not _shadow_target_ok(level, close_now, direction):
         return None
     sig = _psh_signal(
         direction=direction,
@@ -3431,7 +3433,7 @@ def pnt05_triangle_consistency_snap(ctx: ShadowStrategyContext) -> dict[str, Any
     implied_now = float(implied.iloc[-1])
     level = implied_now + 0.5 * sigma * sign_d
     close_now = float(joined["cross"].iloc[-1])
-    if not _pnt_price_target_sane(direction, level, close_now):
+    if not _shadow_target_ok(level, close_now, direction):
         return None
     arr = _psh_ohlc_arrays(ctx.ohlc())
     if arr is None:
@@ -4419,7 +4421,7 @@ def ptw06_measured_leg_repeat(ctx: ShadowStrategyContext) -> dict[str, Any] | No
             return None
         stop = P
         level = P + A
-        if level <= close_i:
+        if not _shadow_target_ok(level, close_i, direction):
             return None
     else:
         P = float(h.iloc[e + 1 : i + 1].max())
@@ -4429,7 +4431,7 @@ def ptw06_measured_leg_repeat(ctx: ShadowStrategyContext) -> dict[str, Any] | No
             return None
         stop = P
         level = P - A
-        if level >= close_i:
+        if not _shadow_target_ok(level, close_i, direction):
             return None
     return _psh_signal(
         direction=direction,
