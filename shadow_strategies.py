@@ -662,7 +662,7 @@ def _simulate_shadow_trade(
         candles_to_exit=candles,
     )
     outcome = str(exit_data.get("outcome") or ("WIN" if pnl_d > 0 else "LOSS"))
-    return {
+    baseline = {
         "direction": direction,
         "entry_price": round(entry, 5),
         "stop_loss": round(stop, 5),
@@ -689,6 +689,404 @@ def _simulate_shadow_trade(
         "entry_atr": atr,
         "custom_exit": dict(custom_exit) if isinstance(custom_exit, Mapping) else None,
     }
+    # Parallel what-if exits (write-only nested objects). Baseline fields unchanged.
+    try:
+        variants = _shadow_exit_variant_fields(
+            direction=direction,
+            entry=entry,
+            stop=stop,
+            tp1=tp1,
+            tp2=tp2,
+            tp3=tp3,
+            forward_df=forward_df,
+            past_df=past_df,
+            position_size=ps,
+            leveraged_exposure=exposure,
+            timeframe=tf,
+            atr=float(atr or 0) or risk,
+            ticker=str(signal.get("ticker") or ""),
+            strategy_id=sid,
+            custom_exit=custom_exit,
+            macro_bias=bias,
+            trail_regime=trail_regime,
+            trend_strength=ts_use,
+            rate_differential=rd_use,
+            baseline=baseline,
+        )
+        baseline.update(variants)
+    except Exception as e:  # noqa: BLE001
+        log(f"[SHADOW EXIT VAR] {sid}: {e}", level="warning")
+    return baseline
+
+
+_SHADOW_EXIT_TRAIL_RS: tuple[tuple[str, float], ...] = (
+    ("shadow_exit_trail_0_50r", 0.50),
+    ("shadow_exit_trail_1_00r", 1.00),
+    ("shadow_exit_trail_1_50r", 1.50),
+    ("shadow_exit_trail_2_00r", 2.00),
+    ("shadow_exit_trail_2_50r", 2.50),
+)
+_SHADOW_EXIT_HARD_TP_RS: tuple[tuple[str, float], ...] = (
+    ("shadow_exit_hard_tp_1_00r", 1.00),
+    ("shadow_exit_hard_tp_1_50r", 1.50),
+    ("shadow_exit_hard_tp_2_00r", 2.00),
+)
+_SHADOW_EXIT_TIME_NS: tuple[tuple[str, int], ...] = (
+    ("shadow_exit_time_exit_3", 3),
+    ("shadow_exit_time_exit_5", 5),
+)
+
+
+def _shadow_exit_variant_snapshot(
+    *,
+    exit_price: Any,
+    exit_reason: Any,
+    pnl_dollars: Any,
+    pnl_pct: Any,
+    candles_to_exit: Any,
+) -> dict[str, Any]:
+    return {
+        "exit_price": exit_price,
+        "exit_reason": exit_reason,
+        "pnl_dollars": pnl_dollars,
+        "pnl_pct": pnl_pct,
+        "candles_to_exit": candles_to_exit,
+    }
+
+
+def _shadow_exit_pack_from_raw(
+    *,
+    ticker: str,
+    direction: str,
+    timeframe: str,
+    position_size: float,
+    entry: float,
+    leveraged_exposure: float,
+    exit_price: float,
+    exit_reason: str,
+    candles_to_exit: int,
+) -> dict[str, Any] | None:
+    """Apply the same cost model as the baseline and pack the nested variant object."""
+    from continuous_backtester import _apply_realistic_costs
+
+    d = str(direction).strip().upper()
+    move = (float(exit_price) - float(entry)) if d == "LONG" else (float(entry) - float(exit_price))
+    denom = float(position_size) * float(entry) if position_size > 0 and entry > 0 else 0.0
+    raw_pct = (float(position_size) * move / denom) if denom > 0 else 0.0
+    pnl_d, pnl_pct, _gross, _cf = _apply_realistic_costs(
+        ticker=ticker,
+        direction=d,
+        timeframe=timeframe,
+        position_size=position_size,
+        entry=entry,
+        leveraged_exposure=leveraged_exposure,
+        raw_pct=raw_pct,
+        candles_to_exit=int(candles_to_exit),
+    )
+    return _shadow_exit_variant_snapshot(
+        exit_price=round(float(exit_price), 5),
+        exit_reason=exit_reason,
+        pnl_dollars=pnl_d,
+        pnl_pct=pnl_pct,
+        candles_to_exit=int(candles_to_exit),
+    )
+
+
+def _simulate_stop_rule_walk(
+    *,
+    direction: str,
+    entry: float,
+    stop: float,
+    forward_df: pd.DataFrame,
+    target: float | None = None,
+    max_sessions: int | None = None,
+    target_reason: str = "HARD_TP",
+    time_reason_prefix: str = "TIME_EXIT",
+) -> dict[str, Any] | None:
+    """
+    Candle walk: stop first, then optional hard TP / time exit, else window end.
+    Entry day is session 1. No trailing / no TP ladder.
+    """
+    d = str(direction).strip().upper()
+    if d not in ("LONG", "SHORT") or forward_df is None or getattr(forward_df, "empty", True):
+        return None
+    try:
+        entry_f = float(entry)
+        stop_f = float(stop)
+    except (TypeError, ValueError):
+        return None
+    if entry_f <= 0 or abs(entry_f - stop_f) <= 0:
+        return None
+    target_f: float | None = None
+    if target is not None:
+        try:
+            target_f = float(target)
+        except (TypeError, ValueError):
+            return None
+    last_close = entry_f
+    last_i = 0
+    for i, (_, candle) in enumerate(forward_df.iterrows(), start=1):
+        try:
+            high = float(candle.get("High", entry_f))
+            low = float(candle.get("Low", entry_f))
+            close = float(candle.get("Close", entry_f))
+        except (TypeError, ValueError):
+            continue
+        if high != high or low != low or close != close:
+            continue
+        last_close, last_i = close, i
+        # 1) Stop always wins if touched
+        if d == "LONG" and low <= stop_f:
+            return {
+                "exit_price": stop_f,
+                "exit_reason": "Stop loss",
+                "candles_to_exit": i,
+            }
+        if d == "SHORT" and high >= stop_f:
+            return {
+                "exit_price": stop_f,
+                "exit_reason": "Stop loss",
+                "candles_to_exit": i,
+            }
+        # 2) Variant rule
+        if target_f is not None:
+            if d == "LONG" and high >= target_f:
+                return {
+                    "exit_price": target_f,
+                    "exit_reason": target_reason,
+                    "candles_to_exit": i,
+                }
+            if d == "SHORT" and low <= target_f:
+                return {
+                    "exit_price": target_f,
+                    "exit_reason": target_reason,
+                    "candles_to_exit": i,
+                }
+        if max_sessions is not None and i >= int(max_sessions):
+            return {
+                "exit_price": close,
+                "exit_reason": f"{time_reason_prefix}_{int(max_sessions)}",
+                "candles_to_exit": i,
+            }
+    if last_i <= 0:
+        return None
+    return {
+        "exit_price": last_close,
+        "exit_reason": "Window ended",
+        "candles_to_exit": last_i,
+    }
+
+
+def _shadow_exit_variant_fields(
+    *,
+    direction: str,
+    entry: float,
+    stop: float,
+    tp1: float,
+    tp2: float,
+    tp3: float,
+    forward_df: pd.DataFrame,
+    past_df: pd.DataFrame,
+    position_size: float,
+    leveraged_exposure: float,
+    timeframe: str,
+    atr: float,
+    ticker: str,
+    strategy_id: str,
+    custom_exit: Mapping[str, Any] | None,
+    macro_bias: str,
+    trail_regime: str,
+    trend_strength: float,
+    rate_differential: float,
+    baseline: Mapping[str, Any],
+) -> dict[str, Any]:
+    """
+    Eleven parallel exit what-ifs from the same entry/stop as the baseline.
+    Nested objects only — never mutate top-level baseline fields.
+    """
+    from continuous_backtester import (
+        LEVERAGE,
+        _apply_realistic_costs,
+        _evaluate_forward_with_trend_continuation,
+    )
+
+    out: dict[str, Any] = {}
+    risk = abs(float(entry) - float(stop))
+    sign = 1.0 if str(direction).upper() == "LONG" else -1.0
+    bias = str(macro_bias or "NEUTRAL")
+
+    def _pack_engine_sim(sim: Mapping[str, Any] | None) -> dict[str, Any] | None:
+        if not sim or sim.get("outcome") in ("NO_DATA", "INVALID"):
+            return None
+        raw_pct = float(sim.get("pnl_pct", 0) or 0)
+        candles = int(sim.get("candles_to_exit", 0) or 0)
+        pnl_d, pnl_pct, _gross, _cf = _apply_realistic_costs(
+            ticker=ticker,
+            direction=direction,
+            timeframe=timeframe,
+            position_size=position_size,
+            entry=entry,
+            leveraged_exposure=leveraged_exposure,
+            raw_pct=raw_pct,
+            candles_to_exit=candles,
+        )
+        return _shadow_exit_variant_snapshot(
+            exit_price=sim.get("exit_price"),
+            exit_reason=sim.get("exit_reason"),
+            pnl_dollars=pnl_d,
+            pnl_pct=pnl_pct,
+            candles_to_exit=candles,
+        )
+
+    # ── Trailing activation R variants (existing engine trail mechanics) ──
+    for field_name, act_r in _SHADOW_EXIT_TRAIL_RS:
+        try:
+            sim = _evaluate_forward_with_trend_continuation(
+                direction,
+                entry,
+                stop,
+                tp1,
+                tp2,
+                tp3,
+                forward_df,
+                strategy_id,
+                position_size=position_size,
+                leverage=LEVERAGE,
+                timeframe=timeframe,
+                macro_bias=bias,
+                macro_bias_adjusted=bias,
+                trail_regime=trail_regime,
+                trend_strength=trend_strength,
+                rate_differential=rate_differential,
+                atr=atr,
+                buffer_stop_price=stop,
+                ticker=ticker,
+                period_mode="NEUTRAL",
+                trail_activate_r=float(act_r),
+            )
+            out[field_name] = _pack_engine_sim(sim)
+        except Exception:  # noqa: BLE001
+            out[field_name] = None
+
+    # ── Hard take-profit at R × stop distance ──
+    for field_name, r_mult in _SHADOW_EXIT_HARD_TP_RS:
+        try:
+            tp = float(entry) + sign * risk * float(r_mult)
+            walked = _simulate_stop_rule_walk(
+                direction=direction,
+                entry=entry,
+                stop=stop,
+                forward_df=forward_df,
+                target=tp,
+                target_reason=f"HARD_TP_{f'{r_mult:.2f}'.replace('.', '_')}R",
+            )
+            if walked is None:
+                out[field_name] = None
+            else:
+                out[field_name] = _shadow_exit_pack_from_raw(
+                    ticker=ticker,
+                    direction=direction,
+                    timeframe=timeframe,
+                    position_size=position_size,
+                    entry=entry,
+                    leveraged_exposure=leveraged_exposure,
+                    exit_price=float(walked["exit_price"]),
+                    exit_reason=str(walked["exit_reason"]),
+                    candles_to_exit=int(walked["candles_to_exit"]),
+                )
+        except Exception:  # noqa: BLE001
+            out[field_name] = None
+
+    # ── Time exits (entry day = session 1) ──
+    for field_name, n_sess in _SHADOW_EXIT_TIME_NS:
+        try:
+            walked = _simulate_stop_rule_walk(
+                direction=direction,
+                entry=entry,
+                stop=stop,
+                forward_df=forward_df,
+                max_sessions=int(n_sess),
+            )
+            if walked is None:
+                out[field_name] = None
+            else:
+                out[field_name] = _shadow_exit_pack_from_raw(
+                    ticker=ticker,
+                    direction=direction,
+                    timeframe=timeframe,
+                    position_size=position_size,
+                    entry=entry,
+                    leveraged_exposure=leveraged_exposure,
+                    exit_price=float(walked["exit_price"]),
+                    exit_reason=str(walked["exit_reason"]),
+                    candles_to_exit=int(walked["candles_to_exit"]),
+                )
+        except Exception:  # noqa: BLE001
+            out[field_name] = None
+
+    # ── baseline_copy: re-simulate the strategy's own exit via this harness ──
+    try:
+        if custom_exit is None:
+            sim = _evaluate_forward_with_trend_continuation(
+                direction,
+                entry,
+                stop,
+                tp1,
+                tp2,
+                tp3,
+                forward_df,
+                strategy_id,
+                position_size=position_size,
+                leverage=LEVERAGE,
+                timeframe=timeframe,
+                macro_bias=bias,
+                macro_bias_adjusted=bias,
+                trail_regime=trail_regime,
+                trend_strength=trend_strength,
+                rate_differential=rate_differential,
+                atr=atr,
+                buffer_stop_price=stop,
+                ticker=ticker,
+                period_mode="NEUTRAL",
+            )
+            copy = _pack_engine_sim(sim)
+        else:
+            sim = _simulate_with_custom_exit(
+                direction=direction,
+                entry=entry,
+                stop=stop,
+                tp1=tp1,
+                tp2=tp2,
+                tp3=tp3,
+                forward_df=forward_df,
+                past_df=past_df,
+                position_size=position_size,
+                timeframe=timeframe,
+                atr=atr,
+                ticker=ticker,
+                strategy_id=strategy_id,
+                custom_exit=custom_exit,
+                macro_bias=bias,
+                trail_regime=trail_regime,
+                trend_strength=trend_strength,
+                rate_differential=rate_differential,
+            )
+            copy = _pack_engine_sim(sim)
+        out["shadow_exit_baseline_copy"] = copy
+        # Self-check: copy must equal top-level baseline on the shared fields.
+        if copy is not None:
+            for k in ("exit_price", "exit_reason", "pnl_dollars", "pnl_pct", "candles_to_exit"):
+                if copy.get(k) != baseline.get(k):
+                    log(
+                        f"[SHADOW EXIT VAR] baseline_copy mismatch {strategy_id} "
+                        f"{ticker} field={k} copy={copy.get(k)!r} base={baseline.get(k)!r}",
+                        level="warning",
+                    )
+                    break
+    except Exception:  # noqa: BLE001
+        out["shadow_exit_baseline_copy"] = None
+
+    return out
 
 
 def _simulate_with_custom_exit(
