@@ -211,6 +211,12 @@ ROLLING_COMBO_RESTRICTION_MIN_TRADES = 2
 ROLLING_COMBO_RESTRICTION_PNL_THRESHOLD = -0.025
 # Write-only ST-MEDIUM sizing-health history: (pnl_dollars, won) in run order.
 _ST_MEDIUM_HISTORY: list[tuple[float, bool]] = []
+# Write-only system health-signal histories (observation only; run order).
+_SYS_FOLLOWTHROUGH_HISTORY: list[float] = []
+_STRAT_PNL_HISTORY: dict[str, list[float]] = {}
+_JPY_PNL_HISTORY: list[float] = []
+_SYS_WIN_HISTORY: list[bool] = []
+_LAST_5R_WIN_DATE: str | None = None  # YYYY-MM-DD of last ≥5R closed win
 # v7.18: strategies with zero trades get sort priority next scan day.
 ZERO_TRADE_STRATEGIES: set[str] = set()
 TRADE_COOLDOWN_DAYS: dict[str, int] = {
@@ -1837,6 +1843,143 @@ def _sizing_health_shadow_fields(
         out["confluence_cap_pnl"] = round(pnl, 2)
 
     return out
+
+
+def _health_signal_row_sort_key(r: Mapping[str, Any]) -> tuple[str, str, str, str]:
+    return (
+        str(r.get("date", ""))[:10],
+        str(r.get("ticker", "")).strip().upper(),
+        str(r.get("timeframe", "")).strip().lower(),
+        str(r.get("strategy_id", "")).strip().upper(),
+    )
+
+
+def _reset_health_signal_histories() -> None:
+    """Clear write-only system / strategy / JPY health-signal histories."""
+    global _LAST_5R_WIN_DATE
+    _SYS_FOLLOWTHROUGH_HISTORY.clear()
+    _STRAT_PNL_HISTORY.clear()
+    _JPY_PNL_HISTORY.clear()
+    _SYS_WIN_HISTORY.clear()
+    _LAST_5R_WIN_DATE = None
+
+
+def _health_signal_shadow_fields(
+    *,
+    strategy_id: str,
+    analysis_date: str,
+) -> dict[str, Any]:
+    """
+    Write-only diagnostic labels from prior closed trades only.
+    Never gates, blocks, sizes, or filters.
+    """
+    ft = _SYS_FOLLOWTHROUGH_HISTORY
+    n_ft = len(ft)
+    if n_ft >= 20:
+        ft20 = sum(ft[-20:]) / 20.0
+        never20 = sum(1 for x in ft[-20:] if x < 0.10) / 20.0
+    else:
+        ft20 = None
+        never20 = None
+    if n_ft >= 50:
+        ft50 = sum(ft[-50:]) / 50.0
+    else:
+        ft50 = None
+
+    sid = str(strategy_id or "").strip().upper()
+    strat_hist = _STRAT_PNL_HISTORY.get(sid, [])
+    sn = len(strat_hist)
+    strat3 = sum(strat_hist[-3:]) if sn >= 3 else None
+    strat10 = sum(strat_hist[-10:]) if sn >= 10 else None
+
+    jpy = _JPY_PNL_HISTORY
+    jn = len(jpy)
+    jpy10 = sum(jpy[-10:]) if jn >= 10 else None
+    jpy20 = sum(jpy[-20:]) if jn >= 20 else None
+
+    wins = _SYS_WIN_HISTORY
+    wn = len(wins)
+    wr20 = (sum(1 for w in wins[-20:] if w) / 20.0) if wn >= 20 else None
+    wr50 = (sum(1 for w in wins[-50:] if w) / 50.0) if wn >= 50 else None
+
+    days_since: int | None = None
+    if _LAST_5R_WIN_DATE:
+        try:
+            curr = datetime.strptime(str(analysis_date or "").strip()[:10], "%Y-%m-%d").date()
+            prev = datetime.strptime(str(_LAST_5R_WIN_DATE)[:10], "%Y-%m-%d").date()
+            days_since = int((curr - prev).days)
+        except (TypeError, ValueError):
+            days_since = None
+
+    return {
+        "sys_followthrough_last20": None if ft20 is None else round(float(ft20), 4),
+        "sys_followthrough_last50": None if ft50 is None else round(float(ft50), 4),
+        "sys_never_profit_rate_20": None if never20 is None else round(float(never20), 4),
+        "strat_health_last3": None if strat3 is None else round(float(strat3), 2),
+        "strat_health_last10": None if strat10 is None else round(float(strat10), 2),
+        "strat_health_n": int(sn),
+        "jpy_health_last10": None if jpy10 is None else round(float(jpy10), 2),
+        "jpy_health_last20": None if jpy20 is None else round(float(jpy20), 2),
+        "sys_winrate_last20": None if wr20 is None else round(float(wr20), 4),
+        "sys_winrate_last50": None if wr50 is None else round(float(wr50), 4),
+        "days_since_5r_win": days_since,
+    }
+
+
+def _record_health_signals_from_row(row: Mapping[str, Any] | None) -> None:
+    """Append one closed REAL trade to health-signal histories (after row built)."""
+    global _LAST_5R_WIN_DATE
+    if not isinstance(row, Mapping):
+        return
+    if row.get("skipped"):
+        return
+    if str(row.get("outcome", "")).strip().upper() not in ("WIN", "LOSS"):
+        return
+
+    pnl = float(row.get("pnl_dollars", 0) or 0)
+    won = str(row.get("outcome", "")).strip().upper() == "WIN"
+    sid = str(row.get("strategy_id", "")).strip().upper()
+    tku = str(row.get("ticker", "")).strip().upper()
+    ds = str(row.get("date", "") or "")[:10]
+
+    try:
+        risk = float(row.get("max_risk_dollars", 0) or 0)
+    except (TypeError, ValueError):
+        risk = 0.0
+    if risk > 0:
+        try:
+            peak = row.get("peak_profit_dollars")
+            if peak is not None:
+                peak_f = float(peak)
+                if peak_f == peak_f:  # not NaN
+                    _SYS_FOLLOWTHROUGH_HISTORY.append(peak_f / risk)
+        except (TypeError, ValueError):
+            pass
+        if pnl >= 5.0 * risk and ds:
+            _LAST_5R_WIN_DATE = ds
+
+    if sid and sid != "SKIP":
+        _STRAT_PNL_HISTORY.setdefault(sid, []).append(pnl)
+
+    if tku.endswith("JPY"):
+        _JPY_PNL_HISTORY.append(pnl)
+
+    _SYS_WIN_HISTORY.append(won)
+
+
+def _rebuild_health_signal_histories_from_rows(rows: list[dict[str, Any]]) -> None:
+    """Rebuild health-signal histories from prior closed REAL trades (job start / resume)."""
+    _reset_health_signal_histories()
+    completed = [
+        r
+        for r in rows
+        if isinstance(r, dict)
+        and not r.get("skipped")
+        and str(r.get("outcome", "")).strip().upper() in ("WIN", "LOSS")
+    ]
+    completed.sort(key=_health_signal_row_sort_key)
+    for r in completed:
+        _record_health_signals_from_row(r)
 
 
 def _combo_trades_in_rolling_window(
@@ -7108,6 +7251,10 @@ def _python_forced_layer2_trade(
             strategy_confluence_count=int(scount),
             strategy_confluence_mult=float(cf_mult),
         ),
+        **_health_signal_shadow_fields(
+            strategy_id=strat_id,
+            analysis_date=analysis_date,
+        ),
     }
 
 
@@ -8347,6 +8494,10 @@ def run_one_backtest(
                 strategy_confluence_count=int(scount),
                 strategy_confluence_mult=float(cf_mult),
             ),
+            **_health_signal_shadow_fields(
+                strategy_id=strategy_id_norm,
+                analysis_date=analysis_date,
+            ),
         }
 
     except Exception as e:  # noqa: BLE001
@@ -9188,6 +9339,7 @@ def continuous_backtest_loop() -> None:
                                 )
                                 if str(outcome).upper() in ("WIN", "LOSS"):
                                     _record_st_medium_from_row(result)
+                                    _record_health_signals_from_row(result)
 
                         should_improve = False
                         with _loop_counters_lock:
@@ -9623,6 +9775,7 @@ def run_chronological_backtest(
         _rebuild_combo_trade_stats_from_rows(merge_hist)
         _rebuild_combo_rolling_trades_from_rows(merge_hist)
         _rebuild_st_medium_history_from_rows(merge_hist)
+        _rebuild_health_signal_histories_from_rows(merge_hist)
         _v72_load_strategy_status(log_startup=True)
         # FIX 18 — restore zero-trade priority after restart (same rule as end-of-day)
         for _z0 in ALL_STRATEGY_IDS:
@@ -10400,6 +10553,7 @@ def run_chronological_backtest(
                                     float(row.get("pnl_dollars", 0) or 0),
                                 )
                                 _record_st_medium_from_row(row)
+                                _record_health_signals_from_row(row)
 
                             npi, nti, ntj = _v71_next_step(pi, ti, tj)
                             chrono_data["chrono_intraday"] = {
