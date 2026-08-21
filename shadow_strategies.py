@@ -721,10 +721,6 @@ def _simulate_shadow_trade(
 
 
 _SHADOW_EXIT_TRAIL_RS: tuple[tuple[str, float], ...] = (
-    ("shadow_exit_trail_0_50r", 0.50),
-    ("shadow_exit_trail_1_00r", 1.00),
-    ("shadow_exit_trail_1_50r", 1.50),
-    ("shadow_exit_trail_2_00r", 2.00),
     ("shadow_exit_trail_2_50r", 2.50),
 )
 _SHADOW_EXIT_HARD_TP_RS: tuple[tuple[str, float], ...] = (
@@ -6440,7 +6436,7 @@ def pr01_extreme_zone_unblocked(ctx: ShadowStrategyContext) -> dict[str, Any] | 
     Not reproduced in shadow (commented, not silently dropped):
       - Live AI structural stop selection beyond the 2.0×ATR default;
         MIN_STOP_PCT / MAX_STOP_PCT clamp after AI stop — shadow uses
-        harness stop_atr_mult=2.0 + standard 11 exit variants.
+        harness stop_atr_mult=2.0 + standard exit variants.
       - Live DIAGNOSTIC skip: SHORT when macro_bias == STRONG_HEADWIND
         (slot-stealer test in continuous_backtester) — omitted so this
         twin measures upstream-blocked entries, not that diagnostic.
