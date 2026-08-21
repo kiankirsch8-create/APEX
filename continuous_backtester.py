@@ -216,7 +216,6 @@ _SYS_FOLLOWTHROUGH_HISTORY: list[float] = []
 _STRAT_PNL_HISTORY: dict[str, list[float]] = {}
 _JPY_PNL_HISTORY: list[float] = []
 _SYS_WIN_HISTORY: list[bool] = []
-_LAST_5R_WIN_DATE: str | None = None  # YYYY-MM-DD of last ≥5R closed win
 # v7.18: strategies with zero trades get sort priority next scan day.
 ZERO_TRADE_STRATEGIES: set[str] = set()
 TRADE_COOLDOWN_DAYS: dict[str, int] = {
@@ -1762,8 +1761,6 @@ def _sizing_health_shadow_fields(
     macro_bias: str,
     pnl_dollars: float,
     st_boost_tier: str,
-    strategy_confluence_count: int,
-    strategy_confluence_mult: float,
 ) -> dict[str, Any]:
     """
     Write-only sizing what-ifs from ST-MEDIUM rolling history.
@@ -1801,46 +1798,12 @@ def _sizing_health_shadow_fields(
         out[mult_k] = float(mult)
         out[pnl_k] = round(pnl * mult, 2)
 
-    if (not is_st_med) or n < 5:
-        out["st_throttle_graded_mult"] = None
-        out["st_throttle_graded_pnl"] = None
-    else:
-        wins = sum(1 for _, won in hist[-5:] if won)
-        if wins >= 4:
-            gmult = 1.00
-        elif wins >= 2:
-            gmult = 0.60
-        elif wins == 1:
-            gmult = 0.35
-        else:
-            gmult = 0.18
-        out["st_throttle_graded_mult"] = float(gmult)
-        out["st_throttle_graded_pnl"] = round(pnl * gmult, 2)
-
-    if conf != "LOW":
-        out["low_upsize_1_5x_pnl"] = None
-        out["low_upsize_2_0x_pnl"] = None
-    else:
-        healthy5 = last5 is not None and float(last5) > 0
-        out["low_upsize_1_5x_pnl"] = round(pnl * (1.5 if healthy5 else 1.0), 2)
-        out["low_upsize_2_0x_pnl"] = round(pnl * (2.0 if healthy5 else 1.0), 2)
-
     tier = str(st_boost_tier or "").strip().upper()
     if tier not in ("STANDARD", "ENHANCED", "FULL_GOLDEN"):
         out["boost_gated_pnl"] = None
     else:
         healthy5 = last5 is not None and float(last5) > 0
         out["boost_gated_pnl"] = round(pnl if healthy5 else pnl * 0.18, 2)
-
-    scount = int(strategy_confluence_count or 0)
-    try:
-        cm = float(strategy_confluence_mult)
-    except (TypeError, ValueError):
-        cm = 1.0
-    if scount >= 5 and cm > 0:
-        out["confluence_cap_pnl"] = round(pnl * (1.0 / cm), 2)
-    else:
-        out["confluence_cap_pnl"] = round(pnl, 2)
 
     return out
 
@@ -1856,18 +1819,15 @@ def _health_signal_row_sort_key(r: Mapping[str, Any]) -> tuple[str, str, str, st
 
 def _reset_health_signal_histories() -> None:
     """Clear write-only system / strategy / JPY health-signal histories."""
-    global _LAST_5R_WIN_DATE
     _SYS_FOLLOWTHROUGH_HISTORY.clear()
     _STRAT_PNL_HISTORY.clear()
     _JPY_PNL_HISTORY.clear()
     _SYS_WIN_HISTORY.clear()
-    _LAST_5R_WIN_DATE = None
 
 
 def _health_signal_shadow_fields(
     *,
     strategy_id: str,
-    analysis_date: str,
 ) -> dict[str, Any]:
     """
     Write-only diagnostic labels from prior closed trades only.
@@ -1902,15 +1862,6 @@ def _health_signal_shadow_fields(
     wr20 = (sum(1 for w in wins[-20:] if w) / 20.0) if wn >= 20 else None
     wr50 = (sum(1 for w in wins[-50:] if w) / 50.0) if wn >= 50 else None
 
-    days_since: int | None = None
-    if _LAST_5R_WIN_DATE:
-        try:
-            curr = datetime.strptime(str(analysis_date or "").strip()[:10], "%Y-%m-%d").date()
-            prev = datetime.strptime(str(_LAST_5R_WIN_DATE)[:10], "%Y-%m-%d").date()
-            days_since = int((curr - prev).days)
-        except (TypeError, ValueError):
-            days_since = None
-
     return {
         "sys_followthrough_last20": None if ft20 is None else round(float(ft20), 4),
         "sys_followthrough_last50": None if ft50 is None else round(float(ft50), 4),
@@ -1922,13 +1873,11 @@ def _health_signal_shadow_fields(
         "jpy_health_last20": None if jpy20 is None else round(float(jpy20), 2),
         "sys_winrate_last20": None if wr20 is None else round(float(wr20), 4),
         "sys_winrate_last50": None if wr50 is None else round(float(wr50), 4),
-        "days_since_5r_win": days_since,
     }
 
 
 def _record_health_signals_from_row(row: Mapping[str, Any] | None) -> None:
     """Append one closed REAL trade to health-signal histories (after row built)."""
-    global _LAST_5R_WIN_DATE
     if not isinstance(row, Mapping):
         return
     if row.get("skipped"):
@@ -1940,7 +1889,6 @@ def _record_health_signals_from_row(row: Mapping[str, Any] | None) -> None:
     won = str(row.get("outcome", "")).strip().upper() == "WIN"
     sid = str(row.get("strategy_id", "")).strip().upper()
     tku = str(row.get("ticker", "")).strip().upper()
-    ds = str(row.get("date", "") or "")[:10]
 
     try:
         risk = float(row.get("max_risk_dollars", 0) or 0)
@@ -1955,8 +1903,6 @@ def _record_health_signals_from_row(row: Mapping[str, Any] | None) -> None:
                     _SYS_FOLLOWTHROUGH_HISTORY.append(peak_f / risk)
         except (TypeError, ValueError):
             pass
-        if pnl >= 5.0 * risk and ds:
-            _LAST_5R_WIN_DATE = ds
 
     if sid and sid != "SKIP":
         _STRAT_PNL_HISTORY.setdefault(sid, []).append(pnl)
@@ -7248,12 +7194,9 @@ def _python_forced_layer2_trade(
             macro_bias=str(ai.get("macro_bias", "") or ""),
             pnl_dollars=float(pnl_dollars or 0),
             st_boost_tier=str(ai.get("st_boost_tier") or "NONE"),
-            strategy_confluence_count=int(scount),
-            strategy_confluence_mult=float(cf_mult),
         ),
         **_health_signal_shadow_fields(
             strategy_id=strat_id,
-            analysis_date=analysis_date,
         ),
     }
 
@@ -8491,12 +8434,9 @@ def run_one_backtest(
                 macro_bias=str(ai.get("macro_bias", "") or ""),
                 pnl_dollars=float(pnl_dollars or 0),
                 st_boost_tier=str(ai.get("st_boost_tier") or "NONE"),
-                strategy_confluence_count=int(scount),
-                strategy_confluence_mult=float(cf_mult),
             ),
             **_health_signal_shadow_fields(
                 strategy_id=strategy_id_norm,
-                analysis_date=analysis_date,
             ),
         }
 
