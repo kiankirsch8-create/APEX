@@ -3960,71 +3960,6 @@ def pnt06_strength_ladder_fade(ctx: ShadowStrategyContext) -> dict[str, Any] | N
     )
 
 
-# ── PNT07 ────────────────────────────────────────────────────────────────────
-@register_shadow_strategy("PNT07_DOUBLE_SIDED_SWEEP")
-def pnt07_double_sided_sweep(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
-    if ctx.timeframe != "1d":
-        return None
-    if not _pnt_gate(ctx):
-        return None
-    arr = _psh_ohlc_arrays(ctx.ohlc())
-    if arr is None:
-        return None
-    _o, h, l, c = arr
-    i = len(c) - 1
-    atr = _phw_atr_at(h, l, c, i)
-    if atr is None:
-        return None
-    highs = [float(x) for x in h.tolist()]
-    lows = [float(x) for x in l.tolist()]
-    f_hi, f_lo = _psh_fractal_swings(highs, lows)
-
-    def _equal_pair(swings: list[tuple[int, float]]) -> float | None:
-        best = None  # (end_idx, mean_level)
-        for a in range(len(swings) - 1):
-            for b in range(a + 1, len(swings)):
-                ia, pa = swings[a]
-                ib, pb = swings[b]
-                if ib - ia < 5:
-                    continue
-                if abs(pa - pb) <= 0.2 * atr:
-                    mean_lvl = (pa + pb) / 2.0
-                    if best is None or ib >= best[0]:
-                        best = (ib, mean_lvl)
-        return None if best is None else float(best[1])
-
-    lower_level = _equal_pair(f_lo)
-    upper_level = _equal_pair(f_hi)
-    if lower_level is None or upper_level is None:
-        return None
-    low_i = float(l.iloc[i])
-    high_i = float(h.iloc[i])
-    close_i = float(c.iloc[i])
-    long_ok = False
-    short_ok = False
-    beyond_lo = lower_level - low_i
-    if 0 < beyond_lo <= 0.5 * atr and close_i > lower_level:
-        long_ok = True
-    beyond_hi = high_i - upper_level
-    if 0 < beyond_hi <= 0.5 * atr and close_i < upper_level:
-        short_ok = True
-    if long_ok and short_ok:
-        return None
-    if long_ok:
-        return _psh_signal(
-            direction="LONG", stop_price=float(low_i), timeframe="1d",
-            strategy_id="PNT07_DOUBLE_SIDED_SWEEP",
-            custom_exit={"type": "price_target", "level": float(upper_level)},
-        )
-    if short_ok:
-        return _psh_signal(
-            direction="SHORT", stop_price=float(high_i), timeframe="1d",
-            strategy_id="PNT07_DOUBLE_SIDED_SWEEP",
-            custom_exit={"type": "price_target", "level": float(lower_level)},
-        )
-    return None
-
-
 # ── PNT08 ────────────────────────────────────────────────────────────────────
 @register_shadow_strategy("PNT08_INSIDE_CLUSTER_TRAP")
 def pnt08_inside_cluster_trap(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
@@ -4279,56 +4214,6 @@ def pnt12_autocorr_fade(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
     )
     sig["stop_atr_mult"] = 1.0
     return sig
-
-
-# ── PNT13 ────────────────────────────────────────────────────────────────────
-@register_shadow_strategy("PNT13_GAP_FILL_HARVEST")
-def pnt13_gap_fill_harvest(ctx: ShadowStrategyContext) -> dict[str, Any] | None:
-    if ctx.timeframe != "1d":
-        return None
-    if not _pnt_gate(ctx):
-        return None
-    arr = _psh_ohlc_arrays(ctx.ohlc())
-    if arr is None:
-        return None
-    o, h, l, c = arr
-    i = len(c) - 1
-    if i < 21:
-        return None
-    atr = _phw_atr_at(h, l, c, i)
-    if atr is None:
-        return None
-    open_i = float(o.iloc[i])
-    close_prev = float(c.iloc[i - 1])
-    if abs(open_i - close_prev) < 0.25 * atr:
-        return None
-    prior_hi = float(h.iloc[i - 21 : i].max())  # [i-21, i-1]
-    prior_lo = float(l.iloc[i - 21 : i].min())
-    if not (prior_lo < open_i < prior_hi):
-        return None
-    low_i = float(l.iloc[i])
-    high_i = float(h.iloc[i])
-    gap_up = open_i > close_prev
-    gap_down = open_i < close_prev
-    if gap_up:
-        if low_i <= close_prev:
-            return None
-        direction = "SHORT"
-        stop = high_i + 1.0 * atr
-    elif gap_down:
-        if high_i >= close_prev:
-            return None
-        direction = "LONG"
-        stop = low_i - 1.0 * atr
-    else:
-        return None
-    return _psh_signal(
-        direction=direction,
-        stop_price=float(stop),
-        timeframe="1d",
-        strategy_id="PNT13_GAP_FILL_HARVEST",
-        custom_exit={"type": "price_target", "level": float(close_prev)},
-    )
 
 
 # ── PNT14 ────────────────────────────────────────────────────────────────────
