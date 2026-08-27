@@ -234,6 +234,7 @@ PROFILES: dict[str, dict[str, Any]] = {
         "per_trade_loss_cap_pct": None,  # disabled
         "daily_loss_stop_pct": None,  # disabled
         "dd_ladder": [],  # disabled
+        # Placeholder only — requires a virtual-position tracker (not implemented).
         "dry_run_after_losing_days": None,
         "warmup_days": 0,
         "warmup_multiplier": 1.0,
@@ -244,6 +245,7 @@ PROFILES: dict[str, dict[str, Any]] = {
         "per_trade_loss_cap_pct": 1.5,
         "daily_loss_stop_pct": 3.0,
         "dd_ladder": [(5.0, 0.5), (8.0, 0.25)],
+        # Placeholder only — requires a virtual-position tracker (not implemented).
         "dry_run_after_losing_days": 3,
         "warmup_days": 40,
         "warmup_multiplier": 0.25,
@@ -500,6 +502,43 @@ class ScanSkip:
     fields: dict[str, Any] = field(default_factory=dict)
 
 
+def build_skip_blocked_log_fields(
+    *,
+    sym: str,
+    timeframe: str,
+    reason: str,
+    fields: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Build a single kwargs dict for ``[SKIP] trade blocked`` logs.
+
+    Callers must unpack this once — never pass the same keys as explicit kwargs
+    alongside ``**skip_fields`` (TypeError on duplicate keywords).
+    """
+    skip_fields = dict(fields or {})
+    skip_fields["ticker"] = str(sym).upper()
+    skip_fields["timeframe"] = timeframe
+    skip_fields["skip_reason"] = reason
+    skip_fields.setdefault("guard_mode", "NORMAL")
+    skip_fields.setdefault("guard_profile", PROFILE)
+    return skip_fields
+
+
+def emit_skip_blocked_log(
+    *,
+    sym: str,
+    timeframe: str,
+    reason: str,
+    fields: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Log ``[SKIP] trade blocked`` safely; returns the fields dict used."""
+    skip_fields = build_skip_blocked_log_fields(
+        sym=sym, timeframe=timeframe, reason=reason, fields=fields
+    )
+    live_log("info", "[SKIP] trade blocked", **skip_fields)
+    return skip_fields
+
+
 @dataclass
 class TradePlan:
     skipped: bool = False
@@ -539,8 +578,6 @@ def load_v76_state() -> dict[str, Any]:
             "guard_activation_date": "",
             "peak_equity": None,
             "day_realized_pnl": 0.0,
-            "consecutive_losing_days": 0,
-            "cfg_dry_run_active": False,
         },
     )
     return d if isinstance(d, dict) else {}
@@ -855,13 +892,10 @@ def _cfg_guardrail_multipliers(
 
 def _resolve_guard_mode(
     *,
-    cfg_dry_run: bool,
     daily_stopped: bool,
     ladder_level: int,
     warmup_mult: float,
 ) -> str:
-    if cfg_dry_run:
-        return "DRY_RUN"
     if daily_stopped:
         return "DAILY_STOPPED"
     if ladder_level >= 2:
@@ -942,14 +976,12 @@ def apply_cfg_guardrails(
         if thresh is not None and day_real <= thresh:
             daily_stopped = True
 
-    cfg_dry = bool(st.get("cfg_dry_run_active"))
     mode = _resolve_guard_mode(
-        cfg_dry_run=cfg_dry,
         daily_stopped=daily_stopped,
         ladder_level=int(m["dd_ladder_level"]),
         warmup_mult=float(m["warmup_mult"]),
     )
-    allow = (not daily_stopped) and (not cfg_dry)
+    allow = not daily_stopped
 
     fields: dict[str, Any] = {
         "guard_profile": PROFILE,
@@ -966,7 +998,6 @@ def apply_cfg_guardrails(
         "guard_final_risk": round(float(risk), 2),
         "guard_day_realized_pnl": round(day_real, 2),
         "guard_day_anchor": round(anchor, 2),
-        "guard_cfg_dry_run": bool(cfg_dry),
         "guard_daily_stopped": bool(daily_stopped),
         "guard_strat_closed_n": int(m["strat_closed_n"]),
         "max_risk_dollars": round(float(risk), 2),
@@ -1000,7 +1031,6 @@ def apply_cfg_guardrails(
             except (TypeError, ValueError):
                 shadow_daily = False
         shadow_mode = _resolve_guard_mode(
-            cfg_dry_run=False,
             daily_stopped=shadow_daily,
             ladder_level=int(sm["dd_ladder_level"]),
             warmup_mult=float(sm["warmup_mult"]),
@@ -1026,54 +1056,11 @@ def roll_cfg_guard_day(
     equity: float,
 ) -> None:
     """
-    On calendar day change: update consecutive losing days / CFG dry-run, then
-    reset day realised P&L. Peak equity and activation date persist.
+    On calendar day change: reset day realised P&L. Peak equity and activation
+    date persist. (CFG dry-run recovery omitted — needs a virtual-position tracker.)
     """
     prev_key = str(st.get("day_key") or st.get("guard_day_key") or "").strip()
     if prev_key and prev_key != new_day_key:
-        try:
-            prev_anchor = float(st.get("day_anchor") or equity)
-        except (TypeError, ValueError):
-            prev_anchor = float(equity)
-        try:
-            day_real = float(st.get("day_realized_pnl") or 0)
-        except (TypeError, ValueError):
-            day_real = 0.0
-        day_equity_pnl = float(equity) - prev_anchor
-        # Prefer realised closes; fall back to equity day P&L when no closes.
-        day_metric = day_real if abs(day_real) > 1e-9 else day_equity_pnl
-
-        lose_after = CFG.get("dry_run_after_losing_days")
-        if lose_after is not None:
-            try:
-                n_need = int(lose_after)
-            except (TypeError, ValueError):
-                n_need = 0
-            if n_need > 0:
-                consec = int(st.get("consecutive_losing_days") or 0)
-                if day_metric < 0:
-                    consec += 1
-                elif day_metric > 0:
-                    consec = 0
-                    if st.get("cfg_dry_run_active"):
-                        st["cfg_dry_run_active"] = False
-                        live_log(
-                            "info",
-                            "[GUARD] CFG dry-run EXIT — positive day P&L",
-                            day=prev_key,
-                            day_metric=round(day_metric, 2),
-                        )
-                st["consecutive_losing_days"] = consec
-                if (not st.get("cfg_dry_run_active")) and consec >= n_need:
-                    st["cfg_dry_run_active"] = True
-                    live_log(
-                        "warning",
-                        "[GUARD] CFG dry-run ENTER — consecutive losing days",
-                        consecutive_losing_days=consec,
-                        threshold=n_need,
-                        day=prev_key,
-                    )
-
         st["day_realized_pnl"] = 0.0
 
     _ensure_guard_activation_date(st, _parse_iso_date(new_day_key) or date.today())
@@ -1233,8 +1220,18 @@ def _forensic_record_from_close(mt5: Any, ticket: int, meta: dict[str, Any]) -> 
     }
 
 
-def _finalize_closed_positions_v76(mt5: Any, *, prior_meta: dict[str, Any] | None = None) -> None:
-    """Detect closed v76 tickets, append forensic rows, prune ticket meta."""
+def _finalize_closed_positions_v76(
+    mt5: Any,
+    *,
+    prior_meta: dict[str, Any] | None = None,
+    st: dict[str, Any] | None = None,
+) -> None:
+    """Detect closed v76 tickets, append forensic rows, prune ticket meta.
+
+    When ``st`` is provided (scan path), mutate that object and do not save —
+    the caller owns persistence. When ``st`` is None (periodic TRAIL CYCLE),
+    load/modify/save state locally so realised day P&L still persists.
+    """
     if mt5 is None:
         return
     try:
@@ -1268,6 +1265,9 @@ def _finalize_closed_positions_v76(mt5: Any, *, prior_meta: dict[str, Any] | Non
     if not to_log:
         return
 
+    own_state = st is None
+    st_use = st if isinstance(st, dict) else load_v76_state()
+
     changed = False
     for k, m in to_log.items():
         try:
@@ -1278,9 +1278,9 @@ def _finalize_closed_positions_v76(mt5: Any, *, prior_meta: dict[str, Any] | Non
         append_live_trade_forensic(record)
         _record_closed_trade_for_sizing_health(record)
         try:
-            st_g = load_v76_state()
-            record_day_realized_pnl(st_g, float(record.get("pnl_dollars", 0) or 0))
-            save_v76_state(st_g)
+            record_day_realized_pnl(st_use, float(record.get("pnl_dollars", 0) or 0))
+            if own_state:
+                save_v76_state(st_use)
         except Exception:  # noqa: BLE001
             pass
         live_log(
@@ -1681,7 +1681,7 @@ def order_send_v76(
     day_anchor: float | None = None,
     scan_d: date | None = None,
 ) -> dict[str, Any]:
-    """Open position (or dry-run / CFG-blocked log only)."""
+    """Open position (or env DRY_RUN / CFG daily-stop skip)."""
     st_use = st if isinstance(st, dict) else load_v76_state()
     try:
         eq_use = (
@@ -1743,7 +1743,9 @@ def order_send_v76(
         allow_new_orders=guard_fields.get("guard_allow_new_orders"),
         profile=PROFILE,
     )
-    save_v76_state(st_use)
+    # Caller-owned state: only persist here when we loaded a fresh copy.
+    if st is None:
+        save_v76_state(st_use)
 
     mode = str(guard_fields.get("guard_mode") or "NORMAL")
     cfg_block = not bool(guard_fields.get("guard_allow_new_orders"))
@@ -1774,8 +1776,7 @@ def order_send_v76(
         )
         return {"ok": False, "error": "daily_loss_stop", "dry_run": False}
 
-    paper = bool(DRY_RUN) or (cfg_block and mode == "DRY_RUN")
-    if paper:
+    if DRY_RUN:
         tick = mt5.symbol_info_tick(broker_sym) if mt5 else None
         entry = float(tick.ask if plan.direction == "LONG" else tick.bid) if tick else plan.entry
         lots = 0.0
@@ -1788,8 +1789,7 @@ def order_send_v76(
                 "lot_size": round(lots, 2),
                 "entry_price_live": entry,
                 "magic_number": APEX_V76_MAGIC,
-                "cfg_dry_run": bool(st_use.get("cfg_dry_run_active")),
-                "env_dry_run": bool(DRY_RUN),
+                "env_dry_run": True,
             }
         )
         dry_meta: dict[str, Any] = {
@@ -1809,24 +1809,23 @@ def order_send_v76(
             row["pyramid_trade"] = True
             row["pyramid_candidate"] = dry_meta.get("pyramid")
         append_decision_log(row)
-        live_log(
-            "info",
-            "[TRADE] DRY_RUN would open",
-            ticker=plan.sym,
-            timeframe=plan.timeframe,
-            strategy_id=plan.strategy_id,
-            direction=plan.direction,
-            lot_size=round(lots, 2),
-            risk_usd=round(plan.risk_usd, 2),
-            final_risk_pct=plan.risk_pct,
-            stop=plan.stop_loss,
-            tp1=plan.tp1,
-            tp2=plan.tp2,
-            tp3=plan.tp3,
-            trail_regime=plan.trail_regime,
-            guard_mode=mode,
-            **_sizing_fields_from_ai(plan.ai),
-        )
+        dry_log = {
+            "ticker": plan.sym,
+            "timeframe": plan.timeframe,
+            "strategy_id": plan.strategy_id,
+            "direction": plan.direction,
+            "lot_size": round(lots, 2),
+            "risk_usd": round(plan.risk_usd, 2),
+            "final_risk_pct": plan.risk_pct,
+            "stop": plan.stop_loss,
+            "tp1": plan.tp1,
+            "tp2": plan.tp2,
+            "tp3": plan.tp3,
+            "trail_regime": plan.trail_regime,
+            "guard_mode": mode,
+        }
+        dry_log.update(_sizing_fields_from_ai(plan.ai))
+        live_log("info", "[TRADE] DRY_RUN would open", **dry_log)
         return {"ok": True, "dry_run": True, "volume": lots, "entry": entry, "retcode": "DRY_RUN"}
 
     old_magic = at.APEX_MAGIC
@@ -1886,28 +1885,31 @@ def order_send_v76(
         row["lot_size"] = lots
         row["magic_number"] = APEX_V76_MAGIC
         append_decision_log(row)
+        order_log = {
+            "ticker": plan.sym,
+            "timeframe": plan.timeframe,
+            "strategy_id": plan.strategy_id,
+            "direction": plan.direction,
+            "broker_symbol": broker_sym,
+            "lot_size": round(lots, 2),
+            "risk_usd": round(plan.risk_usd, 2),
+            "final_risk_pct": plan.risk_pct,
+            "stop": plan.stop_loss,
+            "tp1": plan.tp1,
+            "tp2": plan.tp2,
+            "tp3": plan.tp3,
+            "trail_regime": plan.trail_regime,
+            "mt5_retcode": retcode,
+            "ok": bool(res.get("ok")),
+            "error": res.get("error"),
+            "ticket": res.get("ticket"),
+            "guard_mode": mode,
+        }
+        order_log.update(_sizing_fields_from_ai(plan.ai))
         live_log(
             "info" if res.get("ok") else "warning",
             "[TRADE] MT5 order result",
-            ticker=plan.sym,
-            timeframe=plan.timeframe,
-            strategy_id=plan.strategy_id,
-            direction=plan.direction,
-            broker_symbol=broker_sym,
-            lot_size=round(lots, 2),
-            risk_usd=round(plan.risk_usd, 2),
-            final_risk_pct=plan.risk_pct,
-            stop=plan.stop_loss,
-            tp1=plan.tp1,
-            tp2=plan.tp2,
-            tp3=plan.tp3,
-            trail_regime=plan.trail_regime,
-            mt5_retcode=retcode,
-            ok=bool(res.get("ok")),
-            error=res.get("error"),
-            ticket=res.get("ticket"),
-            guard_mode=mode,
-            **_sizing_fields_from_ai(plan.ai),
+            **order_log,
         )
         return res
     finally:
@@ -2372,8 +2374,13 @@ def _adopt_open_positions(mt5: Any) -> None:
         ticket_meta_v76_save(meta)
 
 
-def manage_trailing_v76(mt5: Any) -> None:
-    """Trailing with deep logging (before/after each pass)."""
+def manage_trailing_v76(mt5: Any, st: dict[str, Any] | None = None) -> None:
+    """Trailing with deep logging (before/after each pass).
+
+    Pass ``st`` from ``run_full_scan_v76`` so realised day P&L updates the same
+    in-memory object the scan saves at the end. Omit ``st`` for the periodic
+    TRAIL CYCLE so the finalizer loads/saves on its own.
+    """
     _log_positions_trailing_phase(mt5, phase="BEFORE")
     pre_meta = ticket_meta_v76_load()
     old_magic = at.APEX_MAGIC
@@ -2386,7 +2393,7 @@ def manage_trailing_v76(mt5: Any) -> None:
         at.APEX_MAGIC = old_magic
         at.TICKET_META_FILE = old_meta_path
     _process_pyramid_in_v76(mt5)
-    _finalize_closed_positions_v76(mt5, prior_meta=pre_meta)
+    _finalize_closed_positions_v76(mt5, prior_meta=pre_meta, st=st)
     _log_positions_trailing_phase(mt5, phase="AFTER")
     publish_live_status(mt5, status="running")
 
@@ -2547,50 +2554,39 @@ def run_full_scan_v76() -> None:
             continue
         if isinstance(result, ScanSkip):
             skipped += 1
-            skip_fields = dict(result.fields)
-            skip_fields.setdefault("guard_mode", "NORMAL" if not st.get("cfg_dry_run_active") else "DRY_RUN")
-            skip_fields.setdefault("guard_profile", PROFILE)
-            live_log(
-                "info",
-                "[SKIP] trade blocked",
-                ticker=sym.upper(),
+            skip_fields = emit_skip_blocked_log(
+                sym=sym,
                 timeframe=tf,
-                skip_reason=result.reason,
-                guard_mode=skip_fields.get("guard_mode"),
-                **skip_fields,
+                reason=result.reason,
+                fields=result.fields,
             )
             append_decision_log(
                 {
                     "date": analysis_date,
-                    "ticker": sym.upper(),
-                    "timeframe": tf,
                     "action": "SKIP",
-                    "skip_reason": result.reason,
                     **skip_fields,
                 },
             )
             continue
 
         plan: TradePlan = result
-        live_log(
-            "info",
-            "[TAKE] trade plan approved",
-            ticker=plan.sym,
-            timeframe=plan.timeframe,
-            strategy_id=plan.strategy_id,
-            direction=plan.direction,
-            macro_bias=plan.log_fields.get("macro_bias"),
-            trend_strength=plan.log_fields.get("trend_strength"),
-            regime=plan.log_fields.get("regime"),
-            confidence=plan.log_fields.get("confidence"),
-            confluence=plan.log_fields.get("strategy_confluence_count"),
-            period_mode=plan.log_fields.get("period_mode"),
-            trail_regime=plan.trail_regime,
-            risk_usd=round(plan.risk_usd, 2),
-            guard_profile=PROFILE,
-            cfg_dry_run=bool(st.get("cfg_dry_run_active")),
-            **_sizing_fields_from_ai(plan.ai),
-        )
+        take_fields = {
+            "ticker": plan.sym,
+            "timeframe": plan.timeframe,
+            "strategy_id": plan.strategy_id,
+            "direction": plan.direction,
+            "macro_bias": plan.log_fields.get("macro_bias"),
+            "trend_strength": plan.log_fields.get("trend_strength"),
+            "regime": plan.log_fields.get("regime"),
+            "confidence": plan.log_fields.get("confidence"),
+            "confluence": plan.log_fields.get("strategy_confluence_count"),
+            "period_mode": plan.log_fields.get("period_mode"),
+            "trail_regime": plan.trail_regime,
+            "risk_usd": round(plan.risk_usd, 2),
+            "guard_profile": PROFILE,
+        }
+        take_fields.update(_sizing_fields_from_ai(plan.ai))
+        live_log("info", "[TAKE] trade plan approved", **take_fields)
         bs = at.resolve_sym(mt5, sym) if mt5 else sym
         if not bs and not DRY_RUN:
             skipped += 1
@@ -2598,7 +2594,7 @@ def run_full_scan_v76() -> None:
                 "warning",
                 "[SKIP] broker symbol resolve failed",
                 ticker=sym.upper(),
-                guard_mode=str(st.get("cfg_dry_run_active") and "DRY_RUN" or "NORMAL"),
+                guard_mode="NORMAL",
                 guard_profile=PROFILE,
             )
             continue
@@ -2613,19 +2609,20 @@ def run_full_scan_v76() -> None:
                     ticker=sym.upper(),
                     timeframe=tf,
                     skip_reason=rs_opp,
-                    guard_mode=str(st.get("cfg_dry_run_active") and "DRY_RUN" or "NORMAL"),
+                    guard_mode="NORMAL",
                     guard_profile=PROFILE,
                 )
-                append_decision_log(
+                conflict_row = dict(plan.log_fields)
+                conflict_row.update(
                     {
                         "date": analysis_date,
                         "action": "SKIP",
                         "skip_reason": rs_opp,
-                        "guard_mode": "DRY_RUN" if st.get("cfg_dry_run_active") else "NORMAL",
+                        "guard_mode": "NORMAL",
                         "guard_profile": PROFILE,
-                        **plan.log_fields,
-                    },
+                    }
                 )
+                append_decision_log(conflict_row)
                 continue
 
         out = order_send_v76(
@@ -2643,7 +2640,7 @@ def run_full_scan_v76() -> None:
             skipped += 1
 
     if mt5:
-        manage_trailing_v76(mt5)
+        manage_trailing_v76(mt5, st=st)
     elif DRY_RUN:
         publish_live_status(None, status="dry_run")
 
