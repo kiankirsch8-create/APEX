@@ -597,10 +597,9 @@ def _rebuild_live_sizing_health_from_rows(rows: list[dict[str, Any]]) -> None:
     ]
     completed.sort(
         key=lambda r: (
+            int(r.get("close_ts") or 0),
             str(r.get("date", ""))[:10],
             str(r.get("ticker", "")).strip().upper(),
-            str(r.get("timeframe", "")).strip().lower(),
-            str(r.get("strategy_id", "")).strip().upper(),
         )
     )
     for r in completed:
@@ -805,6 +804,12 @@ def _forensic_record_from_close(mt5: Any, ticket: int, meta: dict[str, Any]) -> 
 
     return {
         "date": close_date,
+        "close_ts": int(close_ts) if close_ts is not None else None,
+        "close_time_utc": (
+            datetime.fromtimestamp(close_ts, tz=timezone.utc).isoformat()
+            if close_ts is not None
+            else None
+        ),
         "ticker": ticker,
         "direction": direction,
         "strategy_id": str(meta.get("strategy", meta.get("strategy_id", ""))).strip().upper(),
