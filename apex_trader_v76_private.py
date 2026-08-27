@@ -222,6 +222,33 @@ APEX_V76_MAGIC = int(os.environ.get("APEX_V76_PRIVATE_MAGIC", "760761"))
 ORDER_COMMENT_V76 = os.environ.get("APEX_V76_PRIVATE_ORDER_COMMENT", "APEX76P")
 DRY_RUN = os.environ.get("APEX_V76_PRIVATE_DRY_RUN", "true").strip().lower() in ("1", "true", "yes")
 
+# One engine, two profiles. Future risk gates must read through ``CFG`` only —
+# never hard-code profile values, and never fork this file into a second copy.
+PROFILE = "private"  # "private" | "funded"
+PROFILES: dict[str, dict[str, Any]] = {
+    "private": {
+        "cold_start_min_trades": 0,  # disabled
+        "cold_start_multiplier": 1.0,
+        "per_trade_loss_cap_pct": None,  # disabled
+        "daily_loss_stop_pct": None,  # disabled
+        "dd_ladder": [],  # disabled
+        "dry_run_after_losing_days": None,
+        "warmup_days": 0,
+        "warmup_multiplier": 1.0,
+    },
+    "funded": {
+        "cold_start_min_trades": 5,
+        "cold_start_multiplier": 0.25,
+        "per_trade_loss_cap_pct": 1.5,
+        "daily_loss_stop_pct": 3.0,
+        "dd_ladder": [(5.0, 0.5), (8.0, 0.25)],
+        "dry_run_after_losing_days": 3,
+        "warmup_days": 40,
+        "warmup_multiplier": 0.25,
+    },
+}
+CFG: dict[str, Any] = PROFILES[PROFILE]
+
 SCAN_HOURS = at.SCAN_HOURS
 TIMEFRAMES: tuple[str, ...] = ("1w", "1d", "4h")
 TICKERS: list[str] = list(at.TICKERS)
