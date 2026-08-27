@@ -2654,14 +2654,9 @@ def run_full_scan_v76() -> None:
     }
     st["last_scan_summary"] = summary
     save_v76_state(st)
-    live_log(
-        "info",
-        "[SCAN CYCLE] complete",
-        placed=placed,
-        skipped=skipped,
-        dry_run=DRY_RUN,
-        **summary,
-    )
+    complete_fields = dict(summary)
+    complete_fields["dry_run"] = DRY_RUN
+    live_log("info", "[SCAN CYCLE] complete", **complete_fields)
     publish_live_status(
         mt5,
         status="idle",

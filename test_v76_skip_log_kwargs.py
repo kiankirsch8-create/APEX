@@ -52,7 +52,44 @@ def test_build_skip_fields_defaults_guard_mode() -> None:
     assert fields["ticker"] == "GBPUSD"
 
 
+def test_scan_cycle_complete_log_overlapping_summary_no_typeerror() -> None:
+    """
+    summary already has placed/skipped; merging dry_run into one dict then
+    unpacking once must not raise (the pre-fix explicit+**summary crash).
+    """
+    summary = {
+        "placed": 2,
+        "skipped": 5,
+        "cells_checked": 40,
+        "cells_signalled": 7,
+        "period_mode": "NORMAL",
+    }
+    complete_fields = dict(summary)
+    complete_fields["dry_run"] = True
+    with mock.patch.object(v76, "live_log") as mock_log:
+        v76.live_log("info", "[SCAN CYCLE] complete", **complete_fields)
+    mock_log.assert_called_once_with("info", "[SCAN CYCLE] complete", **complete_fields)
+    assert complete_fields["placed"] == 2
+    assert complete_fields["skipped"] == 5
+    assert complete_fields["dry_run"] is True
+    # The broken pattern (explicit kwargs + **summary) must still raise.
+    raised = False
+    try:
+        v76.live_log(
+            "info",
+            "[SCAN CYCLE] complete",
+            placed=summary["placed"],
+            skipped=summary["skipped"],
+            dry_run=True,
+            **summary,
+        )
+    except TypeError:
+        raised = True
+    assert raised, "expected TypeError from duplicate placed/skipped kwargs"
+
+
 if __name__ == "__main__":
     test_skip_blocked_log_with_overlapping_fields_no_typeerror()
     test_build_skip_fields_defaults_guard_mode()
+    test_scan_cycle_complete_log_overlapping_summary_no_typeerror()
     print("ok")
