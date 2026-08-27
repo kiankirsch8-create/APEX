@@ -65,7 +65,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType
-from typing import Any
+from typing import Any, Mapping
 
 
 def _bootstrap_apex_sys_path() -> Path:
@@ -230,6 +230,14 @@ V76_STATE_FILE = at.BASE_DIR / "apex_v76_private_state.json"
 V76_TICKET_META = at.BASE_DIR / "apex_trader_v76_private_tickets.json"
 V76_DECISION_LOG = at.BASE_DIR / "apex_v76_private_decisions.jsonl"
 LIVE_TRADES_FORENSIC = at.BASE_DIR / "live_trades_forensic_private.json"
+
+# A+B live sizing throttle — closed-trade P&L histories (engine process).
+# A: last-3 closed P&Ls per strategy_id. B: last-3 ST-MEDIUM closed P&Ls.
+_LIVE_STRAT_PNL_HISTORY: dict[str, list[float]] = {}
+_LIVE_ST_MEDIUM_PNL_HISTORY: list[float] = []
+_LIVE_SIZING_HEALTH_REBUILT: bool = False
+_LIVE_SIZING_HEALTH_MAXLEN: int = 50
+_AB_THROTTLE_FACTOR: float = 0.18
 
 # Deep live log + remote API snapshot (VPS: ``APEX_DATA_DIR`` / ``C:\Apex``; Railway: set ``APEX_LIVE_V76_DIR``).
 _LOG_RING_MAX = 8000
@@ -535,6 +543,165 @@ def append_live_trade_forensic(record: dict[str, Any]) -> None:
     at._save(LIVE_TRADES_FORENSIC, rows)
 
 
+def _trim_pnl_history(hist: list[float]) -> None:
+    cap = int(_LIVE_SIZING_HEALTH_MAXLEN)
+    if cap > 0 and len(hist) > cap:
+        del hist[:-cap]
+
+
+def _reset_live_sizing_health_histories() -> None:
+    """Clear A+B sizing-health rolling histories."""
+    _LIVE_STRAT_PNL_HISTORY.clear()
+    _LIVE_ST_MEDIUM_PNL_HISTORY.clear()
+
+
+def _record_closed_trade_for_sizing_health(row: Mapping[str, Any] | None) -> None:
+    """
+    Append one CLOSED trade to A+B histories AFTER the trade is finalized.
+    Never called for the trade being sized (no lookahead).
+    """
+    if not isinstance(row, Mapping):
+        return
+    if row.get("skipped"):
+        return
+    if row.get("is_pyramid_add"):
+        return
+    if str(row.get("outcome", "")).strip().upper() not in ("WIN", "LOSS"):
+        return
+    try:
+        pnl = float(row.get("pnl_dollars", 0) or 0)
+    except (TypeError, ValueError):
+        return
+    sid = str(row.get("strategy_id", "")).strip().upper()
+    if sid and sid != "SKIP":
+        hist = _LIVE_STRAT_PNL_HISTORY.setdefault(sid, [])
+        hist.append(pnl)
+        _trim_pnl_history(hist)
+    conf = str(row.get("confidence", "")).strip().upper()
+    mb = str(row.get("macro_bias", "")).strip().upper()
+    if conf == "MEDIUM" and mb == "STRONG_TAILWIND":
+        _LIVE_ST_MEDIUM_PNL_HISTORY.append(pnl)
+        _trim_pnl_history(_LIVE_ST_MEDIUM_PNL_HISTORY)
+
+
+def _rebuild_live_sizing_health_from_rows(rows: list[dict[str, Any]]) -> None:
+    """
+    Rebuild A+B histories from prior closed trades (service restart / resume).
+    Same chronological pattern as backtester rebuild helpers.
+    """
+    _reset_live_sizing_health_histories()
+    completed = [
+        r
+        for r in rows
+        if isinstance(r, dict)
+        and not r.get("skipped")
+        and not r.get("is_pyramid_add")
+        and str(r.get("outcome", "")).strip().upper() in ("WIN", "LOSS")
+    ]
+    completed.sort(
+        key=lambda r: (
+            int(r.get("close_ts") or 0),
+            str(r.get("date", ""))[:10],
+            str(r.get("ticker", "")).strip().upper(),
+        )
+    )
+    for r in completed:
+        _record_closed_trade_for_sizing_health(r)
+
+
+def rebuild_live_sizing_health_from_forensic() -> int:
+    """Load ``live_trades_forensic_private.json`` and rebuild A+B histories."""
+    global _LIVE_SIZING_HEALTH_REBUILT
+    rows = load_live_trades_forensic()
+    _rebuild_live_sizing_health_from_rows(rows)
+    _LIVE_SIZING_HEALTH_REBUILT = True
+    n = sum(len(v) for v in _LIVE_STRAT_PNL_HISTORY.values())
+    live_log(
+        "info",
+        "[SIZING HEALTH] rebuilt A+B histories from forensic log",
+        closed_rows=len(rows),
+        strat_pnls=n,
+        st_medium_pnls=len(_LIVE_ST_MEDIUM_PNL_HISTORY),
+        strategies=len(_LIVE_STRAT_PNL_HISTORY),
+    )
+    return len(rows)
+
+
+def _ensure_live_sizing_health_rebuilt() -> None:
+    global _LIVE_SIZING_HEALTH_REBUILT
+    if _LIVE_SIZING_HEALTH_REBUILT:
+        return
+    rebuild_live_sizing_health_from_forensic()
+
+
+def _last3_sum(hist: list[float]) -> float | None:
+    """Sum of last 3 closed P&Ls, or None if fewer than 3 (no throttle)."""
+    if len(hist) < 3:
+        return None
+    return float(sum(hist[-3:]))
+
+
+def apply_ab_sizing_throttle(plan: TradePlan) -> dict[str, Any]:
+    """
+    Apply A+B sizing throttle to ``plan.risk_usd`` AFTER all existing multipliers.
+    Both factors can stack (0.18 × 0.18). Short histories (<3) do not throttle.
+    Returns fields for decision / forensic logging.
+    """
+    _ensure_live_sizing_health_rebuilt()
+    base_risk = float(plan.risk_usd or 0)
+    sid = str(plan.strategy_id or "").strip().upper()
+    conf = str(
+        plan.ai.get("confidence")
+        if plan.ai.get("confidence") is not None
+        else plan.log_fields.get("confidence", "")
+    ).strip().upper()
+    mb = str(
+        plan.ai.get("macro_bias")
+        if plan.ai.get("macro_bias") is not None
+        else plan.log_fields.get("macro_bias", "")
+    ).strip().upper()
+
+    strat_hist = _LIVE_STRAT_PNL_HISTORY.get(sid, [])
+    strat_sum = _last3_sum(strat_hist)
+    st_sum = _last3_sum(_LIVE_ST_MEDIUM_PNL_HISTORY)
+
+    a_factor = 1.0
+    if strat_sum is not None and float(strat_sum) <= 0.0:
+        a_factor = float(_AB_THROTTLE_FACTOR)
+
+    b_factor = 1.0
+    if conf == "MEDIUM" and mb == "STRONG_TAILWIND":
+        if st_sum is not None and float(st_sum) <= 0.0:
+            b_factor = float(_AB_THROTTLE_FACTOR)
+
+    throttle = float(a_factor) * float(b_factor)
+    final_risk = base_risk * throttle
+    plan.risk_usd = round(final_risk, 2)
+    try:
+        base_pct = float(plan.risk_pct or 0)
+    except (TypeError, ValueError):
+        base_pct = 0.0
+    plan.risk_pct = base_pct * throttle
+
+    fields: dict[str, Any] = {
+        "sizing_health_strategy_id": sid,
+        "sizing_health_strat_last3_sum": None if strat_sum is None else round(float(strat_sum), 2),
+        "sizing_health_st_medium_last3_sum": None if st_sum is None else round(float(st_sum), 2),
+        "sizing_health_throttle_a": float(a_factor),
+        "sizing_health_throttle_b": float(b_factor),
+        "sizing_health_throttle": float(throttle),
+        "sizing_health_base_risk": round(base_risk, 2),
+        "sizing_health_final_risk": round(final_risk, 2),
+        "max_risk_dollars": round(final_risk, 2),
+        "final_risk_pct": plan.risk_pct,
+    }
+    plan.log_fields.update(fields)
+    plan.ai["sizing_health_throttle"] = float(throttle)
+    plan.ai["sizing_health_base_risk"] = round(base_risk, 2)
+    plan.ai["max_risk_dollars"] = round(final_risk, 2)
+    return fields
+
+
 def _pip_size_for_ticker(ticker: str) -> float:
     t = (ticker or "").strip().upper()
     if len(t) == 6 and "JPY" in t:
@@ -640,6 +807,12 @@ def _forensic_record_from_close(mt5: Any, ticket: int, meta: dict[str, Any]) -> 
 
     return {
         "date": close_date,
+        "close_ts": int(close_ts) if close_ts is not None else None,
+        "close_time_utc": (
+            datetime.fromtimestamp(close_ts, tz=timezone.utc).isoformat()
+            if close_ts is not None
+            else None
+        ),
         "ticker": ticker,
         "direction": direction,
         "strategy_id": str(meta.get("strategy", meta.get("strategy_id", ""))).strip().upper(),
@@ -661,7 +834,16 @@ def _forensic_record_from_close(mt5: Any, ticket: int, meta: dict[str, Any]) -> 
         "hold_time_hours": hold_hours,
         "exit_reason": exit_reason,
         "pyramid_trade": bool(meta.get("pyramid_trade")),
+        "is_pyramid_add": bool(meta.get("is_pyramid_add")),
         "continuation_active": bool(meta.get("continuation_active")),
+        "sizing_health_strategy_id": meta.get("sizing_health_strategy_id"),
+        "sizing_health_strat_last3_sum": meta.get("sizing_health_strat_last3_sum"),
+        "sizing_health_st_medium_last3_sum": meta.get("sizing_health_st_medium_last3_sum"),
+        "sizing_health_throttle_a": meta.get("sizing_health_throttle_a"),
+        "sizing_health_throttle_b": meta.get("sizing_health_throttle_b"),
+        "sizing_health_throttle": meta.get("sizing_health_throttle"),
+        "sizing_health_base_risk": meta.get("sizing_health_base_risk"),
+        "sizing_health_final_risk": meta.get("sizing_health_final_risk"),
     }
 
 
@@ -708,6 +890,7 @@ def _finalize_closed_positions_v76(mt5: Any, *, prior_meta: dict[str, Any] | Non
             continue
         record = _forensic_record_from_close(mt5, tid, m)
         append_live_trade_forensic(record)
+        _record_closed_trade_for_sizing_health(record)
         live_log(
             "info",
             "[FORENSIC] position closed",
@@ -1102,6 +1285,23 @@ def order_send_v76(
     plan: TradePlan,
 ) -> dict[str, Any]:
     """Open position (or dry-run log only)."""
+    # Last sizing step: A+B health throttle after all existing multipliers.
+    throttle_fields = apply_ab_sizing_throttle(plan)
+    live_log(
+        "info",
+        "[SIZING HEALTH] A+B throttle",
+        strategy_id=plan.strategy_id,
+        strat_last3_sum=throttle_fields.get("sizing_health_strat_last3_sum"),
+        st_medium_last3_sum=throttle_fields.get("sizing_health_st_medium_last3_sum"),
+        throttle_a=throttle_fields.get("sizing_health_throttle_a"),
+        throttle_b=throttle_fields.get("sizing_health_throttle_b"),
+        throttle=throttle_fields.get("sizing_health_throttle"),
+        base_risk=throttle_fields.get("sizing_health_base_risk"),
+        final_risk=throttle_fields.get("sizing_health_final_risk"),
+        confidence=plan.ai.get("confidence") or plan.log_fields.get("confidence"),
+        macro_bias=plan.ai.get("macro_bias") or plan.log_fields.get("macro_bias"),
+    )
+
     if DRY_RUN:
         tick = mt5.symbol_info_tick(broker_sym) if mt5 else None
         entry = float(tick.ask if plan.direction == "LONG" else tick.bid) if tick else plan.entry
@@ -1122,6 +1322,7 @@ def order_send_v76(
             "sl": plan.stop_loss,
             "r": abs(entry - plan.stop_loss),
             "final_risk_usd": plan.risk_usd,
+            **{k: v for k, v in throttle_fields.items() if k.startswith("sizing_health_")},
         }
         _init_pyramid_tracking(dry_meta, plan, entry)
         if dry_meta.get("pyramid"):
@@ -1176,6 +1377,7 @@ def order_send_v76(
             "st_boost_tier": plan.ai.get("st_boost_tier", "NONE"),
             "st_layer2_score": int(plan.ai.get("st_layer2_score", 0) or 0),
         }
+        meta.update({k: v for k, v in throttle_fields.items() if k.startswith("sizing_health_")})
         meta.update(_macro_manager.merged_macro_result_fields(plan.ai))
         res = at.order_send_live(mt5, broker_sym, plan.direction, plan.stop_loss, plan.risk_usd, meta)
         if res.get("ok") and res.get("ticket"):
@@ -1961,6 +2163,7 @@ def main_loop_v76() -> None:
         locked_count=len(_v76_logic.LOCKED_STRATEGY_IDS),
     )
     publish_live_status(None, status="starting")
+    rebuild_live_sizing_health_from_forensic()
     if not DRY_RUN:
         at.emit_startup_diagnostics()
 
