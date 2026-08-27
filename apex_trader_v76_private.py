@@ -564,6 +564,8 @@ def _record_closed_trade_for_sizing_health(row: Mapping[str, Any] | None) -> Non
         return
     if row.get("skipped"):
         return
+    if row.get("is_pyramid_add"):
+        return
     if str(row.get("outcome", "")).strip().upper() not in ("WIN", "LOSS"):
         return
     try:
@@ -593,6 +595,7 @@ def _rebuild_live_sizing_health_from_rows(rows: list[dict[str, Any]]) -> None:
         for r in rows
         if isinstance(r, dict)
         and not r.get("skipped")
+        and not r.get("is_pyramid_add")
         and str(r.get("outcome", "")).strip().upper() in ("WIN", "LOSS")
     ]
     completed.sort(
@@ -831,6 +834,7 @@ def _forensic_record_from_close(mt5: Any, ticket: int, meta: dict[str, Any]) -> 
         "hold_time_hours": hold_hours,
         "exit_reason": exit_reason,
         "pyramid_trade": bool(meta.get("pyramid_trade")),
+        "is_pyramid_add": bool(meta.get("is_pyramid_add")),
         "continuation_active": bool(meta.get("continuation_active")),
         "sizing_health_strategy_id": meta.get("sizing_health_strategy_id"),
         "sizing_health_strat_last3_sum": meta.get("sizing_health_strat_last3_sum"),
