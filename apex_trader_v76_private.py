@@ -222,8 +222,10 @@ APEX_V76_MAGIC = int(os.environ.get("APEX_V76_PRIVATE_MAGIC", "760761"))
 ORDER_COMMENT_V76 = os.environ.get("APEX_V76_PRIVATE_ORDER_COMMENT", "APEX76P")
 DRY_RUN = os.environ.get("APEX_V76_PRIVATE_DRY_RUN", "true").strip().lower() in ("1", "true", "yes")
 
-# One engine, two profiles. Future risk gates must read through ``CFG`` only —
-# never hard-code profile values, and never fork this file into a second copy.
+# One engine, two profiles. Risk gates read through ``CFG`` only.
+# Keep PROFILE="private" for live capital. Funded multipliers are also computed
+# as write-only ``shadow_funded_*`` fields for forward evidence — do not point
+# real capital at PROFILE="funded" until that evidence is reviewed.
 PROFILE = "private"  # "private" | "funded"
 PROFILES: dict[str, dict[str, Any]] = {
     "private": {
@@ -232,6 +234,7 @@ PROFILES: dict[str, dict[str, Any]] = {
         "per_trade_loss_cap_pct": None,  # disabled
         "daily_loss_stop_pct": None,  # disabled
         "dd_ladder": [],  # disabled
+        # Placeholder only — requires a virtual-position tracker (not implemented).
         "dry_run_after_losing_days": None,
         "warmup_days": 0,
         "warmup_multiplier": 1.0,
@@ -242,6 +245,7 @@ PROFILES: dict[str, dict[str, Any]] = {
         "per_trade_loss_cap_pct": 1.5,
         "daily_loss_stop_pct": 3.0,
         "dd_ladder": [(5.0, 0.5), (8.0, 0.25)],
+        # Placeholder only — requires a virtual-position tracker (not implemented).
         "dry_run_after_losing_days": 3,
         "warmup_days": 40,
         "warmup_multiplier": 0.25,
@@ -262,6 +266,7 @@ LIVE_TRADES_FORENSIC = at.BASE_DIR / "live_trades_forensic_private.json"
 # A: last-3 closed P&Ls per strategy_id. B: last-3 ST-MEDIUM closed P&Ls.
 _LIVE_STRAT_PNL_HISTORY: dict[str, list[float]] = {}
 _LIVE_ST_MEDIUM_PNL_HISTORY: list[float] = []
+_LIVE_STRAT_TRADE_COUNT: dict[str, int] = {}  # total closed (excl. pyramid adds)
 _LIVE_SIZING_HEALTH_REBUILT: bool = False
 _LIVE_SIZING_HEALTH_MAXLEN: int = 50
 _AB_THROTTLE_FACTOR: float = 0.18
@@ -497,6 +502,43 @@ class ScanSkip:
     fields: dict[str, Any] = field(default_factory=dict)
 
 
+def build_skip_blocked_log_fields(
+    *,
+    sym: str,
+    timeframe: str,
+    reason: str,
+    fields: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Build a single kwargs dict for ``[SKIP] trade blocked`` logs.
+
+    Callers must unpack this once — never pass the same keys as explicit kwargs
+    alongside ``**skip_fields`` (TypeError on duplicate keywords).
+    """
+    skip_fields = dict(fields or {})
+    skip_fields["ticker"] = str(sym).upper()
+    skip_fields["timeframe"] = timeframe
+    skip_fields["skip_reason"] = reason
+    skip_fields.setdefault("guard_mode", "NORMAL")
+    skip_fields.setdefault("guard_profile", PROFILE)
+    return skip_fields
+
+
+def emit_skip_blocked_log(
+    *,
+    sym: str,
+    timeframe: str,
+    reason: str,
+    fields: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Log ``[SKIP] trade blocked`` safely; returns the fields dict used."""
+    skip_fields = build_skip_blocked_log_fields(
+        sym=sym, timeframe=timeframe, reason=reason, fields=fields
+    )
+    live_log("info", "[SKIP] trade blocked", **skip_fields)
+    return skip_fields
+
+
 @dataclass
 class TradePlan:
     skipped: bool = False
@@ -532,6 +574,10 @@ def load_v76_state() -> dict[str, Any]:
             "daily_pnl": [],
             "day_key": "",
             "day_anchor": None,
+            # CFG guardrail persistence (survives restarts)
+            "guard_activation_date": "",
+            "peak_equity": None,
+            "day_realized_pnl": 0.0,
         },
     )
     return d if isinstance(d, dict) else {}
@@ -580,6 +626,7 @@ def _reset_live_sizing_health_histories() -> None:
     """Clear A+B sizing-health rolling histories."""
     _LIVE_STRAT_PNL_HISTORY.clear()
     _LIVE_ST_MEDIUM_PNL_HISTORY.clear()
+    _LIVE_STRAT_TRADE_COUNT.clear()
 
 
 def _record_closed_trade_for_sizing_health(row: Mapping[str, Any] | None) -> None:
@@ -604,6 +651,7 @@ def _record_closed_trade_for_sizing_health(row: Mapping[str, Any] | None) -> Non
         hist = _LIVE_STRAT_PNL_HISTORY.setdefault(sid, [])
         hist.append(pnl)
         _trim_pnl_history(hist)
+        _LIVE_STRAT_TRADE_COUNT[sid] = int(_LIVE_STRAT_TRADE_COUNT.get(sid, 0) or 0) + 1
     conf = str(row.get("confidence", "")).strip().upper()
     mb = str(row.get("macro_bias", "")).strip().upper()
     if conf == "MEDIUM" and mb == "STRONG_TAILWIND":
@@ -727,6 +775,304 @@ def apply_ab_sizing_throttle(plan: TradePlan) -> dict[str, Any]:
     plan.ai["sizing_health_base_risk"] = round(base_risk, 2)
     plan.ai["max_risk_dollars"] = round(final_risk, 2)
     return fields
+
+
+def _parse_iso_date(raw: Any) -> date | None:
+    try:
+        return date.fromisoformat(str(raw or "").strip()[:10])
+    except (TypeError, ValueError):
+        return None
+
+
+def _trading_days_inclusive(start: date, end: date) -> int:
+    """Count Mon–Fri calendar days from start through end inclusive."""
+    if end < start:
+        return 0
+    n = 0
+    d = start
+    one = timedelta(days=1)
+    while d <= end:
+        if d.weekday() < 5:
+            n += 1
+        d += one
+    return n
+
+
+def _ensure_guard_activation_date(st: dict[str, Any], scan_d: date) -> date:
+    raw = str(st.get("guard_activation_date") or "").strip()
+    parsed = _parse_iso_date(raw)
+    if parsed is None:
+        st["guard_activation_date"] = scan_d.isoformat()
+        return scan_d
+    return parsed
+
+
+def _update_peak_equity(st: dict[str, Any], equity: float) -> float:
+    try:
+        eq = float(equity)
+    except (TypeError, ValueError):
+        eq = 0.0
+    try:
+        peak = float(st.get("peak_equity")) if st.get("peak_equity") is not None else eq
+    except (TypeError, ValueError):
+        peak = eq
+    if eq > peak:
+        peak = eq
+    st["peak_equity"] = round(peak, 2)
+    return float(peak)
+
+
+def _cfg_guardrail_multipliers(
+    *,
+    cfg: Mapping[str, Any],
+    st: dict[str, Any],
+    strategy_id: str,
+    equity: float,
+    scan_d: date,
+) -> dict[str, Any]:
+    """
+    Compute warmup / cold-start / drawdown-ladder multipliers from ``cfg``.
+    None / 0 / empty values are no-ops (multiplier 1.0). Does not mutate risk.
+    """
+    sid = str(strategy_id or "").strip().upper()
+    warmup_m = 1.0
+    cold_m = 1.0
+    ladder_m = 1.0
+    ladder_level = 0
+    dd_pct = 0.0
+
+    try:
+        warmup_days = int(cfg.get("warmup_days") or 0)
+    except (TypeError, ValueError):
+        warmup_days = 0
+    if warmup_days > 0:
+        act = _ensure_guard_activation_date(st, scan_d)
+        elapsed = _trading_days_inclusive(act, scan_d)
+        if elapsed < warmup_days:
+            try:
+                warmup_m = float(cfg.get("warmup_multiplier") or 1.0)
+            except (TypeError, ValueError):
+                warmup_m = 1.0
+
+    try:
+        cold_min = int(cfg.get("cold_start_min_trades") or 0)
+    except (TypeError, ValueError):
+        cold_min = 0
+    if cold_min > 0:
+        n_closed = int(_LIVE_STRAT_TRADE_COUNT.get(sid, 0) or 0)
+        if n_closed < cold_min:
+            try:
+                cold_m = float(cfg.get("cold_start_multiplier") or 1.0)
+            except (TypeError, ValueError):
+                cold_m = 1.0
+
+    ladder = cfg.get("dd_ladder") or []
+    peak = _update_peak_equity(st, equity)
+    if peak > 0 and isinstance(ladder, (list, tuple)) and len(ladder) > 0:
+        dd_pct = max(0.0, (peak - float(equity)) / peak * 100.0)
+        for i, item in enumerate(ladder, start=1):
+            try:
+                thr, mult = float(item[0]), float(item[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if dd_pct >= thr:
+                ladder_m = mult
+                ladder_level = i
+
+    return {
+        "warmup_mult": float(warmup_m),
+        "cold_start_mult": float(cold_m),
+        "dd_ladder_mult": float(ladder_m),
+        "dd_ladder_level": int(ladder_level),
+        "dd_pct": round(float(dd_pct), 4),
+        "peak_equity": round(float(peak), 2),
+        "strat_closed_n": int(_LIVE_STRAT_TRADE_COUNT.get(sid, 0) or 0),
+    }
+
+
+def _resolve_guard_mode(
+    *,
+    daily_stopped: bool,
+    ladder_level: int,
+    warmup_mult: float,
+) -> str:
+    if daily_stopped:
+        return "DAILY_STOPPED"
+    if ladder_level >= 2:
+        return "LADDER_2"
+    if ladder_level == 1:
+        return "LADDER_1"
+    if float(warmup_mult) != 1.0:
+        return "WARMUP"
+    return "NORMAL"
+
+
+def apply_cfg_guardrails(
+    plan: TradePlan,
+    *,
+    st: dict[str, Any],
+    equity: float,
+    day_anchor: float,
+    day_realized_pnl: float,
+    scan_d: date,
+) -> dict[str, Any]:
+    """
+    Apply CFG guardrails on top of A+B-throttled ``plan.risk_usd``.
+    Private profile (None/0/empty) is a no-op. Returns log fields + allow flag.
+    """
+    _ensure_live_sizing_health_rebuilt()
+    post_ab = float(plan.risk_usd or 0)
+    try:
+        eq = float(equity)
+    except (TypeError, ValueError):
+        eq = 0.0
+    try:
+        anchor = float(day_anchor)
+    except (TypeError, ValueError):
+        anchor = eq
+    try:
+        day_real = float(day_realized_pnl)
+    except (TypeError, ValueError):
+        day_real = 0.0
+
+    m = _cfg_guardrail_multipliers(
+        cfg=CFG,
+        st=st,
+        strategy_id=plan.strategy_id,
+        equity=eq,
+        scan_d=scan_d,
+    )
+    risk = post_ab * m["warmup_mult"] * m["cold_start_mult"] * m["dd_ladder_mult"]
+
+    # Per-trade loss cap: reduce size only — never widen the stop.
+    cap_pct = CFG.get("per_trade_loss_cap_pct")
+    cap_applied = 1.0
+    if cap_pct is not None and eq > 0:
+        try:
+            max_risk = eq * float(cap_pct) / 100.0
+        except (TypeError, ValueError):
+            max_risk = risk
+        if max_risk >= 0 and risk > max_risk and risk > 0:
+            cap_applied = max_risk / risk
+            risk = max_risk
+
+    plan.risk_usd = round(float(risk), 2)
+    try:
+        base_pct = float(plan.risk_pct or 0)
+    except (TypeError, ValueError):
+        base_pct = 0.0
+    # Scale pct by post-AB → final ratio when post_ab > 0
+    if post_ab > 0:
+        plan.risk_pct = base_pct * (float(risk) / post_ab)
+    plan.ai["max_risk_dollars"] = round(float(risk), 2)
+
+    daily_stopped = False
+    stop_pct = CFG.get("daily_loss_stop_pct")
+    if stop_pct is not None and anchor > 0:
+        try:
+            thresh = -float(stop_pct) / 100.0 * anchor
+        except (TypeError, ValueError):
+            thresh = None
+        if thresh is not None and day_real <= thresh:
+            daily_stopped = True
+
+    mode = _resolve_guard_mode(
+        daily_stopped=daily_stopped,
+        ladder_level=int(m["dd_ladder_level"]),
+        warmup_mult=float(m["warmup_mult"]),
+    )
+    allow = not daily_stopped
+
+    fields: dict[str, Any] = {
+        "guard_profile": PROFILE,
+        "guard_mode": mode,
+        "guard_allow_new_orders": bool(allow),
+        "guard_warmup_mult": float(m["warmup_mult"]),
+        "guard_cold_start_mult": float(m["cold_start_mult"]),
+        "guard_dd_ladder_mult": float(m["dd_ladder_mult"]),
+        "guard_dd_ladder_level": int(m["dd_ladder_level"]),
+        "guard_dd_pct": m["dd_pct"],
+        "guard_peak_equity": m["peak_equity"],
+        "guard_loss_cap_mult": round(float(cap_applied), 6),
+        "guard_post_ab_risk": round(post_ab, 2),
+        "guard_final_risk": round(float(risk), 2),
+        "guard_day_realized_pnl": round(day_real, 2),
+        "guard_day_anchor": round(anchor, 2),
+        "guard_daily_stopped": bool(daily_stopped),
+        "guard_strat_closed_n": int(m["strat_closed_n"]),
+        "max_risk_dollars": round(float(risk), 2),
+        "final_risk_pct": plan.risk_pct,
+    }
+    plan.log_fields.update(fields)
+    plan.ai["guard_mode"] = mode
+    plan.ai["max_risk_dollars"] = round(float(risk), 2)
+
+    # Shadow-only funded profile measurement (never applied when PROFILE != funded).
+    if PROFILE != "funded":
+        sm = _cfg_guardrail_multipliers(
+            cfg=PROFILES["funded"],
+            st=st,
+            strategy_id=plan.strategy_id,
+            equity=eq,
+            scan_d=scan_d,
+        )
+        shadow_risk = post_ab * sm["warmup_mult"] * sm["cold_start_mult"] * sm["dd_ladder_mult"]
+        fcap = PROFILES["funded"].get("per_trade_loss_cap_pct")
+        if fcap is not None and eq > 0:
+            try:
+                shadow_risk = min(shadow_risk, eq * float(fcap) / 100.0)
+            except (TypeError, ValueError):
+                pass
+        f_stop = PROFILES["funded"].get("daily_loss_stop_pct")
+        shadow_daily = False
+        if f_stop is not None and anchor > 0:
+            try:
+                shadow_daily = day_real <= (-float(f_stop) / 100.0 * anchor)
+            except (TypeError, ValueError):
+                shadow_daily = False
+        shadow_mode = _resolve_guard_mode(
+            daily_stopped=shadow_daily,
+            ladder_level=int(sm["dd_ladder_level"]),
+            warmup_mult=float(sm["warmup_mult"]),
+        )
+        shadow = {
+            "shadow_funded_mode": shadow_mode,
+            "shadow_funded_warmup_mult": float(sm["warmup_mult"]),
+            "shadow_funded_cold_start_mult": float(sm["cold_start_mult"]),
+            "shadow_funded_dd_ladder_mult": float(sm["dd_ladder_mult"]),
+            "shadow_funded_final_risk": round(float(shadow_risk), 2),
+            "shadow_funded_daily_stopped": bool(shadow_daily),
+        }
+        fields.update(shadow)
+        plan.log_fields.update(shadow)
+
+    return fields
+
+
+def roll_cfg_guard_day(
+    st: dict[str, Any],
+    *,
+    new_day_key: str,
+    equity: float,
+) -> None:
+    """
+    On calendar day change: reset day realised P&L. Peak equity and activation
+    date persist. (CFG dry-run recovery omitted — needs a virtual-position tracker.)
+    """
+    prev_key = str(st.get("day_key") or st.get("guard_day_key") or "").strip()
+    if prev_key and prev_key != new_day_key:
+        st["day_realized_pnl"] = 0.0
+
+    _ensure_guard_activation_date(st, _parse_iso_date(new_day_key) or date.today())
+    _update_peak_equity(st, equity)
+
+
+def record_day_realized_pnl(st: dict[str, Any], pnl: float) -> None:
+    """Accumulate realised P&L for the current trading day (persisted)."""
+    try:
+        st["day_realized_pnl"] = round(float(st.get("day_realized_pnl") or 0) + float(pnl), 2)
+    except (TypeError, ValueError):
+        return
 
 
 def _pip_size_for_ticker(ticker: str) -> float:
@@ -874,8 +1220,18 @@ def _forensic_record_from_close(mt5: Any, ticket: int, meta: dict[str, Any]) -> 
     }
 
 
-def _finalize_closed_positions_v76(mt5: Any, *, prior_meta: dict[str, Any] | None = None) -> None:
-    """Detect closed v76 tickets, append forensic rows, prune ticket meta."""
+def _finalize_closed_positions_v76(
+    mt5: Any,
+    *,
+    prior_meta: dict[str, Any] | None = None,
+    st: dict[str, Any] | None = None,
+) -> None:
+    """Detect closed v76 tickets, append forensic rows, prune ticket meta.
+
+    When ``st`` is provided (scan path), mutate that object and do not save —
+    the caller owns persistence. When ``st`` is None (periodic TRAIL CYCLE),
+    load/modify/save state locally so realised day P&L still persists.
+    """
     if mt5 is None:
         return
     try:
@@ -909,6 +1265,9 @@ def _finalize_closed_positions_v76(mt5: Any, *, prior_meta: dict[str, Any] | Non
     if not to_log:
         return
 
+    own_state = st is None
+    st_use = st if isinstance(st, dict) else load_v76_state()
+
     changed = False
     for k, m in to_log.items():
         try:
@@ -918,6 +1277,12 @@ def _finalize_closed_positions_v76(mt5: Any, *, prior_meta: dict[str, Any] | Non
         record = _forensic_record_from_close(mt5, tid, m)
         append_live_trade_forensic(record)
         _record_closed_trade_for_sizing_health(record)
+        try:
+            record_day_realized_pnl(st_use, float(record.get("pnl_dollars", 0) or 0))
+            if own_state:
+                save_v76_state(st_use)
+        except Exception:  # noqa: BLE001
+            pass
         live_log(
             "info",
             "[FORENSIC] position closed",
@@ -1310,9 +1675,37 @@ def order_send_v76(
     mt5: Any,
     broker_sym: str,
     plan: TradePlan,
+    *,
+    st: dict[str, Any] | None = None,
+    equity: float | None = None,
+    day_anchor: float | None = None,
+    scan_d: date | None = None,
 ) -> dict[str, Any]:
-    """Open position (or dry-run log only)."""
-    # Last sizing step: A+B health throttle after all existing multipliers.
+    """Open position (or env DRY_RUN / CFG daily-stop skip)."""
+    st_use = st if isinstance(st, dict) else load_v76_state()
+    try:
+        eq_use = (
+            float(equity)
+            if equity is not None
+            else float(st_use.get("last_equity") or st_use.get("last_balance") or 0)
+        )
+    except (TypeError, ValueError):
+        eq_use = 0.0
+    try:
+        anchor_use = (
+            float(day_anchor)
+            if day_anchor is not None
+            else float(st_use.get("day_anchor") or eq_use)
+        )
+    except (TypeError, ValueError):
+        anchor_use = eq_use
+    try:
+        day_real = float(st_use.get("day_realized_pnl") or 0)
+    except (TypeError, ValueError):
+        day_real = 0.0
+    scan_use = scan_d or datetime.now(timezone.utc).date()
+
+    # Sizing: existing multipliers → A+B throttle → CFG guardrails.
     throttle_fields = apply_ab_sizing_throttle(plan)
     live_log(
         "info",
@@ -1328,6 +1721,60 @@ def order_send_v76(
         confidence=plan.ai.get("confidence") or plan.log_fields.get("confidence"),
         macro_bias=plan.ai.get("macro_bias") or plan.log_fields.get("macro_bias"),
     )
+    guard_fields = apply_cfg_guardrails(
+        plan,
+        st=st_use,
+        equity=eq_use,
+        day_anchor=anchor_use,
+        day_realized_pnl=day_real,
+        scan_d=scan_use,
+    )
+    live_log(
+        "info",
+        "[GUARD] CFG sizing",
+        strategy_id=plan.strategy_id,
+        guard_mode=guard_fields.get("guard_mode"),
+        warmup_mult=guard_fields.get("guard_warmup_mult"),
+        cold_start_mult=guard_fields.get("guard_cold_start_mult"),
+        dd_ladder_mult=guard_fields.get("guard_dd_ladder_mult"),
+        loss_cap_mult=guard_fields.get("guard_loss_cap_mult"),
+        post_ab_risk=guard_fields.get("guard_post_ab_risk"),
+        final_risk=guard_fields.get("guard_final_risk"),
+        allow_new_orders=guard_fields.get("guard_allow_new_orders"),
+        profile=PROFILE,
+    )
+    # Caller-owned state: only persist here when we loaded a fresh copy.
+    if st is None:
+        save_v76_state(st_use)
+
+    mode = str(guard_fields.get("guard_mode") or "NORMAL")
+    cfg_block = not bool(guard_fields.get("guard_allow_new_orders"))
+
+    if cfg_block and mode == "DAILY_STOPPED":
+        row = dict(plan.log_fields)
+        row.update(
+            {
+                "action": "SKIP",
+                "skip_reason": "CFG daily loss stop — no new positions today",
+                "magic_number": APEX_V76_MAGIC,
+            }
+        )
+        append_decision_log(row)
+        live_log(
+            "warning",
+            "[SKIP] CFG daily loss stop",
+            ticker=plan.sym,
+            timeframe=plan.timeframe,
+            strategy_id=plan.strategy_id,
+            guard_mode=mode,
+            day_realized_pnl=guard_fields.get("guard_day_realized_pnl"),
+            guard_warmup_mult=guard_fields.get("guard_warmup_mult"),
+            guard_cold_start_mult=guard_fields.get("guard_cold_start_mult"),
+            guard_dd_ladder_mult=guard_fields.get("guard_dd_ladder_mult"),
+            guard_loss_cap_mult=guard_fields.get("guard_loss_cap_mult"),
+            guard_final_risk=guard_fields.get("guard_final_risk"),
+        )
+        return {"ok": False, "error": "daily_loss_stop", "dry_run": False}
 
     if DRY_RUN:
         tick = mt5.symbol_info_tick(broker_sym) if mt5 else None
@@ -1342,6 +1789,7 @@ def order_send_v76(
                 "lot_size": round(lots, 2),
                 "entry_price_live": entry,
                 "magic_number": APEX_V76_MAGIC,
+                "env_dry_run": True,
             }
         )
         dry_meta: dict[str, Any] = {
@@ -1350,29 +1798,34 @@ def order_send_v76(
             "r": abs(entry - plan.stop_loss),
             "final_risk_usd": plan.risk_usd,
             **{k: v for k, v in throttle_fields.items() if k.startswith("sizing_health_")},
+            **{
+                k: v
+                for k, v in guard_fields.items()
+                if str(k).startswith("guard_") or str(k).startswith("shadow_")
+            },
         }
         _init_pyramid_tracking(dry_meta, plan, entry)
         if dry_meta.get("pyramid"):
             row["pyramid_trade"] = True
             row["pyramid_candidate"] = dry_meta.get("pyramid")
         append_decision_log(row)
-        live_log(
-            "info",
-            "[TRADE] DRY_RUN would open",
-            ticker=plan.sym,
-            timeframe=plan.timeframe,
-            strategy_id=plan.strategy_id,
-            direction=plan.direction,
-            lot_size=round(lots, 2),
-            risk_usd=round(plan.risk_usd, 2),
-            final_risk_pct=plan.risk_pct,
-            stop=plan.stop_loss,
-            tp1=plan.tp1,
-            tp2=plan.tp2,
-            tp3=plan.tp3,
-            trail_regime=plan.trail_regime,
-            **_sizing_fields_from_ai(plan.ai),
-        )
+        dry_log = {
+            "ticker": plan.sym,
+            "timeframe": plan.timeframe,
+            "strategy_id": plan.strategy_id,
+            "direction": plan.direction,
+            "lot_size": round(lots, 2),
+            "risk_usd": round(plan.risk_usd, 2),
+            "final_risk_pct": plan.risk_pct,
+            "stop": plan.stop_loss,
+            "tp1": plan.tp1,
+            "tp2": plan.tp2,
+            "tp3": plan.tp3,
+            "trail_regime": plan.trail_regime,
+            "guard_mode": mode,
+        }
+        dry_log.update(_sizing_fields_from_ai(plan.ai))
+        live_log("info", "[TRADE] DRY_RUN would open", **dry_log)
         return {"ok": True, "dry_run": True, "volume": lots, "entry": entry, "retcode": "DRY_RUN"}
 
     old_magic = at.APEX_MAGIC
@@ -1405,6 +1858,13 @@ def order_send_v76(
             "st_layer2_score": int(plan.ai.get("st_layer2_score", 0) or 0),
         }
         meta.update({k: v for k, v in throttle_fields.items() if k.startswith("sizing_health_")})
+        meta.update(
+            {
+                k: v
+                for k, v in guard_fields.items()
+                if str(k).startswith("guard_") or str(k).startswith("shadow_")
+            }
+        )
         meta.update(_macro_manager.merged_macro_result_fields(plan.ai))
         res = at.order_send_live(mt5, broker_sym, plan.direction, plan.stop_loss, plan.risk_usd, meta)
         if res.get("ok") and res.get("ticket"):
@@ -1425,32 +1885,37 @@ def order_send_v76(
         row["lot_size"] = lots
         row["magic_number"] = APEX_V76_MAGIC
         append_decision_log(row)
+        order_log = {
+            "ticker": plan.sym,
+            "timeframe": plan.timeframe,
+            "strategy_id": plan.strategy_id,
+            "direction": plan.direction,
+            "broker_symbol": broker_sym,
+            "lot_size": round(lots, 2),
+            "risk_usd": round(plan.risk_usd, 2),
+            "final_risk_pct": plan.risk_pct,
+            "stop": plan.stop_loss,
+            "tp1": plan.tp1,
+            "tp2": plan.tp2,
+            "tp3": plan.tp3,
+            "trail_regime": plan.trail_regime,
+            "mt5_retcode": retcode,
+            "ok": bool(res.get("ok")),
+            "error": res.get("error"),
+            "ticket": res.get("ticket"),
+            "guard_mode": mode,
+        }
+        order_log.update(_sizing_fields_from_ai(plan.ai))
         live_log(
             "info" if res.get("ok") else "warning",
             "[TRADE] MT5 order result",
-            ticker=plan.sym,
-            timeframe=plan.timeframe,
-            strategy_id=plan.strategy_id,
-            direction=plan.direction,
-            broker_symbol=broker_sym,
-            lot_size=round(lots, 2),
-            risk_usd=round(plan.risk_usd, 2),
-            final_risk_pct=plan.risk_pct,
-            stop=plan.stop_loss,
-            tp1=plan.tp1,
-            tp2=plan.tp2,
-            tp3=plan.tp3,
-            trail_regime=plan.trail_regime,
-            mt5_retcode=retcode,
-            ok=bool(res.get("ok")),
-            error=res.get("error"),
-            ticket=res.get("ticket"),
-            **_sizing_fields_from_ai(plan.ai),
+            **order_log,
         )
         return res
     finally:
         at.APEX_MAGIC = old_magic
         at.ORDER_COMMENT = old_comment
+
 
 
 def _log_positions_trailing_phase(mt5: Any, *, phase: str) -> None:
@@ -1909,8 +2374,13 @@ def _adopt_open_positions(mt5: Any) -> None:
         ticket_meta_v76_save(meta)
 
 
-def manage_trailing_v76(mt5: Any) -> None:
-    """Trailing with deep logging (before/after each pass)."""
+def manage_trailing_v76(mt5: Any, st: dict[str, Any] | None = None) -> None:
+    """Trailing with deep logging (before/after each pass).
+
+    Pass ``st`` from ``run_full_scan_v76`` so realised day P&L updates the same
+    in-memory object the scan saves at the end. Omit ``st`` for the periodic
+    TRAIL CYCLE so the finalizer loads/saves on its own.
+    """
     _log_positions_trailing_phase(mt5, phase="BEFORE")
     pre_meta = ticket_meta_v76_load()
     old_magic = at.APEX_MAGIC
@@ -1923,7 +2393,7 @@ def manage_trailing_v76(mt5: Any) -> None:
         at.APEX_MAGIC = old_magic
         at.TICKET_META_FILE = old_meta_path
     _process_pyramid_in_v76(mt5)
-    _finalize_closed_positions_v76(mt5, prior_meta=pre_meta)
+    _finalize_closed_positions_v76(mt5, prior_meta=pre_meta, st=st)
     _log_positions_trailing_phase(mt5, phase="AFTER")
     publish_live_status(mt5, status="running")
 
@@ -1977,12 +2447,15 @@ def run_full_scan_v76() -> None:
 
     now = datetime.now(timezone.utc)
     dk = now.strftime("%Y-%m-%d")
+    roll_cfg_guard_day(st, new_day_key=dk, equity=equity)
     if st.get("day_key") != dk:
         st["day_key"] = dk
         st["day_anchor"] = equity
     day_anchor = float(st.get("day_anchor") or equity)
     day_pnl = equity - day_anchor
     st["last_daily_pnl"] = round(day_pnl, 2)
+    _update_peak_equity(st, equity)
+    _ensure_guard_activation_date(st, scan_d)
 
     period_mode = _live_period_mode(st, balance, scan_d)
     st["last_period_mode"] = period_mode
@@ -2081,73 +2554,93 @@ def run_full_scan_v76() -> None:
             continue
         if isinstance(result, ScanSkip):
             skipped += 1
-            live_log(
-                "info",
-                "[SKIP] trade blocked",
-                ticker=sym.upper(),
+            skip_fields = emit_skip_blocked_log(
+                sym=sym,
                 timeframe=tf,
-                skip_reason=result.reason,
-                **result.fields,
+                reason=result.reason,
+                fields=result.fields,
             )
             append_decision_log(
                 {
                     "date": analysis_date,
-                    "ticker": sym.upper(),
-                    "timeframe": tf,
                     "action": "SKIP",
-                    "skip_reason": result.reason,
-                    **result.fields,
+                    **skip_fields,
                 },
             )
             continue
 
         plan: TradePlan = result
-        live_log(
-            "info",
-            "[TAKE] trade plan approved",
-            ticker=plan.sym,
-            timeframe=plan.timeframe,
-            strategy_id=plan.strategy_id,
-            direction=plan.direction,
-            macro_bias=plan.log_fields.get("macro_bias"),
-            trend_strength=plan.log_fields.get("trend_strength"),
-            regime=plan.log_fields.get("regime"),
-            confidence=plan.log_fields.get("confidence"),
-            confluence=plan.log_fields.get("strategy_confluence_count"),
-            period_mode=plan.log_fields.get("period_mode"),
-            trail_regime=plan.trail_regime,
-            risk_usd=round(plan.risk_usd, 2),
-            **_sizing_fields_from_ai(plan.ai),
-        )
+        take_fields = {
+            "ticker": plan.sym,
+            "timeframe": plan.timeframe,
+            "strategy_id": plan.strategy_id,
+            "direction": plan.direction,
+            "macro_bias": plan.log_fields.get("macro_bias"),
+            "trend_strength": plan.log_fields.get("trend_strength"),
+            "regime": plan.log_fields.get("regime"),
+            "confidence": plan.log_fields.get("confidence"),
+            "confluence": plan.log_fields.get("strategy_confluence_count"),
+            "period_mode": plan.log_fields.get("period_mode"),
+            "trail_regime": plan.trail_regime,
+            "risk_usd": round(plan.risk_usd, 2),
+            "guard_profile": PROFILE,
+        }
+        take_fields.update(_sizing_fields_from_ai(plan.ai))
+        live_log("info", "[TAKE] trade plan approved", **take_fields)
         bs = at.resolve_sym(mt5, sym) if mt5 else sym
         if not bs and not DRY_RUN:
             skipped += 1
-            live_log("warning", "[SKIP] broker symbol resolve failed", ticker=sym.upper())
+            live_log(
+                "warning",
+                "[SKIP] broker symbol resolve failed",
+                ticker=sym.upper(),
+                guard_mode="NORMAL",
+                guard_profile=PROFILE,
+            )
             continue
 
         if mt5:
             ok_opp, rs_opp = at.account_symbol_direction_conflict(mt5, bs, plan.direction)
             if ok_opp:
                 skipped += 1
-                live_log("info", "[SKIP] conflict", ticker=sym.upper(), timeframe=tf, skip_reason=rs_opp)
-                append_decision_log(
+                live_log(
+                    "info",
+                    "[SKIP] conflict",
+                    ticker=sym.upper(),
+                    timeframe=tf,
+                    skip_reason=rs_opp,
+                    guard_mode="NORMAL",
+                    guard_profile=PROFILE,
+                )
+                conflict_row = dict(plan.log_fields)
+                conflict_row.update(
                     {
                         "date": analysis_date,
                         "action": "SKIP",
                         "skip_reason": rs_opp,
-                        **plan.log_fields,
-                    },
+                        "guard_mode": "NORMAL",
+                        "guard_profile": PROFILE,
+                    }
                 )
+                append_decision_log(conflict_row)
                 continue
 
-        out = order_send_v76(mt5, bs or sym, plan)
+        out = order_send_v76(
+            mt5,
+            bs or sym,
+            plan,
+            st=st,
+            equity=equity,
+            day_anchor=day_anchor,
+            scan_d=scan_d,
+        )
         if out.get("ok"):
             placed += 1
         else:
             skipped += 1
 
     if mt5:
-        manage_trailing_v76(mt5)
+        manage_trailing_v76(mt5, st=st)
     elif DRY_RUN:
         publish_live_status(None, status="dry_run")
 
@@ -2161,14 +2654,9 @@ def run_full_scan_v76() -> None:
     }
     st["last_scan_summary"] = summary
     save_v76_state(st)
-    live_log(
-        "info",
-        "[SCAN CYCLE] complete",
-        placed=placed,
-        skipped=skipped,
-        dry_run=DRY_RUN,
-        **summary,
-    )
+    complete_fields = dict(summary)
+    complete_fields["dry_run"] = DRY_RUN
+    live_log("info", "[SCAN CYCLE] complete", **complete_fields)
     publish_live_status(
         mt5,
         status="idle",
