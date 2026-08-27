@@ -698,7 +698,7 @@ def apply_ab_sizing_throttle(plan: TradePlan) -> dict[str, Any]:
     plan.log_fields.update(fields)
     plan.ai["sizing_health_throttle"] = float(throttle)
     plan.ai["sizing_health_base_risk"] = round(base_risk, 2)
-    plan.ai["_max_risk_dollars"] = round(final_risk, 2)
+    plan.ai["max_risk_dollars"] = round(final_risk, 2)
     return fields
 
 
