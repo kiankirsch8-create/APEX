@@ -1827,16 +1827,35 @@ def _apply_ab_throttle_to_ai_sizing(
         ai["_leveraged_exposure"] = round(baseline_le * ab_throttle, 2)
         ai["_max_risk_dollars"] = round(baseline_mrd * ab_throttle, 2)
         ai["_account_risk_pct"] = baseline_rp * ab_throttle
+        ai["_ab_throttle"] = ab_throttle
+        ai["_ab_mult_a"] = mult_a
+        ai["_ab_mult_b"] = mult_b
+        ai.pop("_ab_mult_a_unapplied", None)
+        ai.pop("_ab_mult_b_unapplied", None)
+    elif APPLY_AB_THROTTLE:
+        ai["_ab_throttle"] = ab_throttle
+        ai["_ab_mult_a"] = mult_a
+        ai["_ab_mult_b"] = mult_b
+        ai.pop("_ab_mult_a_unapplied", None)
+        ai.pop("_ab_mult_b_unapplied", None)
+    else:
+        # Flag off: sizing unscaled; baseline must not divide by computed throttle.
+        ai["_ab_throttle"] = 1.0
+        ai["_ab_mult_a"] = 1.0
+        ai["_ab_mult_b"] = 1.0
+        ai["_ab_mult_a_unapplied"] = mult_a
+        ai["_ab_mult_b_unapplied"] = mult_b
 
-    ai["_ab_throttle"] = ab_throttle
-    ai["_ab_mult_a"] = mult_a
-    ai["_ab_mult_b"] = mult_b
-
-    return {
-        "ab_mult_a": float(mult_a),
-        "ab_mult_b": float(mult_b),
-        "ab_throttle": float(ab_throttle),
+    out: dict[str, Any] = {
+        "ab_mult_a": float(ai["_ab_mult_a"]),
+        "ab_mult_b": float(ai["_ab_mult_b"]),
+        "ab_throttle": float(ai["_ab_throttle"]),
     }
+    if "_ab_mult_a_unapplied" in ai:
+        out["ab_mult_a_unapplied"] = float(ai["_ab_mult_a_unapplied"])
+    if "_ab_mult_b_unapplied" in ai:
+        out["ab_mult_b_unapplied"] = float(ai["_ab_mult_b_unapplied"])
+    return out
 
 
 def _ab_trade_record_fields(
@@ -1846,20 +1865,27 @@ def _ab_trade_record_fields(
     ab_throttle: float,
     ab_mult_a: float,
     ab_mult_b: float,
+    ab_mult_a_unapplied: float | None = None,
+    ab_mult_b_unapplied: float | None = None,
 ) -> dict[str, Any]:
-    """Applied-trade row fields: R-multiple P&L, baseline shadow, throttle components."""
+    """Applied-trade row fields: net R-multiple, baseline shadow, throttle components."""
     thr = float(ab_throttle or 1.0)
     applied_pnl = float(pnl_dollars or 0)
     baseline_pnl = round(applied_pnl / thr, 2) if thr > 0 else round(applied_pnl, 2)
     risk = float(max_risk_dollars or 0)
     r_mult = round(applied_pnl / risk, 6) if risk > 0 else 0.0
-    return {
-        "pnl_pct": r_mult,
+    fields: dict[str, Any] = {
+        "pnl_r_net": r_mult,
         "shadow_baseline_pnl_dollars": baseline_pnl,
         "ab_throttle": thr,
         "ab_mult_a": float(ab_mult_a),
         "ab_mult_b": float(ab_mult_b),
     }
+    if ab_mult_a_unapplied is not None:
+        fields["ab_mult_a_unapplied"] = float(ab_mult_a_unapplied)
+    if ab_mult_b_unapplied is not None:
+        fields["ab_mult_b_unapplied"] = float(ab_mult_b_unapplied)
+    return fields
 
 
 def _sizing_health_shadow_fields(
@@ -7155,6 +7181,16 @@ def _python_forced_layer2_trade(
         ab_throttle=float(ai.get("_ab_throttle", 1.0) or 1.0),
         ab_mult_a=float(ai.get("_ab_mult_a", 1.0) or 1.0),
         ab_mult_b=float(ai.get("_ab_mult_b", 1.0) or 1.0),
+        ab_mult_a_unapplied=(
+            float(ai["_ab_mult_a_unapplied"])
+            if ai.get("_ab_mult_a_unapplied") is not None
+            else None
+        ),
+        ab_mult_b_unapplied=(
+            float(ai["_ab_mult_b_unapplied"])
+            if ai.get("_ab_mult_b_unapplied") is not None
+            else None
+        ),
     )
     confidence = str(ai.get("confidence", "LOW")).strip().upper()
     td = trend_result.get("trend") or {}
@@ -7203,6 +7239,7 @@ def _python_forced_layer2_trade(
         "exit_reason": exit_r,
         "outcome": outcome,
         "correct": correct,
+        "pnl_pct": pnl_pct_display,
         "pnl_dollars": pnl_dollars,
         "gross_pnl_pct": gross_pnl_pct,
         **_cost_fields,
@@ -8324,6 +8361,16 @@ def run_one_backtest(
             ab_throttle=float(ai.get("_ab_throttle", 1.0) or 1.0),
             ab_mult_a=float(ai.get("_ab_mult_a", 1.0) or 1.0),
             ab_mult_b=float(ai.get("_ab_mult_b", 1.0) or 1.0),
+            ab_mult_a_unapplied=(
+                float(ai["_ab_mult_a_unapplied"])
+                if ai.get("_ab_mult_a_unapplied") is not None
+                else None
+            ),
+            ab_mult_b_unapplied=(
+                float(ai["_ab_mult_b_unapplied"])
+                if ai.get("_ab_mult_b_unapplied") is not None
+                else None
+            ),
         )
 
         # Shadow trail sims need the forward path — run before del fut.
@@ -8468,6 +8515,7 @@ def run_one_backtest(
             "exit_reason": exit_r,
             "outcome": outcome,
             "correct": correct,
+            "pnl_pct": pnl_pct_display,
             "pnl_dollars": pnl_dollars,
             "gross_pnl_pct": gross_pnl_pct,
             **_cost_fields,
