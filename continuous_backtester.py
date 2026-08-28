@@ -216,6 +216,11 @@ _SYS_FOLLOWTHROUGH_HISTORY: list[float] = []
 _STRAT_PNL_HISTORY: dict[str, list[float]] = {}
 _JPY_PNL_HISTORY: list[float] = []
 _SYS_WIN_HISTORY: list[bool] = []
+
+# A+B sizing throttle — applied at open when True (matches apex_trader_v76_private live engine).
+APPLY_AB_THROTTLE = True
+_AB_THROTTLE_FACTOR = 0.18
+
 # v7.18: strategies with zero trades get sort priority next scan day.
 ZERO_TRADE_STRATEGIES: set[str] = set()
 TRADE_COOLDOWN_DAYS: dict[str, int] = {
@@ -1753,6 +1758,108 @@ def _record_st_medium_from_row(row: Mapping[str, Any] | None) -> None:
         pnl_dollars=float(row.get("pnl_dollars", 0) or 0),
         outcome=str(row.get("outcome", "") or ""),
     )
+
+
+def _last3_pnl_sum(hist: list[float]) -> float | None:
+    """Sum of last 3 closed P&Ls, or None if fewer than 3 (no throttle)."""
+    if len(hist) < 3:
+        return None
+    return float(sum(hist[-3:]))
+
+
+def _compute_ab_throttle_at_open(
+    *,
+    strategy_id: str,
+    confidence: str,
+    macro_bias: str,
+) -> tuple[float, float, float]:
+    """
+    A+B throttle from prior closed-trade histories only (matches live engine).
+    Returns (mult_a, mult_b, ab_throttle). Both factors stack; no clamping.
+    """
+    sid = str(strategy_id or "").strip().upper()
+    conf = str(confidence or "").strip().upper()
+    mb = str(macro_bias or "").strip().upper()
+
+    strat_hist = _STRAT_PNL_HISTORY.get(sid, [])
+    strat3 = _last3_pnl_sum(strat_hist)
+    mult_a = (
+        float(_AB_THROTTLE_FACTOR)
+        if strat3 is not None and float(strat3) <= 0.0
+        else 1.0
+    )
+
+    mult_b = 1.0
+    if conf == "MEDIUM" and mb == "STRONG_TAILWIND":
+        st_hist = _ST_MEDIUM_HISTORY
+        n = len(st_hist)
+        last3 = sum(p for p, _ in st_hist[-3:]) if n >= 3 else None
+        if last3 is not None and float(last3) <= 0.0:
+            mult_b = float(_AB_THROTTLE_FACTOR)
+
+    ab_throttle = float(mult_a) * float(mult_b)
+    return float(mult_a), float(mult_b), float(ab_throttle)
+
+
+def _apply_ab_throttle_to_ai_sizing(
+    ai: dict[str, Any],
+    *,
+    strategy_id: str,
+    confidence: str,
+    macro_bias: str,
+) -> dict[str, Any]:
+    """
+    Apply A+B throttle to ``ai`` sizing fields after all other multipliers.
+    When ``APPLY_AB_THROTTLE`` is False, records 1.0 multipliers without scaling.
+    """
+    mult_a, mult_b, ab_throttle = _compute_ab_throttle_at_open(
+        strategy_id=strategy_id,
+        confidence=confidence,
+        macro_bias=macro_bias,
+    )
+    baseline_ps = float(ai.get("_position_size", 0) or 0)
+    baseline_le = float(ai.get("_leveraged_exposure", 0) or 0)
+    baseline_mrd = float(ai.get("_max_risk_dollars", 0) or 0)
+    baseline_rp = float(ai.get("_account_risk_pct", 0) or 0)
+
+    if APPLY_AB_THROTTLE and ab_throttle != 1.0:
+        ai["_position_size"] = round(baseline_ps * ab_throttle, 2)
+        ai["_leveraged_exposure"] = round(baseline_le * ab_throttle, 2)
+        ai["_max_risk_dollars"] = round(baseline_mrd * ab_throttle, 2)
+        ai["_account_risk_pct"] = baseline_rp * ab_throttle
+
+    ai["_ab_throttle"] = ab_throttle
+    ai["_ab_mult_a"] = mult_a
+    ai["_ab_mult_b"] = mult_b
+
+    return {
+        "ab_mult_a": float(mult_a),
+        "ab_mult_b": float(mult_b),
+        "ab_throttle": float(ab_throttle),
+    }
+
+
+def _ab_trade_record_fields(
+    *,
+    pnl_dollars: float,
+    max_risk_dollars: float,
+    ab_throttle: float,
+    ab_mult_a: float,
+    ab_mult_b: float,
+) -> dict[str, Any]:
+    """Applied-trade row fields: R-multiple P&L, baseline shadow, throttle components."""
+    thr = float(ab_throttle or 1.0)
+    applied_pnl = float(pnl_dollars or 0)
+    baseline_pnl = round(applied_pnl / thr, 2) if thr > 0 else round(applied_pnl, 2)
+    risk = float(max_risk_dollars or 0)
+    r_mult = round(applied_pnl / risk, 6) if risk > 0 else 0.0
+    return {
+        "pnl_pct": r_mult,
+        "shadow_baseline_pnl_dollars": baseline_pnl,
+        "ab_throttle": thr,
+        "ab_mult_a": float(ab_mult_a),
+        "ab_mult_b": float(ab_mult_b),
+    }
 
 
 def _sizing_health_shadow_fields(
@@ -6867,6 +6974,12 @@ def _python_forced_layer2_trade(
         trade_date=scan_d_macro if scan_d_macro is not None else analysis_date,
         past=past,
     )
+    _apply_ab_throttle_to_ai_sizing(
+        ai,
+        strategy_id=str(ai.get("strategy_id", strat_id)).strip().upper(),
+        confidence=str(ai.get("confidence", "LOW")).strip().upper(),
+        macro_bias=str(ai.get("macro_bias", "") or ""),
+    )
 
     entry = float(ai.get("entry", entry) or entry)
     stop = float(ai.get("stop_loss", stop) or stop)
@@ -7036,6 +7149,13 @@ def _python_forced_layer2_trade(
         raw_pct=raw_pct,
         candles_to_exit=candles_to_exit,
     )
+    _ab_row = _ab_trade_record_fields(
+        pnl_dollars=pnl_dollars,
+        max_risk_dollars=max_risk_dollars,
+        ab_throttle=float(ai.get("_ab_throttle", 1.0) or 1.0),
+        ab_mult_a=float(ai.get("_ab_mult_a", 1.0) or 1.0),
+        ab_mult_b=float(ai.get("_ab_mult_b", 1.0) or 1.0),
+    )
     confidence = str(ai.get("confidence", "LOW")).strip().upper()
     td = trend_result.get("trend") or {}
     if not isinstance(td, dict):
@@ -7083,10 +7203,10 @@ def _python_forced_layer2_trade(
         "exit_reason": exit_r,
         "outcome": outcome,
         "correct": correct,
-        "pnl_pct": pnl_pct_display,
         "pnl_dollars": pnl_dollars,
         "gross_pnl_pct": gross_pnl_pct,
         **_cost_fields,
+        **_ab_row,
         "leverage": LEVERAGE,
         "position_size": round(position_size, 2),
         "leveraged_exposure": round(leveraged_exposure, 2),
@@ -8089,6 +8209,12 @@ def run_one_backtest(
             trade_date=analysis_date,
             past=past,
         )
+        _apply_ab_throttle_to_ai_sizing(
+            ai,
+            strategy_id=strategy_id_norm,
+            confidence=str(ai.get("confidence", confidence) or "").strip().upper(),
+            macro_bias=str(ai.get("macro_bias", "") or ""),
+        )
 
         position_size = float(ai.get("_position_size", 0) or 0)
         leveraged_exposure = float(ai.get("_leveraged_exposure", 0) or 0)
@@ -8191,6 +8317,13 @@ def run_one_backtest(
             leveraged_exposure=leveraged_exposure,
             raw_pct=raw_pct,
             candles_to_exit=candles_to_exit,
+        )
+        _ab_row = _ab_trade_record_fields(
+            pnl_dollars=pnl_dollars,
+            max_risk_dollars=max_risk_dollars,
+            ab_throttle=float(ai.get("_ab_throttle", 1.0) or 1.0),
+            ab_mult_a=float(ai.get("_ab_mult_a", 1.0) or 1.0),
+            ab_mult_b=float(ai.get("_ab_mult_b", 1.0) or 1.0),
         )
 
         # Shadow trail sims need the forward path — run before del fut.
@@ -8335,10 +8468,10 @@ def run_one_backtest(
             "exit_reason": exit_r,
             "outcome": outcome,
             "correct": correct,
-            "pnl_pct": pnl_pct_display,
             "pnl_dollars": pnl_dollars,
             "gross_pnl_pct": gross_pnl_pct,
             **_cost_fields,
+            **_ab_row,
             "leverage": LEVERAGE,
             "position_size": round(position_size, 2),
             "leveraged_exposure": round(leveraged_exposure, 2),
