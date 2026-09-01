@@ -35,14 +35,19 @@ to no-op (multiplier 1.0 / disabled).
 | `stack_nocold` | 40d @ 0.25 | — | ladder | 1.5% | 3.0% |
 | `full_stack` | 40d @ 0.25 | 5 @ 0.25 | ladder | 1.5% | 3.0% |
 
-## SHADOW_COMPOUND_RISK_PCTS
+## SHADOW_COMPOUND_RISK_FRACTIONS
 
-Independent capital curves at fixed account risk percentages:
+Independent capital curves sized as a fraction of **current equity** per trade
+(fractions, not percent points — `0.005` = 0.50%):
 
-`[0.10, 0.15, 0.20, 0.30, 0.50]`
+`[0.001, 0.0015, 0.002, 0.003, 0.005]` → 0.10%, 0.15%, 0.20%, 0.30%, 0.50%
 
-Each runs **bare** (`compound_NN_bare`) and with **`full_stack`** guardrails
-(`compound_NN_full`).
+Each runs **bare** (`compound_010_bare`, …) and with **`full_stack`** guardrails
+(`compound_010_full`, …). Label = fraction × 10000, zero-padded to 3 digits.
+
+Risk scales with each curve's own capital:
+
+`target_risk = curve_capital × fraction`
 
 ## Per-curve state
 

@@ -303,8 +303,27 @@ SHADOW_GUARD_CONFIGS: dict[str, dict[str, Any]] = {
     },
 }
 
-SHADOW_COMPOUND_RISK_PCTS: list[float] = [0.10, 0.15, 0.20, 0.30, 0.50]
+SHADOW_COMPOUND_RISK_FRACTIONS: list[float] = [0.001, 0.0015, 0.002, 0.003, 0.005]
+# 0.10%, 0.15%, 0.20%, 0.30%, 0.50% of current equity per trade
 SHADOW_FULL_STACK_CFG: dict[str, Any] = dict(SHADOW_GUARD_CONFIGS["full_stack"])
+
+
+def _compound_curve_label(risk_fraction: float) -> str:
+    """Map risk fraction to curve id segment: 0.001 -> '010', 0.005 -> '050'."""
+    return f"{int(round(float(risk_fraction) * 10000)):03d}"
+
+
+def _compound_risk_ratio(
+    *,
+    curve_capital: float,
+    compound_risk_fraction: float,
+    reference_risk_dollars: float,
+) -> float:
+    """Scale trade size from curve equity vs flat-base reference risk."""
+    target_risk_dollars = float(curve_capital) * float(compound_risk_fraction)
+    if reference_risk_dollars > 0:
+        return target_risk_dollars / float(reference_risk_dollars)
+    return 1.0
 
 # v7.18: strategies with zero trades get sort priority next scan day.
 ZERO_TRADE_STRATEGIES: set[str] = set()
@@ -2214,7 +2233,7 @@ class _ShadowCurveState:
     curve_id: str
     curve_kind: str  # "guard" | "compound_bare" | "compound_full"
     guard_cfg: dict[str, Any] = field(default_factory=dict)
-    compound_risk_pct: float | None = None
+    compound_risk_fraction: float | None = None
     capital: float = STARTING_CAPITAL
     peak_capital: float = STARTING_CAPITAL
     day_anchor: float = STARTING_CAPITAL
@@ -2233,7 +2252,9 @@ class _ShadowCurveState:
             "curve_id": self.curve_id,
             "curve_kind": self.curve_kind,
             "guard_cfg": dict(self.guard_cfg),
-            "compound_risk_pct": self.compound_risk_pct,
+            "compound_risk_fraction": self.compound_risk_fraction,
+            # legacy key for resumed jobs saved before rename
+            "compound_risk_pct": self.compound_risk_fraction,
             "capital": round(float(self.capital), 2),
             "peak_capital": round(float(self.peak_capital), 2),
             "day_anchor": round(float(self.day_anchor), 2),
@@ -2268,14 +2289,15 @@ class _ShadowCurveState:
         daily_anchors = (
             {str(k): float(v) for k, v in anchor_raw.items()} if isinstance(anchor_raw, dict) else {}
         )
+        frac_raw = raw.get("compound_risk_fraction")
+        if frac_raw is None:
+            frac_raw = raw.get("compound_risk_pct")
         return cls(
             curve_id=str(raw.get("curve_id") or ""),
             curve_kind=str(raw.get("curve_kind") or "guard"),
             guard_cfg=dict(raw.get("guard_cfg") or {}),
-            compound_risk_pct=(
-                float(raw["compound_risk_pct"])
-                if raw.get("compound_risk_pct") is not None
-                else None
+            compound_risk_fraction=(
+                float(frac_raw) if frac_raw is not None else None
             ),
             capital=float(raw.get("capital", STARTING_CAPITAL) or STARTING_CAPITAL),
             peak_capital=float(raw.get("peak_capital", STARTING_CAPITAL) or STARTING_CAPITAL),
@@ -2306,19 +2328,19 @@ class _ShadowGuardRunner:
                 curve_kind="guard",
                 guard_cfg=dict(cfg),
             )
-        for pct in SHADOW_COMPOUND_RISK_PCTS:
-            pct_key = int(round(pct * 100))
-            bare_id = f"compound_{pct_key}_bare"
-            full_id = f"compound_{pct_key}_full"
+        for frac in SHADOW_COMPOUND_RISK_FRACTIONS:
+            frac_key = _compound_curve_label(frac)
+            bare_id = f"compound_{frac_key}_bare"
+            full_id = f"compound_{frac_key}_full"
             self.curves[bare_id] = _ShadowCurveState(
                 curve_id=bare_id,
                 curve_kind="compound_bare",
-                compound_risk_pct=float(pct),
+                compound_risk_fraction=float(frac),
             )
             self.curves[full_id] = _ShadowCurveState(
                 curve_id=full_id,
                 curve_kind="compound_full",
-                compound_risk_pct=float(pct),
+                compound_risk_fraction=float(frac),
                 guard_cfg=dict(SHADOW_FULL_STACK_CFG),
             )
 
@@ -2421,7 +2443,11 @@ class _ShadowGuardRunner:
                     strat_pnl_history=st.strat_pnl_history,
                     st_medium_history=st.st_medium_history,
                 )
-                risk_ratio = float(st.compound_risk_pct or pre_ab_risk_pct) / pre_ab_risk_pct
+                risk_ratio = _compound_risk_ratio(
+                    curve_capital=st.capital,
+                    compound_risk_fraction=float(st.compound_risk_fraction or 0),
+                    reference_risk_dollars=pre_ab_mrd,
+                )
                 guard_mult = 1.0
                 if st.curve_kind == "compound_full":
                     guard_row = _compute_cfg_guard_multipliers(
