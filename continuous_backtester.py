@@ -1871,13 +1871,122 @@ def _last3_pnl_sum(hist: list[float]) -> float | None:
     return float(sum(hist[-3:]))
 
 
+def _shadow_strat_closed_count(strat_pnl_history: Mapping[str, Any], sid: str) -> int:
+    entry = strat_pnl_history.get(str(sid or "").strip().upper())
+    if isinstance(entry, dict):
+        return int(entry.get("n", 0) or 0)
+    if isinstance(entry, list):
+        return len(entry)
+    return 0
+
+
+def _shadow_strat_last3_pnls(strat_pnl_history: Mapping[str, Any], sid: str) -> list[float]:
+    entry = strat_pnl_history.get(str(sid or "").strip().upper())
+    if isinstance(entry, dict):
+        raw = entry.get("last3") or []
+        return [float(x) for x in raw] if isinstance(raw, list) else []
+    if isinstance(entry, list):
+        return [float(x) for x in entry]
+    return []
+
+
+def _shadow_strat_last3_sum(strat_pnl_history: Mapping[str, Any], sid: str) -> float | None:
+    return _last3_pnl_sum(_shadow_strat_last3_pnls(strat_pnl_history, sid))
+
+
+def _shadow_record_strat_pnl(strat_pnl_history: dict[str, Any], sid: str, pnl: float) -> None:
+    key = str(sid or "").strip().upper()
+    if not key or key == "SKIP":
+        return
+    entry = strat_pnl_history.get(key)
+    if isinstance(entry, list):
+        entry = {"n": len(entry), "last3": [float(x) for x in entry[-3:]]}
+    elif not isinstance(entry, dict):
+        entry = {"n": 0, "last3": []}
+    last3 = [float(x) for x in (entry.get("last3") or [])]
+    last3.append(float(pnl))
+    entry["n"] = int(entry.get("n", 0) or 0) + 1
+    entry["last3"] = last3[-3:]
+    strat_pnl_history[key] = entry
+
+
+def _shadow_st_medium_count(st_medium_history: Mapping[str, Any] | list[Any]) -> int:
+    if isinstance(st_medium_history, dict):
+        return int(st_medium_history.get("n", 0) or 0)
+    if isinstance(st_medium_history, list):
+        return len(st_medium_history)
+    return 0
+
+
+def _shadow_st_medium_last3_sum(st_medium_history: Mapping[str, Any] | list[Any]) -> float | None:
+    if isinstance(st_medium_history, dict):
+        n = _shadow_st_medium_count(st_medium_history)
+        if n < 3:
+            return None
+        last3 = st_medium_history.get("last3") or []
+        if not isinstance(last3, list) or len(last3) < 3:
+            return None
+        total = 0.0
+        for item in last3[-3:]:
+            if isinstance(item, (list, tuple)) and item:
+                total += float(item[0])
+        return total
+    if isinstance(st_medium_history, list):
+        n = len(st_medium_history)
+        if n < 3:
+            return None
+        return float(sum(p for p, _ in st_medium_history[-3:]))
+    return None
+
+
+def _shadow_record_st_medium(st_medium_history: dict[str, Any], pnl: float, won: bool) -> None:
+    if "n" not in st_medium_history or "last3" not in st_medium_history:
+        st_medium_history.clear()
+        st_medium_history.update({"n": 0, "last3": []})
+    last3 = list(st_medium_history.get("last3") or [])
+    last3.append([float(pnl), bool(won)])
+    st_medium_history["last3"] = last3[-3:]
+    st_medium_history["n"] = int(st_medium_history.get("n", 0) or 0) + 1
+
+
+def _normalize_shadow_strat_history(raw: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for k, v in raw.items():
+        sid = str(k).strip().upper()
+        if isinstance(v, dict):
+            last3_raw = v.get("last3") or []
+            out[sid] = {
+                "n": int(v.get("n", 0) or 0),
+                "last3": [float(x) for x in last3_raw][-3:] if isinstance(last3_raw, list) else [],
+            }
+        elif isinstance(v, list):
+            last3 = [float(x) for x in v][-3:]
+            out[sid] = {"n": len(v), "last3": last3}
+    return out
+
+
+def _normalize_shadow_st_medium_history(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict) and "last3" in raw:
+        last3_raw = raw.get("last3") or []
+        last3: list[list[Any]] = []
+        if isinstance(last3_raw, list):
+            for item in last3_raw[-3:]:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    last3.append([float(item[0]), bool(item[1])])
+        return {"n": int(raw.get("n", len(last3)) or 0), "last3": last3}
+    if isinstance(raw, list):
+        last3 = [[float(p), bool(w)] for p, w in raw[-3:]]
+        return {"n": len(raw), "last3": last3}
+    return {"n": 0, "last3": []}
+
+
 def _compute_ab_throttle_at_open(
     *,
     strategy_id: str,
     confidence: str,
     macro_bias: str,
-    strat_pnl_history: dict[str, list[float]] | None = None,
-    st_medium_history: list[tuple[float, bool]] | None = None,
+    strat_pnl_history: dict[str, Any] | None = None,
+    st_medium_history: Mapping[str, Any] | list[Any] | None = None,
 ) -> tuple[float, float, float]:
     """
     A+B throttle from prior closed-trade histories only (matches live engine).
@@ -1887,9 +1996,10 @@ def _compute_ab_throttle_at_open(
     conf = str(confidence or "").strip().upper()
     mb = str(macro_bias or "").strip().upper()
 
-    strat_hist_src = _STRAT_PNL_HISTORY if strat_pnl_history is None else strat_pnl_history
-    strat_hist = strat_hist_src.get(sid, [])
-    strat3 = _last3_pnl_sum(strat_hist)
+    if strat_pnl_history is None:
+        strat3 = _last3_pnl_sum(_STRAT_PNL_HISTORY.get(sid, []))
+    else:
+        strat3 = _shadow_strat_last3_sum(strat_pnl_history, sid)
     mult_a = (
         float(_AB_THROTTLE_FACTOR)
         if strat3 is not None and float(strat3) <= 0.0
@@ -1899,8 +2009,7 @@ def _compute_ab_throttle_at_open(
     mult_b = 1.0
     if conf == "MEDIUM" and mb == "STRONG_TAILWIND":
         st_hist = _ST_MEDIUM_HISTORY if st_medium_history is None else st_medium_history
-        n = len(st_hist)
-        last3 = sum(p for p, _ in st_hist[-3:]) if n >= 3 else None
+        last3 = _shadow_st_medium_last3_sum(st_hist)
         if last3 is not None and float(last3) <= 0.0:
             mult_b = float(_AB_THROTTLE_FACTOR)
 
@@ -1995,10 +2104,9 @@ def _merged_guard_cfg(cfg: Mapping[str, Any] | None) -> dict[str, Any]:
 
 def _guard_strat_closed_count_from(
     strategy_id: str,
-    strat_pnl_history: Mapping[str, list[float]],
+    strat_pnl_history: Mapping[str, Any],
 ) -> int:
-    sid = str(strategy_id or "").strip().upper()
-    return len(strat_pnl_history.get(sid, []))
+    return _shadow_strat_closed_count(strat_pnl_history, strategy_id)
 
 
 def _guard_daily_loss_stopped_for_cfg(
@@ -2057,7 +2165,7 @@ def _compute_cfg_guard_multipliers(
     activation_date: date | None,
     day_realized_pnl: float,
     day_anchor: float,
-    strat_pnl_history: Mapping[str, list[float]],
+    strat_pnl_history: Mapping[str, Any],
     baseline_max_risk_dollars: float,
 ) -> dict[str, Any]:
     """Compute guard multipliers without mutating sizing. Returns log fields + guard_blocked."""
@@ -2239,8 +2347,8 @@ class _ShadowCurveState:
     day_anchor: float = STARTING_CAPITAL
     day_pnl: float = 0.0
     activation_date: str = ""
-    st_medium_history: list[tuple[float, bool]] = field(default_factory=list)
-    strat_pnl_history: dict[str, list[float]] = field(default_factory=dict)
+    st_medium_history: dict[str, Any] = field(default_factory=lambda: {"n": 0, "last3": []})
+    strat_pnl_history: dict[str, dict[str, Any]] = field(default_factory=dict)
     trades_taken: int = 0
     trades_blocked: int = 0
     daily_pnls: dict[str, float] = field(default_factory=dict)
@@ -2260,8 +2368,8 @@ class _ShadowCurveState:
             "day_anchor": round(float(self.day_anchor), 2),
             "day_pnl": round(float(self.day_pnl), 2),
             "activation_date": self.activation_date,
-            "st_medium_history": list(self.st_medium_history),
-            "strat_pnl_history": {k: list(v) for k, v in self.strat_pnl_history.items()},
+            "st_medium_history": dict(self.st_medium_history),
+            "strat_pnl_history": {k: dict(v) for k, v in self.strat_pnl_history.items()},
             "trades_taken": int(self.trades_taken),
             "trades_blocked": int(self.trades_blocked),
             "daily_pnls": dict(self.daily_pnls),
@@ -2271,18 +2379,8 @@ class _ShadowCurveState:
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "_ShadowCurveState":
-        st_raw = raw.get("st_medium_history") or []
-        st_hist: list[tuple[float, bool]] = []
-        if isinstance(st_raw, list):
-            for item in st_raw:
-                if isinstance(item, (list, tuple)) and len(item) >= 2:
-                    st_hist.append((float(item[0]), bool(item[1])))
-        strat_raw = raw.get("strat_pnl_history") or {}
-        strat_hist: dict[str, list[float]] = {}
-        if isinstance(strat_raw, dict):
-            for k, v in strat_raw.items():
-                if isinstance(v, list):
-                    strat_hist[str(k).strip().upper()] = [float(x) for x in v]
+        st_hist = _normalize_shadow_st_medium_history(raw.get("st_medium_history"))
+        strat_hist = _normalize_shadow_strat_history(raw.get("strat_pnl_history") or {})
         daily_raw = raw.get("daily_pnls") or {}
         daily_pnls = {str(k): float(v) for k, v in daily_raw.items()} if isinstance(daily_raw, dict) else {}
         anchor_raw = raw.get("daily_anchors") or {}
@@ -2377,6 +2475,8 @@ class _ShadowGuardRunner:
             st.daily_anchors[ds] = round(float(st.day_anchor), 2)
 
     def process_trade(self, ctx: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+        if ctx.get("skipped") or str(ctx.get("outcome") or "").strip().upper() not in ("WIN", "LOSS"):
+            return {}
         out: dict[str, dict[str, Any]] = {}
         date_str = str(ctx.get("date") or "")[:10]
         scan_d = _parse_guard_date(date_str)
@@ -2499,9 +2599,9 @@ class _ShadowGuardRunner:
             if dd > st.max_drawdown_pct_seen:
                 st.max_drawdown_pct_seen = float(dd)
         if sid and sid != "SKIP":
-            st.strat_pnl_history.setdefault(sid, []).append(float(pnl))
+            _shadow_record_strat_pnl(st.strat_pnl_history, sid, float(pnl))
         if conf == "MEDIUM" and mb == "STRONG_TAILWIND":
-            st.st_medium_history.append((float(pnl), bool(won)))
+            _shadow_record_st_medium(st.st_medium_history, float(pnl), bool(won))
 
     def _curve_summary(self, st: _ShadowCurveState) -> dict[str, Any]:
         peak = float(st.peak_capital or STARTING_CAPITAL)
@@ -2562,6 +2662,7 @@ def _shadow_trade_ctx_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
         "pre_ab_max_risk": float(row.get("max_risk_dollars") or 0) / ab,
         "max_risk_dollars": float(row.get("max_risk_dollars") or 0),
         "outcome": row.get("outcome"),
+        "skipped": bool(row.get("skipped") or row.get("skip_trade")),
     }
 
 
@@ -11359,9 +11460,10 @@ def run_chronological_backtest(
                             row["session"] = session
                             row.setdefault("date", date_str)
                             _shadow_maps = shadow_runner.process_trade(_shadow_trade_ctx_from_row(row))
-                            guard_map, compound_map = _split_shadow_trade_maps(_shadow_maps)
-                            row["shadow_guard"] = guard_map
-                            row["shadow_compound"] = compound_map
+                            if _shadow_maps:
+                                guard_map, compound_map = _split_shadow_trade_maps(_shadow_maps)
+                                row["shadow_guard"] = guard_map
+                                row["shadow_compound"] = compound_map
                             day_trades.append(row)
                             day_pnl += pnl
                             capital += pnl
