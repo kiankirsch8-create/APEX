@@ -6,8 +6,9 @@ All contract specs in SHADOW_INSTRUMENTS are ESTIMATES. Correct in one place bel
 from __future__ import annotations
 
 import json
-from datetime import date, timedelta
-from typing import Any, Mapping
+import time
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Iterator, Mapping
 
 from utils import DATA_DIR, log
 
@@ -50,8 +51,14 @@ SHADOW_INSTRUMENTS: dict[str, dict[str, Any]] = {
 }
 
 SHADOW_INSTRUMENTS_FILE = DATA_DIR / "shadow_instruments.jsonl"
+SHADOW_PROBE_CACHE_FILE = DATA_DIR / "shadow_universe_probe.json"
 
-SHADOW_FX_CURRENCIES: tuple[str, ...] = (
+SHADOW_MAX_EXTRA_FX = 25
+SHADOW_UNIVERSE_HARD_CAP = 45
+PROBE_BATCH_SLEEP_SEC = 0.5
+
+# Majors + traded crosses for Part 2 extra_fx discovery only (not Part 1 blocked pairs).
+SHADOW_FX_EXTRA_CURRENCIES: tuple[str, ...] = (
     "USD",
     "EUR",
     "GBP",
@@ -63,6 +70,9 @@ SHADOW_FX_CURRENCIES: tuple[str, ...] = (
     "SEK",
     "NOK",
     "ZAR",
+)
+
+SHADOW_FX_CURRENCIES: tuple[str, ...] = SHADOW_FX_EXTRA_CURRENCIES + (
     "MXN",
     "PLN",
     "TRY",
@@ -87,14 +97,13 @@ _AB_CLASSES: tuple[ShadowClass, ...] = (
     "index_future",
 )
 
-_shadow_strat_by_class: dict[ShadowClass, dict[str, list[float]]] = {
+_shadow_strat_by_class: dict[ShadowClass, dict[str, dict[str, Any]]] = {
     c: {} for c in _AB_CLASSES
 }
-_shadow_st_medium_by_class: dict[ShadowClass, list[tuple[float, bool]]] = {
-    c: [] for c in _AB_CLASSES
+_shadow_st_medium_by_class: dict[ShadowClass, dict[str, Any]] = {
+    c: {"n": 0, "last3": []} for c in _AB_CLASSES
 }
 
-_shadow_trades_buffer: list[dict[str, Any]] = []
 _shadow_eval_ticker: str | None = None
 _shadow_eval_class: ShadowClass | None = None
 
@@ -111,19 +120,54 @@ _shadow_universe: dict[str, Any] = {
 
 
 def reset_run_state() -> None:
-    global _shadow_trades_buffer
     for c in _AB_CLASSES:
         _shadow_strat_by_class[c].clear()
-        _shadow_st_medium_by_class[c].clear()
-    _shadow_trades_buffer = []
+        _shadow_st_medium_by_class[c] = {"n": 0, "last3": []}
 
 
 def _strat_history_dict(shadow_class: ShadowClass) -> dict[str, dict[str, Any]]:
     raw = _shadow_strat_by_class.get(shadow_class, {})
-    return {
-        sid: {"n": len(vals), "last3": [float(x) for x in vals[-3:]]}
-        for sid, vals in raw.items()
-    }
+    out: dict[str, dict[str, Any]] = {}
+    for sid, entry in raw.items():
+        if isinstance(entry, dict):
+            last3_raw = entry.get("last3") or []
+            out[sid] = {
+                "n": int(entry.get("n", 0) or 0),
+                "last3": [float(x) for x in last3_raw][-3:]
+                if isinstance(last3_raw, list)
+                else [],
+            }
+        elif isinstance(entry, list):
+            out[sid] = {"n": len(entry), "last3": [float(x) for x in entry[-3:]]}
+    return out
+
+
+def _record_strat_pnl_for_class(shadow_class: ShadowClass, sid: str, pnl: float) -> None:
+    key = str(sid or "").strip().upper()
+    if not key or key == "SKIP":
+        return
+    hist = _shadow_strat_by_class.setdefault(shadow_class, {})
+    entry = hist.get(key)
+    if isinstance(entry, list):
+        entry = {"n": len(entry), "last3": [float(x) for x in entry[-3:]]}
+    elif not isinstance(entry, dict):
+        entry = {"n": 0, "last3": []}
+    last3 = [float(x) for x in (entry.get("last3") or [])]
+    last3.append(float(pnl))
+    entry["n"] = int(entry.get("n", 0) or 0) + 1
+    entry["last3"] = last3[-3:]
+    hist[key] = entry
+
+
+def _record_st_medium_for_class(shadow_class: ShadowClass, pnl: float, won: bool) -> None:
+    hist = _shadow_st_medium_by_class.setdefault(shadow_class, {"n": 0, "last3": []})
+    if "n" not in hist or "last3" not in hist:
+        hist.clear()
+        hist.update({"n": 0, "last3": []})
+    last3 = list(hist.get("last3") or [])
+    last3.append([float(pnl), bool(won)])
+    hist["last3"] = last3[-3:]
+    hist["n"] = int(hist.get("n", 0) or 0) + 1
 
 
 def active_shadow_class() -> ShadowClass | None:
@@ -194,55 +238,51 @@ def universe_meta() -> dict[str, Any]:
     return dict(_shadow_universe.get("discovery", {}))
 
 
-def trades_buffer() -> list[dict[str, Any]]:
-    return list(_shadow_trades_buffer)
+def _close_ts_from_row(r: Mapping[str, Any]) -> int:
+    ts_raw = r.get("close_ts")
+    if ts_raw is not None:
+        try:
+            ts = int(ts_raw)
+            if ts > 0:
+                return ts
+        except (TypeError, ValueError):
+            pass
+    ct = r.get("close_time_utc")
+    if ct:
+        try:
+            dt = datetime.fromisoformat(str(ct).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp())
+        except (TypeError, ValueError):
+            pass
+    return 0
 
 
-def _record_ab_histories(row: Mapping[str, Any], shadow_class: ShadowClass) -> None:
-    if str(row.get("outcome", "")).strip().upper() not in ("WIN", "LOSS"):
-        return
-    sid = str(row.get("strategy_id", "")).strip().upper()
-    pnl = float(row.get("pnl_dollars", 0) or 0)
-    if sid and sid != "SKIP":
-        _shadow_strat_by_class.setdefault(shadow_class, {}).setdefault(sid, []).append(pnl)
-    if (
-        str(row.get("confidence", "")).strip().upper() == "MEDIUM"
-        and str(row.get("macro_bias", "")).strip().upper() == "STRONG_TAILWIND"
-    ):
-        won = str(row.get("outcome", "")).strip().upper() == "WIN"
-        _shadow_st_medium_by_class.setdefault(shadow_class, []).append((pnl, won))
-
-
-def rebuild_histories(rows: list[dict[str, Any]]) -> None:
-    reset_run_state()
-    completed = [
-        r
-        for r in rows
-        if isinstance(r, dict)
-        and not r.get("skipped")
-        and str(r.get("outcome", "")).strip().upper() in ("WIN", "LOSS")
-    ]
-    completed.sort(
-        key=lambda r: (
-            str(r.get("date", ""))[:10],
-            str(r.get("ticker", "")).strip().upper(),
-            str(r.get("timeframe", "")).strip().lower(),
-            str(r.get("strategy_id", "")).strip().upper(),
-        )
+def _shadow_trade_sort_key(r: Mapping[str, Any]) -> tuple[int, str, str, str]:
+    ts = _close_ts_from_row(r)
+    if ts <= 0:
+        d = str(r.get("date", ""))[:10]
+        try:
+            ts = int(
+                datetime.strptime(d, "%Y-%m-%d")
+                .replace(tzinfo=timezone.utc)
+                .timestamp()
+            )
+        except ValueError:
+            ts = 0
+    return (
+        ts,
+        str(r.get("ticker", "")).strip().upper(),
+        str(r.get("timeframe", "")).strip().lower(),
+        str(r.get("strategy_id", "")).strip().upper(),
     )
-    for r in completed:
-        sc = str(r.get("shadow_class") or "blocked_fx")
-        if sc not in _AB_CLASSES:
-            sc = "blocked_fx"
-        _record_ab_histories(r, sc)
-        _shadow_trades_buffer.append(dict(r))
 
 
-def load_trades_for_job(job_id: str) -> list[dict[str, Any]]:
+def _iter_trades_for_job(job_id: str) -> Iterator[dict[str, Any]]:
     jid = str(job_id or "").strip()
     if not jid or not SHADOW_INSTRUMENTS_FILE.is_file():
-        return []
-    out: list[dict[str, Any]] = []
+        return
     try:
         with open(SHADOW_INSTRUMENTS_FILE, encoding="utf-8") as f:
             for line in f:
@@ -254,10 +294,45 @@ def load_trades_for_job(job_id: str) -> list[dict[str, Any]]:
                 except json.JSONDecodeError:
                     continue
                 if isinstance(row, dict) and str(row.get("job_id", "")).strip() == jid:
-                    out.append(row)
+                    yield row
     except OSError as e:
-        log(f"[SHADOW INST] load error: {e}", level="warning")
-    return out
+        log(f"[SHADOW INST] stream error: {e}", level="warning")
+
+
+def _record_ab_histories(row: Mapping[str, Any], shadow_class: ShadowClass) -> None:
+    if str(row.get("outcome", "")).strip().upper() not in ("WIN", "LOSS"):
+        return
+    sid = str(row.get("strategy_id", "")).strip().upper()
+    pnl = float(row.get("pnl_dollars", 0) or 0)
+    if sid and sid != "SKIP":
+        _record_strat_pnl_for_class(shadow_class, sid, pnl)
+    if (
+        str(row.get("confidence", "")).strip().upper() == "MEDIUM"
+        and str(row.get("macro_bias", "")).strip().upper() == "STRONG_TAILWIND"
+    ):
+        won = str(row.get("outcome", "")).strip().upper() == "WIN"
+        _record_st_medium_for_class(shadow_class, pnl, won)
+
+
+def rebuild_histories(job_id: str) -> None:
+    reset_run_state()
+    completed: list[dict[str, Any]] = []
+    for r in _iter_trades_for_job(job_id):
+        if (
+            not r.get("skipped")
+            and str(r.get("outcome", "")).strip().upper() in ("WIN", "LOSS")
+        ):
+            completed.append(r)
+    completed.sort(key=_shadow_trade_sort_key)
+    for r in completed:
+        sc = str(r.get("shadow_class") or "blocked_fx")
+        if sc not in _AB_CLASSES:
+            sc = "blocked_fx"
+        _record_ab_histories(r, sc)
+
+
+def load_trades_for_job(job_id: str) -> list[dict[str, Any]]:
+    return list(_iter_trades_for_job(job_id))
 
 
 def append_trade_row(row: dict[str, Any]) -> None:
@@ -284,14 +359,14 @@ def persist_shadow_trade(row: dict[str, Any], *, job_id: str) -> None:
         out["provisional_roll_series"] = True
     append_trade_row(out)
     _record_ab_histories(out, sc)
-    _shadow_trades_buffer.append(out)
 
 
-def ab_histories_for_active() -> tuple[dict[str, dict[str, Any]] | None, list[tuple[float, bool]] | None]:
+def ab_histories_for_active() -> tuple[dict[str, dict[str, Any]] | None, dict[str, Any] | None]:
     sc = active_shadow_class()
     if not sc:
         return None, None
-    return _strat_history_dict(sc), list(_shadow_st_medium_by_class.get(sc, []))
+    st_hist = _shadow_st_medium_by_class.get(sc, {"n": 0, "last3": []})
+    return _strat_history_dict(sc), dict(st_hist)
 
 
 def trade_fields_for_row(sym: str) -> dict[str, Any]:
@@ -345,26 +420,27 @@ def _ticker_stats(trades: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def compute_summary(trades: list[dict[str, Any]]) -> dict[str, Any]:
-    executed = [
-        t
-        for t in trades
-        if isinstance(t, dict)
-        and not t.get("skipped")
-        and str(t.get("outcome", "")).strip().upper() in ("WIN", "LOSS")
-    ]
+def compute_summary(job_id: str) -> dict[str, Any]:
     by_ticker: dict[str, list[dict[str, Any]]] = {}
-    for t in executed:
+    executed = 0
+    for t in _iter_trades_for_job(job_id):
+        if (
+            not isinstance(t, dict)
+            or t.get("skipped")
+            or str(t.get("outcome", "")).strip().upper() not in ("WIN", "LOSS")
+        ):
+            continue
+        executed += 1
         tkr = str(t.get("shadow_instrument") or t.get("ticker", "")).strip().upper()
         if tkr:
             by_ticker.setdefault(tkr, []).append(t)
     summary: dict[str, Any] = {
         "by_ticker": {},
-        "total_trades": len(executed),
+        "total_trades": executed,
         "primary_metric": "R-multiple (pnl / max_risk_dollars)",
     }
     for tkr, rows in sorted(by_ticker.items()):
-        rows.sort(key=lambda r: str(r.get("date", ""))[:10])
+        rows.sort(key=_shadow_trade_sort_key)
         stats = _ticker_stats(rows)
         by_year: dict[str, dict[str, Any]] = {}
         buckets: dict[str, list[dict[str, Any]]] = {}
@@ -419,7 +495,7 @@ def apply_instrument_costs(
     model = str(spec.get("cost_model") or "cfd").lower()
     spread_cost = 0.0
     comm_cost = 0.0
-    financing = 0.0
+    financing_applied = 0.0
     if model == "cfd":
         spread = float(spec.get("spread_est") or 0)
         contract_size = float(spec.get("contract_size") or 1)
@@ -427,11 +503,17 @@ def apply_instrument_costs(
         fin_yr = float(spec.get("financing_pct_yr") or 0) / 100.0
         financing = notional * fin_yr * max(0.0, float(nights_held)) / 365.0
         if str(direction or "").strip().upper() == "SHORT":
-            financing = -financing
+            # ESTIMATE: short receives financing minus broker markup (~50%).
+            financing_applied = +financing * 0.5
+        else:
+            financing_applied = -financing
     elif model == "futures":
         comm_side = float(spec.get("commission_per_contract") or 0)
         comm_cost = comm_side * abs(contracts) * 2.0
-    net = gross - spread_cost - comm_cost + financing
+        financing_applied = 0.0
+    else:
+        financing_applied = 0.0
+    net = gross - spread_cost - comm_cost + financing_applied
     net_pct = (net / notional * 100.0) if notional > 0 else gross_pct
     return (
         round(net, 2),
@@ -440,8 +522,8 @@ def apply_instrument_costs(
             "gross_pnl_dollars": round(gross, 2),
             "spread_cost": round(spread_cost, 2),
             "commission_cost": round(comm_cost, 2),
-            "swap_amount": round(financing, 2),
-            "total_cost_dollars": round(spread_cost + comm_cost - financing, 2),
+            "swap_amount": round(financing_applied, 2),
+            "total_cost_dollars": round(spread_cost + comm_cost - financing_applied, 2),
             "nights_held": round(float(nights_held), 2),
             "cost_model": model,
             "spec_estimated": True,
@@ -452,15 +534,60 @@ def apply_instrument_costs(
 def _fx_pair_candidates() -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
-    for a in SHADOW_FX_CURRENCIES:
-        for b in SHADOW_FX_CURRENCIES:
+    for a in SHADOW_FX_EXTRA_CURRENCIES:
+        for b in SHADOW_FX_EXTRA_CURRENCIES:
             if a == b:
                 continue
             for pair in (f"{a}{b}", f"{b}{a}"):
                 if pair not in seen:
                     seen.add(pair)
                     out.append(pair)
-    return out
+    return sorted(out)
+
+
+def _probe_cache_key(symbol: str, start_d: date, end_d: date) -> str:
+    return f"{symbol}|{start_d.isoformat()}|{end_d.isoformat()}"
+
+
+def _load_probe_cache() -> dict[str, dict[str, Any]]:
+    if not SHADOW_PROBE_CACHE_FILE.is_file():
+        return {}
+    try:
+        raw = json.loads(SHADOW_PROBE_CACHE_FILE.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_probe_cache(cache: Mapping[str, Mapping[str, Any]]) -> None:
+    try:
+        SHADOW_PROBE_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SHADOW_PROBE_CACHE_FILE.write_text(
+            json.dumps(dict(cache), separators=(",", ":")),
+            encoding="utf-8",
+        )
+    except OSError as e:
+        log(f"[SHADOW INST] probe cache write error: {e}", level="warning")
+
+
+def _probe_fx_ohlc_cached(
+    pair: str,
+    start_d: date,
+    end_d: date,
+    *,
+    yf_download_fn: Any,
+    hourly_ok: bool,
+    cache: dict[str, dict[str, Any]],
+) -> tuple[bool, str, bool]:
+    key = _probe_cache_key(pair, start_d, end_d)
+    hit = cache.get(key)
+    if isinstance(hit, dict) and "ok" in hit:
+        return bool(hit.get("ok")), str(hit.get("reason", "")), False
+    ok, reason = _test_fx_ohlc(
+        pair, start_d, end_d, yf_download_fn=yf_download_fn, hourly_ok=hourly_ok
+    )
+    cache[key] = {"ok": ok, "reason": reason}
+    return ok, reason, True
 
 
 def _count_bars(df: Any) -> int:
@@ -578,20 +705,36 @@ def init_shadow_universe(
     hourly_ok = end_d >= hourly_earliest_fn()
     tested = 0
     loaded_fx = 0
+    loaded_part1 = 0
+    loaded_extra_fx = 0
     failed: dict[str, str] = {}
     tickers: set[str] = set()
     class_by: dict[str, ShadowClass] = {}
     yf_by: dict[str, str] = {}
     real = set(real_chrono_tickers)
+    probe_cache = _load_probe_cache()
+    cache_dirty = False
+    extra_fx_untested = 0
 
     part1 = set(blocked_pairs) | set(PART1_DATA_EXCLUDED_FX)
     for pair in sorted(part1):
         if pair in SHADOW_INSTRUMENTS:
             continue
         tested += 1
-        ok, reason = _test_fx_ohlc(pair, start_d, end_d, yf_download_fn=yf_download_fn, hourly_ok=hourly_ok)
+        ok, reason, probed = _probe_fx_ohlc_cached(
+            pair,
+            start_d,
+            end_d,
+            yf_download_fn=yf_download_fn,
+            hourly_ok=hourly_ok,
+            cache=probe_cache,
+        )
+        if probed:
+            cache_dirty = True
+            time.sleep(PROBE_BATCH_SLEEP_SEC)
         if ok:
             loaded_fx += 1
+            loaded_part1 += 1
             tickers.add(pair)
             class_by[pair] = "blocked_fx"
             yf_by[pair] = f"{pair}=X"
@@ -603,18 +746,45 @@ def init_shadow_universe(
                     level="warning",
                 )
 
-    for pair in _fx_pair_candidates():
-        if pair in tickers or pair in real:
-            continue
+    extra_candidates = [
+        p for p in _fx_pair_candidates() if p not in tickers and p not in real
+    ]
+    for idx, pair in enumerate(extra_candidates):
+        if loaded_extra_fx >= SHADOW_MAX_EXTRA_FX:
+            extra_fx_untested = len(extra_candidates) - idx
+            break
         tested += 1
-        ok, reason = _test_fx_ohlc(pair, start_d, end_d, yf_download_fn=yf_download_fn, hourly_ok=hourly_ok)
+        ok, reason, probed = _probe_fx_ohlc_cached(
+            pair,
+            start_d,
+            end_d,
+            yf_download_fn=yf_download_fn,
+            hourly_ok=hourly_ok,
+            cache=probe_cache,
+        )
+        if probed:
+            cache_dirty = True
+            time.sleep(PROBE_BATCH_SLEEP_SEC)
         if ok:
             loaded_fx += 1
+            loaded_extra_fx += 1
             tickers.add(pair)
             class_by[pair] = "extra_fx"
             yf_by[pair] = f"{pair}=X"
         else:
             failed[pair] = reason
+    else:
+        extra_fx_untested = 0
+
+    if extra_fx_untested > 0:
+        log(
+            f"[SHADOW INST] extra_fx cap reached ({SHADOW_MAX_EXTRA_FX} loaded); "
+            f"{extra_fx_untested} candidates left untested",
+            level="info",
+        )
+
+    if cache_dirty:
+        _save_probe_cache(probe_cache)
 
     loaded_nf = 0
     for ticker, spec in SHADOW_INSTRUMENTS.items():
@@ -637,19 +807,43 @@ def init_shadow_universe(
                 _shadow_universe["provisional_futures"].add(ticker)
         else:
             failed[ticker] = reason
+        time.sleep(PROBE_BATCH_SLEEP_SEC)
+
+    hard_cap_applied = False
+    total_loaded = len(tickers)
+    if total_loaded > SHADOW_UNIVERSE_HARD_CAP:
+        log(
+            f"[SHADOW INST] ERROR: {total_loaded} instruments exceeds hard cap "
+            f"{SHADOW_UNIVERSE_HARD_CAP}; disabling extra_fx",
+            level="error",
+        )
+        for sym in list(tickers):
+            if class_by.get(sym) == "extra_fx":
+                tickers.discard(sym)
+                class_by.pop(sym, None)
+                yf_by.pop(sym, None)
+        loaded_extra_fx = 0
+        loaded_fx = loaded_part1
+        hard_cap_applied = True
+        total_loaded = len(tickers)
 
     _shadow_universe["tickers"] = tickers
     _shadow_universe["class_by_ticker"] = class_by
     _shadow_universe["yf_by_ticker"] = yf_by
     _shadow_universe["failed"] = failed
 
-    total_loaded = len(tickers)
     real_scan_count = len(real)
     est_pct = round(100.0 * total_loaded / max(1, real_scan_count), 1)
     discovery = {
         "enabled": True,
         "pairs_tested": tested,
         "fx_loaded": loaded_fx,
+        "part1_fx_loaded": loaded_part1,
+        "extra_fx_loaded": loaded_extra_fx,
+        "extra_fx_untested": extra_fx_untested,
+        "extra_fx_max": SHADOW_MAX_EXTRA_FX,
+        "universe_hard_cap": SHADOW_UNIVERSE_HARD_CAP,
+        "hard_cap_applied": hard_cap_applied,
         "non_forex_loaded": loaded_nf,
         "total_loaded": total_loaded,
         "total_failed": len(failed),
@@ -664,7 +858,7 @@ def init_shadow_universe(
         f"~{est_pct}% vs {real_scan_count} real tickers/day",
         level="info",
     )
-    if total_loaded > 40:
+    if total_loaded > SHADOW_UNIVERSE_HARD_CAP - 5:
         log(
             f"[SHADOW INST] WARNING: {total_loaded} shadow instruments — materially longer run",
             level="warning",

@@ -11274,9 +11274,8 @@ def run_chronological_backtest(
                 if extra not in tickers:
                     tickers.append(extra)
             _si.reset_run_state()
-            prior_shadow = _si.load_trades_for_job(job_id)
-            if prior_shadow:
-                _si.rebuild_histories(prior_shadow)
+            if _si.SHADOW_INSTRUMENTS_FILE.is_file():
+                _si.rebuild_histories(job_id)
 
         shadow_runner = _ShadowGuardRunner.from_chrono(chrono_data)
         shadow_runner.set_median_nights_by_tf(
@@ -12191,9 +12190,7 @@ def run_chronological_backtest(
         chrono_data["shadow_compound_summary"] = shadow_runner.compound_summaries()
         chrono_data["shadow_event_summary"] = shadow_runner.event_summaries()
         if SHADOW_BLOCKED_PAIRS:
-            chrono_data["shadow_instrument_summary"] = _si.compute_summary(
-                _si.trades_buffer()
-            )
+            chrono_data["shadow_instrument_summary"] = _si.compute_summary(job_id)
         _persist_shadow_guard_state(chrono_data, shadow_runner)
         chrono_data["v74_metrics"] = _v74_chrono_trade_metrics(all_trades)
         _assert_swap_financing_modeled(all_trades, context=f"Chrono {job_id}")
