@@ -42,6 +42,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import traceback
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 import pandas as pd
@@ -220,6 +221,109 @@ _SYS_WIN_HISTORY: list[bool] = []
 # A+B sizing throttle — applied at open when True (matches apex_trader_v76_private live engine).
 APPLY_AB_THROTTLE = True
 _AB_THROTTLE_FACTOR = 0.18
+
+# CFG guardrails — shadow-only in chrono backtests (real run stays unguarded).
+# See APEX_shadow_spec_funded.md for the full configuration matrix.
+APPLY_GUARDRAILS = False  # True only in unit tests; live curve never applies guardrails
+WARMUP_DAYS = 40  # trading days from run start (funded default / full_stack)
+WARMUP_MULTIPLIER = 0.25
+COLD_START_MIN_TRADES = 5  # closed trades for this strategy
+COLD_START_MULTIPLIER = 0.25
+DD_LADDER: list[tuple[float, float]] = [(5.0, 0.5), (8.0, 0.25)]  # (drawdown %, size mult)
+PER_TRADE_LOSS_CAP_PCT = 1.5  # of current equity
+DAILY_LOSS_STOP_PCT = 3.0  # of the day's starting equity
+
+_FUNDED_GUARD_DEFAULTS: dict[str, Any] = {
+    "warmup_days": 0,
+    "warmup_multiplier": 1.0,
+    "cold_start_min_trades": 0,
+    "cold_start_multiplier": 1.0,
+    "dd_ladder": [],
+    "per_trade_loss_cap_pct": None,
+    "daily_loss_stop_pct": None,
+}
+
+# 23 parallel shadow guard configurations (APEX_shadow_spec_funded.md).
+SHADOW_GUARD_CONFIGS: dict[str, dict[str, Any]] = {
+    "ramp20_050": {"warmup_days": 20, "warmup_multiplier": 0.50},
+    "ramp20_025": {"warmup_days": 20, "warmup_multiplier": 0.25},
+    "ramp40_050": {"warmup_days": 40, "warmup_multiplier": 0.50},
+    "ramp40_025": {"warmup_days": 40, "warmup_multiplier": 0.25},
+    "ramp60_025": {"warmup_days": 60, "warmup_multiplier": 0.25},
+    "cold3_025": {"cold_start_min_trades": 3, "cold_start_multiplier": 0.25},
+    "cold5_025": {"cold_start_min_trades": 5, "cold_start_multiplier": 0.25},
+    "cold5_050": {"cold_start_min_trades": 5, "cold_start_multiplier": 0.50},
+    "cold10_025": {"cold_start_min_trades": 10, "cold_start_multiplier": 0.25},
+    "dd5_050": {"dd_ladder": [(5.0, 0.5)]},
+    "dd8_025": {"dd_ladder": [(8.0, 0.25)]},
+    "dd_ladder": {"dd_ladder": [(5.0, 0.5), (8.0, 0.25)]},
+    "cap100": {"per_trade_loss_cap_pct": 1.0},
+    "cap150": {"per_trade_loss_cap_pct": 1.5},
+    "daily2": {"daily_loss_stop_pct": 2.0},
+    "daily3": {"daily_loss_stop_pct": 3.0},
+    "daily5": {"daily_loss_stop_pct": 5.0},
+    "ramp40_cold5": {
+        "warmup_days": 40,
+        "warmup_multiplier": 0.25,
+        "cold_start_min_trades": 5,
+        "cold_start_multiplier": 0.25,
+    },
+    "ramp40_ladder": {
+        "warmup_days": 40,
+        "warmup_multiplier": 0.25,
+        "dd_ladder": [(5.0, 0.5), (8.0, 0.25)],
+    },
+    "cold5_ladder": {
+        "cold_start_min_trades": 5,
+        "cold_start_multiplier": 0.25,
+        "dd_ladder": [(5.0, 0.5), (8.0, 0.25)],
+    },
+    "stack_noramp": {
+        "cold_start_min_trades": 5,
+        "cold_start_multiplier": 0.25,
+        "dd_ladder": [(5.0, 0.5), (8.0, 0.25)],
+        "per_trade_loss_cap_pct": 1.5,
+        "daily_loss_stop_pct": 3.0,
+    },
+    "stack_nocold": {
+        "warmup_days": 40,
+        "warmup_multiplier": 0.25,
+        "dd_ladder": [(5.0, 0.5), (8.0, 0.25)],
+        "per_trade_loss_cap_pct": 1.5,
+        "daily_loss_stop_pct": 3.0,
+    },
+    "full_stack": {
+        "warmup_days": 40,
+        "warmup_multiplier": 0.25,
+        "cold_start_min_trades": 5,
+        "cold_start_multiplier": 0.25,
+        "dd_ladder": [(5.0, 0.5), (8.0, 0.25)],
+        "per_trade_loss_cap_pct": 1.5,
+        "daily_loss_stop_pct": 3.0,
+    },
+}
+
+SHADOW_COMPOUND_RISK_FRACTIONS: list[float] = [0.001, 0.0015, 0.002, 0.003, 0.005]
+# 0.10%, 0.15%, 0.20%, 0.30%, 0.50% of current equity per trade
+SHADOW_FULL_STACK_CFG: dict[str, Any] = dict(SHADOW_GUARD_CONFIGS["full_stack"])
+
+
+def _compound_curve_label(risk_fraction: float) -> str:
+    """Map risk fraction to curve id segment: 0.001 -> '010', 0.005 -> '050'."""
+    return f"{int(round(float(risk_fraction) * 10000)):03d}"
+
+
+def _compound_risk_ratio(
+    *,
+    curve_capital: float,
+    compound_risk_fraction: float,
+    reference_risk_dollars: float,
+) -> float:
+    """Scale trade size from curve equity vs flat-base reference risk."""
+    target_risk_dollars = float(curve_capital) * float(compound_risk_fraction)
+    if reference_risk_dollars > 0:
+        return target_risk_dollars / float(reference_risk_dollars)
+    return 1.0
 
 # v7.18: strategies with zero trades get sort priority next scan day.
 ZERO_TRADE_STRATEGIES: set[str] = set()
@@ -1846,11 +1950,122 @@ def _last3_pnl_sum(hist: list[float]) -> float | None:
     return float(sum(hist[-3:]))
 
 
+def _shadow_strat_closed_count(strat_pnl_history: Mapping[str, Any], sid: str) -> int:
+    entry = strat_pnl_history.get(str(sid or "").strip().upper())
+    if isinstance(entry, dict):
+        return int(entry.get("n", 0) or 0)
+    if isinstance(entry, list):
+        return len(entry)
+    return 0
+
+
+def _shadow_strat_last3_pnls(strat_pnl_history: Mapping[str, Any], sid: str) -> list[float]:
+    entry = strat_pnl_history.get(str(sid or "").strip().upper())
+    if isinstance(entry, dict):
+        raw = entry.get("last3") or []
+        return [float(x) for x in raw] if isinstance(raw, list) else []
+    if isinstance(entry, list):
+        return [float(x) for x in entry]
+    return []
+
+
+def _shadow_strat_last3_sum(strat_pnl_history: Mapping[str, Any], sid: str) -> float | None:
+    return _last3_pnl_sum(_shadow_strat_last3_pnls(strat_pnl_history, sid))
+
+
+def _shadow_record_strat_pnl(strat_pnl_history: dict[str, Any], sid: str, pnl: float) -> None:
+    key = str(sid or "").strip().upper()
+    if not key or key == "SKIP":
+        return
+    entry = strat_pnl_history.get(key)
+    if isinstance(entry, list):
+        entry = {"n": len(entry), "last3": [float(x) for x in entry[-3:]]}
+    elif not isinstance(entry, dict):
+        entry = {"n": 0, "last3": []}
+    last3 = [float(x) for x in (entry.get("last3") or [])]
+    last3.append(float(pnl))
+    entry["n"] = int(entry.get("n", 0) or 0) + 1
+    entry["last3"] = last3[-3:]
+    strat_pnl_history[key] = entry
+
+
+def _shadow_st_medium_count(st_medium_history: Mapping[str, Any] | list[Any]) -> int:
+    if isinstance(st_medium_history, dict):
+        return int(st_medium_history.get("n", 0) or 0)
+    if isinstance(st_medium_history, list):
+        return len(st_medium_history)
+    return 0
+
+
+def _shadow_st_medium_last3_sum(st_medium_history: Mapping[str, Any] | list[Any]) -> float | None:
+    if isinstance(st_medium_history, dict):
+        n = _shadow_st_medium_count(st_medium_history)
+        if n < 3:
+            return None
+        last3 = st_medium_history.get("last3") or []
+        if not isinstance(last3, list) or len(last3) < 3:
+            return None
+        total = 0.0
+        for item in last3[-3:]:
+            if isinstance(item, (list, tuple)) and item:
+                total += float(item[0])
+        return total
+    if isinstance(st_medium_history, list):
+        n = len(st_medium_history)
+        if n < 3:
+            return None
+        return float(sum(p for p, _ in st_medium_history[-3:]))
+    return None
+
+
+def _shadow_record_st_medium(st_medium_history: dict[str, Any], pnl: float, won: bool) -> None:
+    if "n" not in st_medium_history or "last3" not in st_medium_history:
+        st_medium_history.clear()
+        st_medium_history.update({"n": 0, "last3": []})
+    last3 = list(st_medium_history.get("last3") or [])
+    last3.append([float(pnl), bool(won)])
+    st_medium_history["last3"] = last3[-3:]
+    st_medium_history["n"] = int(st_medium_history.get("n", 0) or 0) + 1
+
+
+def _normalize_shadow_strat_history(raw: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for k, v in raw.items():
+        sid = str(k).strip().upper()
+        if isinstance(v, dict):
+            last3_raw = v.get("last3") or []
+            out[sid] = {
+                "n": int(v.get("n", 0) or 0),
+                "last3": [float(x) for x in last3_raw][-3:] if isinstance(last3_raw, list) else [],
+            }
+        elif isinstance(v, list):
+            last3 = [float(x) for x in v][-3:]
+            out[sid] = {"n": len(v), "last3": last3}
+    return out
+
+
+def _normalize_shadow_st_medium_history(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict) and "last3" in raw:
+        last3_raw = raw.get("last3") or []
+        last3: list[list[Any]] = []
+        if isinstance(last3_raw, list):
+            for item in last3_raw[-3:]:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    last3.append([float(item[0]), bool(item[1])])
+        return {"n": int(raw.get("n", len(last3)) or 0), "last3": last3}
+    if isinstance(raw, list):
+        last3 = [[float(p), bool(w)] for p, w in raw[-3:]]
+        return {"n": len(raw), "last3": last3}
+    return {"n": 0, "last3": []}
+
+
 def _compute_ab_throttle_at_open(
     *,
     strategy_id: str,
     confidence: str,
     macro_bias: str,
+    strat_pnl_history: dict[str, Any] | None = None,
+    st_medium_history: Mapping[str, Any] | list[Any] | None = None,
 ) -> tuple[float, float, float]:
     """
     A+B throttle from prior closed-trade histories only (matches live engine).
@@ -1860,8 +2075,10 @@ def _compute_ab_throttle_at_open(
     conf = str(confidence or "").strip().upper()
     mb = str(macro_bias or "").strip().upper()
 
-    strat_hist = _STRAT_PNL_HISTORY.get(sid, [])
-    strat3 = _last3_pnl_sum(strat_hist)
+    if strat_pnl_history is None:
+        strat3 = _last3_pnl_sum(_STRAT_PNL_HISTORY.get(sid, []))
+    else:
+        strat3 = _shadow_strat_last3_sum(strat_pnl_history, sid)
     mult_a = (
         float(_AB_THROTTLE_FACTOR)
         if strat3 is not None and float(strat3) <= 0.0
@@ -1870,9 +2087,8 @@ def _compute_ab_throttle_at_open(
 
     mult_b = 1.0
     if conf == "MEDIUM" and mb == "STRONG_TAILWIND":
-        st_hist = _ST_MEDIUM_HISTORY
-        n = len(st_hist)
-        last3 = sum(p for p, _ in st_hist[-3:]) if n >= 3 else None
+        st_hist = _ST_MEDIUM_HISTORY if st_medium_history is None else st_medium_history
+        last3 = _shadow_st_medium_last3_sum(st_hist)
         if last3 is not None and float(last3) <= 0.0:
             mult_b = float(_AB_THROTTLE_FACTOR)
 
@@ -1937,6 +2153,235 @@ def _apply_ab_throttle_to_ai_sizing(
     return out
 
 
+def _trading_days_inclusive(start: date, end: date) -> int:
+    """Count Mon–Fri calendar days from start through end inclusive."""
+    if end < start:
+        return 0
+    n = 0
+    d = start
+    one = timedelta(days=1)
+    while d <= end:
+        if d.weekday() < 5:
+            n += 1
+        d += one
+    return n
+
+
+def _parse_guard_date(raw: Any) -> date | None:
+    try:
+        return date.fromisoformat(str(raw or "").strip()[:10])
+    except (TypeError, ValueError):
+        return None
+
+
+def _merged_guard_cfg(cfg: Mapping[str, Any] | None) -> dict[str, Any]:
+    out = dict(_FUNDED_GUARD_DEFAULTS)
+    if cfg:
+        out.update(cfg)
+    return out
+
+
+def _guard_strat_closed_count_from(
+    strategy_id: str,
+    strat_pnl_history: Mapping[str, Any],
+) -> int:
+    return _shadow_strat_closed_count(strat_pnl_history, strategy_id)
+
+
+def _guard_daily_loss_stopped_for_cfg(
+    *,
+    cfg: Mapping[str, Any],
+    day_realized_pnl: float,
+    day_anchor: float,
+) -> bool:
+    merged = _merged_guard_cfg(cfg)
+    daily_pct = merged.get("daily_loss_stop_pct")
+    if daily_pct is None or float(day_anchor) <= 0:
+        return False
+    try:
+        thresh = -float(daily_pct) / 100.0 * float(day_anchor)
+    except (TypeError, ValueError):
+        return False
+    return float(day_realized_pnl) <= thresh
+
+
+def _guard_daily_loss_stopped(*, day_realized_pnl: float, day_anchor: float) -> bool:
+    if not APPLY_GUARDRAILS:
+        return False
+    return _guard_daily_loss_stopped_for_cfg(
+        cfg={
+            "daily_loss_stop_pct": DAILY_LOSS_STOP_PCT,
+        },
+        day_realized_pnl=day_realized_pnl,
+        day_anchor=day_anchor,
+    )
+
+
+def _resolve_guard_mode(
+    *,
+    daily_stopped: bool,
+    ladder_level: int,
+    warmup_mult: float,
+) -> str:
+    if daily_stopped:
+        return "DAILY_STOPPED"
+    if ladder_level >= 2:
+        return "LADDER_2"
+    if ladder_level == 1:
+        return "LADDER_1"
+    if float(warmup_mult) != 1.0:
+        return "WARMUP"
+    return "NORMAL"
+
+
+def _compute_cfg_guard_multipliers(
+    *,
+    cfg: Mapping[str, Any],
+    strategy_id: str,
+    capital: float,
+    peak_capital: float,
+    scan_d: date | None,
+    activation_date: date | None,
+    day_realized_pnl: float,
+    day_anchor: float,
+    strat_pnl_history: Mapping[str, Any],
+    baseline_max_risk_dollars: float,
+) -> dict[str, Any]:
+    """Compute guard multipliers without mutating sizing. Returns log fields + guard_blocked."""
+    merged = _merged_guard_cfg(cfg)
+    warmup_m = 1.0
+    cold_m = 1.0
+    ladder_m = 1.0
+    ladder_level = 0
+    loss_cap_m = 1.0
+    daily_stopped = _guard_daily_loss_stopped_for_cfg(
+        cfg=merged,
+        day_realized_pnl=day_realized_pnl,
+        day_anchor=day_anchor,
+    )
+
+    if activation_date is not None and day_anchor > 0 and not daily_stopped:
+        sid = str(strategy_id or "").strip().upper()
+        sd = scan_d or activation_date
+
+        try:
+            warmup_days = int(merged.get("warmup_days") or 0)
+        except (TypeError, ValueError):
+            warmup_days = 0
+        if warmup_days > 0:
+            elapsed = _trading_days_inclusive(activation_date, sd)
+            if elapsed < warmup_days:
+                warmup_m = float(merged.get("warmup_multiplier") or 1.0)
+
+        try:
+            cold_min = int(merged.get("cold_start_min_trades") or 0)
+        except (TypeError, ValueError):
+            cold_min = 0
+        if cold_min > 0:
+            if _guard_strat_closed_count_from(sid, strat_pnl_history) < cold_min:
+                cold_m = float(merged.get("cold_start_multiplier") or 1.0)
+
+        peak = float(peak_capital or capital or STARTING_CAPITAL)
+        eq = float(capital or 0)
+        dd_ladder = merged.get("dd_ladder") or []
+        if peak > 0 and dd_ladder:
+            dd_pct = max(0.0, (peak - eq) / peak * 100.0)
+            for i, item in enumerate(dd_ladder, start=1):
+                try:
+                    thr, mult = float(item[0]), float(item[1])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                if dd_pct >= thr:
+                    ladder_m = mult
+                    ladder_level = i
+
+        pre_cap_mrd = float(baseline_max_risk_dollars or 0) * warmup_m * cold_m * ladder_m
+        cap_pct = merged.get("per_trade_loss_cap_pct")
+        if cap_pct is not None and eq > 0 and pre_cap_mrd > 0:
+            max_risk = eq * float(cap_pct) / 100.0
+            if max_risk >= 0 and pre_cap_mrd > max_risk:
+                loss_cap_m = max_risk / pre_cap_mrd
+
+    guard_total = warmup_m * cold_m * ladder_m * loss_cap_m
+    mode = _resolve_guard_mode(
+        daily_stopped=daily_stopped,
+        ladder_level=ladder_level,
+        warmup_mult=warmup_m,
+    )
+    return {
+        "guard_warmup_mult": float(warmup_m),
+        "guard_cold_start_mult": float(cold_m),
+        "guard_ladder_mult": float(ladder_m),
+        "guard_loss_cap_mult": round(float(loss_cap_m), 6),
+        "guard_total_mult": round(float(guard_total), 6),
+        "guard_mode": mode,
+        "guard_blocked": bool(daily_stopped),
+    }
+
+
+def _guard_strat_closed_count(strategy_id: str) -> int:
+    """Closed trades for strategy in this run (same counter as strat_health_n)."""
+    return _guard_strat_closed_count_from(strategy_id, _STRAT_PNL_HISTORY)
+
+
+def _funded_guard_cfg_for_tests() -> dict[str, Any]:
+    return {
+        "warmup_days": WARMUP_DAYS,
+        "warmup_multiplier": WARMUP_MULTIPLIER,
+        "cold_start_min_trades": COLD_START_MIN_TRADES,
+        "cold_start_multiplier": COLD_START_MULTIPLIER,
+        "dd_ladder": list(DD_LADDER),
+        "per_trade_loss_cap_pct": PER_TRADE_LOSS_CAP_PCT,
+        "daily_loss_stop_pct": DAILY_LOSS_STOP_PCT,
+    }
+
+
+def _apply_cfg_guardrails_to_ai_sizing(
+    ai: dict[str, Any],
+    *,
+    strategy_id: str,
+    capital: float,
+    peak_capital: float,
+    scan_d: date | None,
+    activation_date: date | None,
+    day_realized_pnl: float,
+    day_anchor: float,
+) -> dict[str, Any]:
+    """
+    Apply CFG guardrails after A+B throttle (unit tests / legacy). Returns log fields +
+    guard_blocked when daily loss stop is active.
+    """
+    baseline_mrd = float(ai.get("_max_risk_dollars", 0) or 0)
+    ab_thr = float(ai.get("_ab_throttle", 1.0) or 1.0)
+    pre_ab_mrd = baseline_mrd / ab_thr if ab_thr > 0 else baseline_mrd
+    row = _compute_cfg_guard_multipliers(
+        cfg=_funded_guard_cfg_for_tests() if APPLY_GUARDRAILS else {},
+        strategy_id=strategy_id,
+        capital=capital,
+        peak_capital=peak_capital,
+        scan_d=scan_d,
+        activation_date=activation_date if APPLY_GUARDRAILS else None,
+        day_realized_pnl=day_realized_pnl,
+        day_anchor=day_anchor,
+        strat_pnl_history=_STRAT_PNL_HISTORY,
+        baseline_max_risk_dollars=pre_ab_mrd * ab_thr,
+    )
+    if APPLY_GUARDRAILS and not row.get("guard_blocked"):
+        stack = float(row["guard_total_mult"])
+        if stack != 1.0:
+            ai["_position_size"] = round(float(ai.get("_position_size", 0) or 0) * stack, 2)
+            ai["_leveraged_exposure"] = round(float(ai.get("_leveraged_exposure", 0) or 0) * stack, 2)
+            ai["_max_risk_dollars"] = round(baseline_mrd * stack, 2)
+            ai["_account_risk_pct"] = float(ai.get("_account_risk_pct", 0) or 0) * stack
+    ai["_guard_warmup_mult"] = row["guard_warmup_mult"]
+    ai["_guard_cold_start_mult"] = row["guard_cold_start_mult"]
+    ai["_guard_ladder_mult"] = row["guard_ladder_mult"]
+    ai["_guard_loss_cap_mult"] = row["guard_loss_cap_mult"]
+    ai["_guard_total_mult"] = row["guard_total_mult"]
+    ai["_guard_mode"] = row["guard_mode"]
+    return row
+
+
 def _ab_trade_record_fields(
     *,
     pnl_dollars: float,
@@ -1946,11 +2391,14 @@ def _ab_trade_record_fields(
     ab_mult_b: float,
     ab_mult_a_unapplied: float | None = None,
     ab_mult_b_unapplied: float | None = None,
+    guard_total_mult: float = 1.0,
 ) -> dict[str, Any]:
     """Applied-trade row fields: net R-multiple, baseline shadow, throttle components."""
     thr = float(ab_throttle or 1.0)
+    gtot = float(guard_total_mult or 1.0)
     applied_pnl = float(pnl_dollars or 0)
-    baseline_pnl = round(applied_pnl / thr, 2) if thr > 0 else round(applied_pnl, 2)
+    denom = thr * gtot
+    baseline_pnl = round(applied_pnl / denom, 2) if denom > 0 else round(applied_pnl, 2)
     risk = float(max_risk_dollars or 0)
     r_mult = round(applied_pnl / risk, 6) if risk > 0 else 0.0
     fields: dict[str, Any] = {
@@ -1965,6 +2413,353 @@ def _ab_trade_record_fields(
     if ab_mult_b_unapplied is not None:
         fields["ab_mult_b_unapplied"] = float(ab_mult_b_unapplied)
     return fields
+
+
+@dataclass
+class _ShadowCurveState:
+    curve_id: str
+    curve_kind: str  # "guard" | "compound_bare" | "compound_full"
+    guard_cfg: dict[str, Any] = field(default_factory=dict)
+    compound_risk_fraction: float | None = None
+    capital: float = STARTING_CAPITAL
+    peak_capital: float = STARTING_CAPITAL
+    day_anchor: float = STARTING_CAPITAL
+    day_pnl: float = 0.0
+    activation_date: str = ""
+    st_medium_history: dict[str, Any] = field(default_factory=lambda: {"n": 0, "last3": []})
+    strat_pnl_history: dict[str, dict[str, Any]] = field(default_factory=dict)
+    trades_taken: int = 0
+    trades_blocked: int = 0
+    daily_pnls: dict[str, float] = field(default_factory=dict)
+    daily_anchors: dict[str, float] = field(default_factory=dict)
+    max_drawdown_pct_seen: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "curve_id": self.curve_id,
+            "curve_kind": self.curve_kind,
+            "guard_cfg": dict(self.guard_cfg),
+            "compound_risk_fraction": self.compound_risk_fraction,
+            # legacy key for resumed jobs saved before rename
+            "compound_risk_pct": self.compound_risk_fraction,
+            "capital": round(float(self.capital), 2),
+            "peak_capital": round(float(self.peak_capital), 2),
+            "day_anchor": round(float(self.day_anchor), 2),
+            "day_pnl": round(float(self.day_pnl), 2),
+            "activation_date": self.activation_date,
+            "st_medium_history": dict(self.st_medium_history),
+            "strat_pnl_history": {k: dict(v) for k, v in self.strat_pnl_history.items()},
+            "trades_taken": int(self.trades_taken),
+            "trades_blocked": int(self.trades_blocked),
+            "daily_pnls": dict(self.daily_pnls),
+            "daily_anchors": dict(self.daily_anchors),
+            "max_drawdown_pct_seen": round(float(self.max_drawdown_pct_seen), 4),
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "_ShadowCurveState":
+        st_hist = _normalize_shadow_st_medium_history(raw.get("st_medium_history"))
+        strat_hist = _normalize_shadow_strat_history(raw.get("strat_pnl_history") or {})
+        daily_raw = raw.get("daily_pnls") or {}
+        daily_pnls = {str(k): float(v) for k, v in daily_raw.items()} if isinstance(daily_raw, dict) else {}
+        anchor_raw = raw.get("daily_anchors") or {}
+        daily_anchors = (
+            {str(k): float(v) for k, v in anchor_raw.items()} if isinstance(anchor_raw, dict) else {}
+        )
+        frac_raw = raw.get("compound_risk_fraction")
+        if frac_raw is None:
+            frac_raw = raw.get("compound_risk_pct")
+        return cls(
+            curve_id=str(raw.get("curve_id") or ""),
+            curve_kind=str(raw.get("curve_kind") or "guard"),
+            guard_cfg=dict(raw.get("guard_cfg") or {}),
+            compound_risk_fraction=(
+                float(frac_raw) if frac_raw is not None else None
+            ),
+            capital=float(raw.get("capital", STARTING_CAPITAL) or STARTING_CAPITAL),
+            peak_capital=float(raw.get("peak_capital", STARTING_CAPITAL) or STARTING_CAPITAL),
+            day_anchor=float(raw.get("day_anchor", STARTING_CAPITAL) or STARTING_CAPITAL),
+            day_pnl=float(raw.get("day_pnl", 0) or 0),
+            activation_date=str(raw.get("activation_date") or ""),
+            st_medium_history=st_hist,
+            strat_pnl_history=strat_hist,
+            trades_taken=int(raw.get("trades_taken", 0) or 0),
+            trades_blocked=int(raw.get("trades_blocked", 0) or 0),
+            daily_pnls=daily_pnls,
+            daily_anchors=daily_anchors,
+            max_drawdown_pct_seen=float(raw.get("max_drawdown_pct_seen", 0) or 0),
+        )
+
+
+class _ShadowGuardRunner:
+    """Parallel shadow guard + compound capital curves for chrono backtests."""
+
+    def __init__(self) -> None:
+        self.curves: dict[str, _ShadowCurveState] = {}
+        self._init_curves()
+
+    def _init_curves(self) -> None:
+        for cid, cfg in SHADOW_GUARD_CONFIGS.items():
+            self.curves[cid] = _ShadowCurveState(
+                curve_id=cid,
+                curve_kind="guard",
+                guard_cfg=dict(cfg),
+            )
+        for frac in SHADOW_COMPOUND_RISK_FRACTIONS:
+            frac_key = _compound_curve_label(frac)
+            bare_id = f"compound_{frac_key}_bare"
+            full_id = f"compound_{frac_key}_full"
+            self.curves[bare_id] = _ShadowCurveState(
+                curve_id=bare_id,
+                curve_kind="compound_bare",
+                compound_risk_fraction=float(frac),
+            )
+            self.curves[full_id] = _ShadowCurveState(
+                curve_id=full_id,
+                curve_kind="compound_full",
+                compound_risk_fraction=float(frac),
+                guard_cfg=dict(SHADOW_FULL_STACK_CFG),
+            )
+
+    @classmethod
+    def from_chrono(cls, chrono_data: Mapping[str, Any] | None) -> "_ShadowGuardRunner":
+        runner = cls()
+        if not chrono_data:
+            return runner
+        saved = chrono_data.get("shadow_guard_state")
+        if not isinstance(saved, dict):
+            return runner
+        curves_raw = saved.get("curves")
+        if not isinstance(curves_raw, dict):
+            return runner
+        for cid, raw in curves_raw.items():
+            if cid in runner.curves and isinstance(raw, dict):
+                runner.curves[cid] = _ShadowCurveState.from_dict(raw)
+        return runner
+
+    def to_persistence(self) -> dict[str, Any]:
+        return {"curves": {cid: st.to_dict() for cid, st in self.curves.items()}}
+
+    def on_new_day(self, date_str: str) -> None:
+        for st in self.curves.values():
+            if not st.activation_date:
+                st.activation_date = date_str
+            st.day_anchor = float(st.capital)
+            st.day_pnl = 0.0
+
+    def finalize_day(self, date_str: str) -> None:
+        ds = str(date_str or "")[:10]
+        for st in self.curves.values():
+            st.daily_pnls[ds] = round(float(st.day_pnl), 2)
+            st.daily_anchors[ds] = round(float(st.day_anchor), 2)
+
+    def process_trade(self, ctx: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+        if ctx.get("skipped") or str(ctx.get("outcome") or "").strip().upper() not in ("WIN", "LOSS"):
+            return {}
+        out: dict[str, dict[str, Any]] = {}
+        date_str = str(ctx.get("date") or "")[:10]
+        scan_d = _parse_guard_date(date_str)
+        sid = str(ctx.get("strategy_id") or "").strip().upper()
+        conf = str(ctx.get("confidence") or "").strip().upper()
+        mb = str(ctx.get("macro_bias") or "").strip().upper()
+        baseline_pnl = float(ctx.get("baseline_pnl") or 0)
+        ab_real = float(ctx.get("ab_throttle") or 1.0)
+        if ab_real <= 0:
+            ab_real = 1.0
+        pre_ab_risk_pct = float(ctx.get("pre_ab_risk_pct") or 0)
+        if pre_ab_risk_pct <= 0:
+            pre_ab_risk_pct = float(RISK_BY_CONFIDENCE.get(conf, 0.005))
+        pre_ab_mrd = float(ctx.get("pre_ab_max_risk") or 0)
+        if pre_ab_mrd <= 0:
+            pre_ab_mrd = float(ctx.get("max_risk_dollars") or 0) / ab_real
+        outcome = str(ctx.get("outcome") or "").strip().upper()
+        won = outcome == "WIN"
+
+        for cid, st in self.curves.items():
+            if not st.activation_date and date_str:
+                st.activation_date = date_str
+            act = _parse_guard_date(st.activation_date)
+
+            blocked = False
+            mult = 1.0
+            pnl = 0.0
+
+            if st.curve_kind == "guard":
+                guard_row = _compute_cfg_guard_multipliers(
+                    cfg=st.guard_cfg,
+                    strategy_id=sid,
+                    capital=st.capital,
+                    peak_capital=st.peak_capital,
+                    scan_d=scan_d,
+                    activation_date=act,
+                    day_realized_pnl=st.day_pnl,
+                    day_anchor=st.day_anchor,
+                    strat_pnl_history=st.strat_pnl_history,
+                    baseline_max_risk_dollars=pre_ab_mrd * ab_real,
+                )
+                if guard_row.get("guard_blocked"):
+                    blocked = True
+                    st.trades_blocked += 1
+                else:
+                    _, _, ab_shadow = _compute_ab_throttle_at_open(
+                        strategy_id=sid,
+                        confidence=conf,
+                        macro_bias=mb,
+                        strat_pnl_history=st.strat_pnl_history,
+                        st_medium_history=st.st_medium_history,
+                    )
+                    guard_mult = float(guard_row.get("guard_total_mult") or 1.0)
+                    mult = round(ab_shadow * guard_mult, 6)
+                    pnl = round(baseline_pnl * mult, 2)
+                    st.trades_taken += 1
+                    self._apply_pnl(st, pnl, date_str, sid, conf, mb, won)
+            else:
+                guard_row = None
+                _, _, ab_shadow = _compute_ab_throttle_at_open(
+                    strategy_id=sid,
+                    confidence=conf,
+                    macro_bias=mb,
+                    strat_pnl_history=st.strat_pnl_history,
+                    st_medium_history=st.st_medium_history,
+                )
+                risk_ratio = _compound_risk_ratio(
+                    curve_capital=st.capital,
+                    compound_risk_fraction=float(st.compound_risk_fraction or 0),
+                    reference_risk_dollars=pre_ab_mrd,
+                )
+                guard_mult = 1.0
+                if st.curve_kind == "compound_full":
+                    guard_row = _compute_cfg_guard_multipliers(
+                        cfg=st.guard_cfg,
+                        strategy_id=sid,
+                        capital=st.capital,
+                        peak_capital=st.peak_capital,
+                        scan_d=scan_d,
+                        activation_date=act,
+                        day_realized_pnl=st.day_pnl,
+                        day_anchor=st.day_anchor,
+                        strat_pnl_history=st.strat_pnl_history,
+                        baseline_max_risk_dollars=pre_ab_mrd * ab_real * risk_ratio,
+                    )
+                    if guard_row.get("guard_blocked"):
+                        blocked = True
+                        st.trades_blocked += 1
+                    else:
+                        guard_mult = float(guard_row.get("guard_total_mult") or 1.0)
+                if not blocked:
+                    mult = round(ab_shadow * risk_ratio * guard_mult, 6)
+                    pnl = round(baseline_pnl * mult, 2)
+                    st.trades_taken += 1
+                    self._apply_pnl(st, pnl, date_str, sid, conf, mb, won)
+
+            out[cid] = {
+                "mult": float(mult),
+                "pnl": float(pnl),
+                "blocked": bool(blocked),
+            }
+        return out
+
+    def _apply_pnl(
+        self,
+        st: _ShadowCurveState,
+        pnl: float,
+        date_str: str,
+        sid: str,
+        conf: str,
+        mb: str,
+        won: bool,
+    ) -> None:
+        st.capital += pnl
+        st.day_pnl += pnl
+        if st.capital > st.peak_capital:
+            st.peak_capital = st.capital
+        if st.peak_capital > 0:
+            dd = (st.peak_capital - st.capital) / st.peak_capital * 100.0
+            if dd > st.max_drawdown_pct_seen:
+                st.max_drawdown_pct_seen = float(dd)
+        if sid and sid != "SKIP":
+            _shadow_record_strat_pnl(st.strat_pnl_history, sid, float(pnl))
+        if conf == "MEDIUM" and mb == "STRONG_TAILWIND":
+            _shadow_record_st_medium(st.st_medium_history, float(pnl), bool(won))
+
+    def _curve_summary(self, st: _ShadowCurveState) -> dict[str, Any]:
+        peak = float(st.peak_capital or STARTING_CAPITAL)
+        cap = float(st.capital or STARTING_CAPITAL)
+        worst_day_pct = 0.0
+        positive_months = 0
+        month_pnls: dict[str, float] = {}
+        for ds, dp in st.daily_pnls.items():
+            anchor = float(st.daily_anchors.get(ds, st.day_anchor or STARTING_CAPITAL))
+            day_pct = (float(dp) / anchor * 100.0) if anchor > 0 else 0.0
+            if day_pct < worst_day_pct:
+                worst_day_pct = day_pct
+            ym = ds[:7]
+            month_pnls[ym] = month_pnls.get(ym, 0.0) + float(dp)
+        for mp in month_pnls.values():
+            if mp > 0:
+                positive_months += 1
+        return {
+            "final_capital": round(cap, 2),
+            "peak_capital": round(peak, 2),
+            "max_drawdown_pct": round(float(st.max_drawdown_pct_seen), 2),
+            "worst_day_pct": round(float(worst_day_pct), 2),
+            "positive_months": int(positive_months),
+            "trades_taken": int(st.trades_taken),
+            "trades_blocked": int(st.trades_blocked),
+        }
+
+    def guard_summaries(self) -> dict[str, dict[str, Any]]:
+        return {
+            cid: self._curve_summary(st)
+            for cid, st in self.curves.items()
+            if st.curve_kind == "guard"
+        }
+
+    def compound_summaries(self) -> dict[str, dict[str, Any]]:
+        return {
+            cid: self._curve_summary(st)
+            for cid, st in self.curves.items()
+            if st.curve_kind.startswith("compound_")
+        }
+
+
+def _shadow_trade_ctx_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    ab = float(row.get("ab_throttle") or 1.0)
+    if ab <= 0:
+        ab = 1.0
+    acct_risk = float(row.get("account_risk_pct") or 0)
+    conf = str(row.get("confidence") or "").strip().upper()
+    pre_ab_risk = acct_risk / ab if ab > 0 else float(RISK_BY_CONFIDENCE.get(conf, 0.005))
+    return {
+        "date": row.get("date"),
+        "strategy_id": row.get("strategy_id"),
+        "confidence": conf,
+        "macro_bias": str(row.get("macro_bias_adjusted") or row.get("macro_bias") or ""),
+        "baseline_pnl": float(row.get("shadow_baseline_pnl_dollars") or 0),
+        "ab_throttle": ab,
+        "pre_ab_risk_pct": pre_ab_risk,
+        "pre_ab_max_risk": float(row.get("max_risk_dollars") or 0) / ab,
+        "max_risk_dollars": float(row.get("max_risk_dollars") or 0),
+        "outcome": row.get("outcome"),
+        "skipped": bool(row.get("skipped") or row.get("skip_trade")),
+    }
+
+
+def _split_shadow_trade_maps(
+    combined: Mapping[str, Mapping[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    guard: dict[str, dict[str, Any]] = {}
+    compound: dict[str, dict[str, Any]] = {}
+    for cid, payload in combined.items():
+        if cid in SHADOW_GUARD_CONFIGS:
+            guard[cid] = dict(payload)
+        else:
+            compound[cid] = dict(payload)
+    return guard, compound
+
+
+def _persist_shadow_guard_state(chrono_data: dict[str, Any], runner: _ShadowGuardRunner) -> None:
+    chrono_data["shadow_guard_state"] = runner.to_persistence()
 
 
 def _sizing_health_shadow_fields(
@@ -6566,6 +7361,8 @@ def _python_forced_layer2_trade(
     chrono_compounding_base: float | None = None,
     chrono_peak_capital: float | None = None,
     chrono_day_pnl: float = 0.0,
+    chrono_guard_activation_date: str | None = None,
+    chrono_day_anchor: float | None = None,
     period_mode: str = "NEUTRAL",
     atr_ref: float | None = None,
     past: pd.DataFrame | None = None,
@@ -7271,6 +8068,7 @@ def _python_forced_layer2_trade(
             if ai.get("_ab_mult_b_unapplied") is not None
             else None
         ),
+        guard_total_mult=1.0,
     )
     confidence = str(ai.get("confidence", "LOW")).strip().upper()
     td = trend_result.get("trend") or {}
@@ -7480,6 +8278,8 @@ def run_one_backtest(
     chrono_peak_capital: float | None = None,
     chrono_day_pnl: float = 0.0,
     chrono_job_id: str = "",
+    chrono_guard_activation_date: str | None = None,
+    chrono_day_anchor: float | None = None,
 ) -> dict[str, Any] | None:
     _shadow_hook: dict[str, Any] | None = None
     _shadow_past_ref: Any = None
@@ -7940,6 +8740,8 @@ def run_one_backtest(
                     chrono_compounding_base=chrono_compounding_base,
                     chrono_peak_capital=chrono_peak_capital,
                     chrono_day_pnl=chrono_day_pnl,
+                    chrono_guard_activation_date=chrono_guard_activation_date,
+                    chrono_day_anchor=chrono_day_anchor,
                     period_mode=period_mode,
                     atr_ref=float(ind.get("atr", 0) or 0) or None,
                     past=past,
@@ -8452,6 +9254,7 @@ def run_one_backtest(
                 if ai.get("_ab_mult_b_unapplied") is not None
                 else None
             ),
+            guard_total_mult=1.0,
         )
 
         # Shadow trail sims need the forward path — run before del fut.
@@ -9991,6 +10794,7 @@ def run_chronological_backtest(
             ("capital", STARTING_CAPITAL),
             ("compounding_base_capital", STARTING_CAPITAL),
             ("peak_capital", STARTING_CAPITAL),
+            ("guard_activation_date", ""),
             ("account_type", ACCOUNT_TYPE),
             ("days_processed", 0),
         ):
@@ -10050,6 +10854,8 @@ def run_chronological_backtest(
         if not tickers:
             tickers = ["EURUSD"]
 
+        shadow_runner = _ShadowGuardRunner.from_chrono(chrono_data)
+
         intraday_res = chrono_data.get("chrono_intraday")
         if isinstance(intraday_res, dict) and intraday_res.get("date"):
             dsd = str(intraday_res["date"])
@@ -10093,6 +10899,8 @@ def run_chronological_backtest(
                 chrono_data.pop("chrono_intraday", None)
 
             intra = chrono_data.get("chrono_intraday")
+            if not isinstance(intra, dict) or str(intra.get("date", "")) != date_str:
+                shadow_runner.on_new_day(date_str)
             finalize_day_only = False
             resume_idx = 0
             v71_pi_s = v71_ti_s = v71_tj_s = 0
@@ -10157,6 +10965,16 @@ def run_chronological_backtest(
                     if ipeak is not None:
                         peak_capital = float(ipeak)
                     peak_capital = _update_run_peak_capital(capital, peak_capital)
+
+            if not str(chrono_data.get("guard_activation_date") or "").strip():
+                chrono_data["guard_activation_date"] = date_str
+            if isinstance(intra, dict) and str(intra.get("date", "")) == date_str:
+                try:
+                    day_anchor_capital = float(intra.get("day_anchor_capital"))
+                except (TypeError, ValueError):
+                    day_anchor_capital = float(capital) - float(day_pnl or 0)
+            else:
+                day_anchor_capital = float(capital) - float(day_pnl or 0)
 
             scan_date = datetime.strptime(date_str, "%Y-%m-%d").date()
             global CHRONO_DAILY_PNL_FOR_CB, CHRONO_CIRCUIT_HALT_UNTIL, CHRONO_PENDING_HALT_UNTIL
@@ -10363,6 +11181,7 @@ def run_chronological_backtest(
                                     "capital": round(capital, 2),
                                     "compounding_base_capital": round(compounding_base, 2),
                                     "peak_capital": round(peak_capital, 2),
+                                    "day_anchor_capital": round(day_anchor_capital, 2),
                                 }
                                 _persist_chrono_capital_state(
                                     chrono_data,
@@ -10405,6 +11224,7 @@ def run_chronological_backtest(
                                     "capital": round(capital, 2),
                                     "compounding_base_capital": round(compounding_base, 2),
                                     "peak_capital": round(peak_capital, 2),
+                                    "day_anchor_capital": round(day_anchor_capital, 2),
                                 }
                                 _persist_chrono_capital_state(
                                     chrono_data,
@@ -10442,6 +11262,7 @@ def run_chronological_backtest(
                                     "capital": round(capital, 2),
                                     "compounding_base_capital": round(compounding_base, 2),
                                     "peak_capital": round(peak_capital, 2),
+                                    "day_anchor_capital": round(day_anchor_capital, 2),
                                 }
                                 _persist_chrono_capital_state(
                                     chrono_data,
@@ -10479,6 +11300,7 @@ def run_chronological_backtest(
                                     "capital": round(capital, 2),
                                     "compounding_base_capital": round(compounding_base, 2),
                                     "peak_capital": round(peak_capital, 2),
+                                    "day_anchor_capital": round(day_anchor_capital, 2),
                                 }
                                 _persist_chrono_capital_state(
                                     chrono_data,
@@ -10526,6 +11348,7 @@ def run_chronological_backtest(
                                     "capital": round(capital, 2),
                                     "compounding_base_capital": round(compounding_base, 2),
                                     "peak_capital": round(peak_capital, 2),
+                                    "day_anchor_capital": round(day_anchor_capital, 2),
                                 }
                                 _persist_chrono_capital_state(
                                     chrono_data,
@@ -10562,6 +11385,7 @@ def run_chronological_backtest(
                                     "capital": round(capital, 2),
                                     "compounding_base_capital": round(compounding_base, 2),
                                     "peak_capital": round(peak_capital, 2),
+                                    "day_anchor_capital": round(day_anchor_capital, 2),
                                 }
                                 _persist_chrono_capital_state(
                                     chrono_data,
@@ -10624,6 +11448,7 @@ def run_chronological_backtest(
                                     "capital": round(capital, 2),
                                     "compounding_base_capital": round(compounding_base, 2),
                                     "peak_capital": round(peak_capital, 2),
+                                    "day_anchor_capital": round(day_anchor_capital, 2),
                                 }
                                 _persist_chrono_capital_state(
                                     chrono_data,
@@ -10651,6 +11476,7 @@ def run_chronological_backtest(
                                     "capital": round(capital, 2),
                                     "compounding_base_capital": round(compounding_base, 2),
                                     "peak_capital": round(peak_capital, 2),
+                                    "day_anchor_capital": round(day_anchor_capital, 2),
                                 }
                                 _persist_chrono_capital_state(
                                     chrono_data,
@@ -10696,6 +11522,7 @@ def run_chronological_backtest(
                                     "capital": round(capital, 2),
                                     "compounding_base_capital": round(compounding_base, 2),
                                     "peak_capital": round(peak_capital, 2),
+                                    "day_anchor_capital": round(day_anchor_capital, 2),
                                 }
                                 _persist_chrono_capital_state(
                                     chrono_data,
@@ -10713,6 +11540,11 @@ def run_chronological_backtest(
                             row["job_id"] = job_id
                             row["session"] = session
                             row.setdefault("date", date_str)
+                            _shadow_maps = shadow_runner.process_trade(_shadow_trade_ctx_from_row(row))
+                            if _shadow_maps:
+                                guard_map, compound_map = _split_shadow_trade_maps(_shadow_maps)
+                                row["shadow_guard"] = guard_map
+                                row["shadow_compound"] = compound_map
                             day_trades.append(row)
                             day_pnl += pnl
                             capital += pnl
@@ -10770,6 +11602,7 @@ def run_chronological_backtest(
                                 "capital": round(capital, 2),
                                 "compounding_base_capital": round(compounding_base, 2),
                                 "peak_capital": round(peak_capital, 2),
+                                "day_anchor_capital": round(day_anchor_capital, 2),
                             }
                             _persist_chrono_capital_state(
                                 chrono_data,
@@ -10777,6 +11610,7 @@ def run_chronological_backtest(
                                 compounding_base=compounding_base,
                                 peak_capital=peak_capital,
                             )
+                            _persist_shadow_guard_state(chrono_data, shadow_runner)
                             chrono_data["current_date"] = date_str
                             chrono_data["status"] = "running"
                             save_json(chrono_path, chrono_data)
@@ -10807,6 +11641,7 @@ def run_chronological_backtest(
                 period_mode=eod_period_mode,
             )
             peak_capital = _update_run_peak_capital(capital, peak_capital)
+            shadow_runner.finalize_day(date_str)
 
             daily_summary = {
                 "date": date_str,
@@ -10835,6 +11670,7 @@ def run_chronological_backtest(
             chrono_data["status"] = "running"
             prev_dp = int(chrono_data.get("days_processed", 0) or 0)
             chrono_data["days_processed"] = prev_dp + 1
+            _persist_shadow_guard_state(chrono_data, shadow_runner)
             save_json(chrono_path, chrono_data)
 
             log(
@@ -10891,6 +11727,9 @@ def run_chronological_backtest(
             "strategy_performance": _calc_strategy_performance(all_trades),
             "timeframe_performance": _calc_tf_performance(all_trades),
         }
+        chrono_data["shadow_guard_summary"] = shadow_runner.guard_summaries()
+        chrono_data["shadow_compound_summary"] = shadow_runner.compound_summaries()
+        _persist_shadow_guard_state(chrono_data, shadow_runner)
         chrono_data["v74_metrics"] = _v74_chrono_trade_metrics(all_trades)
         _assert_swap_financing_modeled(all_trades, context=f"Chrono {job_id}")
         save_json(chrono_path, chrono_data)
