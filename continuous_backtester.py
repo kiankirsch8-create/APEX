@@ -70,6 +70,8 @@ from macro_manager import (
 from regime_engine import compute_pair_regime
 from utils import DATA_DIR, env, load_json, log, save_json, utcnow_iso
 
+import shadow_instruments as _si
+
 set_backtest_mode(True)
 
 # ── COOLDOWN TRACKER — module-level, NEVER inside any loop ──
@@ -623,14 +625,24 @@ BLOCKED_PAIRS: frozenset[str] = frozenset(
         "AUDUSD",  # 183 trades, 37.2% WR, -$1,049 — consistent underperformer across all regimes
     },
 )
-# Chrono-only: fully evaluate BLOCKED_PAIRS in isolation (real curve unchanged).
+# Chrono-only: shadow-evaluate blocked/excluded/discovered instruments (real curve unchanged).
 SHADOW_BLOCKED_PAIRS = True
-SHADOW_BLOCKED_PAIRS_FILE = DATA_DIR / "shadow_blocked_pairs.jsonl"
 
-_SHADOW_BLOCKED_EVAL_TICKER: str | None = None
-_SHADOW_BLOCKED_STRAT_PNL: dict[str, list[float]] = {}
-_SHADOW_BLOCKED_ST_MEDIUM: list[tuple[float, bool]] = []
-_SHADOW_BLOCKED_TRADES_BUFFER: list[dict[str, Any]] = []
+
+def _real_chrono_forex_tickers() -> frozenset[str]:
+    """Tickers that may affect the live chrono capital curve."""
+    return frozenset(
+        t
+        for t in CHRONO_TICKERS
+        if t not in BLOCKED_PAIRS and t not in EXCLUDED_PAIRS
+    )
+
+
+def _shadow_eval_active(sym: str, *, chrono_yfinance: bool) -> bool:
+    return bool(
+        chrono_yfinance and SHADOW_BLOCKED_PAIRS and _si.is_shadow_ticker(str(sym).strip().upper())
+    )
+
 # Group 1 forensic blocks (union with strategy_status.json ``blocked`` at evaluation time)
 BLOCKED_STRATEGIES_GROUP1: frozenset[str] = frozenset(
     {
@@ -979,195 +991,10 @@ def _is_group1_blocked_strategy(strategy_id: str) -> bool:
     return str(strategy_id or "").strip().upper() in BLOCKED_STRATEGIES_GROUP1
 
 
-def _shadow_blocked_pair_chrono_eval(sym: str, *, chrono_yfinance: bool) -> bool:
-    """True when a BLOCKED_PAIR should run the full chrono pipeline in shadow."""
-    sym_u = str(sym or "").strip().upper()
-    return bool(chrono_yfinance and SHADOW_BLOCKED_PAIRS and sym_u in BLOCKED_PAIRS)
-
-
-def _in_shadow_blocked_eval(sym: str | None = None) -> bool:
-    active = _SHADOW_BLOCKED_EVAL_TICKER
-    if not active:
-        return False
-    if sym is None:
-        return True
-    return active == str(sym).strip().upper()
-
-
-def _enter_shadow_blocked_eval(sym: str) -> None:
-    global _SHADOW_BLOCKED_EVAL_TICKER
-    _SHADOW_BLOCKED_EVAL_TICKER = str(sym or "").strip().upper()
-
-
-def _exit_shadow_blocked_eval() -> None:
-    global _SHADOW_BLOCKED_EVAL_TICKER
-    _SHADOW_BLOCKED_EVAL_TICKER = None
-
-
-def _reset_shadow_blocked_run_state() -> None:
-    global _SHADOW_BLOCKED_TRADES_BUFFER
-    _SHADOW_BLOCKED_STRAT_PNL.clear()
-    _SHADOW_BLOCKED_ST_MEDIUM.clear()
-    _SHADOW_BLOCKED_TRADES_BUFFER = []
-
-
-def _shadow_blocked_strat_history_for_ab() -> dict[str, dict[str, Any]]:
-    return {
-        sid: {"n": len(vals), "last3": [float(x) for x in vals[-3:]]}
-        for sid, vals in _SHADOW_BLOCKED_STRAT_PNL.items()
-    }
-
-
-def _record_shadow_blocked_ab_histories(row: Mapping[str, Any]) -> None:
-    if str(row.get("outcome", "")).strip().upper() not in ("WIN", "LOSS"):
-        return
-    sid = str(row.get("strategy_id", "")).strip().upper()
-    pnl = float(row.get("pnl_dollars", 0) or 0)
-    if sid and sid != "SKIP":
-        _SHADOW_BLOCKED_STRAT_PNL.setdefault(sid, []).append(pnl)
-    if (
-        str(row.get("confidence", "")).strip().upper() == "MEDIUM"
-        and str(row.get("macro_bias", "")).strip().upper() == "STRONG_TAILWIND"
-    ):
-        won = str(row.get("outcome", "")).strip().upper() == "WIN"
-        _SHADOW_BLOCKED_ST_MEDIUM.append((pnl, won))
-
-
-def _rebuild_shadow_blocked_histories(rows: list[dict[str, Any]]) -> None:
-    _SHADOW_BLOCKED_STRAT_PNL.clear()
-    _SHADOW_BLOCKED_ST_MEDIUM.clear()
-    completed = [
-        r
-        for r in rows
-        if isinstance(r, dict)
-        and not r.get("skipped")
-        and str(r.get("outcome", "")).strip().upper() in ("WIN", "LOSS")
-    ]
-    completed.sort(key=_health_signal_row_sort_key)
-    for r in completed:
-        sid = str(r.get("strategy_id", "")).strip().upper()
-        pnl = float(r.get("pnl_dollars", 0) or 0)
-        if sid and sid != "SKIP":
-            _SHADOW_BLOCKED_STRAT_PNL.setdefault(sid, []).append(pnl)
-        if (
-            str(r.get("confidence", "")).strip().upper() == "MEDIUM"
-            and str(r.get("macro_bias", "")).strip().upper() == "STRONG_TAILWIND"
-        ):
-            won = str(r.get("outcome", "")).strip().upper() == "WIN"
-            _SHADOW_BLOCKED_ST_MEDIUM.append((pnl, won))
-
-
-def _load_shadow_blocked_trades_for_job(job_id: str) -> list[dict[str, Any]]:
-    jid = str(job_id or "").strip()
-    if not jid or not SHADOW_BLOCKED_PAIRS_FILE.is_file():
-        return []
-    out: list[dict[str, Any]] = []
-    try:
-        with open(SHADOW_BLOCKED_PAIRS_FILE, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(row, dict) and str(row.get("job_id", "")).strip() == jid:
-                    out.append(row)
-    except OSError as e:
-        log(f"[SHADOW BLOCKED] load error: {e}", level="warning")
-    return out
-
-
-def _append_shadow_blocked_pair_row(row: dict[str, Any]) -> None:
-    try:
-        SHADOW_BLOCKED_PAIRS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(SHADOW_BLOCKED_PAIRS_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(row, default=str, separators=(",", ":")) + "\n")
-    except OSError as e:
-        log(f"[SHADOW BLOCKED] append error: {e}", level="error")
-
-
-def _persist_shadow_blocked_pair_trade(row: dict[str, Any], *, job_id: str) -> None:
-    out = dict(row)
-    out["shadow_reason"] = "BLOCKED_PAIR"
-    out.setdefault("job_id", job_id)
-    _append_shadow_blocked_pair_row(out)
-    _record_shadow_blocked_ab_histories(out)
-    _SHADOW_BLOCKED_TRADES_BUFFER.append(out)
-
-
-def _standalone_max_drawdown_pct(pnls: list[float], start_capital: float = STARTING_CAPITAL) -> float:
-    cap = float(start_capital)
-    peak = cap
-    max_dd = 0.0
-    for pnl in pnls:
-        cap += float(pnl)
-        if cap > peak:
-            peak = cap
-        if peak > 0:
-            dd = (peak - cap) / peak * 100.0
-            if dd > max_dd:
-                max_dd = dd
-    return round(float(max_dd), 2)
-
-
-def _shadow_blocked_ticker_stats(trades: list[dict[str, Any]]) -> dict[str, Any]:
-    wins = [t for t in trades if t.get("outcome") == "WIN"]
-    losses = [t for t in trades if t.get("outcome") == "LOSS"]
-    pnl = sum(float(t.get("pnl_dollars", 0) or 0) for t in trades)
-    net_r = sum(float(t.get("pnl_r_net", 0) or 0) for t in trades)
-    pnls = [float(t.get("pnl_dollars", 0) or 0) for t in trades]
-    return {
-        "trade_count": len(trades),
-        "wins": len(wins),
-        "losses": len(losses),
-        "win_rate_pct": round(len(wins) / max(1, len(trades)) * 100.0, 1),
-        "net_pnl": round(pnl, 2),
-        "net_r": round(net_r, 4),
-        "max_drawdown_pct_standalone": _standalone_max_drawdown_pct(pnls),
-    }
-
-
-def _compute_shadow_blocked_summary(trades: list[dict[str, Any]]) -> dict[str, Any]:
-    executed = [
-        t
-        for t in trades
-        if isinstance(t, dict)
-        and not t.get("skipped")
-        and str(t.get("outcome", "")).strip().upper() in ("WIN", "LOSS")
-    ]
-    by_ticker: dict[str, list[dict[str, Any]]] = {}
-    for t in executed:
-        tkr = str(t.get("ticker", "")).strip().upper()
-        if tkr:
-            by_ticker.setdefault(tkr, []).append(t)
-    summary: dict[str, Any] = {"by_ticker": {}, "total_trades": len(executed)}
-    for tkr, rows in sorted(by_ticker.items()):
-        rows.sort(key=lambda r: str(r.get("date", ""))[:10])
-        ticker_stats = _shadow_blocked_ticker_stats(rows)
-        by_year: dict[str, dict[str, Any]] = {}
-        year_buckets: dict[str, list[dict[str, Any]]] = {}
-        for r in rows:
-            yr = str(r.get("date", ""))[:4] or "unknown"
-            year_buckets.setdefault(yr, []).append(r)
-        for yr, yr_rows in sorted(year_buckets.items()):
-            by_year[yr] = _shadow_blocked_ticker_stats(yr_rows)
-        ticker_stats["by_year"] = by_year
-        summary["by_ticker"][tkr] = ticker_stats
-    return summary
-
-
-def _maybe_shadow_blocked_trade_fields(sym: str) -> dict[str, Any]:
-    if _in_shadow_blocked_eval(sym):
-        return {"shadow_reason": "BLOCKED_PAIR"}
-    return {}
-
-
 def _hard_block_skip_reason(sym: str, strategy_id: str) -> str | None:
     """Return skip reason when pair/strategy is hard-blocked; None if trade may proceed."""
     sym_u = str(sym or "").strip().upper()
-    if sym_u in BLOCKED_PAIRS and not _in_shadow_blocked_eval(sym_u):
+    if sym_u in BLOCKED_PAIRS and not _si.in_shadow_eval(sym_u):
         return f"[BLOCKED PAIR] {sym_u} in BLOCKED_PAIRS list"
     sid_u = str(strategy_id or "").strip().upper()
     if _is_group1_blocked_strategy(sid_u):
@@ -2529,8 +2356,9 @@ def _compute_ab_throttle_at_open(
     mb = str(macro_bias or "").strip().upper()
 
     if strat_pnl_history is None:
-        if _SHADOW_BLOCKED_EVAL_TICKER is not None:
-            strat3 = _shadow_strat_last3_sum(_shadow_blocked_strat_history_for_ab(), sid)
+        si_strat, si_st = _si.ab_histories_for_active()
+        if si_strat is not None:
+            strat3 = _shadow_strat_last3_sum(si_strat, sid)
         else:
             strat3 = _last3_pnl_sum(_STRAT_PNL_HISTORY.get(sid, []))
     else:
@@ -2543,8 +2371,9 @@ def _compute_ab_throttle_at_open(
 
     mult_b = 1.0
     if conf == "MEDIUM" and mb == "STRONG_TAILWIND":
-        if st_medium_history is None and _SHADOW_BLOCKED_EVAL_TICKER is not None:
-            st_hist = _SHADOW_BLOCKED_ST_MEDIUM
+        si_strat, si_st = _si.ab_histories_for_active()
+        if st_medium_history is None and si_st is not None:
+            st_hist = si_st
         else:
             st_hist = _ST_MEDIUM_HISTORY if st_medium_history is None else st_medium_history
         last3 = _shadow_st_medium_last3_sum(st_hist)
@@ -8394,6 +8223,15 @@ def _python_forced_layer2_trade(
         confidence=str(ai.get("confidence", "LOW")).strip().upper(),
         macro_bias=str(ai.get("macro_bias", "") or ""),
     )
+    if _si.in_shadow_eval(sym):
+        _inst_spec = _si.instrument_spec_for(sym)
+        if _inst_spec:
+            _si.apply_instrument_sizing(
+                ai,
+                spec=_inst_spec,
+                entry=float(ai.get("entry", entry) or entry),
+                risk_dollars=float(ai.get("_max_risk_dollars", 0) or 0),
+            )
 
     entry = float(ai.get("entry", entry) or entry)
     stop = float(ai.get("stop_loss", stop) or stop)
@@ -8553,17 +8391,32 @@ def _python_forced_layer2_trade(
     if outcome not in ("WIN", "LOSS"):
         outcome = "WIN" if raw_pct > 0 else "LOSS"
     correct = outcome == "WIN"
-    pnl_dollars, pnl_pct_display, gross_pnl_pct, _cost_fields = _apply_realistic_costs(
-        ticker=sym,
-        direction=direction,
-        timeframe=timeframe,
-        position_size=position_size,
-        entry=entry,
-        leveraged_exposure=leveraged_exposure,
-        raw_pct=raw_pct,
-        candles_to_exit=candles_to_exit,
-        sizing_mult=_position_sizing_mult_from_ai(ai),
-    )
+    _inst_spec_cost = _si.instrument_spec_for(sym) if _si.in_shadow_eval(sym) else None
+    nights_held_est = max(0.0, float(candles_to_exit) * _tf_days(timeframe))
+    if _inst_spec_cost:
+        contracts = float(ai.get("_instrument_contracts", ai.get("_position_size", 0)) or 0)
+        notional = float(ai.get("_leveraged_exposure", leveraged_exposure) or 0)
+        pnl_dollars, pnl_pct_display, gross_pnl_pct, _cost_fields = _si.apply_instrument_costs(
+            spec=_inst_spec_cost,
+            direction=direction,
+            contracts=contracts,
+            entry=entry,
+            notional=notional,
+            raw_pct=raw_pct,
+            nights_held=nights_held_est,
+        )
+    else:
+        pnl_dollars, pnl_pct_display, gross_pnl_pct, _cost_fields = _apply_realistic_costs(
+            ticker=sym,
+            direction=direction,
+            timeframe=timeframe,
+            position_size=position_size,
+            entry=entry,
+            leveraged_exposure=leveraged_exposure,
+            raw_pct=raw_pct,
+            candles_to_exit=candles_to_exit,
+            sizing_mult=_position_sizing_mult_from_ai(ai),
+        )
     _ab_row = _ab_trade_record_fields(
         pnl_dollars=pnl_dollars,
         max_risk_dollars=max_risk_dollars,
@@ -8750,8 +8603,11 @@ def _python_forced_layer2_trade(
         **_health_signal_shadow_fields(
             strategy_id=strat_id,
         ),
-        **_maybe_shadow_blocked_trade_fields(sym),
+        **_si.trade_fields_for_row(sym),
     }
+
+
+def _invoke_shadow_strategies_hook(hook: dict[str, Any]) -> None:
     """Write-only shadow strategy pass — never raises into the real scan."""
     try:
         from shadow_strategies import run_shadow_strategies_safe
@@ -8798,11 +8654,11 @@ def run_one_backtest(
 ) -> dict[str, Any] | None:
     _shadow_hook: dict[str, Any] | None = None
     _shadow_past_ref: Any = None
-    shadow_blocked_eval = False
+    shadow_eval = False
     try:
         sym = (ticker or "").strip().upper()
-        shadow_blocked_eval = _shadow_blocked_pair_chrono_eval(sym, chrono_yfinance=chrono_yfinance)
-        if sym in BLOCKED_PAIRS and not shadow_blocked_eval:
+        shadow_eval = _shadow_eval_active(sym, chrono_yfinance=chrono_yfinance)
+        if sym in BLOCKED_PAIRS and not shadow_eval:
             if sym not in _BLOCKED_PAIR_LOGGED:
                 log(f"[BLOCKED PAIR] {sym} skipped — in BLOCKED_PAIRS list", level="info")
                 _BLOCKED_PAIR_LOGGED.add(sym)
@@ -8816,11 +8672,12 @@ def run_one_backtest(
                     is_exotic=sym in EXOTIC_REDUCE,
                 )
             return None
-        if shadow_blocked_eval:
-            _enter_shadow_blocked_eval(sym)
+        if shadow_eval:
+            sc = _si.shadow_class_for_ticker(sym) or "blocked_fx"
+            _si.enter_shadow_eval(sym, shadow_class=sc)
             if sym not in _BLOCKED_PAIR_LOGGED:
                 log(
-                    f"[SHADOW BLOCKED PAIR] {sym} — full chrono eval, trades isolated from real curve",
+                    f"[SHADOW INST] {sym} ({sc}) — full chrono eval, isolated from real curve",
                     level="info",
                 )
                 _BLOCKED_PAIR_LOGGED.add(sym)
@@ -8890,8 +8747,10 @@ def run_one_backtest(
                     is_exotic=sym in EXOTIC_REDUCE,
                 )
 
-        is_forex = len(sym) == 6 and sym.isalpha()
-        yf_ticker = sym + "=X" if is_forex else sym
+        is_forex = len(sym) == 6 and sym.isalpha() and _si.instrument_spec_for(sym) is None
+        yf_ticker = _si.yf_symbol_for(sym) if _si.in_shadow_eval(sym) or _si.is_shadow_ticker(sym) else (
+            sym + "=X" if is_forex else sym
+        )
 
         past, future = get_ohlcv(yf_ticker, tf_key, analysis_date.strip(), chrono_yfinance=chrono_yfinance)
         if past is None or future is None or past.empty or future.empty:
@@ -9050,7 +8909,7 @@ def run_one_backtest(
         ind["swing_highs"] = swing_highs[-5:]
         ind["swing_lows"] = swing_lows[-5:]
 
-        if sym in EXCLUDED_PAIRS:
+        if sym in EXCLUDED_PAIRS and not _shadow_eval_active(sym, chrono_yfinance=chrono_yfinance):
             reason = "Excluded pair (backtest data)"
             log(f"[Backtest] FILTERED: {sym} — {reason}", level="info")
             return {
@@ -10033,7 +9892,7 @@ def run_one_backtest(
             **_health_signal_shadow_fields(
                 strategy_id=strategy_id_norm,
             ),
-            **_maybe_shadow_blocked_trade_fields(sym),
+            **_si.trade_fields_for_row(sym),
         }
 
     except Exception as e:  # noqa: BLE001
@@ -10049,8 +9908,8 @@ def run_one_backtest(
             )
         return None
     finally:
-        if shadow_blocked_eval:
-            _exit_shadow_blocked_eval()
+        if shadow_eval:
+            _si.exit_shadow_eval()
         if _shadow_hook is not None:
             _invoke_shadow_strategies_hook(_shadow_hook)
 
@@ -11387,16 +11246,42 @@ def run_chronological_backtest(
         if not tickers:
             tickers = ["EURUSD"]
 
+        def _shadow_yf_probe(yf_sym: str, start_s: str, end_s: str, interval: str) -> Any:
+            return safe_yf_download(yf_sym, start_s, end_s, interval)
+
+        if SHADOW_BLOCKED_PAIRS:
+            saved_discovery = chrono_data.get("shadow_universe_discovery")
+            if isinstance(saved_discovery, dict) and saved_discovery.get("loaded_tickers"):
+                _si.restore_universe_from_saved(
+                    saved_discovery,
+                    blocked_pairs=BLOCKED_PAIRS,
+                    real_chrono_tickers=_real_chrono_forex_tickers(),
+                )
+                discovery = saved_discovery
+            else:
+                discovery = _si.init_shadow_universe(
+                    start_date=start_date,
+                    end_date=end_date,
+                    blocked_pairs=BLOCKED_PAIRS,
+                    excluded_pairs=EXCLUDED_PAIRS,
+                    real_chrono_tickers=_real_chrono_forex_tickers(),
+                    yf_download_fn=_shadow_yf_probe,
+                    hourly_earliest_fn=yf_chrono_hourly_earliest_scan_date,
+                    enabled=True,
+                )
+                chrono_data["shadow_universe_discovery"] = discovery
+            for extra in _si.extra_chrono_tickers():
+                if extra not in tickers:
+                    tickers.append(extra)
+            _si.reset_run_state()
+            prior_shadow = _si.load_trades_for_job(job_id)
+            if prior_shadow:
+                _si.rebuild_histories(prior_shadow)
+
         shadow_runner = _ShadowGuardRunner.from_chrono(chrono_data)
         shadow_runner.set_median_nights_by_tf(
             _compute_median_nights_by_tf(list(chrono_data.get("all_trades") or []))
         )
-        if SHADOW_BLOCKED_PAIRS:
-            _reset_shadow_blocked_run_state()
-            prior_shadow = _load_shadow_blocked_trades_for_job(job_id)
-            if prior_shadow:
-                _SHADOW_BLOCKED_TRADES_BUFFER.extend(prior_shadow)
-                _rebuild_shadow_blocked_histories(prior_shadow)
 
         intraday_res = chrono_data.get("chrono_intraday")
         if isinstance(intraday_res, dict) and intraday_res.get("date"):
@@ -12083,8 +11968,8 @@ def run_chronological_backtest(
                             row["session"] = session
                             row.setdefault("date", date_str)
 
-                            if row.get("shadow_reason") == "BLOCKED_PAIR":
-                                _persist_shadow_blocked_pair_trade(row, job_id=job_id)
+                            if row.get("shadow_class") or row.get("shadow_instrument"):
+                                _si.persist_shadow_trade(row, job_id=job_id)
                                 npi, nti, ntj = _v71_next_step(pi, ti, tj)
                                 chrono_data["chrono_intraday"] = {
                                     "date": date_str,
@@ -12306,8 +12191,8 @@ def run_chronological_backtest(
         chrono_data["shadow_compound_summary"] = shadow_runner.compound_summaries()
         chrono_data["shadow_event_summary"] = shadow_runner.event_summaries()
         if SHADOW_BLOCKED_PAIRS:
-            chrono_data["shadow_blocked_summary"] = _compute_shadow_blocked_summary(
-                list(_SHADOW_BLOCKED_TRADES_BUFFER)
+            chrono_data["shadow_instrument_summary"] = _si.compute_summary(
+                _si.trades_buffer()
             )
         _persist_shadow_guard_state(chrono_data, shadow_runner)
         chrono_data["v74_metrics"] = _v74_chrono_trade_metrics(all_trades)
