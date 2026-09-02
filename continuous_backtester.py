@@ -392,12 +392,30 @@ DIAGNOSTIC_ALLOW_MULTI_TF_PER_DAY = True  # DIAGNOSTIC — REMOVE BEFORE LIVE
 SINGLE_TRADE_MAX_PCT_OF_CURRENT = 0.08
 LEVERAGE = 50
 
-# ── REALISTIC CONDITIONS (v1: spread + slippage + commission; swap wired but OFF) ──
+# ── REALISTIC CONDITIONS (v1: spread + slippage + commission + estimated swap) ──
 REALISTIC_COSTS_ENABLED = True
-SWAP_ENABLED = False              # flip True only after pasting real Capital.com per-pair swap values
 COMMISSION_PER_LOT_ROUNDTURN = 0.0   # Capital.com forex is spread-only
 SLIPPAGE_PIPS_ROUNDTURN = 1.0        # conservative execution haircut (~0.5 pip/side)
 SPREAD_DEFAULT_PIPS = 2.5            # fallback for any pair not in SPREAD_PIPS (logs a warning)
+
+# Estimated overnight financing — annual policy rates (percent) + broker markup.
+# Measured from Capital.com AUDJPY: long +0.00576%/night, short -0.01398%/night
+# -> implied markup 1.50%/yr, AUD-JPY diff 3.60%/yr.
+# Funding is charged on the FULL leveraged position value, not on margin.
+SWAP_RATES: dict[str, float] = {
+    "USD": 4.3,
+    "EUR": 2.6,
+    "JPY": 0.4,
+    "GBP": 4.3,
+    "CHF": 0.6,
+    "AUD": 4.1,
+    "NZD": 4.0,
+    "CAD": 3.6,
+    "SEK": 2.5,
+    "NOK": 4.3,
+    "ZAR": 7.6,
+}
+SWAP_BROKER_MARKUP_PCT = 1.5
 
 # Representative Capital.com retail spreads (pips). REPLACE with live platform values for max accuracy.
 SPREAD_PIPS: dict[str, float] = {
@@ -409,14 +427,6 @@ SPREAD_PIPS: dict[str, float] = {
     "AUDNZD": 2.5, "AUDCAD": 2.5, "AUDCHF": 3.0, "NZDCAD": 3.0, "NZDCHF": 3.5, "CADCHF": 3.0,
     "USDSEK": 20.0, "USDNOK": 20.0, "USDMXN": 60.0, "USDZAR": 50.0,
 }
-# Signed swap, % of notional PER NIGHT. Negative = pay, positive = receive (carry credit).
-# Time-varying in reality — keep SWAP_ENABLED=False until real per-pair/direction values are pasted.
-SWAP_DAILY_PCT: dict[str, dict[str, float]] = {
-    "USDJPY": {"LONG": 0.0010, "SHORT": -0.0015},
-    "CADJPY": {"LONG": 0.0008, "SHORT": -0.0013},
-    "CHFJPY": {"LONG": 0.0006, "SHORT": -0.0011},
-}
-SWAP_DEFAULT_PCT = 0.0
 
 IMPROVE_EVERY = 100
 
@@ -1249,6 +1259,67 @@ def _tf_days(timeframe: str) -> float:
     return {"1w": 7.0, "1d": 1.0, "4h": 4 / 24, "1h": 1 / 24, "30m": 0.5 / 24, "15m": 0.25 / 24}.get(tf, 1.0)
 
 
+def _estimate_swap_amount(
+    *,
+    ticker: str,
+    direction: str,
+    leveraged_exposure: float,
+    nights_held: float,
+) -> float:
+    """Estimated overnight financing from policy-rate differential + broker markup."""
+    if leveraged_exposure <= 0 or nights_held <= 0:
+        return 0.0
+    tkr = str(ticker or "").strip().upper()
+    if len(tkr) != 6 or not tkr.isalpha():
+        log(f"[SWAP] no rate table entry for {tkr} — non-forex or invalid symbol", level="warn")
+        return 0.0
+    base, quote = tkr[:3], tkr[3:6]
+    if base not in SWAP_RATES or quote not in SWAP_RATES:
+        missing = [c for c in (base, quote) if c not in SWAP_RATES]
+        log(
+            f"[SWAP] no rate table entry for {tkr} — missing {','.join(missing)}",
+            level="warn",
+        )
+        return 0.0
+    carry = (SWAP_RATES[base] - SWAP_RATES[quote]) / 100.0
+    if str(direction or "").strip().upper() == "SHORT":
+        carry = -carry
+    net = carry - SWAP_BROKER_MARKUP_PCT / 100.0
+    return leveraged_exposure * net * float(nights_held) / 365.0
+
+
+def _position_sizing_mult_from_ai(ai: Mapping[str, Any] | None) -> float:
+    """Combined A+B throttle and CFG guard multiplier applied at sizing time."""
+    if not ai:
+        return 1.0
+    mult = float(ai.get("_ab_throttle", 1.0) or 1.0)
+    guard = ai.get("_guard_total_mult")
+    if guard is not None:
+        mult *= float(guard or 1.0)
+    return mult if mult > 0 else 1.0
+
+
+def _assert_swap_financing_modeled(trades: list[dict[str, Any]], *, context: str = "") -> None:
+    """Loud error when overnight trades exist but total swap_amount is exactly zero."""
+    executed = [
+        t
+        for t in trades
+        if isinstance(t, dict) and not t.get("skipped") and t.get("outcome") in ("WIN", "LOSS")
+    ]
+    if not executed:
+        return
+    total_swap = sum(float(t.get("swap_amount", 0) or 0) for t in executed)
+    any_overnight = any(float(t.get("nights_held", 0) or 0) > 0 for t in executed)
+    if any_overnight and total_swap == 0.0:
+        prefix = f"[SWAP] {context}: " if context else "[SWAP] "
+        log(
+            f"{prefix}ERROR — sum(swap_amount) is exactly 0 across {len(executed)} trades "
+            f"but {sum(1 for t in executed if float(t.get('nights_held', 0) or 0) > 0)} "
+            f"held overnight (nights_held > 0). Swap financing is not being modelled.",
+            level="error",
+        )
+
+
 def _apply_realistic_costs(
     *,
     ticker: str,
@@ -1259,6 +1330,7 @@ def _apply_realistic_costs(
     leveraged_exposure: float,
     raw_pct: float,
     candles_to_exit: int,
+    sizing_mult: float = 1.0,
 ) -> tuple[float, float, float, dict[str, float]]:
     """Return (net_pnl_dollars, net_pnl_pct, gross_pnl_pct, cost_fields).
 
@@ -1291,10 +1363,17 @@ def _apply_realistic_costs(
     slip_cost = leveraged_exposure * ((SLIPPAGE_PIPS_ROUNDTURN * pip) / entry)
     comm_cost = COMMISSION_PER_LOT_ROUNDTURN * (position_size / 100000.0)
     nights = max(0.0, float(candles_to_exit) * _tf_days(timeframe))
-    swap_amt = 0.0
-    if SWAP_ENABLED:
-        swap_pct = SWAP_DAILY_PCT.get(tkr, {}).get(str(direction).upper(), SWAP_DEFAULT_PCT)
-        swap_amt = leveraged_exposure * swap_pct * nights
+    sz = float(sizing_mult or 1.0)
+    if sz <= 0:
+        sz = 1.0
+    # leveraged_exposure is actual held notional; sizing_mult is the combined throttle applied at open.
+    reference_exp = leveraged_exposure / sz
+    swap_amt = _estimate_swap_amount(
+        ticker=tkr,
+        direction=str(direction or ""),
+        leveraged_exposure=reference_exp,
+        nights_held=nights,
+    ) * sz
     net = gross - spread_cost - slip_cost - comm_cost + swap_amt
     net_pct = (net / leveraged_exposure) * 100.0
     fields = {
@@ -7971,6 +8050,7 @@ def _python_forced_layer2_trade(
         leveraged_exposure=leveraged_exposure,
         raw_pct=raw_pct,
         candles_to_exit=candles_to_exit,
+        sizing_mult=_position_sizing_mult_from_ai(ai),
     )
     _ab_row = _ab_trade_record_fields(
         pnl_dollars=pnl_dollars,
@@ -9156,6 +9236,7 @@ def run_one_backtest(
             leveraged_exposure=leveraged_exposure,
             raw_pct=raw_pct,
             candles_to_exit=candles_to_exit,
+            sizing_mult=_position_sizing_mult_from_ai(ai),
         )
         _ab_row = _ab_trade_record_fields(
             pnl_dollars=pnl_dollars,
@@ -11650,6 +11731,7 @@ def run_chronological_backtest(
         chrono_data["shadow_compound_summary"] = shadow_runner.compound_summaries()
         _persist_shadow_guard_state(chrono_data, shadow_runner)
         chrono_data["v74_metrics"] = _v74_chrono_trade_metrics(all_trades)
+        _assert_swap_financing_modeled(all_trades, context=f"Chrono {job_id}")
         save_json(chrono_path, chrono_data)
         log(
             f"[Chrono {job_id}] Complete. Capital: {capital:.2f}, P&L: {capital - STARTING_CAPITAL:+.2f}",
