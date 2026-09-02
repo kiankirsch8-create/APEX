@@ -307,6 +307,266 @@ SHADOW_COMPOUND_RISK_FRACTIONS: list[float] = [0.001, 0.0015, 0.002, 0.003, 0.00
 # 0.10%, 0.15%, 0.20%, 0.30%, 0.50% of current equity per trade
 SHADOW_FULL_STACK_CFG: dict[str, Any] = dict(SHADOW_GUARD_CONFIGS["full_stack"])
 
+# Static high-impact event calendar (2021-2026). Full table in high_impact_events_data.py.
+from high_impact_events_data import HIGH_IMPACT_EVENTS
+
+EVENT_LOOKAHEAD_DAYS = 30
+
+# Entry-only shadow curves testing event proximity rules (real curve unchanged).
+SHADOW_EVENT_CONFIGS: dict[str, dict[str, Any]] = {
+    "ev_block_pre1": {"block_pre_days": 1},
+    "ev_block_pre3": {"block_pre_days": 3},
+    "ev_block_post1": {"block_post_days": 1},
+    "ev_block_post3": {"block_post_days": 3},
+    "ev_block_both1": {"block_pre_days": 1, "block_post_days": 1},
+    "ev_block_both3": {"block_pre_days": 3, "block_post_days": 3},
+    "ev_half_pre1": {"pre_days": 1, "pre_mult": 0.5},
+    "ev_half_pre3": {"pre_days": 3, "pre_mult": 0.5},
+    "ev_quarter_pre1": {"pre_days": 1, "pre_mult": 0.25},
+    "ev_half_both3": {
+        "pre_days": 3,
+        "pre_mult": 0.5,
+        "post_days": 3,
+        "post_mult": 0.5,
+    },
+    "ev_only_pre3": {"only_within_pre_days": 3},
+    "ev_only_post3": {"only_within_post_days": 3},
+    "ev_only_both3": {"only_within_pre_days": 3, "only_within_post_days": 3},
+    "ev_double_post3": {"post_days": 3, "post_mult": 2.0},
+    "ev_no_hold_through": {"block_if_event_within_expected_hold": True},
+}
+
+# Fallback median hold (nights) per timeframe for ev_no_hold_through (no lookahead).
+DEFAULT_MEDIAN_NIGHTS_BY_TF: dict[str, float] = {
+    "1w": 5.0,
+    "1d": 2.0,
+    "4h": 0.5,
+    "1h": 0.25,
+    "30m": 0.12,
+    "15m": 0.06,
+}
+
+_EVENTS_BY_DATE_CUR: dict[tuple[str, str], list[tuple[str, str, str]]] = {}
+_EVENTS_BY_DATE: dict[str, list[tuple[str, str, str]]] = {}
+
+
+def _init_event_calendar_indexes() -> None:
+    """Build day/currency indexes from HIGH_IMPACT_EVENTS (idempotent)."""
+    if _EVENTS_BY_DATE:
+        return
+    for ds, cur, etype in HIGH_IMPACT_EVENTS:
+        _EVENTS_BY_DATE.setdefault(ds, []).append((ds, cur, etype))
+        _EVENTS_BY_DATE_CUR.setdefault((ds, cur), []).append((ds, cur, etype))
+
+
+_init_event_calendar_indexes()
+
+
+def _event_pair_currencies(ticker: str) -> tuple[str, ...]:
+    cur = get_currencies(ticker)
+    return tuple(cur) if cur else ("USD",)
+
+
+def _events_for_currency(cur: str, d: date | str) -> list[tuple[str, str, str]]:
+    """Events on ``d`` for currency ``cur``."""
+    if isinstance(d, str):
+        try:
+            d = date.fromisoformat(str(d).strip()[:10])
+        except ValueError:
+            return []
+    return list(_EVENTS_BY_DATE_CUR.get((d.isoformat(), str(cur).upper()), []))
+
+
+def _events_in_window(
+    ticker: str,
+    start_d: date | str,
+    end_d: date | str,
+) -> list[tuple[str, str, str]]:
+    """Events affecting either leg of ``ticker`` between ``start_d`` and ``end_d`` inclusive."""
+    if isinstance(start_d, str):
+        try:
+            start_d = date.fromisoformat(str(start_d).strip()[:10])
+        except ValueError:
+            return []
+    if isinstance(end_d, str):
+        try:
+            end_d = date.fromisoformat(str(end_d).strip()[:10])
+        except ValueError:
+            return []
+    if end_d < start_d:
+        start_d, end_d = end_d, start_d
+    currencies = set(_event_pair_currencies(ticker))
+    out: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    cur = start_d
+    one = timedelta(days=1)
+    while cur <= end_d:
+        for ev in _EVENTS_BY_DATE.get(cur.isoformat(), []):
+            if ev[1] in currencies and ev not in seen:
+                seen.add(ev)
+                out.append(ev)
+        cur += one
+    return out
+
+
+def _days_to_next_event(ticker: str, d: date | str) -> int | None:
+    """Days until the next event affecting either leg; None beyond 30-day horizon."""
+    if isinstance(d, str):
+        try:
+            d = date.fromisoformat(str(d).strip()[:10])
+        except ValueError:
+            return None
+    currencies = set(_event_pair_currencies(ticker))
+    for offset in range(0, EVENT_LOOKAHEAD_DAYS + 1):
+        probe = d + timedelta(days=offset)
+        for ev in _EVENTS_BY_DATE.get(probe.isoformat(), []):
+            if ev[1] in currencies:
+                return offset
+    return None
+
+
+def _days_since_last_event(ticker: str, d: date | str) -> int | None:
+    """Days since the last event affecting either leg; None beyond 30-day horizon."""
+    if isinstance(d, str):
+        try:
+            d = date.fromisoformat(str(d).strip()[:10])
+        except ValueError:
+            return None
+    currencies = set(_event_pair_currencies(ticker))
+    for offset in range(0, EVENT_LOOKAHEAD_DAYS + 1):
+        probe = d - timedelta(days=offset)
+        for ev in _EVENTS_BY_DATE.get(probe.isoformat(), []):
+            if ev[1] in currencies:
+                return offset
+    return None
+
+
+def _event_entry_window_label(days_to_next: int | None, days_since_last: int | None) -> str:
+    if days_to_next is not None and days_to_next <= 1:
+        return "PRE_1D"
+    if days_to_next is not None and days_to_next <= 3:
+        return "PRE_3D"
+    if days_since_last is not None and days_since_last <= 1:
+        return "POST_1D"
+    if days_since_last is not None and days_since_last <= 3:
+        return "POST_3D"
+    return "CLEAR"
+
+
+def _event_attribution_fields(
+    *,
+    ticker: str,
+    entry_date: str,
+    nights_held: float,
+) -> dict[str, Any]:
+    """Descriptive event proximity fields for a completed trade row."""
+    try:
+        entry_d = date.fromisoformat(str(entry_date).strip()[:10])
+    except ValueError:
+        return {
+            "event_days_to_next": None,
+            "event_days_since_last": None,
+            "event_held_through": 0,
+            "event_held_types": [],
+            "event_entry_window": "CLEAR",
+        }
+    nights = max(0.0, float(nights_held or 0))
+    exit_d = entry_d + timedelta(days=nights)
+    held = _events_in_window(ticker, entry_d, exit_d)
+    dtn = _days_to_next_event(ticker, entry_d)
+    dsl = _days_since_last_event(ticker, entry_d)
+    return {
+        "event_days_to_next": dtn,
+        "event_days_since_last": dsl,
+        "event_held_through": len(held),
+        "event_held_types": sorted({ev[2] for ev in held}),
+        "event_entry_window": _event_entry_window_label(dtn, dsl),
+    }
+
+
+def _compute_median_nights_by_tf(
+    trades: list[dict[str, Any]] | None,
+) -> dict[str, float]:
+    """Per-timeframe median nights_held from prior trades, else defaults."""
+    out = dict(DEFAULT_MEDIAN_NIGHTS_BY_TF)
+    if not trades:
+        return out
+    buckets: dict[str, list[float]] = {}
+    for t in trades:
+        if not isinstance(t, dict) or t.get("skipped"):
+            continue
+        if t.get("outcome") not in ("WIN", "LOSS"):
+            continue
+        tf = str(t.get("timeframe") or "").strip().lower()
+        if not tf:
+            continue
+        nights = float(t.get("nights_held", 0) or 0)
+        buckets.setdefault(tf, []).append(nights)
+    for tf, vals in buckets.items():
+        if vals:
+            s = sorted(vals)
+            mid = len(s) // 2
+            out[tf] = float(s[mid] if len(s) % 2 else (s[mid - 1] + s[mid]) / 2.0)
+    return out
+
+
+def _compute_event_shadow_entry(
+    *,
+    cfg: Mapping[str, Any],
+    ticker: str,
+    entry_d: date | None,
+    timeframe: str,
+    median_nights_by_tf: Mapping[str, float],
+) -> dict[str, Any]:
+    """Evaluate entry-only event shadow rule; returns {blocked, mult}."""
+    mult = 1.0
+    if entry_d is None:
+        return {"blocked": False, "mult": 1.0}
+    dtn = _days_to_next_event(ticker, entry_d)
+    dsl = _days_since_last_event(ticker, entry_d)
+
+    block_pre = cfg.get("block_pre_days")
+    if block_pre is not None and dtn is not None and dtn <= int(block_pre):
+        return {"blocked": True, "mult": 0.0}
+
+    block_post = cfg.get("block_post_days")
+    if block_post is not None and dsl is not None and dsl <= int(block_post):
+        return {"blocked": True, "mult": 0.0}
+
+    pre_days = cfg.get("pre_days")
+    pre_mult = cfg.get("pre_mult")
+    if pre_days is not None and dtn is not None and dtn <= int(pre_days):
+        mult *= float(pre_mult if pre_mult is not None else 1.0)
+
+    post_days = cfg.get("post_days")
+    post_mult = cfg.get("post_mult")
+    if post_days is not None and dsl is not None and dsl <= int(post_days):
+        mult *= float(post_mult if post_mult is not None else 1.0)
+
+    only_pre = cfg.get("only_within_pre_days")
+    only_post = cfg.get("only_within_post_days")
+    if only_pre is not None or only_post is not None:
+        in_pre = only_pre is not None and dtn is not None and dtn <= int(only_pre)
+        in_post = only_post is not None and dsl is not None and dsl <= int(only_post)
+        if only_pre is not None and only_post is not None:
+            if not (in_pre or in_post):
+                return {"blocked": True, "mult": 0.0}
+        elif only_pre is not None and not in_pre:
+            return {"blocked": True, "mult": 0.0}
+        elif only_post is not None and not in_post:
+            return {"blocked": True, "mult": 0.0}
+
+    if cfg.get("block_if_event_within_expected_hold"):
+        tf = str(timeframe or "").strip().lower()
+        median_nights = float(
+            median_nights_by_tf.get(tf, DEFAULT_MEDIAN_NIGHTS_BY_TF.get(tf, 1.0))
+        )
+        hold_end = entry_d + timedelta(days=max(0, int(round(median_nights))))
+        if _events_in_window(ticker, entry_d, hold_end):
+            return {"blocked": True, "mult": 0.0}
+
+    return {"blocked": False, "mult": round(float(mult), 6)}
+
 
 def _compound_curve_label(risk_fraction: float) -> str:
     """Map risk fraction to curve id segment: 0.001 -> '010', 0.005 -> '050'."""
@@ -2418,8 +2678,9 @@ def _ab_trade_record_fields(
 @dataclass
 class _ShadowCurveState:
     curve_id: str
-    curve_kind: str  # "guard" | "compound_bare" | "compound_full"
+    curve_kind: str  # "guard" | "compound_bare" | "compound_full" | "event"
     guard_cfg: dict[str, Any] = field(default_factory=dict)
+    event_cfg: dict[str, Any] = field(default_factory=dict)
     compound_risk_fraction: float | None = None
     capital: float = STARTING_CAPITAL
     peak_capital: float = STARTING_CAPITAL
@@ -2439,6 +2700,7 @@ class _ShadowCurveState:
             "curve_id": self.curve_id,
             "curve_kind": self.curve_kind,
             "guard_cfg": dict(self.guard_cfg),
+            "event_cfg": dict(self.event_cfg),
             "compound_risk_fraction": self.compound_risk_fraction,
             # legacy key for resumed jobs saved before rename
             "compound_risk_pct": self.compound_risk_fraction,
@@ -2473,6 +2735,7 @@ class _ShadowCurveState:
             curve_id=str(raw.get("curve_id") or ""),
             curve_kind=str(raw.get("curve_kind") or "guard"),
             guard_cfg=dict(raw.get("guard_cfg") or {}),
+            event_cfg=dict(raw.get("event_cfg") or {}),
             compound_risk_fraction=(
                 float(frac_raw) if frac_raw is not None else None
             ),
@@ -2492,11 +2755,17 @@ class _ShadowCurveState:
 
 
 class _ShadowGuardRunner:
-    """Parallel shadow guard + compound capital curves for chrono backtests."""
+    """Parallel shadow guard + compound + event capital curves for chrono backtests."""
 
     def __init__(self) -> None:
         self.curves: dict[str, _ShadowCurveState] = {}
+        self.median_nights_by_tf: dict[str, float] = dict(DEFAULT_MEDIAN_NIGHTS_BY_TF)
         self._init_curves()
+
+    def set_median_nights_by_tf(self, medians: Mapping[str, float]) -> None:
+        self.median_nights_by_tf = dict(DEFAULT_MEDIAN_NIGHTS_BY_TF)
+        for tf, val in medians.items():
+            self.median_nights_by_tf[str(tf).strip().lower()] = float(val)
 
     def _init_curves(self) -> None:
         for cid, cfg in SHADOW_GUARD_CONFIGS.items():
@@ -2519,6 +2788,12 @@ class _ShadowGuardRunner:
                 curve_kind="compound_full",
                 compound_risk_fraction=float(frac),
                 guard_cfg=dict(SHADOW_FULL_STACK_CFG),
+            )
+        for eid, cfg in SHADOW_EVENT_CONFIGS.items():
+            self.curves[eid] = _ShadowCurveState(
+                curve_id=eid,
+                curve_kind="event",
+                event_cfg=dict(cfg),
             )
 
     @classmethod
@@ -2574,6 +2849,8 @@ class _ShadowGuardRunner:
             pre_ab_mrd = float(ctx.get("max_risk_dollars") or 0) / ab_real
         outcome = str(ctx.get("outcome") or "").strip().upper()
         won = outcome == "WIN"
+        ticker = str(ctx.get("ticker") or "").strip().upper()
+        timeframe = str(ctx.get("timeframe") or "").strip().lower()
 
         for cid, st in self.curves.items():
             if not st.activation_date and date_str:
@@ -2610,6 +2887,30 @@ class _ShadowGuardRunner:
                     )
                     guard_mult = float(guard_row.get("guard_total_mult") or 1.0)
                     mult = round(ab_shadow * guard_mult, 6)
+                    pnl = round(baseline_pnl * mult, 2)
+                    st.trades_taken += 1
+                    self._apply_pnl(st, pnl, date_str, sid, conf, mb, won)
+            elif st.curve_kind == "event":
+                event_row = _compute_event_shadow_entry(
+                    cfg=st.event_cfg,
+                    ticker=ticker,
+                    entry_d=scan_d,
+                    timeframe=timeframe,
+                    median_nights_by_tf=self.median_nights_by_tf,
+                )
+                if event_row.get("blocked"):
+                    blocked = True
+                    st.trades_blocked += 1
+                else:
+                    _, _, ab_shadow = _compute_ab_throttle_at_open(
+                        strategy_id=sid,
+                        confidence=conf,
+                        macro_bias=mb,
+                        strat_pnl_history=st.strat_pnl_history,
+                        st_medium_history=st.st_medium_history,
+                    )
+                    event_mult = float(event_row.get("mult") or 1.0)
+                    mult = round(ab_shadow * event_mult, 6)
                     pnl = round(baseline_pnl * mult, 2)
                     st.trades_taken += 1
                     self._apply_pnl(st, pnl, date_str, sid, conf, mb, won)
@@ -2722,6 +3023,13 @@ class _ShadowGuardRunner:
             if st.curve_kind.startswith("compound_")
         }
 
+    def event_summaries(self) -> dict[str, dict[str, Any]]:
+        return {
+            cid: self._curve_summary(st)
+            for cid, st in self.curves.items()
+            if st.curve_kind == "event"
+        }
+
 
 def _shadow_trade_ctx_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
     ab = float(row.get("ab_throttle") or 1.0)
@@ -2732,6 +3040,8 @@ def _shadow_trade_ctx_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
     pre_ab_risk = acct_risk / ab if ab > 0 else float(RISK_BY_CONFIDENCE.get(conf, 0.005))
     return {
         "date": row.get("date"),
+        "ticker": row.get("ticker"),
+        "timeframe": row.get("timeframe"),
         "strategy_id": row.get("strategy_id"),
         "confidence": conf,
         "macro_bias": str(row.get("macro_bias_adjusted") or row.get("macro_bias") or ""),
@@ -2747,15 +3057,18 @@ def _shadow_trade_ctx_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
 
 def _split_shadow_trade_maps(
     combined: Mapping[str, Mapping[str, Any]],
-) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
     guard: dict[str, dict[str, Any]] = {}
     compound: dict[str, dict[str, Any]] = {}
+    event: dict[str, dict[str, Any]] = {}
     for cid, payload in combined.items():
         if cid in SHADOW_GUARD_CONFIGS:
             guard[cid] = dict(payload)
+        elif cid in SHADOW_EVENT_CONFIGS:
+            event[cid] = dict(payload)
         else:
             compound[cid] = dict(payload)
-    return guard, compound
+    return guard, compound, event
 
 
 def _persist_shadow_guard_state(chrono_data: dict[str, Any], runner: _ShadowGuardRunner) -> None:
@@ -8121,6 +8434,11 @@ def _python_forced_layer2_trade(
         "pnl_dollars": pnl_dollars,
         "gross_pnl_pct": gross_pnl_pct,
         **_cost_fields,
+        **_event_attribution_fields(
+            ticker=sym,
+            entry_date=analysis_date,
+            nights_held=float(_cost_fields.get("nights_held", 0) or 0),
+        ),
         **_ab_row,
         "leverage": LEVERAGE,
         "position_size": round(position_size, 2),
@@ -9403,6 +9721,11 @@ def run_one_backtest(
             "pnl_dollars": pnl_dollars,
             "gross_pnl_pct": gross_pnl_pct,
             **_cost_fields,
+            **_event_attribution_fields(
+                ticker=sym,
+                entry_date=analysis_date,
+                nights_held=float(_cost_fields.get("nights_held", 0) or 0),
+            ),
             **_ab_row,
             "leverage": LEVERAGE,
             "position_size": round(position_size, 2),
@@ -10855,6 +11178,9 @@ def run_chronological_backtest(
             tickers = ["EURUSD"]
 
         shadow_runner = _ShadowGuardRunner.from_chrono(chrono_data)
+        shadow_runner.set_median_nights_by_tf(
+            _compute_median_nights_by_tf(list(chrono_data.get("all_trades") or []))
+        )
 
         intraday_res = chrono_data.get("chrono_intraday")
         if isinstance(intraday_res, dict) and intraday_res.get("date"):
@@ -11542,9 +11868,13 @@ def run_chronological_backtest(
                             row.setdefault("date", date_str)
                             _shadow_maps = shadow_runner.process_trade(_shadow_trade_ctx_from_row(row))
                             if _shadow_maps:
-                                guard_map, compound_map = _split_shadow_trade_maps(_shadow_maps)
-                                row["shadow_guard"] = guard_map
-                                row["shadow_compound"] = compound_map
+                                guard_map, compound_map, event_map = _split_shadow_trade_maps(_shadow_maps)
+                                if guard_map:
+                                    row["shadow_guard"] = guard_map
+                                if compound_map:
+                                    row["shadow_compound"] = compound_map
+                                if event_map:
+                                    row["shadow_event"] = event_map
                             day_trades.append(row)
                             day_pnl += pnl
                             capital += pnl
@@ -11729,6 +12059,7 @@ def run_chronological_backtest(
         }
         chrono_data["shadow_guard_summary"] = shadow_runner.guard_summaries()
         chrono_data["shadow_compound_summary"] = shadow_runner.compound_summaries()
+        chrono_data["shadow_event_summary"] = shadow_runner.event_summaries()
         _persist_shadow_guard_state(chrono_data, shadow_runner)
         chrono_data["v74_metrics"] = _v74_chrono_trade_metrics(all_trades)
         _assert_swap_financing_modeled(all_trades, context=f"Chrono {job_id}")

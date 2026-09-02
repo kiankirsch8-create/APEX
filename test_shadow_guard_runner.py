@@ -29,9 +29,10 @@ def test_shadow_runner_parallel_curves() -> None:
     assert "full_stack" in maps
     assert "compound_050_bare" in maps
     assert "compound_050_full" in maps
-    guard, compound = cb._split_shadow_trade_maps(maps)
+    guard, compound, event = cb._split_shadow_trade_maps(maps)
     assert len(guard) == 23
     assert len(compound) == len(cb.SHADOW_COMPOUND_RISK_FRACTIONS) * 2
+    assert len(event) == len(cb.SHADOW_EVENT_CONFIGS)
     assert maps["ramp40_025"]["blocked"] is False
     assert maps["ramp40_025"]["mult"] == cb.WARMUP_MULTIPLIER
 
