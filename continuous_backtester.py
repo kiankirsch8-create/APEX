@@ -627,6 +627,8 @@ BLOCKED_PAIRS: frozenset[str] = frozenset(
 )
 # Chrono-only: shadow-evaluate blocked/excluded/discovered instruments (real curve unchanged).
 SHADOW_BLOCKED_PAIRS = True
+# After this many completed simulated days, assert BLOCKED_PAIRS are producing shadow trades.
+SHADOW_BLOCKED_PAIRS_ASSERT_DAYS = 30
 
 
 def _real_chrono_forex_tickers() -> frozenset[str]:
@@ -991,10 +993,25 @@ def _is_group1_blocked_strategy(strategy_id: str) -> bool:
     return str(strategy_id or "").strip().upper() in BLOCKED_STRATEGIES_GROUP1
 
 
-def _hard_block_skip_reason(sym: str, strategy_id: str) -> str | None:
-    """Return skip reason when pair/strategy is hard-blocked; None if trade may proceed."""
+def _hard_block_skip_reason(
+    sym: str,
+    strategy_id: str,
+    *,
+    shadow_trade_row: bool = False,
+) -> str | None:
+    """Return skip reason when pair/strategy is hard-blocked; None if trade may proceed.
+
+    Pair blocks are bypassed only on the shadow path:
+    - while ``in_shadow_eval`` (inside the chrono scan), or
+    - when the already-built result is a shadow trade row (chrono post-scan, after
+      ``exit_shadow_eval`` — the failure mode that dropped BLOCKED_PAIRS trades).
+    Real-curve path still refuses BLOCKED_PAIRS.
+    """
     sym_u = str(sym or "").strip().upper()
-    if sym_u in BLOCKED_PAIRS and not _si.in_shadow_eval(sym_u):
+    allow_shadow_pair = _si.in_shadow_eval(sym_u) or (
+        bool(shadow_trade_row) and SHADOW_BLOCKED_PAIRS
+    )
+    if sym_u in BLOCKED_PAIRS and not allow_shadow_pair:
         return f"[BLOCKED PAIR] {sym_u} in BLOCKED_PAIRS list"
     sid_u = str(strategy_id or "").strip().upper()
     if _is_group1_blocked_strategy(sid_u):
@@ -11274,7 +11291,7 @@ def run_chronological_backtest(
                 if extra not in tickers:
                     tickers.append(extra)
             _si.reset_run_state()
-            if _si.SHADOW_INSTRUMENTS_FILE.is_file():
+            if _si.job_instruments_path(job_id).is_file():
                 _si.rebuild_histories(job_id)
 
         shadow_runner = _ShadowGuardRunner.from_chrono(chrono_data)
@@ -11918,6 +11935,9 @@ def run_chronological_backtest(
                             exec_block = _hard_block_skip_reason(
                                 str(res.get("ticker", ticker)),
                                 str(res.get("strategy_id", "")),
+                                shadow_trade_row=bool(
+                                    res.get("shadow_class") or res.get("shadow_instrument")
+                                ),
                             )
                             if exec_block:
                                 row = _chrono_gate_skip_row(
@@ -12129,6 +12149,17 @@ def run_chronological_backtest(
             chrono_data["status"] = "running"
             prev_dp = int(chrono_data.get("days_processed", 0) or 0)
             chrono_data["days_processed"] = prev_dp + 1
+            if (
+                SHADOW_BLOCKED_PAIRS
+                and int(chrono_data["days_processed"]) == SHADOW_BLOCKED_PAIRS_ASSERT_DAYS
+                and not chrono_data.get("_shadow_blocked_pairs_asserted")
+            ):
+                _si.assert_blocked_pairs_have_trades(
+                    job_id,
+                    blocked_pairs=BLOCKED_PAIRS,
+                    discovery=chrono_data.get("shadow_universe_discovery") or {},
+                )
+                chrono_data["_shadow_blocked_pairs_asserted"] = True
             _persist_shadow_guard_state(chrono_data, shadow_runner)
             save_json(chrono_path, chrono_data)
 
