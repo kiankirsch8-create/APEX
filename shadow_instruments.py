@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import time
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Iterator, Mapping
 
 from utils import DATA_DIR, log
@@ -50,12 +51,29 @@ SHADOW_INSTRUMENTS: dict[str, dict[str, Any]] = {
     },
 }
 
-SHADOW_INSTRUMENTS_FILE = DATA_DIR / "shadow_instruments.jsonl"
+SHADOW_INSTRUMENTS_FILE = DATA_DIR / "shadow_instruments.jsonl"  # legacy; prefer per-job path
+SHADOW_BLOCKED_PAIRS_FILE = DATA_DIR / "shadow_blocked_pairs.jsonl"  # legacy; prefer per-job path
 SHADOW_PROBE_CACHE_FILE = DATA_DIR / "shadow_universe_probe.json"
 
 SHADOW_MAX_EXTRA_FX = 25
 SHADOW_UNIVERSE_HARD_CAP = 45
 PROBE_BATCH_SLEEP_SEC = 0.5
+# Auto-discovered extra FX off: Yahoo mirror conventions (CHFEUR etc.) are not interpretable
+# and dominated scan cost (~241%/day) in job 4a6f3034.
+SHADOW_EXTRA_FX_ENABLED = False
+
+
+def _safe_job_id(job_id: str) -> str:
+    jid = str(job_id or "").strip() or "unknown"
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in jid)
+
+
+def job_instruments_path(job_id: str) -> Path:
+    return DATA_DIR / f"shadow_instruments_{_safe_job_id(job_id)}.jsonl"
+
+
+def job_blocked_pairs_path(job_id: str) -> Path:
+    return DATA_DIR / f"shadow_blocked_pairs_{_safe_job_id(job_id)}.jsonl"
 
 # Majors + traded crosses for Part 2 extra_fx discovery only (not Part 1 blocked pairs).
 SHADOW_FX_EXTRA_CURRENCIES: tuple[str, ...] = (
@@ -112,6 +130,7 @@ _shadow_universe: dict[str, Any] = {
     "class_by_ticker": {},
     "yf_by_ticker": {},
     "spec_by_ticker": {},
+    "reason_by_ticker": {},
     "failed": {},
     "provisional_futures": set(),
     "real_tickers": set(),
@@ -281,10 +300,13 @@ def _shadow_trade_sort_key(r: Mapping[str, Any]) -> tuple[int, str, str, str]:
 
 def _iter_trades_for_job(job_id: str) -> Iterator[dict[str, Any]]:
     jid = str(job_id or "").strip()
-    if not jid or not SHADOW_INSTRUMENTS_FILE.is_file():
+    if not jid:
+        return
+    path = job_instruments_path(jid)
+    if not path.is_file():
         return
     try:
-        with open(SHADOW_INSTRUMENTS_FILE, encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -293,8 +315,11 @@ def _iter_trades_for_job(job_id: str) -> Iterator[dict[str, Any]]:
                     row = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if isinstance(row, dict) and str(row.get("job_id", "")).strip() == jid:
-                    yield row
+                if isinstance(row, dict):
+                    # Per-job file; still tolerate legacy rows that embedded job_id.
+                    row_jid = str(row.get("job_id", "")).strip()
+                    if not row_jid or row_jid == jid:
+                        yield row
     except OSError as e:
         log(f"[SHADOW INST] stream error: {e}", level="warning")
 
@@ -335,13 +360,40 @@ def load_trades_for_job(job_id: str) -> list[dict[str, Any]]:
     return list(_iter_trades_for_job(job_id))
 
 
-def append_trade_row(row: dict[str, Any]) -> None:
+def append_trade_row(row: dict[str, Any], *, job_id: str) -> None:
+    path = job_instruments_path(job_id)
     try:
-        SHADOW_INSTRUMENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(SHADOW_INSTRUMENTS_FILE, "a", encoding="utf-8") as f:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(row, default=str, separators=(",", ":")) + "\n")
     except OSError as e:
         log(f"[SHADOW INST] append error: {e}", level="error")
+
+
+def append_blocked_pair_row(row: dict[str, Any], *, job_id: str) -> None:
+    """Dual-write Part 1 blocked/excluded rows to the dedicated per-job file."""
+    path = job_blocked_pairs_path(job_id)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, default=str, separators=(",", ":")) + "\n")
+    except OSError as e:
+        log(f"[SHADOW INST] blocked-pairs append error: {e}", level="error")
+
+
+def shadow_reason_for_ticker(sym: str) -> str | None:
+    sym_u = str(sym or "").strip().upper()
+    reason = _shadow_universe.get("reason_by_ticker", {}).get(sym_u)
+    if reason:
+        return str(reason)
+    sc = shadow_class_for_ticker(sym_u)
+    if sc == "extra_fx":
+        return "EXTRA_FX"
+    if sc == "commodity":
+        return "COMMODITY"
+    if sc == "index_future":
+        return "INDEX_FUTURE"
+    return None
 
 
 def persist_shadow_trade(row: dict[str, Any], *, job_id: str) -> None:
@@ -350,6 +402,9 @@ def persist_shadow_trade(row: dict[str, Any], *, job_id: str) -> None:
     sc = shadow_class_for_ticker(sym) or str(out.get("shadow_class") or "blocked_fx")
     out["shadow_instrument"] = sym
     out["shadow_class"] = sc
+    reason = shadow_reason_for_ticker(sym) or out.get("shadow_reason")
+    if reason:
+        out["shadow_reason"] = reason
     out["spec_estimated"] = bool(sym in SHADOW_INSTRUMENTS)
     mrd = float(out.get("max_risk_dollars", 0) or 0)
     pnl = float(out.get("pnl_dollars", 0) or 0)
@@ -357,7 +412,12 @@ def persist_shadow_trade(row: dict[str, Any], *, job_id: str) -> None:
     out.setdefault("job_id", job_id)
     if is_provisional_future(sym):
         out["provisional_roll_series"] = True
-    append_trade_row(out)
+    append_trade_row(out, job_id=job_id)
+    if sc == "blocked_fx" or str(out.get("shadow_reason", "")) in (
+        "BLOCKED_PAIR",
+        "EXCLUDED_PAIR",
+    ):
+        append_blocked_pair_row(out, job_id=job_id)
     _record_ab_histories(out, sc)
 
 
@@ -378,9 +438,57 @@ def trade_fields_for_row(sym: str) -> dict[str, Any]:
         "shadow_class": sc,
         "spec_estimated": sym in SHADOW_INSTRUMENTS,
     }
+    reason = shadow_reason_for_ticker(sym)
+    if reason:
+        fields["shadow_reason"] = reason
     if is_provisional_future(sym):
         fields["provisional_roll_series"] = True
     return fields
+
+
+def assert_blocked_pairs_have_trades(
+    job_id: str,
+    *,
+    blocked_pairs: frozenset[str] | set[str],
+    discovery: Mapping[str, Any],
+) -> list[str]:
+    """Loud error if loaded BLOCKED_PAIRS produced zero shadow trades after N days."""
+    loaded = {
+        str(t).strip().upper()
+        for t in (discovery.get("loaded_tickers") or [])
+        if isinstance(t, str)
+    }
+    expected = sorted(
+        t
+        for t in blocked_pairs
+        if str(t).strip().upper() in loaded
+        and str(t).strip().upper() not in SHADOW_INSTRUMENTS
+    )
+    if not expected:
+        return []
+    seen: set[str] = set()
+    for row in _iter_trades_for_job(job_id):
+        if row.get("skipped"):
+            continue
+        if str(row.get("outcome", "")).strip().upper() not in ("WIN", "LOSS"):
+            continue
+        tkr = str(row.get("shadow_instrument") or row.get("ticker", "")).strip().upper()
+        if tkr in expected:
+            seen.add(tkr)
+    missing = [t for t in expected if t not in seen]
+    if missing:
+        log(
+            f"[SHADOW INST] ERROR: after startup window, zero shadow trades for "
+            f"BLOCKED_PAIRS loaded into universe: {missing}. "
+            f"BLOCKED_PAIRS gate is still rejecting the shadow path.",
+            level="error",
+        )
+    else:
+        log(
+            f"[SHADOW INST] blocked-pair shadow check OK — trades seen for {expected}",
+            level="info",
+        )
+    return missing
 
 
 def _standalone_max_dd_r(r_values: list[float]) -> float:
@@ -687,6 +795,7 @@ def init_shadow_universe(
         "class_by_ticker": {},
         "yf_by_ticker": {},
         "spec_by_ticker": {k: dict(v) for k, v in SHADOW_INSTRUMENTS.items()},
+        "reason_by_ticker": {},
         "failed": {},
         "provisional_futures": set(),
         "real_tickers": set(real_chrono_tickers),
@@ -711,6 +820,7 @@ def init_shadow_universe(
     tickers: set[str] = set()
     class_by: dict[str, ShadowClass] = {}
     yf_by: dict[str, str] = {}
+    reason_by: dict[str, str] = {}
     real = set(real_chrono_tickers)
     probe_cache = _load_probe_cache()
     cache_dirty = False
@@ -738,6 +848,10 @@ def init_shadow_universe(
             tickers.add(pair)
             class_by[pair] = "blocked_fx"
             yf_by[pair] = f"{pair}=X"
+            if pair in blocked_pairs:
+                reason_by[pair] = "BLOCKED_PAIR"
+            else:
+                reason_by[pair] = "EXCLUDED_PAIR"
         else:
             failed[pair] = reason
             if pair in PART1_DATA_EXCLUDED_FX:
@@ -746,40 +860,47 @@ def init_shadow_universe(
                     level="warning",
                 )
 
-    extra_candidates = [
-        p for p in _fx_pair_candidates() if p not in tickers and p not in real
-    ]
-    for idx, pair in enumerate(extra_candidates):
-        if loaded_extra_fx >= SHADOW_MAX_EXTRA_FX:
-            extra_fx_untested = len(extra_candidates) - idx
-            break
-        tested += 1
-        ok, reason, probed = _probe_fx_ohlc_cached(
-            pair,
-            start_d,
-            end_d,
-            yf_download_fn=yf_download_fn,
-            hourly_ok=hourly_ok,
-            cache=probe_cache,
-        )
-        if probed:
-            cache_dirty = True
-            time.sleep(PROBE_BATCH_SLEEP_SEC)
-        if ok:
-            loaded_fx += 1
-            loaded_extra_fx += 1
-            tickers.add(pair)
-            class_by[pair] = "extra_fx"
-            yf_by[pair] = f"{pair}=X"
+    if SHADOW_EXTRA_FX_ENABLED:
+        extra_candidates = [
+            p for p in _fx_pair_candidates() if p not in tickers and p not in real
+        ]
+        for idx, pair in enumerate(extra_candidates):
+            if loaded_extra_fx >= SHADOW_MAX_EXTRA_FX:
+                extra_fx_untested = len(extra_candidates) - idx
+                break
+            tested += 1
+            ok, reason, probed = _probe_fx_ohlc_cached(
+                pair,
+                start_d,
+                end_d,
+                yf_download_fn=yf_download_fn,
+                hourly_ok=hourly_ok,
+                cache=probe_cache,
+            )
+            if probed:
+                cache_dirty = True
+                time.sleep(PROBE_BATCH_SLEEP_SEC)
+            if ok:
+                loaded_fx += 1
+                loaded_extra_fx += 1
+                tickers.add(pair)
+                class_by[pair] = "extra_fx"
+                yf_by[pair] = f"{pair}=X"
+                reason_by[pair] = "EXTRA_FX"
+            else:
+                failed[pair] = reason
         else:
-            failed[pair] = reason
-    else:
-        extra_fx_untested = 0
+            extra_fx_untested = 0
 
-    if extra_fx_untested > 0:
+        if extra_fx_untested > 0:
+            log(
+                f"[SHADOW INST] extra_fx cap reached ({SHADOW_MAX_EXTRA_FX} loaded); "
+                f"{extra_fx_untested} candidates left untested",
+                level="info",
+            )
+    else:
         log(
-            f"[SHADOW INST] extra_fx cap reached ({SHADOW_MAX_EXTRA_FX} loaded); "
-            f"{extra_fx_untested} candidates left untested",
+            "[SHADOW INST] extra_fx discovery disabled (SHADOW_EXTRA_FX_ENABLED=False)",
             level="info",
         )
 
@@ -803,6 +924,7 @@ def init_shadow_universe(
             sc_nf: ShadowClass = "index_future" if ticker in ("ES", "NQ") else "commodity"
             class_by[ticker] = sc_nf
             yf_by[ticker] = str(spec["source"])
+            reason_by[ticker] = "INDEX_FUTURE" if sc_nf == "index_future" else "COMMODITY"
             if provisional:
                 _shadow_universe["provisional_futures"].add(ticker)
         else:
@@ -822,6 +944,7 @@ def init_shadow_universe(
                 tickers.discard(sym)
                 class_by.pop(sym, None)
                 yf_by.pop(sym, None)
+                reason_by.pop(sym, None)
         loaded_extra_fx = 0
         loaded_fx = loaded_part1
         hard_cap_applied = True
@@ -830,6 +953,7 @@ def init_shadow_universe(
     _shadow_universe["tickers"] = tickers
     _shadow_universe["class_by_ticker"] = class_by
     _shadow_universe["yf_by_ticker"] = yf_by
+    _shadow_universe["reason_by_ticker"] = reason_by
     _shadow_universe["failed"] = failed
 
     real_scan_count = len(real)
@@ -839,6 +963,7 @@ def init_shadow_universe(
         "pairs_tested": tested,
         "fx_loaded": loaded_fx,
         "part1_fx_loaded": loaded_part1,
+        "extra_fx_enabled": bool(SHADOW_EXTRA_FX_ENABLED),
         "extra_fx_loaded": loaded_extra_fx,
         "extra_fx_untested": extra_fx_untested,
         "extra_fx_max": SHADOW_MAX_EXTRA_FX,
@@ -849,6 +974,7 @@ def init_shadow_universe(
         "total_failed": len(failed),
         "failed_sample": dict(list(failed.items())[:20]),
         "loaded_tickers": sorted(tickers),
+        "reason_by_ticker": dict(reason_by),
         "est_scan_increase_pct_per_day": est_pct,
     }
     _shadow_universe["discovery"] = discovery
@@ -875,25 +1001,37 @@ def restore_universe_from_saved(
     """Rehydrate shadow universe from a prior chrono job (skip OHLC re-probe)."""
     global _shadow_universe
     loaded = [str(t).strip().upper() for t in (discovery.get("loaded_tickers") or [])]
+    saved_reasons = discovery.get("reason_by_ticker") or {}
     tickers: set[str] = set()
     class_by: dict[str, ShadowClass] = {}
     yf_by: dict[str, str] = {}
+    reason_by: dict[str, str] = {}
     for sym in loaded:
         tickers.add(sym)
         if sym in blocked_pairs or sym in PART1_DATA_EXCLUDED_FX:
             class_by[sym] = "blocked_fx"
+            yf_by[sym] = f"{sym}=X"
+            if sym in blocked_pairs:
+                reason_by[sym] = "BLOCKED_PAIR"
+            else:
+                reason_by[sym] = "EXCLUDED_PAIR"
         elif sym in SHADOW_INSTRUMENTS:
             class_by[sym] = "index_future" if sym in ("ES", "NQ") else "commodity"
             yf_by[sym] = str(SHADOW_INSTRUMENTS[sym]["source"])
+            reason_by[sym] = "INDEX_FUTURE" if sym in ("ES", "NQ") else "COMMODITY"
         else:
             class_by[sym] = "extra_fx"
             yf_by[sym] = f"{sym}=X"
+            reason_by[sym] = "EXTRA_FX"
+        if isinstance(saved_reasons, dict) and saved_reasons.get(sym):
+            reason_by[sym] = str(saved_reasons[sym])
     provisional = {t for t in loaded if t in ("ES", "NQ")}
     _shadow_universe = {
         "tickers": tickers,
         "class_by_ticker": class_by,
         "yf_by_ticker": yf_by,
         "spec_by_ticker": {k: dict(v) for k, v in SHADOW_INSTRUMENTS.items()},
+        "reason_by_ticker": reason_by,
         "failed": dict(discovery.get("failed_sample") or {}),
         "provisional_futures": provisional,
         "real_tickers": set(real_chrono_tickers),

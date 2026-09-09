@@ -5,7 +5,6 @@ import json
 from datetime import date
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
 
 import continuous_backtester as cb
 import shadow_instruments as si
@@ -18,7 +17,18 @@ def test_hard_block_bypassed_in_shadow_eval() -> None:
         assert si.trade_fields_for_row("AUDUSD")["shadow_class"] == "blocked_fx"
     finally:
         si.exit_shadow_eval()
+    # After exit_shadow_eval the in-scan bypass is gone, but a completed shadow
+    # trade row must still pass the chrono post-scan gate.
     assert cb._hard_block_skip_reason("AUDUSD", "T01") is not None
+    assert (
+        cb._hard_block_skip_reason("AUDUSD", "T01", shadow_trade_row=True) is None
+    )
+
+
+def test_hard_block_still_blocks_real_curve() -> None:
+    si.exit_shadow_eval()
+    assert cb._hard_block_skip_reason("AUDUSD", "T01") is not None
+    assert cb._hard_block_skip_reason("AUDUSD", "T01", shadow_trade_row=False) is not None
 
 
 def test_shadow_ab_histories_per_class() -> None:
@@ -43,7 +53,8 @@ def test_shadow_ab_histories_per_class() -> None:
 
 def test_compute_summary_streams_jsonl(tmp_path: Path, monkeypatch: Any) -> None:
     job_id = "test-job-summary"
-    jsonl = tmp_path / "shadow_instruments.jsonl"
+    monkeypatch.setattr(si, "DATA_DIR", tmp_path)
+    jsonl = si.job_instruments_path(job_id)
     rows = [
         {
             "job_id": job_id,
@@ -65,7 +76,6 @@ def test_compute_summary_streams_jsonl(tmp_path: Path, monkeypatch: Any) -> None
         },
     ]
     jsonl.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
-    monkeypatch.setattr(si, "SHADOW_INSTRUMENTS_FILE", jsonl)
     summary = si.compute_summary(job_id)
     aud = summary["by_ticker"]["AUDUSD"]
     assert aud["net_r"] == 0.5
@@ -121,7 +131,48 @@ def test_fx_pair_candidates_majors_only() -> None:
     assert "USDMXN" not in pairs
 
 
-def test_extra_fx_cap_stops_probing(monkeypatch: Any) -> None:
+def test_extra_fx_disabled_by_default(monkeypatch: Any) -> None:
+    assert si.SHADOW_EXTRA_FX_ENABLED is False
+    monkeypatch.setattr(si, "PART1_DATA_EXCLUDED_FX", frozenset())
+    probe_calls: list[str] = []
+
+    def fake_probe(
+        pair: str,
+        start_d: date,
+        end_d: date,
+        *,
+        yf_download_fn: Any,
+        hourly_ok: bool,
+        cache: dict[str, dict[str, Any]],
+    ) -> tuple[bool, str, bool]:
+        probe_calls.append(pair)
+        return True, "ok", True
+
+    monkeypatch.setattr(si, "_probe_fx_ohlc_cached", fake_probe)
+    monkeypatch.setattr(
+        si,
+        "_test_non_forex_ohlc",
+        lambda *a, **k: (False, "skip", False),
+    )
+    monkeypatch.setattr(si, "time", type("T", (), {"sleep": staticmethod(lambda _: None)})())
+    discovery = si.init_shadow_universe(
+        start_date="2021-01-01",
+        end_date="2025-01-01",
+        blocked_pairs=frozenset({"AUDUSD"}),
+        excluded_pairs=frozenset(),
+        real_chrono_tickers=frozenset(),
+        yf_download_fn=lambda *a, **k: None,
+        hourly_earliest_fn=lambda: date(2020, 1, 1),
+        enabled=True,
+    )
+    assert discovery["extra_fx_enabled"] is False
+    assert discovery["extra_fx_loaded"] == 0
+    assert probe_calls == ["AUDUSD"]
+    assert discovery["reason_by_ticker"]["AUDUSD"] == "BLOCKED_PAIR"
+
+
+def test_extra_fx_cap_stops_probing_when_enabled(monkeypatch: Any) -> None:
+    monkeypatch.setattr(si, "SHADOW_EXTRA_FX_ENABLED", True)
     monkeypatch.setattr(si, "SHADOW_MAX_EXTRA_FX", 2)
     monkeypatch.setattr(si, "PART1_DATA_EXCLUDED_FX", frozenset())
     probe_calls: list[str] = []
@@ -162,7 +213,8 @@ def test_extra_fx_cap_stops_probing(monkeypatch: Any) -> None:
 
 def test_rebuild_histories_sorts_by_close_ts(tmp_path: Path, monkeypatch: Any) -> None:
     job_id = "sort-job"
-    jsonl = tmp_path / "shadow_instruments.jsonl"
+    monkeypatch.setattr(si, "DATA_DIR", tmp_path)
+    jsonl = si.job_instruments_path(job_id)
     rows = [
         {
             "job_id": job_id,
@@ -189,10 +241,75 @@ def test_rebuild_histories_sorts_by_close_ts(tmp_path: Path, monkeypatch: Any) -
         },
     ]
     jsonl.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
-    monkeypatch.setattr(si, "SHADOW_INSTRUMENTS_FILE", jsonl)
     si.rebuild_histories(job_id)
     hist = si._shadow_strat_by_class["blocked_fx"]["T01"]
     assert hist["last3"] == [-5.0, 10.0]
+
+
+def test_persist_dual_writes_blocked_pairs_file(tmp_path: Path, monkeypatch: Any) -> None:
+    job_id = "dual-write"
+    monkeypatch.setattr(si, "DATA_DIR", tmp_path)
+    si._shadow_universe["class_by_ticker"] = {"AUDUSD": "blocked_fx", "AUDCAD": "blocked_fx"}
+    si._shadow_universe["reason_by_ticker"] = {
+        "AUDUSD": "BLOCKED_PAIR",
+        "AUDCAD": "EXCLUDED_PAIR",
+    }
+    si.persist_shadow_trade(
+        {
+            "ticker": "AUDUSD",
+            "outcome": "WIN",
+            "pnl_dollars": 10.0,
+            "max_risk_dollars": 10.0,
+            "strategy_id": "T01",
+        },
+        job_id=job_id,
+    )
+    si.persist_shadow_trade(
+        {
+            "ticker": "AUDCAD",
+            "outcome": "LOSS",
+            "pnl_dollars": -5.0,
+            "max_risk_dollars": 10.0,
+            "strategy_id": "T01",
+        },
+        job_id=job_id,
+    )
+    inst = si.job_instruments_path(job_id).read_text(encoding="utf-8").strip().splitlines()
+    blocked = si.job_blocked_pairs_path(job_id).read_text(encoding="utf-8").strip().splitlines()
+    assert len(inst) == 2
+    assert len(blocked) == 2
+    reasons = {json.loads(line)["shadow_reason"] for line in blocked}
+    assert reasons == {"BLOCKED_PAIR", "EXCLUDED_PAIR"}
+
+
+def test_assert_blocked_pairs_have_trades(tmp_path: Path, monkeypatch: Any) -> None:
+    job_id = "assert-job"
+    monkeypatch.setattr(si, "DATA_DIR", tmp_path)
+    discovery = {"loaded_tickers": ["AUDUSD", "USDCAD", "AUDCAD"]}
+    missing = si.assert_blocked_pairs_have_trades(
+        job_id,
+        blocked_pairs=frozenset({"AUDUSD", "USDCAD"}),
+        discovery=discovery,
+    )
+    assert missing == ["AUDUSD", "USDCAD"]
+    si.job_instruments_path(job_id).write_text(
+        json.dumps(
+            {
+                "ticker": "AUDUSD",
+                "shadow_instrument": "AUDUSD",
+                "outcome": "WIN",
+                "pnl_dollars": 1.0,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    missing2 = si.assert_blocked_pairs_have_trades(
+        job_id,
+        blocked_pairs=frozenset({"AUDUSD", "USDCAD"}),
+        discovery=discovery,
+    )
+    assert missing2 == ["USDCAD"]
 
 
 def test_real_curve_tickers_exclude_blocked() -> None:
