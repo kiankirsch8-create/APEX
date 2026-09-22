@@ -30,13 +30,36 @@ def test_sessions_for_utc_hour_overlaps_and_primary() -> None:
     assert cb.sessions_for_utc_hour(18)[0] == "new_york"
 
 
-def test_chrono_session_no_longer_hardcodes_new_york_for_daily() -> None:
-    tags = cb.session_tag_fields(analysis_date="2024-03-01")
-    assert tags["entry_hour_utc"] == 0
-    assert tags["session"] in ("sydney", "tokyo")
-    assert tags["session"] in tags["sessions"]
-    # Old helper mapped every 1d/1w trade to new_york — that must not be the entry-hour tag.
-    assert tags["session"] != "new_york"
+def test_daily_weekly_session_is_na() -> None:
+    for tf in ("1d", "1w", "1D", "1W"):
+        tags = cb.session_tag_fields(timeframe=tf, analysis_date="2024-03-01")
+        assert tags["session"] == "n/a"
+        assert tags["sessions"] == []
+        assert tags["entry_hour_utc"] is None
+
+
+def test_intraday_session_uses_entry_hour() -> None:
+    tags = cb.session_tag_fields(
+        timeframe="1h",
+        analysis_date="2024-03-01",
+        entry_hour_utc=14,
+    )
+    assert tags["entry_hour_utc"] == 14
+    assert tags["sessions"] == ["london", "new_york"]
+    assert tags["session"] == "new_york"
+
+    tags_4h = cb.session_tag_fields(
+        timeframe="4h",
+        entry_hour_utc=23,
+    )
+    assert tags_4h["session"] == "sydney"
+    assert tags_4h["sessions"] == ["sydney"]
+
+    # Intraday without a recoverable hour stays untaggable — no invented default.
+    tags_missing = cb.session_tag_fields(timeframe="1h", past=None)
+    assert tags_missing["session"] == "n/a"
+    assert tags_missing["sessions"] == []
+    assert tags_missing["entry_hour_utc"] is None
 
 
 def test_finalize_net_outcome_uses_pnl_dollars() -> None:
@@ -74,13 +97,16 @@ def test_assert_outcome_matches_net_pnl_logs_mismatch(capsys=None) -> None:
     cb._assert_outcome_matches_net_pnl(good, context="unit-test-ok")
 
 
-def test_calc_session_performance_uses_primary_tags() -> None:
+def test_calc_session_performance_skips_na() -> None:
     trades = [
         {"session": "sydney", "outcome": "WIN", "pnl_dollars": 10.0},
+        {"session": "n/a", "outcome": "WIN", "pnl_dollars": 99.0},
         {"session": "new_york", "outcome": "LOSS", "pnl_dollars": -5.0},
         {"session": "new_york", "outcome": "WIN", "pnl_dollars": 2.0},
+        {"session": "n/a", "outcome": "LOSS", "pnl_dollars": -1.0},
     ]
     perf = cb._calc_session_performance(trades)
     assert perf["sydney"]["total"] == 1
     assert perf["new_york"]["total"] == 2
-    assert "asia" not in perf
+    assert "n/a" not in perf
+    assert perf["untaggable_trades"] == 2

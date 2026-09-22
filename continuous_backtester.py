@@ -802,6 +802,10 @@ TRADE_SESSION_WINDOWS: dict[str, tuple[int, int]] = {
     "new_york": (12, 21),
 }
 TRADE_SESSION_ORDER: tuple[str, ...] = ("sydney", "tokyo", "london", "new_york")
+# Only these TFs carry an intraday bar timestamp usable for session tagging.
+# 1d/1w span all sessions — no honest entry hour exists.
+INTRADAY_SESSION_TFS: frozenset[str] = frozenset({"15m", "30m", "1h", "4h"})
+SESSION_UNTAGGABLE = "n/a"
 
 # Rolling batch: only scan pairs relevant to the active UTC session (Lovable toggles via session_config).
 SESSION_PAIRS: dict[str, tuple[str, ...]] = {
@@ -8446,7 +8450,11 @@ def _python_forced_layer2_trade(
         outcome_gross=outcome_gross,
         pnl_dollars=pnl_dollars,
     )
-    _session_tags = session_tag_fields(past=past, analysis_date=analysis_date)
+    _session_tags = session_tag_fields(
+        timeframe=tf_key,
+        past=past,
+        analysis_date=analysis_date,
+    )
     _ab_row = _ab_trade_record_fields(
         pnl_dollars=pnl_dollars,
         max_risk_dollars=max_risk_dollars,
@@ -9657,7 +9665,11 @@ def run_one_backtest(
             outcome_gross=outcome_gross,
             pnl_dollars=pnl_dollars,
         )
-        _session_tags = session_tag_fields(past=past, analysis_date=analysis_date)
+        _session_tags = session_tag_fields(
+            timeframe=tf_key,
+            past=past,
+            analysis_date=analysis_date,
+        )
         _ab_row = _ab_trade_record_fields(
             pnl_dollars=pnl_dollars,
             max_risk_dollars=max_risk_dollars,
@@ -10951,13 +10963,8 @@ def _utc_hour_from_timestamp(ts: Any) -> int | None:
         return None
 
 
-def entry_utc_hour_from_past(past: pd.DataFrame | None, analysis_date: str = "") -> int:
-    """
-    Entry hour in UTC from the signal bar timestamp.
-
-    Daily/weekly Yahoo bars are typically stamped at 00:00 — that hour is used
-    as-is (not invented from wall-clock). Fallback: 0 if no bar index.
-    """
+def entry_utc_hour_from_past(past: pd.DataFrame | None, analysis_date: str = "") -> int | None:
+    """Entry hour in UTC from the signal bar timestamp, or None if unavailable."""
     if past is not None and not getattr(past, "empty", True):
         try:
             h = _utc_hour_from_timestamp(past.index[-1])
@@ -10965,21 +10972,44 @@ def entry_utc_hour_from_past(past: pd.DataFrame | None, analysis_date: str = "")
                 return h
         except (IndexError, KeyError, TypeError, AttributeError):
             pass
-    _ = analysis_date  # reserved for future date-based fallbacks
-    return 0
+    _ = analysis_date
+    return None
+
+
+def _is_intraday_session_tf(timeframe: str) -> bool:
+    return str(timeframe or "").strip().lower() in INTRADAY_SESSION_TFS
 
 
 def session_tag_fields(
     *,
+    timeframe: str,
     past: pd.DataFrame | None = None,
     analysis_date: str = "",
     entry_hour_utc: int | None = None,
 ) -> dict[str, Any]:
+    """
+    Tag trade session from entry-bar UTC hour — only for intraday TFs.
+
+    Daily/weekly bars span all sessions and carry no recoverable entry hour;
+    those trades get session=\"n/a\", sessions=[], entry_hour_utc=None.
+    """
+    if not _is_intraday_session_tf(timeframe):
+        return {
+            "session": SESSION_UNTAGGABLE,
+            "sessions": [],
+            "entry_hour_utc": None,
+        }
     hour = (
         int(entry_hour_utc) % 24
         if entry_hour_utc is not None
         else entry_utc_hour_from_past(past, analysis_date)
     )
+    if hour is None:
+        return {
+            "session": SESSION_UNTAGGABLE,
+            "sessions": [],
+            "entry_hour_utc": None,
+        }
     primary, sessions = sessions_for_utc_hour(hour)
     return {
         "session": primary,
@@ -11033,16 +11063,30 @@ def _assert_outcome_matches_net_pnl(
 
 
 def _chrono_session_for_timeframe(timeframe: str) -> str:
-    """Deprecated timeframe→session map (was the all-new_york bug). Prefer session_tag_fields."""
-    _ = timeframe
-    primary, _sessions = sessions_for_utc_hour(0)
-    return primary
+    """Legacy helper — delegates to session_tag_fields (n/a for daily/weekly)."""
+    return str(session_tag_fields(timeframe=timeframe).get("session") or SESSION_UNTAGGABLE)
 
 
 def _calc_session_performance(trades: list[dict[str, Any]]) -> dict[str, Any]:
+    untaggable = 0
+    tagged: list[dict[str, Any]] = []
+    for t in trades:
+        if not isinstance(t, dict):
+            continue
+        sess = str(t.get("session") or "").strip().lower()
+        if sess in ("", SESSION_UNTAGGABLE, "none", "nan"):
+            untaggable += 1
+            continue
+        tagged.append(t)
+    if untaggable:
+        log(
+            f"[SESSION] {untaggable} trades untaggable (non-intraday / no entry hour) "
+            f"— excluded from session_performance",
+            level="info",
+        )
     sessions: dict[str, Any] = {}
     for s in TRADE_SESSION_ORDER:
-        s_trades = [t for t in trades if t.get("session") == s]
+        s_trades = [t for t in tagged if t.get("session") == s]
         if not s_trades:
             continue
         wins = [t for t in s_trades if t.get("outcome") == "WIN"]
@@ -11054,6 +11098,8 @@ def _calc_session_performance(trades: list[dict[str, Any]]) -> dict[str, Any]:
             "win_rate": round(len(wins) / max(1, len(s_trades)) * 100, 1),
             "pnl": round(sum(float(t.get("pnl_dollars", 0) or 0) for t in s_trades), 2),
         }
+    if untaggable:
+        sessions["untaggable_trades"] = untaggable
     return sessions
 
 
@@ -11751,7 +11797,10 @@ def run_chronological_backtest(
                             if chrono_stop_requested(job_id):
                                 chrono_abort = True
                                 break
-                            session_fields = session_tag_fields(analysis_date=date_str)
+                            session_fields = session_tag_fields(
+                                timeframe=timeframe,
+                                analysis_date=date_str,
+                            )
                             session = session_fields["session"]
                             tpos = CHRONO_TICKERS.index(ticker) + 1 if ticker in CHRONO_TICKERS else 0
                             CHRONO_LIVE_STATUS.update(
