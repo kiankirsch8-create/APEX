@@ -318,6 +318,39 @@ LOT_FLOOR_POLICY = "skip"  # primary label; both "skip" and "round_up" are alway
 LOT_FLOOR_POLICIES: tuple[str, ...] = ("skip", "round_up")
 LOT_FLOOR_REF_ACCOUNT = 10000.0  # position_size on the real curve is sized for this
 
+# ---------------------------------------------------------------------------
+# Shadow stop placement — write-only forward sims (real curve unchanged).
+#
+# Finding (job 0f19c0a2 / enforce_rules): ATR and structure stops exist upstream
+# (model prompt, ATR fallback, Layer-2 ATR) but MIN_STOP_PCT floors them to a
+# fixed % (0.50% 1d / 0.80% 1w). No Python swing initial-stop; swings are trail-
+# only. This is a shadow experiment of alternatives to that floor, not a bug fix
+# of the floor itself.
+# ---------------------------------------------------------------------------
+SHADOW_STOP_ENABLED = True
+SHADOW_STOP_CONFIGS: list[tuple[str, dict[str, Any]]] = [
+    # controls
+    ("fixed_current", {"mode": "fixed_pct", "mult": 1.00}),  # baseline
+    ("fixed_075", {"mode": "fixed_pct", "mult": 0.75}),
+    ("fixed_125", {"mode": "fixed_pct", "mult": 1.25}),
+    ("fixed_200", {"mode": "fixed_pct", "mult": 2.00}),
+    # volatility
+    ("atr_1_0", {"mode": "atr", "mult": 1.0}),
+    ("atr_1_5", {"mode": "atr", "mult": 1.5}),
+    ("atr_2_0", {"mode": "atr", "mult": 2.0}),
+    ("atr_2_5", {"mode": "atr", "mult": 2.5}),
+    # structure
+    ("swing_10", {"mode": "swing", "lookback": 10, "buffer_atr": 0.0}),
+    ("swing_20", {"mode": "swing", "lookback": 20, "buffer_atr": 0.0}),
+    ("swing_20_buf", {"mode": "swing", "lookback": 20, "buffer_atr": 0.25}),
+    # hybrid — never tighter than volatility allows
+    ("max_atr15_swing", {"mode": "max", "of": ["atr_1_5", "swing_20_buf"]}),
+]
+SHADOW_STOP_MIN_LOT_ACCTS: tuple[int, ...] = (25_000, 50_000, 100_000)
+SHADOW_STOP_CFG_BY_NAME: dict[str, dict[str, Any]] = {
+    name: dict(cfg) for name, cfg in SHADOW_STOP_CONFIGS
+}
+
 # Static high-impact event calendar (2021-2026). Full table in high_impact_events_data.py.
 from high_impact_events_data import HIGH_IMPACT_EVENTS
 
@@ -3416,6 +3449,428 @@ def _lotfloor_trade_ctx_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
         "outcome": row.get("outcome"),
         "skipped": bool(row.get("skipped") or row.get("skip_trade")),
     }
+
+
+def _median_float(vals: list[float]) -> float | None:
+    if not vals:
+        return None
+    s = sorted(float(v) for v in vals)
+    n = len(s)
+    mid = n // 2
+    if n % 2:
+        return float(s[mid])
+    return float((s[mid - 1] + s[mid]) / 2.0)
+
+
+def _shadow_stop_atr14(past: Any, atr_hint: float) -> float:
+    """ATR(14) on the trade's timeframe from past bars; fall back to hint."""
+    try:
+        if past is not None and not getattr(past, "empty", True):
+            atr_s = _atr_series_wilder(past, 14)
+            if len(atr_s) > 0:
+                cur = float(atr_s.iloc[-1])
+                if math.isfinite(cur) and cur > 0:
+                    return cur
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        h = float(atr_hint or 0)
+    except (TypeError, ValueError):
+        h = 0.0
+    return h if math.isfinite(h) and h > 0 else 0.0
+
+
+def _shadow_stop_swing_price(
+    *,
+    direction: str,
+    entry: float,
+    past: Any,
+    lookback: int,
+    buffer_atr: float,
+    atr: float,
+) -> float | None:
+    """
+    Lowest low (long) / highest high (short) over ``lookback`` closed bars
+    before entry, minus/plus ``buffer_atr * ATR(14)``.
+    """
+    if past is None or getattr(past, "empty", True):
+        return None
+    try:
+        # Exclude the entry bar (last row); use prior closed bars only.
+        hist = past.iloc[:-1] if len(past) >= 2 else past
+        if hist is None or len(hist) < 1:
+            return None
+        window = hist.tail(max(1, int(lookback)))
+        buf = float(buffer_atr or 0) * float(atr or 0)
+        d = str(direction or "").strip().upper()
+        e = float(entry)
+        if d == "LONG":
+            swing = float(pd.to_numeric(window["Low"], errors="coerce").min())
+            if not math.isfinite(swing):
+                return None
+            stop = swing - buf
+            if stop >= e:
+                return None
+            return float(stop)
+        if d == "SHORT":
+            swing = float(pd.to_numeric(window["High"], errors="coerce").max())
+            if not math.isfinite(swing):
+                return None
+            stop = swing + buf
+            if stop <= e:
+                return None
+            return float(stop)
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _shadow_stop_price_for_cfg(
+    *,
+    cfg: Mapping[str, Any],
+    direction: str,
+    entry: float,
+    current_stop: float,
+    atr: float,
+    past: Any,
+    dist_cache: dict[str, float],
+) -> float | None:
+    """
+    Resolve a stop PRICE for one config. ``dist_cache`` holds named distances
+    already computed (for ``max`` hybrids).
+    """
+    mode = str(cfg.get("mode") or "").strip().lower()
+    d = str(direction or "").strip().upper()
+    e = float(entry)
+    if d not in ("LONG", "SHORT") or e <= 0:
+        return None
+
+    def _price_from_dist(dist: float) -> float | None:
+        if not math.isfinite(dist) or dist <= 0:
+            return None
+        if d == "LONG":
+            return e - dist
+        return e + dist
+
+    if mode == "fixed_pct":
+        base = abs(e - float(current_stop))
+        mult = float(cfg.get("mult") or 1.0)
+        return _price_from_dist(base * mult)
+
+    if mode == "atr":
+        mult = float(cfg.get("mult") or 1.0)
+        return _price_from_dist(float(atr) * mult)
+
+    if mode == "swing":
+        return _shadow_stop_swing_price(
+            direction=d,
+            entry=e,
+            past=past,
+            lookback=int(cfg.get("lookback") or 20),
+            buffer_atr=float(cfg.get("buffer_atr") or 0),
+            atr=float(atr),
+        )
+
+    if mode == "max":
+        names = list(cfg.get("of") or [])
+        dists: list[float] = []
+        for nm in names:
+            key = str(nm)
+            if key in dist_cache and dist_cache[key] > 0:
+                dists.append(float(dist_cache[key]))
+                continue
+            sub = SHADOW_STOP_CFG_BY_NAME.get(key)
+            if not sub:
+                continue
+            sp = _shadow_stop_price_for_cfg(
+                cfg=sub,
+                direction=d,
+                entry=e,
+                current_stop=current_stop,
+                atr=atr,
+                past=past,
+                dist_cache=dist_cache,
+            )
+            if sp is None:
+                continue
+            dist = abs(e - float(sp))
+            if dist > 0:
+                dist_cache[key] = dist
+                dists.append(dist)
+        if not dists:
+            return None
+        return _price_from_dist(max(dists))
+
+    return None
+
+
+def _shadow_stopped_then_target(
+    *,
+    direction: str,
+    original_tp: float,
+    forward_df: Any,
+    hit_stop: bool,
+    candles_to_exit: int,
+) -> bool:
+    """
+    True when this config's stop was hit AND price later reached the original
+    take-profit within the remaining forward window (wick / premature stop).
+    """
+    if not hit_stop:
+        return False
+    try:
+        tp = float(original_tp)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(tp) or forward_df is None or getattr(forward_df, "empty", True):
+        return False
+    d = str(direction or "").strip().upper()
+    try:
+        rows = list(forward_df.iterrows())
+    except Exception:  # noqa: BLE001
+        return False
+    # candles_to_exit is 1-indexed count at exit; scan bars strictly after.
+    start = max(0, int(candles_to_exit or 0))
+    for i in range(start, len(rows)):
+        candle = rows[i][1]
+        try:
+            high = float(candle.get("High", candle.get("high", tp)))
+            low = float(candle.get("Low", candle.get("low", tp)))
+        except (TypeError, ValueError):
+            continue
+        if d == "LONG" and high >= tp:
+            return True
+        if d == "SHORT" and low <= tp:
+            return True
+    return False
+
+
+@dataclass
+class _StopCurveState:
+    curve_id: str
+    capital: float
+    peak_capital: float
+    day_anchor: float
+    day_pnl: float = 0.0
+    trades: int = 0
+    stop_hits: int = 0
+    stopped_then_target: int = 0
+    net_r: float = 0.0
+    daily_pnls: dict[str, float] = field(default_factory=dict)
+    daily_anchors: dict[str, float] = field(default_factory=dict)
+    max_drawdown_pct_seen: float = 0.0
+    stop_dist_pcts: list[float] = field(default_factory=list)
+    lots_list: list[float] = field(default_factory=list)
+    below_min_lot_n: dict[str, int] = field(default_factory=dict)
+    below_min_lot_d: dict[str, int] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "curve_id": self.curve_id,
+            "capital": round(float(self.capital), 2),
+            "peak_capital": round(float(self.peak_capital), 2),
+            "day_anchor": round(float(self.day_anchor), 2),
+            "day_pnl": round(float(self.day_pnl), 2),
+            "trades": int(self.trades),
+            "stop_hits": int(self.stop_hits),
+            "stopped_then_target": int(self.stopped_then_target),
+            "net_r": round(float(self.net_r), 6),
+            "daily_pnls": dict(self.daily_pnls),
+            "daily_anchors": dict(self.daily_anchors),
+            "max_drawdown_pct_seen": round(float(self.max_drawdown_pct_seen), 4),
+            "stop_dist_pcts": [round(float(x), 6) for x in self.stop_dist_pcts[-5000:]],
+            "lots_list": [round(float(x), 6) for x in self.lots_list[-5000:]],
+            "below_min_lot_n": {k: int(v) for k, v in self.below_min_lot_n.items()},
+            "below_min_lot_d": {k: int(v) for k, v in self.below_min_lot_d.items()},
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "_StopCurveState":
+        start = float(STARTING_CAPITAL)
+        return cls(
+            curve_id=str(raw.get("curve_id") or ""),
+            capital=float(raw.get("capital", start) or start),
+            peak_capital=float(raw.get("peak_capital", start) or start),
+            day_anchor=float(raw.get("day_anchor", start) or start),
+            day_pnl=float(raw.get("day_pnl", 0) or 0),
+            trades=int(raw.get("trades", 0) or 0),
+            stop_hits=int(raw.get("stop_hits", 0) or 0),
+            stopped_then_target=int(raw.get("stopped_then_target", 0) or 0),
+            net_r=float(raw.get("net_r", 0) or 0),
+            daily_pnls={str(k): float(v) for k, v in (raw.get("daily_pnls") or {}).items()},
+            daily_anchors={str(k): float(v) for k, v in (raw.get("daily_anchors") or {}).items()},
+            max_drawdown_pct_seen=float(raw.get("max_drawdown_pct_seen", 0) or 0),
+            stop_dist_pcts=[float(x) for x in (raw.get("stop_dist_pcts") or [])],
+            lots_list=[float(x) for x in (raw.get("lots_list") or [])],
+            below_min_lot_n={str(k): int(v) for k, v in (raw.get("below_min_lot_n") or {}).items()},
+            below_min_lot_d={str(k): int(v) for k, v in (raw.get("below_min_lot_d") or {}).items()},
+        )
+
+
+class _ShadowStopRunner:
+    """Per-config capital curves for alternate stop placement (real curve untouched)."""
+
+    def __init__(self) -> None:
+        self.curves: dict[str, _StopCurveState] = {}
+        self._init_curves()
+
+    def _init_curves(self) -> None:
+        if not SHADOW_STOP_ENABLED:
+            return
+        start = float(STARTING_CAPITAL)
+        for name, _cfg in SHADOW_STOP_CONFIGS:
+            self.curves[name] = _StopCurveState(
+                curve_id=name,
+                capital=start,
+                peak_capital=start,
+                day_anchor=start,
+                below_min_lot_n={str(a): 0 for a in SHADOW_STOP_MIN_LOT_ACCTS},
+                below_min_lot_d={str(a): 0 for a in SHADOW_STOP_MIN_LOT_ACCTS},
+            )
+
+    @classmethod
+    def from_chrono(cls, chrono_data: Mapping[str, Any] | None) -> "_ShadowStopRunner":
+        runner = cls()
+        if not SHADOW_STOP_ENABLED or not chrono_data:
+            return runner
+        saved = chrono_data.get("shadow_stop_state")
+        if not isinstance(saved, dict):
+            return runner
+        curves_raw = saved.get("curves")
+        if not isinstance(curves_raw, dict):
+            return runner
+        for cid, raw in curves_raw.items():
+            if cid in runner.curves and isinstance(raw, dict):
+                runner.curves[cid] = _StopCurveState.from_dict(raw)
+        return runner
+
+    def to_persistence(self) -> dict[str, Any]:
+        return {"curves": {cid: st.to_dict() for cid, st in self.curves.items()}}
+
+    def on_new_day(self, date_str: str) -> None:
+        for st in self.curves.values():
+            st.day_anchor = float(st.capital)
+            st.day_pnl = 0.0
+
+    def finalize_day(self, date_str: str) -> None:
+        ds = str(date_str or "")[:10]
+        for st in self.curves.values():
+            st.daily_pnls[ds] = round(float(st.day_pnl), 2)
+            st.daily_anchors[ds] = round(float(st.day_anchor), 2)
+
+    def process_trade(self, row: Mapping[str, Any]) -> None:
+        if not SHADOW_STOP_ENABLED or not self.curves:
+            return
+        if row.get("skipped") or row.get("skip_trade"):
+            return
+        if str(row.get("outcome") or "").strip().upper() not in ("WIN", "LOSS"):
+            return
+        if row.get("shadow_class") or row.get("shadow_instrument"):
+            return
+        smap = row.get("shadow_stop")
+        if not isinstance(smap, dict):
+            return
+        max_risk = float(row.get("max_risk_dollars") or 0)
+        entry = float(row.get("entry_price") or row.get("entry") or 0)
+        date_str = str(row.get("date") or "")[:10]
+        _ = date_str
+
+        for name, st in self.curves.items():
+            payload = smap.get(name)
+            if not isinstance(payload, dict):
+                continue
+            try:
+                pnl = float(payload.get("pnl") if payload.get("pnl") is not None else 0)
+            except (TypeError, ValueError):
+                pnl = 0.0
+            try:
+                lots = float(payload.get("lots") or 0)
+            except (TypeError, ValueError):
+                lots = 0.0
+            try:
+                stop_px = float(payload.get("stop") or 0)
+            except (TypeError, ValueError):
+                stop_px = 0.0
+            exit_reason = str(payload.get("exit_reason") or "").strip().upper()
+            stt = bool(payload.get("stopped_then_target"))
+
+            trade_r = (pnl / max_risk) if max_risk > 0 else 0.0
+            st.trades += 1
+            st.net_r += float(trade_r)
+            st.capital += pnl
+            st.day_pnl += pnl
+            if st.capital > st.peak_capital:
+                st.peak_capital = st.capital
+            if st.peak_capital > 0:
+                dd = (st.peak_capital - st.capital) / st.peak_capital * 100.0
+                if dd > st.max_drawdown_pct_seen:
+                    st.max_drawdown_pct_seen = float(dd)
+            if exit_reason == "STOP":
+                st.stop_hits += 1
+            if stt:
+                st.stopped_then_target += 1
+            if lots > 0:
+                st.lots_list.append(lots)
+            if entry > 0 and stop_px > 0:
+                st.stop_dist_pcts.append(abs(entry - stop_px) / entry * 100.0)
+            # pct_below_min_lot at 25k/50k/100k (lots scaled from 10k ref)
+            for acct in SHADOW_STOP_MIN_LOT_ACCTS:
+                key = str(int(acct))
+                st.below_min_lot_d[key] = int(st.below_min_lot_d.get(key, 0)) + 1
+                scaled = lots * (float(acct) / float(LOT_FLOOR_REF_ACCOUNT))
+                if scaled < float(LOT_MIN):
+                    st.below_min_lot_n[key] = int(st.below_min_lot_n.get(key, 0)) + 1
+
+    def _curve_summary(self, st: _StopCurveState) -> dict[str, Any]:
+        peak = float(st.peak_capital or STARTING_CAPITAL)
+        cap = float(st.capital or STARTING_CAPITAL)
+        worst_day_pct = 0.0
+        positive_months = 0
+        month_pnls: dict[str, float] = {}
+        for ds, dp in st.daily_pnls.items():
+            anchor = float(st.daily_anchors.get(ds, st.day_anchor or STARTING_CAPITAL))
+            day_pct = (float(dp) / anchor * 100.0) if anchor > 0 else 0.0
+            if day_pct < worst_day_pct:
+                worst_day_pct = day_pct
+            ym = ds[:7]
+            month_pnls[ym] = month_pnls.get(ym, 0.0) + float(dp)
+        for mp in month_pnls.values():
+            if mp > 0:
+                positive_months += 1
+        n = int(st.trades)
+        pct_below: dict[str, float] = {}
+        for acct in SHADOW_STOP_MIN_LOT_ACCTS:
+            key = str(int(acct))
+            den = int(st.below_min_lot_d.get(key, 0) or 0)
+            num = int(st.below_min_lot_n.get(key, 0) or 0)
+            pct_below[f"acct_{key}"] = round((num / den * 100.0) if den > 0 else 0.0, 2)
+        med_dist = _median_float(st.stop_dist_pcts)
+        med_lots = _median_float(st.lots_list)
+        return {
+            "final_capital": round(cap, 2),
+            "peak_capital": round(peak, 2),
+            "max_drawdown_pct": round(float(st.max_drawdown_pct_seen), 2),
+            "worst_day_pct": round(float(worst_day_pct), 2),
+            "positive_months": int(positive_months),
+            "net_r": round(float(st.net_r), 4),
+            "r_per_trade": round(float(st.net_r) / n, 4) if n > 0 else 0.0,
+            "trades": n,
+            "stop_hit_rate": round(float(st.stop_hits) / n * 100.0, 2) if n > 0 else 0.0,
+            "median_stop_distance_pct": None if med_dist is None else round(float(med_dist), 4),
+            "stopped_then_target_count": int(st.stopped_then_target),
+            "median_lots": None if med_lots is None else round(float(med_lots), 4),
+            "pct_below_min_lot": pct_below,
+        }
+
+    def summaries(self) -> dict[str, dict[str, Any]]:
+        return {cid: self._curve_summary(st) for cid, st in self.curves.items()}
+
+
+def _persist_shadow_stop_state(
+    chrono_data: dict[str, Any],
+    runner: _ShadowStopRunner,
+) -> None:
+    chrono_data["shadow_stop_state"] = runner.to_persistence()
 
 
 def _sizing_health_shadow_fields(
@@ -7243,6 +7698,138 @@ def _shadow_trail_null_fields() -> dict[str, Any]:
     return {name: None for name, _ in _SHADOW_TRAIL_ACTIVATE_RS}
 
 
+def _shadow_stop_null_map() -> dict[str, None]:
+    return {name: None for name, _ in SHADOW_STOP_CONFIGS}
+
+
+def _shadow_stop_placement_fields(
+    *,
+    direction: str,
+    entry: float,
+    stop_loss: float,
+    tp1: float,
+    tp2: float,
+    tp3: float,
+    forward_df: pd.DataFrame,
+    past: Any = None,
+    strategy_id: str = "",
+    max_risk_dollars: float = 0.0,
+    timeframe: str = "",
+    macro_bias: str = "",
+    macro_bias_adjusted: str = "",
+    trail_regime: str = "",
+    trend_strength: float = 0.0,
+    rate_differential: float = 0.0,
+    atr: float = 0.0,
+    ticker: str = "",
+    period_mode: str = "NEUTRAL",
+) -> dict[str, Any]:
+    """
+    Replay the same forward path with alternate stop placements.
+    Position sized so dollar risk equals ``max_risk_dollars`` at the new stop.
+    Write-only — never feeds entry/exit/sizing on the real curve.
+    """
+    if not SHADOW_STOP_ENABLED:
+        return {}
+    try:
+        e = float(entry)
+        cur_stop = float(stop_loss)
+        risk_dollars = float(max_risk_dollars or 0)
+        if e <= 0 or risk_dollars <= 0 or abs(e - cur_stop) <= 0:
+            return _shadow_stop_null_map()
+        atr_use = _shadow_stop_atr14(past, float(atr or 0))
+        if atr_use <= 0:
+            atr_use = abs(e - cur_stop)
+        d = str(direction or "").strip().upper()
+        dist_cache: dict[str, float] = {}
+        out: dict[str, Any] = {}
+        for name, cfg in SHADOW_STOP_CONFIGS:
+            stop_px = _shadow_stop_price_for_cfg(
+                cfg=cfg,
+                direction=d,
+                entry=e,
+                current_stop=cur_stop,
+                atr=atr_use,
+                past=past,
+                dist_cache=dist_cache,
+            )
+            if stop_px is None:
+                out[name] = None
+                continue
+            dist = abs(e - float(stop_px))
+            if dist <= 0:
+                out[name] = None
+                continue
+            dist_cache[name] = dist
+            alt_pos = risk_dollars / dist
+            alt_lev = alt_pos * e
+            lots = alt_pos / 100000.0
+            buf = _v75_buffer_stop_price(float(stop_px), e, d, atr_use)
+            sim = _evaluate_forward_with_trend_continuation(
+                d,
+                e,
+                float(stop_px),
+                tp1,
+                tp2,
+                tp3,
+                forward_df,
+                strategy_id,
+                position_size=alt_pos,
+                leverage=LEVERAGE,
+                timeframe=timeframe,
+                macro_bias=macro_bias,
+                macro_bias_adjusted=macro_bias_adjusted,
+                trail_regime=trail_regime,
+                trend_strength=trend_strength,
+                rate_differential=rate_differential,
+                atr=atr_use,
+                buffer_stop_price=buf,
+                ticker=ticker,
+                period_mode=period_mode,
+            )
+            raw_pct = float(sim.get("pnl_pct", 0) or 0)
+            candles = int(sim.get("candles_to_exit", 0) or 0)
+            pnl_d, _pnl_pct, _gross, cost_f = _apply_realistic_costs(
+                ticker=ticker,
+                direction=d,
+                timeframe=timeframe,
+                position_size=alt_pos,
+                entry=e,
+                leveraged_exposure=alt_lev,
+                raw_pct=raw_pct,
+                candles_to_exit=candles,
+            )
+            hit_stop = bool(sim.get("hit_stop"))
+            er = str(sim.get("exit_reason") or "")
+            if not hit_stop and er.strip().upper() in ("STOP", "STOP LOSS"):
+                hit_stop = True
+            stt = _shadow_stopped_then_target(
+                direction=d,
+                original_tp=float(tp1),
+                forward_df=forward_df,
+                hit_stop=hit_stop,
+                candles_to_exit=candles,
+            )
+            nights = float((cost_f or {}).get("nights_held", 0) or 0)
+            if nights <= 0:
+                nights = max(0.0, float(candles) * _tf_days(timeframe))
+            out[name] = {
+                "stop": round(float(stop_px), 5),
+                "lots": round(float(lots), 4),
+                "pnl": round(float(pnl_d), 2),
+                "exit_reason": er,
+                "nights": round(float(nights), 2),
+                "stopped_then_target": bool(stt),
+            }
+        return out
+    except Exception as e:  # noqa: BLE001
+        log(
+            f"[SHADOW STOP] {str(ticker or '').strip().upper()}: {e}",
+            level="warning",
+        )
+        return _shadow_stop_null_map()
+
+
 def _shadow_trail_activation_fields(
     *,
     direction: str,
@@ -8919,6 +9506,27 @@ def _python_forced_layer2_trade(
             ticker=sym,
             period_mode=str(ai.get("period_mode") or period_mode),
         ),
+        "shadow_stop": _shadow_stop_placement_fields(
+            direction=direction,
+            entry=entry,
+            stop_loss=normal_stop_v75,
+            tp1=tp1,
+            tp2=tp2,
+            tp3=tp3,
+            forward_df=fut,
+            past=past,
+            strategy_id=strat_id,
+            max_risk_dollars=float(max_risk_dollars or 0),
+            timeframe=tf_key,
+            macro_bias=str(ai.get("macro_bias", "") or ""),
+            macro_bias_adjusted=mb_adj,
+            trail_regime=trail_reg,
+            trend_strength=ts_ev,
+            rate_differential=float(ai.get("macro_rate_diff", 0) or 0),
+            atr=float(atr_ref or v75_meta.get("entry_atr", 0) or 0),
+            ticker=sym,
+            period_mode=str(ai.get("period_mode") or period_mode),
+        ),
         **_sizing_health_shadow_fields(
             confidence=confidence,
             macro_bias=str(ai.get("macro_bias", "") or ""),
@@ -9997,6 +10605,27 @@ def run_one_backtest(
             ticker=sym,
             period_mode=str(ai.get("period_mode") or period_mode),
         )
+        _shadow_stop_map = _shadow_stop_placement_fields(
+            direction=direction,
+            entry=entry,
+            stop_loss=normal_stop_v75,
+            tp1=tp1,
+            tp2=tp2,
+            tp3=tp3,
+            forward_df=fut,
+            past=past,
+            strategy_id=strategy_id_norm,
+            max_risk_dollars=float(max_risk_dollars or 0),
+            timeframe=tf_key,
+            macro_bias=str(ai.get("macro_bias", "") or ""),
+            macro_bias_adjusted=mb_adj,
+            trail_regime=trail_reg,
+            trend_strength=ts_cl,
+            rate_differential=float(ai.get("macro_rate_diff", 0) or 0),
+            atr=float(ind.get("atr", 0) or v75_meta.get("entry_atr", 0) or 0),
+            ticker=sym,
+            period_mode=str(ai.get("period_mode") or period_mode),
+        )
 
         cond_snap = (
             _trade_condition_snapshot_fields(analysis_date, past, ind)
@@ -10218,6 +10847,7 @@ def run_one_backtest(
                 ),
             ),
             **_shadow_trail_fields,
+            "shadow_stop": _shadow_stop_map,
             **_sizing_health_shadow_fields(
                 confidence=str(ai.get("confidence", confidence) or ""),
                 macro_bias=str(ai.get("macro_bias", "") or ""),
@@ -11794,6 +12424,7 @@ def run_chronological_backtest(
 
         shadow_runner = _ShadowGuardRunner.from_chrono(chrono_data)
         lotfloor_runner = _ShadowLotFloorRunner.from_chrono(chrono_data)
+        stop_runner = _ShadowStopRunner.from_chrono(chrono_data)
         shadow_runner.set_median_nights_by_tf(
             _compute_median_nights_by_tf(list(chrono_data.get("all_trades") or []))
         )
@@ -11844,6 +12475,7 @@ def run_chronological_backtest(
             if not isinstance(intra, dict) or str(intra.get("date", "")) != date_str:
                 shadow_runner.on_new_day(date_str)
                 lotfloor_runner.on_new_day(date_str)
+                stop_runner.on_new_day(date_str)
             finalize_day_only = False
             resume_idx = 0
             v71_pi_s = v71_ti_s = v71_tj_s = 0
@@ -12547,6 +13179,7 @@ def run_chronological_backtest(
                             _lotfloor_map = lotfloor_runner.process_trade(_lotfloor_trade_ctx_from_row(row))
                             if _lotfloor_map:
                                 row["shadow_lotfloor"] = _lotfloor_map
+                            stop_runner.process_trade(row)
                             day_trades.append(row)
                             day_pnl += pnl
                             capital += pnl
@@ -12614,6 +13247,7 @@ def run_chronological_backtest(
                             )
                             _persist_shadow_guard_state(chrono_data, shadow_runner)
                             _persist_shadow_lotfloor_state(chrono_data, lotfloor_runner)
+                            _persist_shadow_stop_state(chrono_data, stop_runner)
                             chrono_data["current_date"] = date_str
                             chrono_data["status"] = "running"
                             save_json(chrono_path, chrono_data)
@@ -12646,6 +13280,7 @@ def run_chronological_backtest(
             peak_capital = _update_run_peak_capital(capital, peak_capital)
             shadow_runner.finalize_day(date_str)
             lotfloor_runner.finalize_day(date_str)
+            stop_runner.finalize_day(date_str)
 
             daily_summary = {
                 "date": date_str,
@@ -12687,6 +13322,7 @@ def run_chronological_backtest(
                 chrono_data["_shadow_blocked_pairs_asserted"] = True
             _persist_shadow_guard_state(chrono_data, shadow_runner)
             _persist_shadow_lotfloor_state(chrono_data, lotfloor_runner)
+            _persist_shadow_stop_state(chrono_data, stop_runner)
             save_json(chrono_path, chrono_data)
 
             log(
@@ -12749,10 +13385,13 @@ def run_chronological_backtest(
         chrono_data["shadow_event_summary"] = shadow_runner.event_summaries()
         if LOT_FLOOR_ENABLED:
             chrono_data["shadow_lotfloor_summary"] = lotfloor_runner.summaries()
+        if SHADOW_STOP_ENABLED:
+            chrono_data["shadow_stop_summary"] = stop_runner.summaries()
         if SHADOW_BLOCKED_PAIRS:
             chrono_data["shadow_instrument_summary"] = _si.compute_summary(job_id)
         _persist_shadow_guard_state(chrono_data, shadow_runner)
         _persist_shadow_lotfloor_state(chrono_data, lotfloor_runner)
+        _persist_shadow_stop_state(chrono_data, stop_runner)
         chrono_data["v74_metrics"] = _v74_chrono_trade_metrics(all_trades)
         _assert_swap_financing_modeled(all_trades, context=f"Chrono {job_id}")
         save_json(chrono_path, chrono_data)
