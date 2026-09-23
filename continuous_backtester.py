@@ -794,6 +794,19 @@ SESSION_WINDOWS: dict[str, tuple[int, int]] = {
     "new_york": (12, 21),
 }
 
+# Trade tagging windows (UTC). Overlaps are expected; primary = nearest midpoint.
+TRADE_SESSION_WINDOWS: dict[str, tuple[int, int]] = {
+    "sydney": (22, 7),
+    "tokyo": (0, 9),
+    "london": (7, 16),
+    "new_york": (12, 21),
+}
+TRADE_SESSION_ORDER: tuple[str, ...] = ("sydney", "tokyo", "london", "new_york")
+# Only these TFs carry an intraday bar timestamp usable for session tagging.
+# 1d/1w span all sessions — no honest entry hour exists.
+INTRADAY_SESSION_TFS: frozenset[str] = frozenset({"15m", "30m", "1h", "4h"})
+SESSION_UNTAGGABLE = "n/a"
+
 # Rolling batch: only scan pairs relevant to the active UTC session (Lovable toggles via session_config).
 SESSION_PAIRS: dict[str, tuple[str, ...]] = {
     "asia": (
@@ -8404,10 +8417,9 @@ def _python_forced_layer2_trade(
     final_stop = float(exit_data.get("final_stop", stop) or stop)
 
     raw_pct = float(exit_data.get("pnl_pct", 0) or 0)
-    outcome = str(exit_data.get("outcome", "LOSS"))
-    if outcome not in ("WIN", "LOSS"):
-        outcome = "WIN" if raw_pct > 0 else "LOSS"
-    correct = outcome == "WIN"
+    outcome_gross = str(exit_data.get("outcome", "LOSS"))
+    if outcome_gross not in ("WIN", "LOSS"):
+        outcome_gross = "WIN" if raw_pct > 0 else "LOSS"
     _inst_spec_cost = _si.instrument_spec_for(sym) if _si.in_shadow_eval(sym) else None
     nights_held_est = max(0.0, float(candles_to_exit) * _tf_days(timeframe))
     if _inst_spec_cost:
@@ -8434,6 +8446,15 @@ def _python_forced_layer2_trade(
             candles_to_exit=candles_to_exit,
             sizing_mult=_position_sizing_mult_from_ai(ai),
         )
+    outcome, outcome_gross, correct = _finalize_net_outcome(
+        outcome_gross=outcome_gross,
+        pnl_dollars=pnl_dollars,
+    )
+    _session_tags = session_tag_fields(
+        timeframe=tf_key,
+        past=past,
+        analysis_date=analysis_date,
+    )
     _ab_row = _ab_trade_record_fields(
         pnl_dollars=pnl_dollars,
         max_risk_dollars=max_risk_dollars,
@@ -8498,11 +8519,13 @@ def _python_forced_layer2_trade(
         "exit_price": exit_p,
         "exit_reason": exit_r,
         "outcome": outcome,
+        "outcome_gross": outcome_gross,
         "correct": correct,
         "pnl_pct": pnl_pct_display,
         "pnl_dollars": pnl_dollars,
         "gross_pnl_pct": gross_pnl_pct,
         **_cost_fields,
+        **_session_tags,
         **_event_attribution_fields(
             ticker=sym,
             entry_date=analysis_date,
@@ -9623,10 +9646,9 @@ def run_one_backtest(
         final_stop = float(exit_data.get("final_stop", stop) or stop)
 
         raw_pct = float(exit_data.get("pnl_pct", 0) or 0)
-        outcome = str(exit_data.get("outcome", "LOSS"))
-        if outcome not in ("WIN", "LOSS"):
-            outcome = "WIN" if raw_pct > 0 else "LOSS"
-        correct = outcome == "WIN"
+        outcome_gross = str(exit_data.get("outcome", "LOSS"))
+        if outcome_gross not in ("WIN", "LOSS"):
+            outcome_gross = "WIN" if raw_pct > 0 else "LOSS"
 
         pnl_dollars, pnl_pct_display, gross_pnl_pct, _cost_fields = _apply_realistic_costs(
             ticker=sym,
@@ -9638,6 +9660,15 @@ def run_one_backtest(
             raw_pct=raw_pct,
             candles_to_exit=candles_to_exit,
             sizing_mult=_position_sizing_mult_from_ai(ai),
+        )
+        outcome, outcome_gross, correct = _finalize_net_outcome(
+            outcome_gross=outcome_gross,
+            pnl_dollars=pnl_dollars,
+        )
+        _session_tags = session_tag_fields(
+            timeframe=tf_key,
+            past=past,
+            analysis_date=analysis_date,
         )
         _ab_row = _ab_trade_record_fields(
             pnl_dollars=pnl_dollars,
@@ -9799,11 +9830,13 @@ def run_one_backtest(
             "exit_price": exit_p,
             "exit_reason": exit_r,
             "outcome": outcome,
+            "outcome_gross": outcome_gross,
             "correct": correct,
             "pnl_pct": pnl_pct_display,
             "pnl_dollars": pnl_dollars,
             "gross_pnl_pct": gross_pnl_pct,
             **_cost_fields,
+            **_session_tags,
             **_event_attribution_fields(
                 ticker=sym,
                 entry_date=analysis_date,
@@ -10862,20 +10895,198 @@ def chrono_results_path(job_id: str) -> Path:
     return DATA_DIR / f"chrono_results_{job_id}.json"
 
 
+def _hour_in_session_window(hour: int, start: int, end: int) -> bool:
+    """True if UTC hour is inside [start, end) — supports midnight wrap (start > end)."""
+    h = int(hour) % 24
+    if start < end:
+        return start <= h < end
+    return h >= start or h < end
+
+
+def _session_midpoint_hour(start: int, end: int) -> float:
+    if start < end:
+        return (float(start) + float(end)) / 2.0
+    dur = (24 - int(start)) + int(end)
+    return (float(start) + dur / 2.0) % 24.0
+
+
+def _circular_hour_distance(a: float, b: float) -> float:
+    d = abs(float(a) - float(b)) % 24.0
+    return min(d, 24.0 - d)
+
+
+def sessions_for_utc_hour(hour: int) -> tuple[str, list[str]]:
+    """
+    Tag a UTC hour into forex sessions.
+
+    Returns (primary, sessions) where ``sessions`` lists every matching window
+    and ``primary`` is the match whose midpoint is nearest the entry hour.
+    """
+    h = int(hour) % 24
+    matched = [
+        name
+        for name, (start, end) in TRADE_SESSION_WINDOWS.items()
+        if _hour_in_session_window(h, start, end)
+    ]
+    if not matched:
+        # Gap hour (e.g. 21:00–22:00 UTC): nearest midpoint among all sessions.
+        primary = min(
+            TRADE_SESSION_WINDOWS.keys(),
+            key=lambda name: _circular_hour_distance(
+                float(h),
+                _session_midpoint_hour(*TRADE_SESSION_WINDOWS[name]),
+            ),
+        )
+        return primary, [primary]
+    primary = min(
+        matched,
+        key=lambda name: (
+            _circular_hour_distance(
+                float(h),
+                _session_midpoint_hour(*TRADE_SESSION_WINDOWS[name]),
+            ),
+            # Tie-break: prefer the later session in TRADE_SESSION_ORDER (handoff).
+            -TRADE_SESSION_ORDER.index(name),
+        ),
+    )
+    sessions = [s for s in TRADE_SESSION_ORDER if s in matched]
+    return primary, sessions
+
+
+def _utc_hour_from_timestamp(ts: Any) -> int | None:
+    try:
+        t = pd.Timestamp(ts)
+        if getattr(t, "tzinfo", None) is not None:
+            t = t.tz_convert("UTC")
+        return int(t.hour)
+    except (TypeError, ValueError, AttributeError, OverflowError):
+        return None
+
+
+def entry_utc_hour_from_past(past: pd.DataFrame | None, analysis_date: str = "") -> int | None:
+    """Entry hour in UTC from the signal bar timestamp, or None if unavailable."""
+    if past is not None and not getattr(past, "empty", True):
+        try:
+            h = _utc_hour_from_timestamp(past.index[-1])
+            if h is not None:
+                return h
+        except (IndexError, KeyError, TypeError, AttributeError):
+            pass
+    _ = analysis_date
+    return None
+
+
+def _is_intraday_session_tf(timeframe: str) -> bool:
+    return str(timeframe or "").strip().lower() in INTRADAY_SESSION_TFS
+
+
+def session_tag_fields(
+    *,
+    timeframe: str,
+    past: pd.DataFrame | None = None,
+    analysis_date: str = "",
+    entry_hour_utc: int | None = None,
+) -> dict[str, Any]:
+    """
+    Tag trade session from entry-bar UTC hour — only for intraday TFs.
+
+    Daily/weekly bars span all sessions and carry no recoverable entry hour;
+    those trades get session=\"n/a\", sessions=[], entry_hour_utc=None.
+    """
+    if not _is_intraday_session_tf(timeframe):
+        return {
+            "session": SESSION_UNTAGGABLE,
+            "sessions": [],
+            "entry_hour_utc": None,
+        }
+    hour = (
+        int(entry_hour_utc) % 24
+        if entry_hour_utc is not None
+        else entry_utc_hour_from_past(past, analysis_date)
+    )
+    if hour is None:
+        return {
+            "session": SESSION_UNTAGGABLE,
+            "sessions": [],
+            "entry_hour_utc": None,
+        }
+    primary, sessions = sessions_for_utc_hour(hour)
+    return {
+        "session": primary,
+        "sessions": sessions,
+        "entry_hour_utc": hour,
+    }
+
+
+def _finalize_net_outcome(
+    *,
+    outcome_gross: str,
+    pnl_dollars: float,
+) -> tuple[str, str, bool]:
+    """Keep price-based verdict as outcome_gross; outcome follows net P&L."""
+    gross = str(outcome_gross or "").strip().upper()
+    if gross not in ("WIN", "LOSS"):
+        gross = "LOSS"
+    outcome = "WIN" if float(pnl_dollars) > 0 else "LOSS"
+    return outcome, gross, outcome == "WIN"
+
+
+def _assert_outcome_matches_net_pnl(
+    trades: list[dict[str, Any]],
+    *,
+    context: str,
+) -> None:
+    bad = [
+        t
+        for t in trades
+        if isinstance(t, dict)
+        and not t.get("skipped")
+        and str(t.get("outcome", "")).strip().upper() == "WIN"
+        and float(t.get("pnl_dollars", 0) or 0) <= 0
+    ]
+    if bad:
+        sample = [
+            {
+                "date": b.get("date"),
+                "ticker": b.get("ticker"),
+                "exit_reason": b.get("exit_reason"),
+                "pnl_dollars": b.get("pnl_dollars"),
+                "outcome_gross": b.get("outcome_gross"),
+            }
+            for b in bad[:5]
+        ]
+        log(
+            f"[OUTCOME] ERROR: {len(bad)} trades have outcome=WIN with pnl_dollars<=0 "
+            f"({context}); sample={sample}",
+            level="error",
+        )
+
+
 def _chrono_session_for_timeframe(timeframe: str) -> str:
-    """Session bucket for P&L rollups (UTC-oriented labels; see ``SESSION_WINDOWS``)."""
-    tf = (timeframe or "").strip().lower()
-    if tf in ("15m", "30m"):
-        return "london"
-    if tf == "1h":
-        return "london"
-    return "new_york"
+    """Legacy helper — delegates to session_tag_fields (n/a for daily/weekly)."""
+    return str(session_tag_fields(timeframe=timeframe).get("session") or SESSION_UNTAGGABLE)
 
 
 def _calc_session_performance(trades: list[dict[str, Any]]) -> dict[str, Any]:
+    untaggable = 0
+    tagged: list[dict[str, Any]] = []
+    for t in trades:
+        if not isinstance(t, dict):
+            continue
+        sess = str(t.get("session") or "").strip().lower()
+        if sess in ("", SESSION_UNTAGGABLE, "none", "nan"):
+            untaggable += 1
+            continue
+        tagged.append(t)
+    if untaggable:
+        log(
+            f"[SESSION] {untaggable} trades untaggable (non-intraday / no entry hour) "
+            f"— excluded from session_performance",
+            level="info",
+        )
     sessions: dict[str, Any] = {}
-    for s in ("asia", "london", "new_york"):
-        s_trades = [t for t in trades if t.get("session") == s]
+    for s in TRADE_SESSION_ORDER:
+        s_trades = [t for t in tagged if t.get("session") == s]
         if not s_trades:
             continue
         wins = [t for t in s_trades if t.get("outcome") == "WIN"]
@@ -10887,6 +11098,8 @@ def _calc_session_performance(trades: list[dict[str, Any]]) -> dict[str, Any]:
             "win_rate": round(len(wins) / max(1, len(s_trades)) * 100, 1),
             "pnl": round(sum(float(t.get("pnl_dollars", 0) or 0) for t in s_trades), 2),
         }
+    if untaggable:
+        sessions["untaggable_trades"] = untaggable
     return sessions
 
 
@@ -11584,7 +11797,11 @@ def run_chronological_backtest(
                             if chrono_stop_requested(job_id):
                                 chrono_abort = True
                                 break
-                            session = _chrono_session_for_timeframe(timeframe)
+                            session_fields = session_tag_fields(
+                                timeframe=timeframe,
+                                analysis_date=date_str,
+                            )
+                            session = session_fields["session"]
                             tpos = CHRONO_TICKERS.index(ticker) + 1 if ticker in CHRONO_TICKERS else 0
                             CHRONO_LIVE_STATUS.update(
                                 {
@@ -11846,7 +12063,15 @@ def run_chronological_backtest(
                                     "date": date_str,
                                     "ticker": str(res.get("ticker", ticker)),
                                     "timeframe": str(res.get("timeframe", timeframe)),
-                                    "session": session,
+                                    "session": str(res.get("session") or session),
+                                    "sessions": list(
+                                        res.get("sessions")
+                                        or session_fields.get("sessions")
+                                        or [session]
+                                    ),
+                                    "entry_hour_utc": res.get(
+                                        "entry_hour_utc", session_fields.get("entry_hour_utc")
+                                    ),
                                     "job_id": job_id,
                                     "skipped": True,
                                     "outcome": "SKIPPED",
@@ -11984,7 +12209,15 @@ def run_chronological_backtest(
                             pnl = float(res.get("pnl_dollars", 0) or 0)
                             row = dict(res)
                             row["job_id"] = job_id
-                            row["session"] = session
+                            # Prefer entry-bar UTC session tags from the scan; date fallback for skips.
+                            if not row.get("session"):
+                                row["session"] = session
+                            if not row.get("sessions"):
+                                row["sessions"] = list(
+                                    res.get("sessions") or session_fields.get("sessions") or [row["session"]]
+                                )
+                            if row.get("entry_hour_utc") is None and session_fields.get("entry_hour_utc") is not None:
+                                row["entry_hour_utc"] = session_fields["entry_hour_utc"]
                             row.setdefault("date", date_str)
 
                             if row.get("shadow_class") or row.get("shadow_instrument"):
@@ -12191,6 +12424,7 @@ def run_chronological_backtest(
             current += timedelta(days=1)
 
         all_trades: list[dict[str, Any]] = list(chrono_data.get("all_trades") or [])
+        _assert_outcome_matches_net_pnl(all_trades, context=f"Chrono {job_id}")
         wins = [t for t in all_trades if t.get("outcome") == "WIN"]
         losses = [t for t in all_trades if t.get("outcome") == "LOSS"]
 
