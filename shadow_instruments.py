@@ -100,7 +100,9 @@ SHADOW_FX_CURRENCIES: tuple[str, ...] = SHADOW_FX_EXTRA_CURRENCIES + (
 )
 
 PART1_DATA_EXCLUDED_FX: frozenset[str] = frozenset(
-    {"AUDCAD", "AUDNZD", "EURCAD", "EURJPY", "GBPAUD", "NZDJPY"}
+    # EURJPY removed with EXCLUDED_PAIRS so it trades on the real curve
+    # (otherwise shadow universe would still capture it via is_shadow_ticker).
+    {"AUDCAD", "AUDNZD", "EURCAD", "GBPAUD", "NZDJPY"}
 )
 
 MIN_SHADOW_DAILY_BARS = 200
