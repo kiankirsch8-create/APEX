@@ -309,6 +309,15 @@ SHADOW_COMPOUND_RISK_FRACTIONS: list[float] = [0.001, 0.0015, 0.002, 0.003, 0.00
 # 0.10%, 0.15%, 0.20%, 0.30%, 0.50% of current equity per trade
 SHADOW_FULL_STACK_CFG: dict[str, Any] = dict(SHADOW_GUARD_CONFIGS["full_stack"])
 
+# Broker minimum lot — shadow curves only. Real curve unchanged for comparability.
+LOT_FLOOR_ENABLED = True
+LOT_MIN = 0.01
+LOT_STEP = 0.01
+LOT_FLOOR_ACCOUNT_SIZES: list[int] = [10000, 25000, 50000, 100000, 200000]
+LOT_FLOOR_POLICY = "skip"  # primary label; both "skip" and "round_up" are always simulated
+LOT_FLOOR_POLICIES: tuple[str, ...] = ("skip", "round_up")
+LOT_FLOOR_REF_ACCOUNT = 10000.0  # position_size on the real curve is sized for this
+
 # Static high-impact event calendar (2021-2026). Full table in high_impact_events_data.py.
 from high_impact_events_data import HIGH_IMPACT_EVENTS
 
@@ -3131,6 +3140,282 @@ def _split_shadow_trade_maps(
 
 def _persist_shadow_guard_state(chrono_data: dict[str, Any], runner: _ShadowGuardRunner) -> None:
     chrono_data["shadow_guard_state"] = runner.to_persistence()
+
+
+def _lot_floor_curve_id(policy: str, account_size: int) -> str:
+    return f"lf_{policy}_{int(account_size)}"
+
+
+def _lot_floor_acct_key(account_size: int) -> str:
+    return f"acct_{int(account_size)}"
+
+
+def _round_lots_down(lots: float, step: float = LOT_STEP) -> float:
+    """Round DOWN to the nearest LOT_STEP (0.017 → 0.01)."""
+    if lots <= 0 or step <= 0:
+        return 0.0
+    n = math.floor((float(lots) / float(step)) + 1e-12)
+    return round(max(0.0, n * float(step)), 10)
+
+
+def apply_lot_floor(
+    *,
+    position_size: float,
+    account_size: float,
+    policy: str,
+    lot_min: float = LOT_MIN,
+    lot_step: float = LOT_STEP,
+    ref_account: float = LOT_FLOOR_REF_ACCOUNT,
+) -> tuple[float, float, bool]:
+    """
+    Return (lots_taken, size_scale_vs_base, blocked).
+
+    ``size_scale_vs_base`` multiplies real-curve pnl_dollars (sized at ref_account).
+    """
+    base_lots = float(position_size or 0) / 100000.0
+    if base_lots <= 0 or ref_account <= 0:
+        return 0.0, 0.0, True
+    raw_lots = base_lots * (float(account_size) / float(ref_account))
+    pol = str(policy or "").strip().lower()
+    if raw_lots < float(lot_min):
+        if pol == "round_up":
+            taken = float(lot_min)
+            return taken, taken / base_lots, False
+        return 0.0, 0.0, True
+    taken = _round_lots_down(raw_lots, lot_step)
+    if taken < float(lot_min):
+        # After step floor, still under minimum (shouldn't happen when raw >= min).
+        if pol == "round_up":
+            taken = float(lot_min)
+            return taken, taken / base_lots, False
+        return 0.0, 0.0, True
+    return taken, taken / base_lots, False
+
+
+@dataclass
+class _LotFloorCurveState:
+    curve_id: str
+    policy: str
+    account_size: int
+    capital: float
+    peak_capital: float
+    day_anchor: float
+    day_pnl: float = 0.0
+    st_medium_history: dict[str, Any] = field(default_factory=lambda: {"n": 0, "last3": []})
+    strat_pnl_history: dict[str, dict[str, Any]] = field(default_factory=dict)
+    trades_taken: int = 0
+    trades_blocked: int = 0
+    taken_net_r: float = 0.0
+    blocked_net_r: float = 0.0
+    daily_pnls: dict[str, float] = field(default_factory=dict)
+    daily_anchors: dict[str, float] = field(default_factory=dict)
+    max_drawdown_pct_seen: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "curve_id": self.curve_id,
+            "policy": self.policy,
+            "account_size": int(self.account_size),
+            "capital": round(float(self.capital), 2),
+            "peak_capital": round(float(self.peak_capital), 2),
+            "day_anchor": round(float(self.day_anchor), 2),
+            "day_pnl": round(float(self.day_pnl), 2),
+            "st_medium_history": dict(self.st_medium_history),
+            "strat_pnl_history": {k: dict(v) for k, v in self.strat_pnl_history.items()},
+            "trades_taken": int(self.trades_taken),
+            "trades_blocked": int(self.trades_blocked),
+            "taken_net_r": round(float(self.taken_net_r), 6),
+            "blocked_net_r": round(float(self.blocked_net_r), 6),
+            "daily_pnls": dict(self.daily_pnls),
+            "daily_anchors": dict(self.daily_anchors),
+            "max_drawdown_pct_seen": round(float(self.max_drawdown_pct_seen), 4),
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "_LotFloorCurveState":
+        acct = int(raw.get("account_size") or LOT_FLOOR_REF_ACCOUNT)
+        return cls(
+            curve_id=str(raw.get("curve_id") or ""),
+            policy=str(raw.get("policy") or "skip"),
+            account_size=acct,
+            capital=float(raw.get("capital", acct) or acct),
+            peak_capital=float(raw.get("peak_capital", acct) or acct),
+            day_anchor=float(raw.get("day_anchor", acct) or acct),
+            day_pnl=float(raw.get("day_pnl", 0) or 0),
+            st_medium_history=_normalize_shadow_st_medium_history(raw.get("st_medium_history")),
+            strat_pnl_history=_normalize_shadow_strat_history(raw.get("strat_pnl_history") or {}),
+            trades_taken=int(raw.get("trades_taken", 0) or 0),
+            trades_blocked=int(raw.get("trades_blocked", 0) or 0),
+            taken_net_r=float(raw.get("taken_net_r", 0) or 0),
+            blocked_net_r=float(raw.get("blocked_net_r", 0) or 0),
+            daily_pnls={str(k): float(v) for k, v in (raw.get("daily_pnls") or {}).items()},
+            daily_anchors={str(k): float(v) for k, v in (raw.get("daily_anchors") or {}).items()},
+            max_drawdown_pct_seen=float(raw.get("max_drawdown_pct_seen", 0) or 0),
+        )
+
+
+class _ShadowLotFloorRunner:
+    """Broker min-lot shadow curves (real curve untouched). 5 sizes × 2 policies."""
+
+    def __init__(self) -> None:
+        self.curves: dict[str, _LotFloorCurveState] = {}
+        self._init_curves()
+
+    def _init_curves(self) -> None:
+        if not LOT_FLOOR_ENABLED:
+            return
+        for policy in LOT_FLOOR_POLICIES:
+            for acct in LOT_FLOOR_ACCOUNT_SIZES:
+                cid = _lot_floor_curve_id(policy, int(acct))
+                self.curves[cid] = _LotFloorCurveState(
+                    curve_id=cid,
+                    policy=policy,
+                    account_size=int(acct),
+                    capital=float(acct),
+                    peak_capital=float(acct),
+                    day_anchor=float(acct),
+                )
+
+    @classmethod
+    def from_chrono(cls, chrono_data: Mapping[str, Any] | None) -> "_ShadowLotFloorRunner":
+        runner = cls()
+        if not LOT_FLOOR_ENABLED or not chrono_data:
+            return runner
+        saved = chrono_data.get("shadow_lotfloor_state")
+        if not isinstance(saved, dict):
+            return runner
+        curves_raw = saved.get("curves")
+        if not isinstance(curves_raw, dict):
+            return runner
+        for cid, raw in curves_raw.items():
+            if cid in runner.curves and isinstance(raw, dict):
+                runner.curves[cid] = _LotFloorCurveState.from_dict(raw)
+        return runner
+
+    def to_persistence(self) -> dict[str, Any]:
+        return {"curves": {cid: st.to_dict() for cid, st in self.curves.items()}}
+
+    def on_new_day(self, date_str: str) -> None:
+        for st in self.curves.values():
+            st.day_anchor = float(st.capital)
+            st.day_pnl = 0.0
+
+    def finalize_day(self, date_str: str) -> None:
+        ds = str(date_str or "")[:10]
+        for st in self.curves.values():
+            st.daily_pnls[ds] = round(float(st.day_pnl), 2)
+            st.daily_anchors[ds] = round(float(st.day_anchor), 2)
+
+    def process_trade(self, ctx: Mapping[str, Any]) -> dict[str, dict[str, dict[str, Any]]]:
+        """
+        Returns nested map: {policy: {acct_N: {lots, pnl, blocked}}}.
+        Blocked trades do not update A+B / capital on that curve.
+        """
+        if not LOT_FLOOR_ENABLED or not self.curves:
+            return {}
+        if ctx.get("skipped") or str(ctx.get("outcome") or "").strip().upper() not in ("WIN", "LOSS"):
+            return {}
+        position_size = float(ctx.get("position_size") or 0)
+        real_pnl = float(ctx.get("pnl_dollars") or 0)
+        max_risk = float(ctx.get("max_risk_dollars") or 0)
+        trade_r = (real_pnl / max_risk) if max_risk > 0 else 0.0
+        outcome = str(ctx.get("outcome") or "").strip().upper()
+        won = outcome == "WIN"
+        sid = str(ctx.get("strategy_id") or "").strip().upper()
+        conf = str(ctx.get("confidence") or "").strip().upper()
+        mb = str(ctx.get("macro_bias") or "").strip().upper()
+        date_str = str(ctx.get("date") or "")[:10]
+
+        nested: dict[str, dict[str, dict[str, Any]]] = {p: {} for p in LOT_FLOOR_POLICIES}
+        for st in self.curves.values():
+            lots, scale, blocked = apply_lot_floor(
+                position_size=position_size,
+                account_size=float(st.account_size),
+                policy=st.policy,
+            )
+            if blocked:
+                st.trades_blocked += 1
+                st.blocked_net_r += float(trade_r)
+                pnl = 0.0
+            else:
+                pnl = round(real_pnl * float(scale), 2)
+                st.trades_taken += 1
+                st.taken_net_r += float(trade_r)
+                st.capital += pnl
+                st.day_pnl += pnl
+                if st.capital > st.peak_capital:
+                    st.peak_capital = st.capital
+                if st.peak_capital > 0:
+                    dd = (st.peak_capital - st.capital) / st.peak_capital * 100.0
+                    if dd > st.max_drawdown_pct_seen:
+                        st.max_drawdown_pct_seen = float(dd)
+                if sid and sid != "SKIP":
+                    _shadow_record_strat_pnl(st.strat_pnl_history, sid, float(pnl))
+                if conf == "MEDIUM" and mb == "STRONG_TAILWIND":
+                    _shadow_record_st_medium(st.st_medium_history, float(pnl), bool(won))
+            nested.setdefault(st.policy, {})[_lot_floor_acct_key(st.account_size)] = {
+                "lots": round(float(lots), 4),
+                "pnl": float(pnl),
+                "blocked": bool(blocked),
+            }
+        return nested
+
+    def _curve_summary(self, st: _LotFloorCurveState) -> dict[str, Any]:
+        peak = float(st.peak_capital or st.account_size)
+        cap = float(st.capital or st.account_size)
+        worst_day_pct = 0.0
+        positive_months = 0
+        month_pnls: dict[str, float] = {}
+        for ds, dp in st.daily_pnls.items():
+            anchor = float(st.daily_anchors.get(ds, st.day_anchor or st.account_size))
+            day_pct = (float(dp) / anchor * 100.0) if anchor > 0 else 0.0
+            if day_pct < worst_day_pct:
+                worst_day_pct = day_pct
+            ym = ds[:7]
+            month_pnls[ym] = month_pnls.get(ym, 0.0) + float(dp)
+        for mp in month_pnls.values():
+            if mp > 0:
+                positive_months += 1
+        return {
+            "final_capital": round(cap, 2),
+            "peak_capital": round(peak, 2),
+            "max_drawdown_pct": round(float(st.max_drawdown_pct_seen), 2),
+            "worst_day_pct": round(float(worst_day_pct), 2),
+            "positive_months": int(positive_months),
+            "trades_taken": int(st.trades_taken),
+            "trades_blocked": int(st.trades_blocked),
+            "taken_net_r": round(float(st.taken_net_r), 4),
+            "blocked_net_r": round(float(st.blocked_net_r), 4),
+            "account_size": int(st.account_size),
+            "policy": st.policy,
+        }
+
+    def summaries(self) -> dict[str, dict[str, dict[str, Any]]]:
+        out: dict[str, dict[str, dict[str, Any]]] = {p: {} for p in LOT_FLOOR_POLICIES}
+        for st in self.curves.values():
+            out.setdefault(st.policy, {})[_lot_floor_acct_key(st.account_size)] = self._curve_summary(st)
+        return out
+
+
+def _persist_shadow_lotfloor_state(
+    chrono_data: dict[str, Any],
+    runner: _ShadowLotFloorRunner,
+) -> None:
+    chrono_data["shadow_lotfloor_state"] = runner.to_persistence()
+
+
+def _lotfloor_trade_ctx_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "date": row.get("date"),
+        "strategy_id": row.get("strategy_id"),
+        "confidence": str(row.get("confidence") or "").strip().upper(),
+        "macro_bias": str(row.get("macro_bias_adjusted") or row.get("macro_bias") or ""),
+        "position_size": float(row.get("position_size") or 0),
+        "pnl_dollars": float(row.get("pnl_dollars") or 0),
+        "max_risk_dollars": float(row.get("max_risk_dollars") or 0),
+        "outcome": row.get("outcome"),
+        "skipped": bool(row.get("skipped") or row.get("skip_trade")),
+    }
 
 
 def _sizing_health_shadow_fields(
@@ -11508,6 +11793,7 @@ def run_chronological_backtest(
                 _si.rebuild_histories(job_id)
 
         shadow_runner = _ShadowGuardRunner.from_chrono(chrono_data)
+        lotfloor_runner = _ShadowLotFloorRunner.from_chrono(chrono_data)
         shadow_runner.set_median_nights_by_tf(
             _compute_median_nights_by_tf(list(chrono_data.get("all_trades") or []))
         )
@@ -11557,6 +11843,7 @@ def run_chronological_backtest(
             intra = chrono_data.get("chrono_intraday")
             if not isinstance(intra, dict) or str(intra.get("date", "")) != date_str:
                 shadow_runner.on_new_day(date_str)
+                lotfloor_runner.on_new_day(date_str)
             finalize_day_only = False
             resume_idx = 0
             v71_pi_s = v71_ti_s = v71_tj_s = 0
@@ -12257,6 +12544,9 @@ def run_chronological_backtest(
                                     row["shadow_compound"] = compound_map
                                 if event_map:
                                     row["shadow_event"] = event_map
+                            _lotfloor_map = lotfloor_runner.process_trade(_lotfloor_trade_ctx_from_row(row))
+                            if _lotfloor_map:
+                                row["shadow_lotfloor"] = _lotfloor_map
                             day_trades.append(row)
                             day_pnl += pnl
                             capital += pnl
@@ -12323,6 +12613,7 @@ def run_chronological_backtest(
                                 peak_capital=peak_capital,
                             )
                             _persist_shadow_guard_state(chrono_data, shadow_runner)
+                            _persist_shadow_lotfloor_state(chrono_data, lotfloor_runner)
                             chrono_data["current_date"] = date_str
                             chrono_data["status"] = "running"
                             save_json(chrono_path, chrono_data)
@@ -12354,6 +12645,7 @@ def run_chronological_backtest(
             )
             peak_capital = _update_run_peak_capital(capital, peak_capital)
             shadow_runner.finalize_day(date_str)
+            lotfloor_runner.finalize_day(date_str)
 
             daily_summary = {
                 "date": date_str,
@@ -12394,6 +12686,7 @@ def run_chronological_backtest(
                 )
                 chrono_data["_shadow_blocked_pairs_asserted"] = True
             _persist_shadow_guard_state(chrono_data, shadow_runner)
+            _persist_shadow_lotfloor_state(chrono_data, lotfloor_runner)
             save_json(chrono_path, chrono_data)
 
             log(
@@ -12454,9 +12747,12 @@ def run_chronological_backtest(
         chrono_data["shadow_guard_summary"] = shadow_runner.guard_summaries()
         chrono_data["shadow_compound_summary"] = shadow_runner.compound_summaries()
         chrono_data["shadow_event_summary"] = shadow_runner.event_summaries()
+        if LOT_FLOOR_ENABLED:
+            chrono_data["shadow_lotfloor_summary"] = lotfloor_runner.summaries()
         if SHADOW_BLOCKED_PAIRS:
             chrono_data["shadow_instrument_summary"] = _si.compute_summary(job_id)
         _persist_shadow_guard_state(chrono_data, shadow_runner)
+        _persist_shadow_lotfloor_state(chrono_data, lotfloor_runner)
         chrono_data["v74_metrics"] = _v74_chrono_trade_metrics(all_trades)
         _assert_swap_financing_modeled(all_trades, context=f"Chrono {job_id}")
         save_json(chrono_path, chrono_data)
