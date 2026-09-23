@@ -3862,7 +3862,7 @@ EXCLUDED_PAIRS = frozenset(
         "AUDNZD",
         "CADCHF",
         "EURCAD",
-        "EURJPY",
+        # EURJPY un-excluded: yfinance data exists; shadow +0.13R / +0.27R on two jobs.
         "GBPAUD",
         "NZDCHF",
         "NZDJPY",

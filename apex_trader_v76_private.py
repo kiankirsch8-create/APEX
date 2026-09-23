@@ -238,6 +238,8 @@ PROFILES: dict[str, dict[str, Any]] = {
         "dry_run_after_losing_days": None,
         "warmup_days": 0,
         "warmup_multiplier": 1.0,
+        "compounding_enabled": False,
+        "compound_risk_fraction": None,
     },
     "funded": {
         "cold_start_min_trades": 5,
@@ -249,6 +251,9 @@ PROFILES: dict[str, dict[str, Any]] = {
         "dry_run_after_losing_days": 3,
         "warmup_days": 40,
         "warmup_multiplier": 0.25,
+        # Shadow compound_020_full: -7.63% max DD / -1.71% worst day with guardrails.
+        "compounding_enabled": True,
+        "compound_risk_fraction": 0.002,  # 0.20% of current equity per trade
     },
 }
 CFG: dict[str, Any] = PROFILES[PROFILE]
@@ -564,6 +569,30 @@ def log_v76(msg: str, level: str = "info") -> None:
     live_log(level, msg)
 
 
+def _migrate_guard_profile_state(st: dict[str, Any]) -> None:
+    """
+    Scope guard activation / peak equity per PROFILE.
+
+    Flat ``guard_activation_date`` / ``peak_equity`` (written under PROFILE=private)
+    migrate into the ``private`` slot once so switching to funded starts clean.
+    """
+    by_act = st.get("guard_activation_date_by_profile")
+    if not isinstance(by_act, dict):
+        by_act = {}
+        st["guard_activation_date_by_profile"] = by_act
+    by_peak = st.get("peak_equity_by_profile")
+    if not isinstance(by_peak, dict):
+        by_peak = {}
+        st["peak_equity_by_profile"] = by_peak
+
+    flat_act = str(st.get("guard_activation_date") or "").strip()
+    if "private" not in by_act and flat_act:
+        by_act["private"] = flat_act
+
+    if "private" not in by_peak and st.get("peak_equity") is not None:
+        by_peak["private"] = st.get("peak_equity")
+
+
 def load_v76_state() -> dict[str, Any]:
     d = at._load(
         V76_STATE_FILE,
@@ -574,13 +603,18 @@ def load_v76_state() -> dict[str, Any]:
             "daily_pnl": [],
             "day_key": "",
             "day_anchor": None,
-            # CFG guardrail persistence (survives restarts)
+            # CFG guardrail persistence (survives restarts) — per PROFILE
             "guard_activation_date": "",
             "peak_equity": None,
+            "guard_activation_date_by_profile": {},
+            "peak_equity_by_profile": {},
             "day_realized_pnl": 0.0,
         },
     )
-    return d if isinstance(d, dict) else {}
+    if not isinstance(d, dict):
+        return {}
+    _migrate_guard_profile_state(d)
+    return d
 
 
 def save_v76_state(d: dict[str, Any]) -> None:
@@ -799,27 +833,41 @@ def _trading_days_inclusive(start: date, end: date) -> int:
 
 
 def _ensure_guard_activation_date(st: dict[str, Any], scan_d: date) -> date:
-    raw = str(st.get("guard_activation_date") or "").strip()
+    _migrate_guard_profile_state(st)
+    by_act = st["guard_activation_date_by_profile"]
+    assert isinstance(by_act, dict)
+    raw = str(by_act.get(PROFILE) or "").strip()
     parsed = _parse_iso_date(raw)
     if parsed is None:
-        st["guard_activation_date"] = scan_d.isoformat()
+        by_act[PROFILE] = scan_d.isoformat()
+        # Keep flat key in sync under private so older readers stay coherent.
+        if PROFILE == "private":
+            st["guard_activation_date"] = scan_d.isoformat()
         return scan_d
+    if PROFILE == "private":
+        st["guard_activation_date"] = parsed.isoformat()
     return parsed
 
 
 def _update_peak_equity(st: dict[str, Any], equity: float) -> float:
+    _migrate_guard_profile_state(st)
+    by_peak = st["peak_equity_by_profile"]
+    assert isinstance(by_peak, dict)
     try:
         eq = float(equity)
     except (TypeError, ValueError):
         eq = 0.0
     try:
-        peak = float(st.get("peak_equity")) if st.get("peak_equity") is not None else eq
-    except (TypeError, ValueError):
+        peak = float(by_peak[PROFILE]) if by_peak.get(PROFILE) is not None else eq
+    except (TypeError, ValueError, KeyError):
         peak = eq
     if eq > peak:
         peak = eq
-    st["peak_equity"] = round(peak, 2)
-    return float(peak)
+    rounded = round(peak, 2)
+    by_peak[PROFILE] = rounded
+    if PROFILE == "private":
+        st["peak_equity"] = rounded
+    return float(rounded)
 
 
 def _cfg_guardrail_multipliers(
