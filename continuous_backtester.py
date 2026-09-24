@@ -4504,6 +4504,7 @@ class _TrailSummaryCurveState:
     day_anchor: float
     day_pnl: float = 0.0
     trades: int = 0
+    fallback_trades: int = 0
     daily_pnls: dict[str, float] = field(default_factory=dict)
     daily_anchors: dict[str, float] = field(default_factory=dict)
     max_drawdown_pct_seen: float = 0.0
@@ -4516,6 +4517,7 @@ class _TrailSummaryCurveState:
             "day_anchor": round(float(self.day_anchor), 2),
             "day_pnl": round(float(self.day_pnl), 2),
             "trades": int(self.trades),
+            "fallback_trades": int(self.fallback_trades),
             "daily_pnls": dict(self.daily_pnls),
             "daily_anchors": dict(self.daily_anchors),
             "max_drawdown_pct_seen": round(float(self.max_drawdown_pct_seen), 4),
@@ -4531,6 +4533,7 @@ class _TrailSummaryCurveState:
             day_anchor=float(raw.get("day_anchor", start) or start),
             day_pnl=float(raw.get("day_pnl", 0) or 0),
             trades=int(raw.get("trades", 0) or 0),
+            fallback_trades=int(raw.get("fallback_trades", 0) or 0),
             daily_pnls={str(k): float(v) for k, v in (raw.get("daily_pnls") or {}).items()},
             daily_anchors={str(k): float(v) for k, v in (raw.get("daily_anchors") or {}).items()},
             max_drawdown_pct_seen=float(raw.get("max_drawdown_pct_seen", 0) or 0),
@@ -4627,12 +4630,15 @@ class _ShadowTrailSummaryRunner:
             if st is None:
                 continue
             payload = row.get(field_name)
-            if not isinstance(payload, dict) or payload.get("pnl_dollars") is None:
-                continue
-            try:
-                pnl = float(payload.get("pnl_dollars") or 0)
-            except (TypeError, ValueError):
-                continue
+            if isinstance(payload, dict) and payload.get("pnl_dollars") is not None:
+                try:
+                    pnl = float(payload["pnl_dollars"])
+                except (TypeError, ValueError):
+                    pnl = float(row.get("pnl_dollars") or 0)
+                    st.fallback_trades += 1
+            else:
+                pnl = float(row.get("pnl_dollars") or 0)  # fall back to live
+                st.fallback_trades += 1
             self._apply(st, pnl)
 
     def _curve_summary(self, st: _TrailSummaryCurveState) -> dict[str, Any]:
@@ -4658,6 +4664,7 @@ class _ShadowTrailSummaryRunner:
             "worst_day_pct": round(float(worst_day_pct), 2),
             "positive_months": int(positive_months),
             "trades": int(st.trades),
+            "fallback_trades": int(st.fallback_trades),
         }
 
     def summaries(self) -> dict[str, dict[str, Any]]:

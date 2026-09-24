@@ -186,14 +186,46 @@ def test_trail_summary_from_existing_fields() -> None:
     assert summaries["trail_live"]["final_capital"] == cb.STARTING_CAPITAL + 25.0
     assert summaries["shadow_trail_at_1_50r"]["final_capital"] == cb.STARTING_CAPITAL + 30.0
     assert summaries["shadow_trail_at_2_50r"]["final_capital"] == cb.STARTING_CAPITAL + 5.0
+    live_n = summaries["trail_live"]["trades"]
+    for cid, s in summaries.items():
+        assert s["trades"] == live_n, cid
     for key in (
         "final_capital",
         "max_drawdown_pct",
         "worst_day_pct",
         "positive_months",
+        "fallback_trades",
     ):
         assert key in summaries["shadow_trail_at_1_50r"]
         assert key in summaries["trail_live"]
     # Real curve constants untouched
     assert cb.APPLY_AB_THROTTLE is True
     assert cb._AB_THROTTLE_FACTOR == 0.18
+
+
+def test_trail_summary_null_payload_falls_back_to_live() -> None:
+    runner = cb._ShadowTrailSummaryRunner()
+    runner.on_new_day("2024-03-01")
+    row = {
+        "date": "2024-03-01",
+        "outcome": "LOSS",
+        "pnl_dollars": -12.0,
+        "shadow_trail_at_0_50r": None,
+        "shadow_trail_at_1_00r": {"exit_reason": "STOP"},  # missing pnl_dollars
+        "shadow_trail_at_1_50r": {"pnl_dollars": -8.0, "exit_reason": "TRAIL_STOP"},
+        # 2_50r omitted entirely
+    }
+    runner.process_trade(row)
+    runner.finalize_day("2024-03-01")
+    summaries = runner.summaries()
+    live_n = summaries["trail_live"]["trades"]
+    assert live_n == 1
+    for cid, s in summaries.items():
+        assert s["trades"] == live_n, cid
+    assert summaries["shadow_trail_at_0_50r"]["fallback_trades"] == 1
+    assert summaries["shadow_trail_at_1_00r"]["fallback_trades"] == 1
+    assert summaries["shadow_trail_at_2_50r"]["fallback_trades"] == 1
+    assert summaries["shadow_trail_at_1_50r"]["fallback_trades"] == 0
+    assert summaries["shadow_trail_at_0_50r"]["final_capital"] == cb.STARTING_CAPITAL - 12.0
+    assert summaries["shadow_trail_at_1_50r"]["final_capital"] == cb.STARTING_CAPITAL - 8.0
+    assert summaries["trail_live"]["fallback_trades"] == 0
