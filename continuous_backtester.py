@@ -370,6 +370,26 @@ SHADOW_SKIP_THROTTLED_CONFIGS: list[tuple[str, dict[str, Any]]] = [
     ("skip_throttled_long", {"skip_below": 1.00, "longs_only": True}),
 ]
 
+# ---------------------------------------------------------------------------
+# Shadow take/block filters (real curve unchanged).
+# no_shorts: drawdown-for-profit trade. Period gates: funded-challenge candidates
+# (no lookahead — previous completed month or last 20 CLOSED trades only).
+# ---------------------------------------------------------------------------
+SHADOW_FILTER_ENABLED = True
+SHADOW_FILTER_CONFIGS: list[tuple[str, dict[str, Any]]] = [
+    ("no_shorts", {"direction_filter": "LONG"}),
+    ("gate_prev_month_r", {"gate": "prev_month_r_positive"}),
+    ("gate_prev_month_pnl", {"gate": "prev_month_pnl_positive"}),
+    ("gate_rolling_20", {"gate": "rolling_20_trade_r_positive"}),
+]
+SHADOW_FILTER_CHALLENGE_TARGET_PCT = 10.0
+SHADOW_FILTER_CHALLENGE_DD_LIMIT_PCT = 10.0
+SHADOW_FILTER_ROLLING_N = 20
+
+# Trail activation capital curves from existing per-trade shadow_trail_* fields
+# (no new forward sims). Live trail uses the row's pnl_dollars.
+SHADOW_TRAIL_SUMMARY_ENABLED = True
+
 # Static high-impact event calendar (2021-2026). Full table in high_impact_events_data.py.
 from high_impact_events_data import HIGH_IMPACT_EVENTS
 
@@ -4149,6 +4169,506 @@ def _shadow_skip_trade_ctx_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
         "shadow_class": row.get("shadow_class"),
         "shadow_instrument": row.get("shadow_instrument"),
     }
+
+
+def _prev_calendar_month(ym: str) -> str | None:
+    """Return YYYY-MM for the month before ``ym``, or None if unparseable."""
+    try:
+        y, m = int(ym[:4]), int(ym[5:7])
+    except (TypeError, ValueError):
+        return None
+    if m <= 1:
+        return f"{y - 1:04d}-12"
+    return f"{y:04d}-{m - 1:02d}"
+
+
+def _months_between_inclusive(start_ym: str, end_ym: str) -> int | None:
+    """Calendar months from start_ym to end_ym inclusive (1 if same month)."""
+    try:
+        y0, m0 = int(start_ym[:4]), int(start_ym[5:7])
+        y1, m1 = int(end_ym[:4]), int(end_ym[5:7])
+    except (TypeError, ValueError):
+        return None
+    return (y1 - y0) * 12 + (m1 - m0) + 1
+
+
+@dataclass
+class _FilterCurveState:
+    curve_id: str
+    direction_filter: str | None  # "LONG" | "SHORT" | None
+    gate: str | None
+    capital: float
+    peak_capital: float
+    day_anchor: float
+    day_pnl: float = 0.0
+    trades_taken: int = 0
+    trades_blocked: int = 0
+    taken_net_r: float = 0.0
+    blocked_net_r: float = 0.0
+    daily_pnls: dict[str, float] = field(default_factory=dict)
+    daily_anchors: dict[str, float] = field(default_factory=dict)
+    max_drawdown_pct_seen: float = 0.0
+    # Gate signal state (updated AFTER each closed trade — no lookahead).
+    month_r: dict[str, float] = field(default_factory=dict)
+    month_pnl: dict[str, float] = field(default_factory=dict)
+    rolling_r: list[float] = field(default_factory=list)
+    # Challenge tracking
+    first_trade_ym: str = ""
+    months_to_plus_10pct: int | None = None
+    dd_under_10pct_to_plus_10: bool | None = None
+    hit_plus_10pct: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "curve_id": self.curve_id,
+            "direction_filter": self.direction_filter,
+            "gate": self.gate,
+            "capital": round(float(self.capital), 2),
+            "peak_capital": round(float(self.peak_capital), 2),
+            "day_anchor": round(float(self.day_anchor), 2),
+            "day_pnl": round(float(self.day_pnl), 2),
+            "trades_taken": int(self.trades_taken),
+            "trades_blocked": int(self.trades_blocked),
+            "taken_net_r": round(float(self.taken_net_r), 6),
+            "blocked_net_r": round(float(self.blocked_net_r), 6),
+            "daily_pnls": dict(self.daily_pnls),
+            "daily_anchors": dict(self.daily_anchors),
+            "max_drawdown_pct_seen": round(float(self.max_drawdown_pct_seen), 4),
+            "month_r": {k: round(float(v), 6) for k, v in self.month_r.items()},
+            "month_pnl": {k: round(float(v), 2) for k, v in self.month_pnl.items()},
+            "rolling_r": [round(float(x), 6) for x in self.rolling_r[-SHADOW_FILTER_ROLLING_N:]],
+            "first_trade_ym": self.first_trade_ym,
+            "months_to_plus_10pct": self.months_to_plus_10pct,
+            "dd_under_10pct_to_plus_10": self.dd_under_10pct_to_plus_10,
+            "hit_plus_10pct": bool(self.hit_plus_10pct),
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "_FilterCurveState":
+        start = float(STARTING_CAPITAL)
+        df = raw.get("direction_filter")
+        gate = raw.get("gate")
+        return cls(
+            curve_id=str(raw.get("curve_id") or ""),
+            direction_filter=(str(df).strip().upper() if df else None),
+            gate=(str(gate).strip().lower() if gate else None),
+            capital=float(raw.get("capital", start) or start),
+            peak_capital=float(raw.get("peak_capital", start) or start),
+            day_anchor=float(raw.get("day_anchor", start) or start),
+            day_pnl=float(raw.get("day_pnl", 0) or 0),
+            trades_taken=int(raw.get("trades_taken", 0) or 0),
+            trades_blocked=int(raw.get("trades_blocked", 0) or 0),
+            taken_net_r=float(raw.get("taken_net_r", 0) or 0),
+            blocked_net_r=float(raw.get("blocked_net_r", 0) or 0),
+            daily_pnls={str(k): float(v) for k, v in (raw.get("daily_pnls") or {}).items()},
+            daily_anchors={str(k): float(v) for k, v in (raw.get("daily_anchors") or {}).items()},
+            max_drawdown_pct_seen=float(raw.get("max_drawdown_pct_seen", 0) or 0),
+            month_r={str(k): float(v) for k, v in (raw.get("month_r") or {}).items()},
+            month_pnl={str(k): float(v) for k, v in (raw.get("month_pnl") or {}).items()},
+            rolling_r=[float(x) for x in (raw.get("rolling_r") or [])],
+            first_trade_ym=str(raw.get("first_trade_ym") or ""),
+            months_to_plus_10pct=(
+                int(raw["months_to_plus_10pct"])
+                if raw.get("months_to_plus_10pct") is not None
+                else None
+            ),
+            dd_under_10pct_to_plus_10=(
+                bool(raw["dd_under_10pct_to_plus_10"])
+                if raw.get("dd_under_10pct_to_plus_10") is not None
+                else None
+            ),
+            hit_plus_10pct=bool(raw.get("hit_plus_10pct", False)),
+        )
+
+
+class _ShadowFilterRunner:
+    """
+    Take/block shadow curves: direction filter and lagged period gates.
+
+    Taken trades apply real ``pnl_dollars`` to capital. Gate signals update from
+    every closed candidate AFTER the decision (no lookahead into the current
+    month / current trade).
+    """
+
+    def __init__(self) -> None:
+        self.curves: dict[str, _FilterCurveState] = {}
+        self._init_curves()
+
+    def _init_curves(self) -> None:
+        if not SHADOW_FILTER_ENABLED:
+            return
+        start = float(STARTING_CAPITAL)
+        for name, cfg in SHADOW_FILTER_CONFIGS:
+            df = cfg.get("direction_filter")
+            gate = cfg.get("gate")
+            self.curves[name] = _FilterCurveState(
+                curve_id=name,
+                direction_filter=(str(df).strip().upper() if df else None),
+                gate=(str(gate).strip().lower() if gate else None),
+                capital=start,
+                peak_capital=start,
+                day_anchor=start,
+            )
+
+    @classmethod
+    def from_chrono(cls, chrono_data: Mapping[str, Any] | None) -> "_ShadowFilterRunner":
+        runner = cls()
+        if not SHADOW_FILTER_ENABLED or not chrono_data:
+            return runner
+        saved = chrono_data.get("shadow_filter_state")
+        if not isinstance(saved, dict):
+            return runner
+        curves_raw = saved.get("curves")
+        if not isinstance(curves_raw, dict):
+            return runner
+        for cid, raw in curves_raw.items():
+            if cid in runner.curves and isinstance(raw, dict):
+                runner.curves[cid] = _FilterCurveState.from_dict(raw)
+        return runner
+
+    def to_persistence(self) -> dict[str, Any]:
+        return {"curves": {cid: st.to_dict() for cid, st in self.curves.items()}}
+
+    def on_new_day(self, date_str: str) -> None:
+        for st in self.curves.values():
+            st.day_anchor = float(st.capital)
+            st.day_pnl = 0.0
+
+    def finalize_day(self, date_str: str) -> None:
+        ds = str(date_str or "")[:10]
+        for st in self.curves.values():
+            st.daily_pnls[ds] = round(float(st.day_pnl), 2)
+            st.daily_anchors[ds] = round(float(st.day_anchor), 2)
+
+    def _gate_allows(self, st: _FilterCurveState, ym: str) -> bool:
+        gate = st.gate
+        if not gate:
+            return True
+        if gate == "prev_month_r_positive":
+            prev = _prev_calendar_month(ym)
+            if prev is None or prev not in st.month_r:
+                return True  # no completed prior month yet — allow
+            return float(st.month_r[prev]) > 0.0
+        if gate == "prev_month_pnl_positive":
+            prev = _prev_calendar_month(ym)
+            if prev is None or prev not in st.month_pnl:
+                return True
+            return float(st.month_pnl[prev]) > 0.0
+        if gate == "rolling_20_trade_r_positive":
+            if len(st.rolling_r) < SHADOW_FILTER_ROLLING_N:
+                return True  # warm-up — allow until 20 closed priors exist
+            window = st.rolling_r[-SHADOW_FILTER_ROLLING_N:]
+            return sum(float(x) for x in window) > 0.0
+        return True
+
+    def _direction_allows(self, st: _FilterCurveState, direction: str) -> bool:
+        if not st.direction_filter:
+            return True
+        return direction == str(st.direction_filter).strip().upper()
+
+    def _maybe_mark_challenge(self, st: _FilterCurveState, ym: str) -> None:
+        if st.hit_plus_10pct:
+            return
+        target = float(STARTING_CAPITAL) * (1.0 + SHADOW_FILTER_CHALLENGE_TARGET_PCT / 100.0)
+        if st.capital < target:
+            return
+        st.hit_plus_10pct = True
+        if st.first_trade_ym and ym:
+            st.months_to_plus_10pct = _months_between_inclusive(st.first_trade_ym, ym)
+        st.dd_under_10pct_to_plus_10 = (
+            float(st.max_drawdown_pct_seen) < SHADOW_FILTER_CHALLENGE_DD_LIMIT_PCT
+        )
+
+    def process_trade(self, ctx: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+        if not SHADOW_FILTER_ENABLED or not self.curves:
+            return {}
+        if ctx.get("skipped") or str(ctx.get("outcome") or "").strip().upper() not in ("WIN", "LOSS"):
+            return {}
+        if ctx.get("shadow_class") or ctx.get("shadow_instrument"):
+            return {}
+
+        direction = str(ctx.get("direction") or "").strip().upper()
+        pnl = float(ctx.get("pnl_dollars") or 0)
+        trade_r = float(ctx.get("pnl_r_net") or 0)
+        date_str = str(ctx.get("date") or "")[:10]
+        ym = date_str[:7] if len(date_str) >= 7 else ""
+        out: dict[str, dict[str, Any]] = {}
+
+        for cid, st in self.curves.items():
+            if ym and not st.first_trade_ym:
+                st.first_trade_ym = ym
+
+            dir_ok = self._direction_allows(st, direction)
+            gate_ok = self._gate_allows(st, ym) if ym else True
+            take = bool(dir_ok and gate_ok)
+
+            if take:
+                st.trades_taken += 1
+                st.taken_net_r += float(trade_r)
+                st.capital += pnl
+                st.day_pnl += pnl
+                if st.capital > st.peak_capital:
+                    st.peak_capital = st.capital
+                if st.peak_capital > 0:
+                    dd = (st.peak_capital - st.capital) / st.peak_capital * 100.0
+                    if dd > st.max_drawdown_pct_seen:
+                        st.max_drawdown_pct_seen = float(dd)
+                self._maybe_mark_challenge(st, ym)
+                capital_pnl = round(float(pnl), 2)
+            else:
+                st.trades_blocked += 1
+                st.blocked_net_r += float(trade_r)
+                capital_pnl = 0.0
+
+            # Update gate signal AFTER decision (includes this trade for future gates).
+            # Use real-curve outcome so naive month gating is reproducible; blocked
+            # trades still inform the lagged signal without affecting capital.
+            if ym:
+                st.month_r[ym] = float(st.month_r.get(ym, 0.0)) + float(trade_r)
+                st.month_pnl[ym] = float(st.month_pnl.get(ym, 0.0)) + float(pnl)
+            st.rolling_r.append(float(trade_r))
+            if len(st.rolling_r) > SHADOW_FILTER_ROLLING_N * 2:
+                st.rolling_r = st.rolling_r[-SHADOW_FILTER_ROLLING_N :]
+
+            out[cid] = {
+                "taken": bool(take),
+                "blocked": not take,
+                "pnl": float(capital_pnl),
+                "gate_open": bool(gate_ok),
+                "direction_ok": bool(dir_ok),
+            }
+        return out
+
+    def _curve_summary(self, st: _FilterCurveState) -> dict[str, Any]:
+        peak = float(st.peak_capital or STARTING_CAPITAL)
+        cap = float(st.capital or STARTING_CAPITAL)
+        worst_day_pct = 0.0
+        positive_months = 0
+        month_pnls: dict[str, float] = {}
+        for ds, dp in st.daily_pnls.items():
+            anchor = float(st.daily_anchors.get(ds, st.day_anchor or STARTING_CAPITAL))
+            day_pct = (float(dp) / anchor * 100.0) if anchor > 0 else 0.0
+            if day_pct < worst_day_pct:
+                worst_day_pct = day_pct
+            ymk = ds[:7]
+            month_pnls[ymk] = month_pnls.get(ymk, 0.0) + float(dp)
+        for mp in month_pnls.values():
+            if mp > 0:
+                positive_months += 1
+        return {
+            "final_capital": round(cap, 2),
+            "peak_capital": round(peak, 2),
+            "max_drawdown_pct": round(float(st.max_drawdown_pct_seen), 2),
+            "worst_day_pct": round(float(worst_day_pct), 2),
+            "positive_months": int(positive_months),
+            "trades_taken": int(st.trades_taken),
+            "trades_blocked": int(st.trades_blocked),
+            "taken_net_r": round(float(st.taken_net_r), 4),
+            "blocked_net_r": round(float(st.blocked_net_r), 4),
+            "months_to_plus_10pct": st.months_to_plus_10pct,
+            "dd_under_10pct_to_plus_10": st.dd_under_10pct_to_plus_10,
+            "hit_plus_10pct": bool(st.hit_plus_10pct),
+            "direction_filter": st.direction_filter,
+            "gate": st.gate,
+        }
+
+    def summaries(self) -> dict[str, dict[str, Any]]:
+        return {cid: self._curve_summary(st) for cid, st in self.curves.items()}
+
+
+def _persist_shadow_filter_state(
+    chrono_data: dict[str, Any],
+    runner: _ShadowFilterRunner,
+) -> None:
+    chrono_data["shadow_filter_state"] = runner.to_persistence()
+
+
+def _shadow_filter_trade_ctx_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "date": row.get("date"),
+        "direction": str(row.get("direction") or "").strip().upper(),
+        "pnl_dollars": float(row.get("pnl_dollars") or 0),
+        "pnl_r_net": float(row.get("pnl_r_net") or 0),
+        "outcome": row.get("outcome"),
+        "skipped": bool(row.get("skipped") or row.get("skip_trade")),
+        "shadow_class": row.get("shadow_class"),
+        "shadow_instrument": row.get("shadow_instrument"),
+    }
+
+
+@dataclass
+class _TrailSummaryCurveState:
+    curve_id: str
+    capital: float
+    peak_capital: float
+    day_anchor: float
+    day_pnl: float = 0.0
+    trades: int = 0
+    daily_pnls: dict[str, float] = field(default_factory=dict)
+    daily_anchors: dict[str, float] = field(default_factory=dict)
+    max_drawdown_pct_seen: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "curve_id": self.curve_id,
+            "capital": round(float(self.capital), 2),
+            "peak_capital": round(float(self.peak_capital), 2),
+            "day_anchor": round(float(self.day_anchor), 2),
+            "day_pnl": round(float(self.day_pnl), 2),
+            "trades": int(self.trades),
+            "daily_pnls": dict(self.daily_pnls),
+            "daily_anchors": dict(self.daily_anchors),
+            "max_drawdown_pct_seen": round(float(self.max_drawdown_pct_seen), 4),
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "_TrailSummaryCurveState":
+        start = float(STARTING_CAPITAL)
+        return cls(
+            curve_id=str(raw.get("curve_id") or ""),
+            capital=float(raw.get("capital", start) or start),
+            peak_capital=float(raw.get("peak_capital", start) or start),
+            day_anchor=float(raw.get("day_anchor", start) or start),
+            day_pnl=float(raw.get("day_pnl", 0) or 0),
+            trades=int(raw.get("trades", 0) or 0),
+            daily_pnls={str(k): float(v) for k, v in (raw.get("daily_pnls") or {}).items()},
+            daily_anchors={str(k): float(v) for k, v in (raw.get("daily_anchors") or {}).items()},
+            max_drawdown_pct_seen=float(raw.get("max_drawdown_pct_seen", 0) or 0),
+        )
+
+
+class _ShadowTrailSummaryRunner:
+    """
+    Capital curves from existing trail shadow fields + live pnl_dollars.
+    No new forward sims — aggregates write-only ``shadow_trail_at_*`` maps.
+    """
+
+    LIVE_KEY = "trail_live"
+
+    def __init__(self) -> None:
+        self.curves: dict[str, _TrailSummaryCurveState] = {}
+        self._init_curves()
+
+    def _init_curves(self) -> None:
+        if not SHADOW_TRAIL_SUMMARY_ENABLED:
+            return
+        start = float(STARTING_CAPITAL)
+        self.curves[self.LIVE_KEY] = _TrailSummaryCurveState(
+            curve_id=self.LIVE_KEY,
+            capital=start,
+            peak_capital=start,
+            day_anchor=start,
+        )
+        for field_name, _act in _SHADOW_TRAIL_ACTIVATE_RS:
+            self.curves[field_name] = _TrailSummaryCurveState(
+                curve_id=field_name,
+                capital=start,
+                peak_capital=start,
+                day_anchor=start,
+            )
+
+    @classmethod
+    def from_chrono(cls, chrono_data: Mapping[str, Any] | None) -> "_ShadowTrailSummaryRunner":
+        runner = cls()
+        if not SHADOW_TRAIL_SUMMARY_ENABLED or not chrono_data:
+            return runner
+        saved = chrono_data.get("shadow_trail_summary_state")
+        if not isinstance(saved, dict):
+            return runner
+        curves_raw = saved.get("curves")
+        if not isinstance(curves_raw, dict):
+            return runner
+        for cid, raw in curves_raw.items():
+            if cid in runner.curves and isinstance(raw, dict):
+                runner.curves[cid] = _TrailSummaryCurveState.from_dict(raw)
+        return runner
+
+    def to_persistence(self) -> dict[str, Any]:
+        return {"curves": {cid: st.to_dict() for cid, st in self.curves.items()}}
+
+    def on_new_day(self, date_str: str) -> None:
+        for st in self.curves.values():
+            st.day_anchor = float(st.capital)
+            st.day_pnl = 0.0
+
+    def finalize_day(self, date_str: str) -> None:
+        ds = str(date_str or "")[:10]
+        for st in self.curves.values():
+            st.daily_pnls[ds] = round(float(st.day_pnl), 2)
+            st.daily_anchors[ds] = round(float(st.day_anchor), 2)
+
+    def _apply(self, st: _TrailSummaryCurveState, pnl: float) -> None:
+        st.trades += 1
+        st.capital += pnl
+        st.day_pnl += pnl
+        if st.capital > st.peak_capital:
+            st.peak_capital = st.capital
+        if st.peak_capital > 0:
+            dd = (st.peak_capital - st.capital) / st.peak_capital * 100.0
+            if dd > st.max_drawdown_pct_seen:
+                st.max_drawdown_pct_seen = float(dd)
+
+    def process_trade(self, row: Mapping[str, Any]) -> None:
+        if not SHADOW_TRAIL_SUMMARY_ENABLED or not self.curves:
+            return
+        if row.get("skipped") or row.get("skip_trade"):
+            return
+        if str(row.get("outcome") or "").strip().upper() not in ("WIN", "LOSS"):
+            return
+        if row.get("shadow_class") or row.get("shadow_instrument"):
+            return
+
+        live_st = self.curves.get(self.LIVE_KEY)
+        if live_st is not None:
+            self._apply(live_st, float(row.get("pnl_dollars") or 0))
+
+        for field_name, _act in _SHADOW_TRAIL_ACTIVATE_RS:
+            st = self.curves.get(field_name)
+            if st is None:
+                continue
+            payload = row.get(field_name)
+            if not isinstance(payload, dict) or payload.get("pnl_dollars") is None:
+                continue
+            try:
+                pnl = float(payload.get("pnl_dollars") or 0)
+            except (TypeError, ValueError):
+                continue
+            self._apply(st, pnl)
+
+    def _curve_summary(self, st: _TrailSummaryCurveState) -> dict[str, Any]:
+        peak = float(st.peak_capital or STARTING_CAPITAL)
+        cap = float(st.capital or STARTING_CAPITAL)
+        worst_day_pct = 0.0
+        positive_months = 0
+        month_pnls: dict[str, float] = {}
+        for ds, dp in st.daily_pnls.items():
+            anchor = float(st.daily_anchors.get(ds, st.day_anchor or STARTING_CAPITAL))
+            day_pct = (float(dp) / anchor * 100.0) if anchor > 0 else 0.0
+            if day_pct < worst_day_pct:
+                worst_day_pct = day_pct
+            ym = ds[:7]
+            month_pnls[ym] = month_pnls.get(ym, 0.0) + float(dp)
+        for mp in month_pnls.values():
+            if mp > 0:
+                positive_months += 1
+        return {
+            "final_capital": round(cap, 2),
+            "peak_capital": round(peak, 2),
+            "max_drawdown_pct": round(float(st.max_drawdown_pct_seen), 2),
+            "worst_day_pct": round(float(worst_day_pct), 2),
+            "positive_months": int(positive_months),
+            "trades": int(st.trades),
+        }
+
+    def summaries(self) -> dict[str, dict[str, Any]]:
+        return {cid: self._curve_summary(st) for cid, st in self.curves.items()}
+
+
+def _persist_shadow_trail_summary_state(
+    chrono_data: dict[str, Any],
+    runner: _ShadowTrailSummaryRunner,
+) -> None:
+    chrono_data["shadow_trail_summary_state"] = runner.to_persistence()
 
 
 def _sizing_health_shadow_fields(
@@ -12704,6 +13224,8 @@ def run_chronological_backtest(
         lotfloor_runner = _ShadowLotFloorRunner.from_chrono(chrono_data)
         stop_runner = _ShadowStopRunner.from_chrono(chrono_data)
         skip_runner = _ShadowSkipThrottledRunner.from_chrono(chrono_data)
+        filter_runner = _ShadowFilterRunner.from_chrono(chrono_data)
+        trail_summary_runner = _ShadowTrailSummaryRunner.from_chrono(chrono_data)
         shadow_runner.set_median_nights_by_tf(
             _compute_median_nights_by_tf(list(chrono_data.get("all_trades") or []))
         )
@@ -12756,6 +13278,8 @@ def run_chronological_backtest(
                 lotfloor_runner.on_new_day(date_str)
                 stop_runner.on_new_day(date_str)
                 skip_runner.on_new_day(date_str)
+                filter_runner.on_new_day(date_str)
+                trail_summary_runner.on_new_day(date_str)
             finalize_day_only = False
             resume_idx = 0
             v71_pi_s = v71_ti_s = v71_tj_s = 0
@@ -13463,6 +13987,10 @@ def run_chronological_backtest(
                             _skip_map = skip_runner.process_trade(_shadow_skip_trade_ctx_from_row(row))
                             if _skip_map:
                                 row["shadow_skip"] = _skip_map
+                            _filter_map = filter_runner.process_trade(_shadow_filter_trade_ctx_from_row(row))
+                            if _filter_map:
+                                row["shadow_filter"] = _filter_map
+                            trail_summary_runner.process_trade(row)
                             day_trades.append(row)
                             day_pnl += pnl
                             capital += pnl
@@ -13532,6 +14060,8 @@ def run_chronological_backtest(
                             _persist_shadow_lotfloor_state(chrono_data, lotfloor_runner)
                             _persist_shadow_stop_state(chrono_data, stop_runner)
                             _persist_shadow_skip_state(chrono_data, skip_runner)
+                            _persist_shadow_filter_state(chrono_data, filter_runner)
+                            _persist_shadow_trail_summary_state(chrono_data, trail_summary_runner)
                             chrono_data["current_date"] = date_str
                             chrono_data["status"] = "running"
                             save_json(chrono_path, chrono_data)
@@ -13566,6 +14096,8 @@ def run_chronological_backtest(
             lotfloor_runner.finalize_day(date_str)
             stop_runner.finalize_day(date_str)
             skip_runner.finalize_day(date_str)
+            filter_runner.finalize_day(date_str)
+            trail_summary_runner.finalize_day(date_str)
 
             daily_summary = {
                 "date": date_str,
@@ -13609,6 +14141,8 @@ def run_chronological_backtest(
             _persist_shadow_lotfloor_state(chrono_data, lotfloor_runner)
             _persist_shadow_stop_state(chrono_data, stop_runner)
             _persist_shadow_skip_state(chrono_data, skip_runner)
+            _persist_shadow_filter_state(chrono_data, filter_runner)
+            _persist_shadow_trail_summary_state(chrono_data, trail_summary_runner)
             save_json(chrono_path, chrono_data)
 
             log(
@@ -13675,12 +14209,18 @@ def run_chronological_backtest(
             chrono_data["shadow_stop_summary"] = stop_runner.summaries()
         if SHADOW_SKIP_THROTTLED_ENABLED:
             chrono_data["shadow_skip_summary"] = skip_runner.summaries()
+        if SHADOW_FILTER_ENABLED:
+            chrono_data["shadow_filter_summary"] = filter_runner.summaries()
+        if SHADOW_TRAIL_SUMMARY_ENABLED:
+            chrono_data["shadow_trail_summary"] = trail_summary_runner.summaries()
         if SHADOW_BLOCKED_PAIRS:
             chrono_data["shadow_instrument_summary"] = _si.compute_summary(job_id)
         _persist_shadow_guard_state(chrono_data, shadow_runner)
         _persist_shadow_lotfloor_state(chrono_data, lotfloor_runner)
         _persist_shadow_stop_state(chrono_data, stop_runner)
         _persist_shadow_skip_state(chrono_data, skip_runner)
+        _persist_shadow_filter_state(chrono_data, filter_runner)
+        _persist_shadow_trail_summary_state(chrono_data, trail_summary_runner)
         chrono_data["v74_metrics"] = _v74_chrono_trade_metrics(all_trades)
         _assert_swap_financing_modeled(all_trades, context=f"Chrono {job_id}")
         save_json(chrono_path, chrono_data)
