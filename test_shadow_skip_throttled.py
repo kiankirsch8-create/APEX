@@ -22,8 +22,8 @@ def test_skip_throttled_config_shape() -> None:
 def test_no_skip_control_never_virtual() -> None:
     """skip_below=0 → every trade taken at baseline * ab_shadow (real-curve mirror)."""
     runner = cb._ShadowSkipThrottledRunner()
-    st = runner.curves["no_skip_control"]
-    _seed_losing_strat(st, "T01")
+    for st in runner.curves.values():
+        _seed_losing_strat(st, "T01")
     out = runner.process_trade(
         {
             "date": "2024-01-02",
@@ -36,16 +36,18 @@ def test_no_skip_control_never_virtual() -> None:
             "outcome": "WIN",
         }
     )
+    ctrl = runner.curves["no_skip_control"]
     assert out["no_skip_control"]["virtual"] is False
     assert abs(out["no_skip_control"]["ab_throttle"] - 0.18) < 1e-9
     assert out["no_skip_control"]["pnl"] == 18.0
     assert out["no_skip_control"]["hist_pnl"] == 18.0  # taken (throttled) PnL in history
-    assert st.trades_virtual == 0
-    assert st.trades_taken == 1
-    assert st.capital == cb.STARTING_CAPITAL + 18.0
+    assert ctrl.trades_virtual == 0
+    assert ctrl.trades_taken == 1
+    assert ctrl.capital == cb.STARTING_CAPITAL + 18.0
     # Sibling still virtualizes the same signal
     assert out["skip_all_throttled"]["virtual"] is True
     assert out["skip_all_throttled"]["pnl"] == 0.0
+    assert runner.curves["skip_all_throttled"].capital == cb.STARTING_CAPITAL
 
 
 def _seed_losing_strat(st: cb._SkipThrottledCurveState, sid: str = "T01") -> None:
