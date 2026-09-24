@@ -351,6 +351,23 @@ SHADOW_STOP_CFG_BY_NAME: dict[str, dict[str, Any]] = {
     name: dict(cfg) for name, cfg in SHADOW_STOP_CONFIGS
 }
 
+# ---------------------------------------------------------------------------
+# Shadow skip A+B-throttled trades (real curve unchanged).
+#
+# Evidence: throttled trades are net negative across jobs; skipping them lifts
+# positive months and cuts drawdown. Design constraint: A+B releases when the
+# last-3 closed sum turns positive — so skipped trades must still feed each
+# curve's A+B histories as VIRTUAL (full-size outcome, no capital impact), or
+# the strategy would stay throttled forever.
+# Live would need real virtual-position tracking — measure in backtest first.
+# ---------------------------------------------------------------------------
+SHADOW_SKIP_THROTTLED_ENABLED = True
+SHADOW_SKIP_THROTTLED_CONFIGS: list[tuple[str, dict[str, Any]]] = [
+    ("skip_all_throttled", {"skip_below": 1.00}),  # skip anything throttled
+    ("skip_double_only", {"skip_below": 0.18}),  # skip only 0.0324 (double) trades
+    ("skip_throttled_long", {"skip_below": 1.00, "longs_only": True}),
+]
+
 # Static high-impact event calendar (2021-2026). Full table in high_impact_events_data.py.
 from high_impact_events_data import HIGH_IMPACT_EVENTS
 
@@ -3871,6 +3888,261 @@ def _persist_shadow_stop_state(
     runner: _ShadowStopRunner,
 ) -> None:
     chrono_data["shadow_stop_state"] = runner.to_persistence()
+
+
+@dataclass
+class _SkipThrottledCurveState:
+    curve_id: str
+    skip_below: float
+    longs_only: bool
+    capital: float
+    peak_capital: float
+    day_anchor: float
+    day_pnl: float = 0.0
+    st_medium_history: dict[str, Any] = field(default_factory=lambda: {"n": 0, "last3": []})
+    strat_pnl_history: dict[str, dict[str, Any]] = field(default_factory=dict)
+    trades_taken: int = 0
+    trades_virtual: int = 0
+    taken_net_r: float = 0.0
+    virtual_net_r: float = 0.0
+    daily_pnls: dict[str, float] = field(default_factory=dict)
+    daily_anchors: dict[str, float] = field(default_factory=dict)
+    max_drawdown_pct_seen: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "curve_id": self.curve_id,
+            "skip_below": float(self.skip_below),
+            "longs_only": bool(self.longs_only),
+            "capital": round(float(self.capital), 2),
+            "peak_capital": round(float(self.peak_capital), 2),
+            "day_anchor": round(float(self.day_anchor), 2),
+            "day_pnl": round(float(self.day_pnl), 2),
+            "st_medium_history": dict(self.st_medium_history),
+            "strat_pnl_history": {k: dict(v) for k, v in self.strat_pnl_history.items()},
+            "trades_taken": int(self.trades_taken),
+            "trades_virtual": int(self.trades_virtual),
+            "taken_net_r": round(float(self.taken_net_r), 6),
+            "virtual_net_r": round(float(self.virtual_net_r), 6),
+            "daily_pnls": dict(self.daily_pnls),
+            "daily_anchors": dict(self.daily_anchors),
+            "max_drawdown_pct_seen": round(float(self.max_drawdown_pct_seen), 4),
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "_SkipThrottledCurveState":
+        start = float(STARTING_CAPITAL)
+        return cls(
+            curve_id=str(raw.get("curve_id") or ""),
+            skip_below=float(raw.get("skip_below", 1.0) or 1.0),
+            longs_only=bool(raw.get("longs_only", False)),
+            capital=float(raw.get("capital", start) or start),
+            peak_capital=float(raw.get("peak_capital", start) or start),
+            day_anchor=float(raw.get("day_anchor", start) or start),
+            day_pnl=float(raw.get("day_pnl", 0) or 0),
+            st_medium_history=_normalize_shadow_st_medium_history(raw.get("st_medium_history")),
+            strat_pnl_history=_normalize_shadow_strat_history(raw.get("strat_pnl_history") or {}),
+            trades_taken=int(raw.get("trades_taken", 0) or 0),
+            trades_virtual=int(raw.get("trades_virtual", 0) or 0),
+            taken_net_r=float(raw.get("taken_net_r", 0) or 0),
+            virtual_net_r=float(raw.get("virtual_net_r", 0) or 0),
+            daily_pnls={str(k): float(v) for k, v in (raw.get("daily_pnls") or {}).items()},
+            daily_anchors={str(k): float(v) for k, v in (raw.get("daily_anchors") or {}).items()},
+            max_drawdown_pct_seen=float(raw.get("max_drawdown_pct_seen", 0) or 0),
+        )
+
+
+class _ShadowSkipThrottledRunner:
+    """
+    Skip A+B-throttled trades on shadow curves.
+
+    Each curve owns capital + A+B histories. When this curve's ab_throttle at open
+    is below ``skip_below`` (and direction matches longs_only), the trade is
+    VIRTUAL: full-size baseline PnL feeds A+B only. Otherwise the trade is TAKEN
+    at ``baseline_pnl * ab_shadow`` (capital + histories).
+    """
+
+    def __init__(self) -> None:
+        self.curves: dict[str, _SkipThrottledCurveState] = {}
+        self._init_curves()
+
+    def _init_curves(self) -> None:
+        if not SHADOW_SKIP_THROTTLED_ENABLED:
+            return
+        start = float(STARTING_CAPITAL)
+        for name, cfg in SHADOW_SKIP_THROTTLED_CONFIGS:
+            self.curves[name] = _SkipThrottledCurveState(
+                curve_id=name,
+                skip_below=float(cfg.get("skip_below", 1.0) or 1.0),
+                longs_only=bool(cfg.get("longs_only", False)),
+                capital=start,
+                peak_capital=start,
+                day_anchor=start,
+            )
+
+    @classmethod
+    def from_chrono(cls, chrono_data: Mapping[str, Any] | None) -> "_ShadowSkipThrottledRunner":
+        runner = cls()
+        if not SHADOW_SKIP_THROTTLED_ENABLED or not chrono_data:
+            return runner
+        saved = chrono_data.get("shadow_skip_state")
+        if not isinstance(saved, dict):
+            return runner
+        curves_raw = saved.get("curves")
+        if not isinstance(curves_raw, dict):
+            return runner
+        for cid, raw in curves_raw.items():
+            if cid in runner.curves and isinstance(raw, dict):
+                runner.curves[cid] = _SkipThrottledCurveState.from_dict(raw)
+        return runner
+
+    def to_persistence(self) -> dict[str, Any]:
+        return {"curves": {cid: st.to_dict() for cid, st in self.curves.items()}}
+
+    def on_new_day(self, date_str: str) -> None:
+        for st in self.curves.values():
+            st.day_anchor = float(st.capital)
+            st.day_pnl = 0.0
+
+    def finalize_day(self, date_str: str) -> None:
+        ds = str(date_str or "")[:10]
+        for st in self.curves.values():
+            st.daily_pnls[ds] = round(float(st.day_pnl), 2)
+            st.daily_anchors[ds] = round(float(st.day_anchor), 2)
+
+    def process_trade(self, ctx: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+        if not SHADOW_SKIP_THROTTLED_ENABLED or not self.curves:
+            return {}
+        if ctx.get("skipped") or str(ctx.get("outcome") or "").strip().upper() not in ("WIN", "LOSS"):
+            return {}
+        if ctx.get("shadow_class") or ctx.get("shadow_instrument"):
+            return {}
+
+        sid = str(ctx.get("strategy_id") or "").strip().upper()
+        conf = str(ctx.get("confidence") or "").strip().upper()
+        mb = str(ctx.get("macro_bias") or "").strip().upper()
+        direction = str(ctx.get("direction") or "").strip().upper()
+        baseline_pnl = float(ctx.get("baseline_pnl") or 0)
+        pre_ab_mrd = float(ctx.get("pre_ab_max_risk") or 0)
+        outcome = str(ctx.get("outcome") or "").strip().upper()
+        won = outcome == "WIN"
+        out: dict[str, dict[str, Any]] = {}
+
+        for cid, st in self.curves.items():
+            _ma, _mb, ab_shadow = _compute_ab_throttle_at_open(
+                strategy_id=sid,
+                confidence=conf,
+                macro_bias=mb,
+                strat_pnl_history=st.strat_pnl_history,
+                st_medium_history=st.st_medium_history,
+            )
+            if ab_shadow <= 0:
+                ab_shadow = 1.0
+
+            eligible_dir = (not st.longs_only) or direction == "LONG"
+            is_virtual = bool(eligible_dir and ab_shadow < float(st.skip_below))
+
+            # Full-size R vs pre-AB risk (same sign as baseline).
+            full_r = (baseline_pnl / pre_ab_mrd) if pre_ab_mrd > 0 else 0.0
+
+            if is_virtual:
+                hist_pnl = round(float(baseline_pnl), 2)
+                capital_pnl = 0.0
+                st.trades_virtual += 1
+                st.virtual_net_r += float(full_r)
+                # Virtual: histories only — capital untouched.
+                if sid and sid != "SKIP":
+                    _shadow_record_strat_pnl(st.strat_pnl_history, sid, float(hist_pnl))
+                if conf == "MEDIUM" and mb == "STRONG_TAILWIND":
+                    _shadow_record_st_medium(st.st_medium_history, float(hist_pnl), bool(won))
+            else:
+                taken_pnl = round(float(baseline_pnl) * float(ab_shadow), 2)
+                hist_pnl = taken_pnl
+                capital_pnl = taken_pnl
+                st.trades_taken += 1
+                st.taken_net_r += float(full_r)  # R at full-size denom; size cancels
+                st.capital += taken_pnl
+                st.day_pnl += taken_pnl
+                if st.capital > st.peak_capital:
+                    st.peak_capital = st.capital
+                if st.peak_capital > 0:
+                    dd = (st.peak_capital - st.capital) / st.peak_capital * 100.0
+                    if dd > st.max_drawdown_pct_seen:
+                        st.max_drawdown_pct_seen = float(dd)
+                if sid and sid != "SKIP":
+                    _shadow_record_strat_pnl(st.strat_pnl_history, sid, float(hist_pnl))
+                if conf == "MEDIUM" and mb == "STRONG_TAILWIND":
+                    _shadow_record_st_medium(st.st_medium_history, float(hist_pnl), bool(won))
+
+            out[cid] = {
+                "virtual": bool(is_virtual),
+                "pnl": float(capital_pnl),
+                "hist_pnl": float(hist_pnl),
+                "ab_throttle": round(float(ab_shadow), 6),
+            }
+        return out
+
+    def _curve_summary(self, st: _SkipThrottledCurveState) -> dict[str, Any]:
+        peak = float(st.peak_capital or STARTING_CAPITAL)
+        cap = float(st.capital or STARTING_CAPITAL)
+        worst_day_pct = 0.0
+        positive_months = 0
+        month_pnls: dict[str, float] = {}
+        for ds, dp in st.daily_pnls.items():
+            anchor = float(st.daily_anchors.get(ds, st.day_anchor or STARTING_CAPITAL))
+            day_pct = (float(dp) / anchor * 100.0) if anchor > 0 else 0.0
+            if day_pct < worst_day_pct:
+                worst_day_pct = day_pct
+            ym = ds[:7]
+            month_pnls[ym] = month_pnls.get(ym, 0.0) + float(dp)
+        for mp in month_pnls.values():
+            if mp > 0:
+                positive_months += 1
+        taken = int(st.trades_taken)
+        virtual = int(st.trades_virtual)
+        return {
+            "final_capital": round(cap, 2),
+            "peak_capital": round(peak, 2),
+            "max_drawdown_pct": round(float(st.max_drawdown_pct_seen), 2),
+            "worst_day_pct": round(float(worst_day_pct), 2),
+            "positive_months": int(positive_months),
+            "trades_taken": taken,
+            "trades_virtual": virtual,
+            "taken_net_r": round(float(st.taken_net_r), 4),
+            "virtual_net_r": round(float(st.virtual_net_r), 4),
+            "r_per_taken_trade": round(float(st.taken_net_r) / taken, 4) if taken > 0 else 0.0,
+            "skip_below": float(st.skip_below),
+            "longs_only": bool(st.longs_only),
+        }
+
+    def summaries(self) -> dict[str, dict[str, Any]]:
+        return {cid: self._curve_summary(st) for cid, st in self.curves.items()}
+
+
+def _persist_shadow_skip_state(
+    chrono_data: dict[str, Any],
+    runner: _ShadowSkipThrottledRunner,
+) -> None:
+    chrono_data["shadow_skip_state"] = runner.to_persistence()
+
+
+def _shadow_skip_trade_ctx_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    ab = float(row.get("ab_throttle") or 1.0)
+    if ab <= 0:
+        ab = 1.0
+    return {
+        "date": row.get("date"),
+        "strategy_id": row.get("strategy_id"),
+        "confidence": str(row.get("confidence") or "").strip().upper(),
+        "macro_bias": str(row.get("macro_bias_adjusted") or row.get("macro_bias") or ""),
+        "direction": str(row.get("direction") or "").strip().upper(),
+        "baseline_pnl": float(row.get("shadow_baseline_pnl_dollars") or 0),
+        "pre_ab_max_risk": float(row.get("max_risk_dollars") or 0) / ab,
+        "outcome": row.get("outcome"),
+        "skipped": bool(row.get("skipped") or row.get("skip_trade")),
+        "shadow_class": row.get("shadow_class"),
+        "shadow_instrument": row.get("shadow_instrument"),
+    }
 
 
 def _sizing_health_shadow_fields(
@@ -12425,6 +12697,7 @@ def run_chronological_backtest(
         shadow_runner = _ShadowGuardRunner.from_chrono(chrono_data)
         lotfloor_runner = _ShadowLotFloorRunner.from_chrono(chrono_data)
         stop_runner = _ShadowStopRunner.from_chrono(chrono_data)
+        skip_runner = _ShadowSkipThrottledRunner.from_chrono(chrono_data)
         shadow_runner.set_median_nights_by_tf(
             _compute_median_nights_by_tf(list(chrono_data.get("all_trades") or []))
         )
@@ -12476,6 +12749,7 @@ def run_chronological_backtest(
                 shadow_runner.on_new_day(date_str)
                 lotfloor_runner.on_new_day(date_str)
                 stop_runner.on_new_day(date_str)
+                skip_runner.on_new_day(date_str)
             finalize_day_only = False
             resume_idx = 0
             v71_pi_s = v71_ti_s = v71_tj_s = 0
@@ -13180,6 +13454,9 @@ def run_chronological_backtest(
                             if _lotfloor_map:
                                 row["shadow_lotfloor"] = _lotfloor_map
                             stop_runner.process_trade(row)
+                            _skip_map = skip_runner.process_trade(_shadow_skip_trade_ctx_from_row(row))
+                            if _skip_map:
+                                row["shadow_skip"] = _skip_map
                             day_trades.append(row)
                             day_pnl += pnl
                             capital += pnl
@@ -13248,6 +13525,7 @@ def run_chronological_backtest(
                             _persist_shadow_guard_state(chrono_data, shadow_runner)
                             _persist_shadow_lotfloor_state(chrono_data, lotfloor_runner)
                             _persist_shadow_stop_state(chrono_data, stop_runner)
+                            _persist_shadow_skip_state(chrono_data, skip_runner)
                             chrono_data["current_date"] = date_str
                             chrono_data["status"] = "running"
                             save_json(chrono_path, chrono_data)
@@ -13281,6 +13559,7 @@ def run_chronological_backtest(
             shadow_runner.finalize_day(date_str)
             lotfloor_runner.finalize_day(date_str)
             stop_runner.finalize_day(date_str)
+            skip_runner.finalize_day(date_str)
 
             daily_summary = {
                 "date": date_str,
@@ -13323,6 +13602,7 @@ def run_chronological_backtest(
             _persist_shadow_guard_state(chrono_data, shadow_runner)
             _persist_shadow_lotfloor_state(chrono_data, lotfloor_runner)
             _persist_shadow_stop_state(chrono_data, stop_runner)
+            _persist_shadow_skip_state(chrono_data, skip_runner)
             save_json(chrono_path, chrono_data)
 
             log(
@@ -13387,11 +13667,14 @@ def run_chronological_backtest(
             chrono_data["shadow_lotfloor_summary"] = lotfloor_runner.summaries()
         if SHADOW_STOP_ENABLED:
             chrono_data["shadow_stop_summary"] = stop_runner.summaries()
+        if SHADOW_SKIP_THROTTLED_ENABLED:
+            chrono_data["shadow_skip_summary"] = skip_runner.summaries()
         if SHADOW_BLOCKED_PAIRS:
             chrono_data["shadow_instrument_summary"] = _si.compute_summary(job_id)
         _persist_shadow_guard_state(chrono_data, shadow_runner)
         _persist_shadow_lotfloor_state(chrono_data, lotfloor_runner)
         _persist_shadow_stop_state(chrono_data, stop_runner)
+        _persist_shadow_skip_state(chrono_data, skip_runner)
         chrono_data["v74_metrics"] = _v74_chrono_trade_metrics(all_trades)
         _assert_swap_financing_modeled(all_trades, context=f"Chrono {job_id}")
         save_json(chrono_path, chrono_data)
