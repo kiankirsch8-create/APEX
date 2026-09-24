@@ -8,13 +8,44 @@ def test_skip_throttled_config_shape() -> None:
     assert cb.SHADOW_SKIP_THROTTLED_ENABLED is True
     names = [n for n, _ in cb.SHADOW_SKIP_THROTTLED_CONFIGS]
     assert names == [
+        "no_skip_control",
         "skip_all_throttled",
         "skip_double_only",
         "skip_throttled_long",
     ]
-    assert cb.SHADOW_SKIP_THROTTLED_CONFIGS[0][1]["skip_below"] == 1.00
-    assert cb.SHADOW_SKIP_THROTTLED_CONFIGS[1][1]["skip_below"] == 0.18
-    assert cb.SHADOW_SKIP_THROTTLED_CONFIGS[2][1].get("longs_only") is True
+    assert cb.SHADOW_SKIP_THROTTLED_CONFIGS[0][1]["skip_below"] == 0.0
+    assert cb.SHADOW_SKIP_THROTTLED_CONFIGS[1][1]["skip_below"] == 1.00
+    assert cb.SHADOW_SKIP_THROTTLED_CONFIGS[2][1]["skip_below"] == 0.18
+    assert cb.SHADOW_SKIP_THROTTLED_CONFIGS[3][1].get("longs_only") is True
+
+
+def test_no_skip_control_never_virtual() -> None:
+    """skip_below=0 → every trade taken at baseline * ab_shadow (real-curve mirror)."""
+    runner = cb._ShadowSkipThrottledRunner()
+    st = runner.curves["no_skip_control"]
+    _seed_losing_strat(st, "T01")
+    out = runner.process_trade(
+        {
+            "date": "2024-01-02",
+            "strategy_id": "T01",
+            "confidence": "HIGH",
+            "macro_bias": "NEUTRAL",
+            "direction": "LONG",
+            "baseline_pnl": 100.0,
+            "pre_ab_max_risk": 50.0,
+            "outcome": "WIN",
+        }
+    )
+    assert out["no_skip_control"]["virtual"] is False
+    assert abs(out["no_skip_control"]["ab_throttle"] - 0.18) < 1e-9
+    assert out["no_skip_control"]["pnl"] == 18.0
+    assert out["no_skip_control"]["hist_pnl"] == 18.0  # taken (throttled) PnL in history
+    assert st.trades_virtual == 0
+    assert st.trades_taken == 1
+    assert st.capital == cb.STARTING_CAPITAL + 18.0
+    # Sibling still virtualizes the same signal
+    assert out["skip_all_throttled"]["virtual"] is True
+    assert out["skip_all_throttled"]["pnl"] == 0.0
 
 
 def _seed_losing_strat(st: cb._SkipThrottledCurveState, sid: str = "T01") -> None:

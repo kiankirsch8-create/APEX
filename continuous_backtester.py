@@ -363,6 +363,8 @@ SHADOW_STOP_CFG_BY_NAME: dict[str, dict[str, Any]] = {
 # ---------------------------------------------------------------------------
 SHADOW_SKIP_THROTTLED_ENABLED = True
 SHADOW_SKIP_THROTTLED_CONFIGS: list[tuple[str, dict[str, Any]]] = [
+    # Control: never virtual — taken at baseline * ab_shadow (mirrors real A+B curve).
+    ("no_skip_control", {"skip_below": 0.0}),
     ("skip_all_throttled", {"skip_below": 1.00}),  # skip anything throttled
     ("skip_double_only", {"skip_below": 0.18}),  # skip only 0.0324 (double) trades
     ("skip_throttled_long", {"skip_below": 1.00, "longs_only": True}),
