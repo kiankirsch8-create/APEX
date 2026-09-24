@@ -3934,9 +3934,11 @@ class _SkipThrottledCurveState:
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "_SkipThrottledCurveState":
         start = float(STARTING_CAPITAL)
+        raw_sb = raw.get("skip_below", 1.0)
+        skip_below = float(1.0 if raw_sb is None else raw_sb)
         return cls(
             curve_id=str(raw.get("curve_id") or ""),
-            skip_below=float(raw.get("skip_below", 1.0) or 1.0),
+            skip_below=skip_below,
             longs_only=bool(raw.get("longs_only", False)),
             capital=float(raw.get("capital", start) or start),
             peak_capital=float(raw.get("peak_capital", start) or start),
@@ -3973,9 +3975,11 @@ class _ShadowSkipThrottledRunner:
             return
         start = float(STARTING_CAPITAL)
         for name, cfg in SHADOW_SKIP_THROTTLED_CONFIGS:
+            raw_sb = cfg.get("skip_below", 1.0)
+            skip_below = float(1.0 if raw_sb is None else raw_sb)
             self.curves[name] = _SkipThrottledCurveState(
                 curve_id=name,
-                skip_below=float(cfg.get("skip_below", 1.0) or 1.0),
+                skip_below=skip_below,
                 longs_only=bool(cfg.get("longs_only", False)),
                 capital=start,
                 peak_capital=start,
