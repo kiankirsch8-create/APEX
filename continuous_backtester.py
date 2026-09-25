@@ -4718,36 +4718,153 @@ def _shadow_expire_date(entry_date: str, nights_held: float) -> str:
     return (ed + timedelta(days=nights)).isoformat()
 
 
+# Mark-to-market closes for equity daily stop: memoised, cache-only (no download).
+# Keyed (ticker, date) → close or None (negative cache). Misses are counted and
+# summarised once per run — a silently under-marked book yields false "no breach".
+_SHADOW_MARK_CACHE: dict[tuple[str, str], float | None] = {}
+_SHADOW_MARK_STATS: dict[str, int | bool] = {
+    "lookups": 0,
+    "hits": 0,
+    "misses": 0,
+    "summary_logged": False,
+}
+
+
+def _reset_shadow_mark_cache() -> None:
+    _SHADOW_MARK_CACHE.clear()
+    _SHADOW_MARK_STATS["lookups"] = 0
+    _SHADOW_MARK_STATS["hits"] = 0
+    _SHADOW_MARK_STATS["misses"] = 0
+    _SHADOW_MARK_STATS["summary_logged"] = False
+
+
+def _shadow_mark_cache_put(ticker: str, date_str: str, price: float | None) -> None:
+    sym = str(ticker or "").strip().upper()
+    ds = str(date_str or "").strip()[:10]
+    if not sym or not ds:
+        return
+    if price is None:
+        _SHADOW_MARK_CACHE[(sym, ds)] = None
+        return
+    try:
+        v = float(price)
+    except (TypeError, ValueError):
+        _SHADOW_MARK_CACHE[(sym, ds)] = None
+        return
+    if math.isfinite(v) and v > 0:
+        _SHADOW_MARK_CACHE[(sym, ds)] = v
+    else:
+        _SHADOW_MARK_CACHE[(sym, ds)] = None
+
+
+def _shadow_mark_miss_summary_log(*, force: bool = False) -> None:
+    if _SHADOW_MARK_STATS["summary_logged"] and not force:
+        return
+    misses = int(_SHADOW_MARK_STATS["misses"] or 0)
+    lookups = int(_SHADOW_MARK_STATS["lookups"] or 0)
+    if misses <= 0 and not force:
+        return
+    _SHADOW_MARK_STATS["summary_logged"] = True
+    pct = (100.0 * misses / lookups) if lookups > 0 else 0.0
+    log(
+        f"[SHADOW EQSTOP] Mark cache summary: {misses}/{lookups} unavailable "
+        f"({pct:.1f}%) — cache-only, no download. "
+        f"If material, equity breach numbers are unreliable (under-marked book "
+        f"→ false 'no breach').",
+        level="error" if pct >= 5.0 else "warning",
+    )
+
+
+def _shadow_mark_unavailable_pct() -> float:
+    lookups = int(_SHADOW_MARK_STATS["lookups"] or 0)
+    misses = int(_SHADOW_MARK_STATS["misses"] or 0)
+    if lookups <= 0:
+        return 0.0
+    return round(100.0 * misses / lookups, 2)
+
+
+def _eqstop_log_mark_coverage_at_run_start(
+    tickers: list[str],
+    start_date: str,
+    end_date: str,
+) -> dict[str, Any]:
+    """
+    Probe how many (ticker, weekday) marks the chrono OHLC cache can already serve
+    for the planned window — no downloads. Coverage is known before the run.
+    """
+    try:
+        d0 = date.fromisoformat(str(start_date).strip()[:10])
+        d1 = date.fromisoformat(str(end_date).strip()[:10])
+    except ValueError:
+        log(
+            "[SHADOW EQSTOP] Mark coverage at run start: invalid date window",
+            level="warning",
+        )
+        return {"needed": 0, "available": 0, "pct": 0.0}
+    syms = sorted({str(t).strip().upper() for t in tickers if str(t).strip()})
+    needed = 0
+    available = 0
+    cur = d0
+    while cur <= d1:
+        if cur.weekday() < 5:
+            ds = cur.isoformat()
+            for sym in syms:
+                needed += 1
+                closes = _peek_chrono_cached_closes(sym, ds)
+                if closes:
+                    try:
+                        v = float(closes[-1])
+                        if math.isfinite(v) and v > 0:
+                            available += 1
+                            # Seed memo so later lookups avoid repeat peeks.
+                            _shadow_mark_cache_put(sym, ds, v)
+                    except (TypeError, ValueError):
+                        pass
+        cur += timedelta(days=1)
+    pct = round(100.0 * available / needed, 2) if needed > 0 else 0.0
+    log(
+        f"[SHADOW EQSTOP] Mark coverage at run start: {available}/{needed} "
+        f"({pct:.1f}%) from chrono OHLC cache across {len(syms)} tickers "
+        f"{start_date}→{end_date} (cache-only; misses will not download)",
+        level="info" if pct >= 80.0 else "warning",
+    )
+    return {"needed": needed, "available": available, "pct": pct, "tickers": len(syms)}
+
+
 def _shadow_mark_close_price(ticker: str, date_str: str) -> float | None:
     """
     Day's mark close for ``ticker`` as of ``date_str``.
-    Prefer chrono OHLC cache (1d first via peek); fall back to a 1d download.
+
+    Cache-only: prefer module memo, then chrono OHLC peek. Never downloads.
+    Misses are memoised as None and counted for the run-level summary.
     """
     sym = str(ticker or "").strip().upper()
     ds = str(date_str or "").strip()[:10]
     if not sym or not ds:
         return None
+    key = (sym, ds)
+    if key in _SHADOW_MARK_CACHE:
+        _SHADOW_MARK_STATS["lookups"] = int(_SHADOW_MARK_STATS["lookups"] or 0) + 1
+        cached = _SHADOW_MARK_CACHE[key]
+        if cached is None:
+            _SHADOW_MARK_STATS["misses"] = int(_SHADOW_MARK_STATS["misses"] or 0) + 1
+        else:
+            _SHADOW_MARK_STATS["hits"] = int(_SHADOW_MARK_STATS["hits"] or 0) + 1
+        return cached
+
+    _SHADOW_MARK_STATS["lookups"] = int(_SHADOW_MARK_STATS["lookups"] or 0) + 1
     closes = _peek_chrono_cached_closes(sym, ds)
     if closes:
         try:
             v = float(closes[-1])
             if math.isfinite(v) and v > 0:
+                _SHADOW_MARK_CACHE[key] = v
+                _SHADOW_MARK_STATS["hits"] = int(_SHADOW_MARK_STATS["hits"] or 0) + 1
                 return v
         except (TypeError, ValueError):
             pass
-    yf_t = f"{sym}=X" if len(sym) == 6 and sym.isalpha() else sym
-    try:
-        past, _fut = _get_ohlcv_download_impl(yf_t, "1d", ds, chrono_yfinance=True)
-    except Exception:  # noqa: BLE001
-        return None
-    if past is None or getattr(past, "empty", True):
-        return None
-    try:
-        v = float(past["Close"].iloc[-1])
-        if math.isfinite(v) and v > 0:
-            return v
-    except Exception:  # noqa: BLE001
-        return None
+    _SHADOW_MARK_CACHE[key] = None
+    _SHADOW_MARK_STATS["misses"] = int(_SHADOW_MARK_STATS["misses"] or 0) + 1
     return None
 
 
@@ -4898,6 +5015,7 @@ def _gather_close_prices(
     provided: Mapping[str, float] | None = None,
 ) -> dict[str, float]:
     out: dict[str, float] = {}
+    ds = str(date_str or "").strip()[:10]
     if provided:
         for t, px in provided.items():
             try:
@@ -4905,12 +5023,14 @@ def _gather_close_prices(
             except (TypeError, ValueError):
                 continue
             if math.isfinite(v) and v > 0:
-                out[str(t).strip().upper()] = v
+                tu = str(t).strip().upper()
+                out[tu] = v
+                _shadow_mark_cache_put(tu, ds, v)
     for t in tickers:
         tu = str(t).strip().upper()
         if tu in out:
             continue
-        px = _shadow_mark_close_price(tu, date_str)
+        px = _shadow_mark_close_price(tu, ds)
         if px is not None:
             out[tu] = float(px)
     return out
@@ -5363,23 +5483,18 @@ class _ShadowEquityDailyStopRunner:
         close_prices: Mapping[str, float] | None = None,
     ) -> None:
         for st in self.curves.values():
-            # Realize overnight expiries into prior capital before anchoring.
-            self._realize_expired(st, date_str)
-            # Day-start equity is realized capital only (opens float separately).
+            # Anchor BEFORE realizing so expiring PnL counts against day D
+            # (measured vs equity the day started with), not into the anchor.
             st.day_anchor = float(st.capital)
             st.day_realized_pnl = 0.0
+            self._realize_expired(st, date_str)
             st.day_stopped = False
-            # Re-check breach at open with MTM of remaining book.
+            # Breach check: realized (incl. today's expiries) + MTM of remaining.
             tickers = {p.ticker for p in st.book.values()}
             prices = _gather_close_prices(tickers, date_str, close_prices)
             breached, _dp, missing = self._record_breaches(st, date_str, prices)
             if missing and st.book:
                 st.mtm_missing_days += 1
-                log(
-                    f"[SHADOW EQSTOP] {st.curve_id} {date_str}: "
-                    f"MTM missing for {missing}/{len(st.book)} opens",
-                    level="error",
-                )
             if breached and st.curve_id != self.REAL_KEY:
                 st.day_stopped = True
 
@@ -5399,11 +5514,6 @@ class _ShadowEquityDailyStopRunner:
             _breached, day_pnl, missing = self._record_breaches(st, ds, prices)
             if missing and st.book:
                 st.mtm_missing_days += 1
-                log(
-                    f"[SHADOW EQSTOP] {st.curve_id} {ds}: "
-                    f"MTM missing for {missing}/{len(st.book)} opens at EOD",
-                    level="error",
-                )
             st.daily_pnls[ds] = round(float(day_pnl), 2)
             st.daily_anchors[ds] = round(float(st.day_anchor), 2)
 
@@ -5477,6 +5587,7 @@ class _ShadowEquityDailyStopRunner:
         for mp in month_pnls.values():
             if mp > 0:
                 positive_months += 1
+        unavail = _shadow_mark_unavailable_pct()
         return {
             "final_capital": round(cap, 2),
             "peak_capital": round(peak, 2),
@@ -5492,11 +5603,13 @@ class _ShadowEquityDailyStopRunner:
             "equity_5pct_breach_days": len(st.equity_5pct_breach_dates),
             "equity_5pct_breach_dates": list(st.equity_5pct_breach_dates),
             "mtm_missing_days": int(st.mtm_missing_days),
+            "mtm_unavailable_pct": float(unavail),
             "open_positions_end": len(st.book),
             "is_real_unguarded": st.curve_id == self.REAL_KEY,
         }
 
     def summaries(self) -> dict[str, dict[str, Any]]:
+        _shadow_mark_miss_summary_log(force=True)
         return {cid: self._curve_summary(st) for cid, st in self.curves.items()}
 
 
@@ -14083,6 +14196,13 @@ def run_chronological_backtest(
         trail_summary_runner = _ShadowTrailSummaryRunner.from_chrono(chrono_data)
         pcap_runner = _ShadowPortfolioCapRunner.from_chrono(chrono_data)
         eqstop_runner = _ShadowEquityDailyStopRunner.from_chrono(chrono_data)
+        _reset_shadow_mark_cache()
+        if SHADOW_EQUITY_DAILY_STOP_ENABLED:
+            _eqstop_log_mark_coverage_at_run_start(
+                tickers,
+                str(chrono_data.get("start_date") or start_date),
+                str(chrono_data.get("end_date") or end_date),
+            )
         shadow_runner.set_median_nights_by_tf(
             _compute_median_nights_by_tf(list(chrono_data.get("all_trades") or []))
         )

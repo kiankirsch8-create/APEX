@@ -238,8 +238,73 @@ def test_equity_5pct_report_on_all_curves_and_real() -> None:
         assert name in summaries
         assert "equity_5pct_breach_days" in summaries[name]
         assert "equity_5pct_breach_dates" in summaries[name]
+        assert "mtm_unavailable_pct" in summaries[name]
     assert summaries["real_unguarded"]["is_real_unguarded"] is True
     assert summaries["real_unguarded"]["equity_5pct_breach_days"] == 0
+
+
+def test_equity_stop_expiry_day_realized_pnl_counts_against_day() -> None:
+    """
+    nights_held=3: enter D, expire D+3. Expiring loss must land in D+3's
+    day_realized_pnl / breach check (anchor set BEFORE realize).
+    """
+    cb._reset_shadow_mark_cache()
+    runner = cb._ShadowEquityDailyStopRunner()
+    entry = "2024-01-02"
+    expire = "2024-01-05"  # entry + 3 nights
+    loss = -600.0  # 6% of 10k starting capital
+
+    runner.on_new_day(entry)
+    with patch.object(cb, "_shadow_mark_close_price", return_value=1.10):
+        out = runner.process_trade(
+            _trade_ctx(
+                date=entry,
+                ticker="EURUSD",
+                entry_price=1.10,
+                position_size=10_000.0,
+                max_risk_dollars=100.0,
+                nights_held=3,
+                pnl_dollars=loss,
+                outcome="LOSS",
+            ),
+            close_prices={"EURUSD": 1.10},
+        )
+    assert out["eqstop_5"]["taken"] is True
+    assert out["eqstop_5"]["expire_date"] == expire
+    st = runner.curves["eqstop_5"]
+    real = runner.curves["real_unguarded"]
+    assert len(st.book) == 1
+    # Capital unchanged until expire (PnL deferred).
+    assert abs(st.capital - cb.STARTING_CAPITAL) < 1e-6
+
+    with patch.object(cb, "_shadow_mark_close_price", return_value=1.10):
+        runner.finalize_day(entry, close_prices={"EURUSD": 1.10})
+        for mid in ("2024-01-03", "2024-01-04"):
+            runner.on_new_day(mid, close_prices={"EURUSD": 1.10})
+            assert len(st.book) == 1
+            assert abs(st.day_realized_pnl) < 1e-9
+            runner.finalize_day(mid, close_prices={"EURUSD": 1.10})
+
+    # Expiry morning: anchor first, then realize into day_realized_pnl.
+    cap_before = float(st.capital)
+    with patch.object(cb, "_shadow_mark_close_price", return_value=1.10):
+        runner.on_new_day(expire, close_prices={"EURUSD": 1.10})
+
+    assert abs(st.day_anchor - cap_before) < 1e-6
+    assert abs(st.day_realized_pnl - loss) < 1e-6
+    assert abs(st.capital - (cap_before + loss)) < 1e-6
+    assert len(st.book) == 0
+    assert expire in st.equity_breach_dates
+    assert expire in st.equity_5pct_breach_dates
+    assert expire in real.equity_5pct_breach_dates
+
+    with patch.object(cb, "_shadow_mark_close_price", return_value=1.10):
+        runner.finalize_day(expire, close_prices={"EURUSD": 1.10})
+    assert abs(st.daily_pnls[expire] - loss) < 1e-6
+    assert abs(st.daily_anchors[expire] - cap_before) < 1e-6
+    # Day equity pct ≈ -6%
+    day_pct = st.daily_pnls[expire] / st.daily_anchors[expire] * 100.0
+    assert day_pct <= -5.0
 
 
 def test_equity_stop_does_not_force_close() -> None:
@@ -288,6 +353,44 @@ def test_equity_mtm_uses_provided_close_not_zero() -> None:
     mtm2, missing2 = cb._book_mtm(book, {})
     assert missing2 == 1
     assert mtm2 == 0.0
+
+
+def test_shadow_mark_close_no_download_and_memoisés() -> None:
+    cb._reset_shadow_mark_cache()
+    download_calls: list[tuple] = []
+
+    def _boom(*args: Any, **kwargs: Any) -> tuple[None, None]:
+        download_calls.append((args, kwargs))
+        raise AssertionError("mark path must not download")
+
+    with patch.object(cb, "_get_ohlcv_download_impl", side_effect=_boom):
+        with patch.object(cb, "_peek_chrono_cached_closes", return_value=[]):
+            assert cb._shadow_mark_close_price("EURUSD", "2024-01-02") is None
+            # Negative memo — second call still no download
+            assert cb._shadow_mark_close_price("EURUSD", "2024-01-02") is None
+        with patch.object(cb, "_peek_chrono_cached_closes", return_value=[1.2345]):
+            px = cb._shadow_mark_close_price("GBPUSD", "2024-01-02")
+            assert px == 1.2345
+            # Memo hit even if peek would now fail
+            with patch.object(cb, "_peek_chrono_cached_closes", return_value=[]):
+                assert cb._shadow_mark_close_price("GBPUSD", "2024-01-02") == 1.2345
+
+    assert download_calls == []
+    assert int(cb._SHADOW_MARK_STATS["misses"]) >= 1
+    assert int(cb._SHADOW_MARK_STATS["hits"]) >= 1
+    assert cb._shadow_mark_unavailable_pct() > 0.0
+
+
+def test_gather_close_prices_seeds_mark_cache() -> None:
+    cb._reset_shadow_mark_cache()
+    with patch.object(cb, "_peek_chrono_cached_closes", return_value=[]):
+        out = cb._gather_close_prices(
+            {"EURUSD"}, "2024-06-03", provided={"EURUSD": 1.08}
+        )
+    assert out["EURUSD"] == 1.08
+    # Seeded — subsequent mark lookup is a memo hit, not a miss.
+    assert cb._shadow_mark_close_price("EURUSD", "2024-06-03") == 1.08
+    assert ("EURUSD", "2024-06-03") in cb._SHADOW_MARK_CACHE
 
 
 def test_persistence_roundtrip() -> None:
