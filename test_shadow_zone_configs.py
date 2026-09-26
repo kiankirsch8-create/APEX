@@ -150,6 +150,11 @@ def test_zone_lookback_recompute_and_distribution() -> None:
         assert "max_drawdown_pct" in summaries[name]
         assert "net_r" in summaries[name]
         assert "r_per_trade" in summaries[name]
+        assert "r_per_trade_weighted" in summaries[name]
+        assert "zone_recompute_unavailable_pct" in summaries[name]
+    # Successful recomputes → 0% unavailable
+    assert summaries["zone_lb_7"]["zone_recompute_unavailable_pct"] == 0.0
+    assert summaries["zone_lb_7"]["zone_recompute_attempts"] == 1
 
 
 def test_zone_interactions() -> None:
@@ -178,7 +183,34 @@ def test_zone_interactions() -> None:
     assert runner.process_trade(eur)["zone_disc_x_nonjpy"]["taken"] is True
 
 
-def test_zone_pct_from_daily_lookback_math() -> None:
+def test_r_per_trade_invariant_to_sizing_mult() -> None:
+    """2.5x and 1.0x configs on identical trades: same r_per_trade, different capital."""
+    runner = cb._ShadowZoneRunner()
+    runner.on_new_day("2024-01-02")
+    # zone 15 → disc_ladder mult 2.5; zone mid 60 → ladder flat 1.0 on same curve
+    # Compare disc_ladder (2.5 at zp=15) vs a flat sizing path: use zone_size_prem_15
+    # which does NOT boost below 70 (mult stays 1.0 at zp=15).
+    ctx = cb._shadow_zone_trade_ctx_from_row(
+        _row(zone_pct=15.0, pnl=100.0, trade_r=2.0, outcome="WIN")
+    )
+    out = runner.process_trade(ctx)
+    assert out["zone_size_disc_ladder"]["mult"] == 2.5
+    assert out["zone_size_prem_15"]["mult"] == 1.0
+    assert out["zone_size_disc_ladder"]["pnl"] == 250.0
+    assert out["zone_size_prem_15"]["pnl"] == 100.0
+
+    runner.finalize_day("2024-01-02")
+    s_boost = runner.summaries()["zone_size_disc_ladder"]
+    s_flat = runner.summaries()["zone_size_prem_15"]
+    assert s_boost["r_per_trade"] == s_flat["r_per_trade"] == 2.0
+    assert s_boost["r_per_trade_weighted"] == 5.0  # 2.0 * 2.5
+    assert s_flat["r_per_trade_weighted"] == 2.0
+    assert s_boost["final_capital"] != s_flat["final_capital"]
+    assert s_boost["final_capital"] > s_flat["final_capital"]
+
+
+def test_zone_pct_from_daily_lookback_math_and_no_download() -> None:
+    cb._reset_zone_pct_cache()
     idx = pd.date_range("2024-01-01", periods=10, freq="D")
     df = pd.DataFrame(
         {
@@ -189,10 +221,48 @@ def test_zone_pct_from_daily_lookback_math() -> None:
         },
         index=idx,
     )
-    # Last 7 days: high 1.20 low 1.00; entry 1.05 → 25%
-    with patch.object(cb, "_get_daily_past_for_zone", return_value=df):
-        zp = cb._zone_pct_from_daily_lookback("EURUSD", "2024-01-10", 1.05, 7)
-    assert zp == 25.0
+    download_calls: list[Any] = []
+
+    def _boom(*args: Any, **kwargs: Any) -> tuple[None, None]:
+        download_calls.append((args, kwargs))
+        raise AssertionError("zone lookback must not download")
+
+    with patch.object(cb, "_get_ohlcv_download_impl", side_effect=_boom):
+        with patch.object(cb, "_peek_chrono_daily_past_for_zone", return_value=df):
+            zp = cb._zone_pct_from_daily_lookback("EURUSD", "2024-01-10", 1.05, 7)
+            assert zp == 25.0
+            # Memoised float — second call must not re-peek download either
+            zp2 = cb._zone_pct_from_daily_lookback("EURUSD", "2024-01-10", 1.05, 7)
+            assert zp2 == 25.0
+            assert ("EURUSD", "2024-01-10", 7) in cb._ZONE_PCT_CACHE
+            assert not isinstance(cb._ZONE_PCT_CACHE[("EURUSD", "2024-01-10", 7)], pd.DataFrame)
+
+        # Cache miss → None, no download
+        with patch.object(cb, "_peek_chrono_daily_past_for_zone", return_value=None):
+            assert cb._zone_pct_from_daily_lookback("GBPUSD", "2024-01-10", 1.25, 14) is None
+
+    assert download_calls == []
+
+
+def test_group_d_no_silent_fallback_reports_unavailable() -> None:
+    """Lookback miss must NOT fall back to existing zone_pct; report unavailable %."""
+    runner = cb._ShadowZoneRunner()
+    runner.on_new_day("2024-01-10")
+    with patch.object(cb, "_zone_pct_from_daily_lookback", return_value=None):
+        ctx = cb._shadow_zone_trade_ctx_from_row(_row(zone_pct=45.0, pnl=80.0))
+        out = runner.process_trade(ctx)
+    assert out["zone_lb_7"]["blocked"] is True
+    assert out["zone_lb_7"]["reason"] == "zone_pct_missing"
+    assert out["zone_lb_7"]["zone_pct"] is None
+    # Control still uses existing
+    assert out["zone_lb_current"]["taken"] is True
+    assert out["zone_lb_current"]["zone_pct"] == 45.0
+
+    runner.finalize_day("2024-01-10")
+    s = runner.summaries()["zone_lb_7"]
+    assert s["zone_recompute_unavailable_pct"] == 100.0
+    assert s["zone_recompute_misses"] == 1
+    assert s["trades_taken"] == 0
 
 
 def test_zone_summary_reports_drawdown() -> None:
@@ -208,3 +278,6 @@ def test_zone_summary_reports_drawdown() -> None:
     assert s["max_drawdown_pct"] > 0
     assert s["trades_taken"] == 1
     assert s["final_capital"] < cb.STARTING_CAPITAL
+    # Unweighted R stays -2; weighted is -5
+    assert s["r_per_trade"] == -2.0
+    assert s["r_per_trade_weighted"] == -5.0

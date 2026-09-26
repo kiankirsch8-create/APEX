@@ -4740,11 +4740,18 @@ def _persist_shadow_trail_summary_state(
 # Zone shadow helpers + runner
 # ---------------------------------------------------------------------------
 
-_ZONE_DAILY_PAST_CACHE: dict[tuple[str, str], Any] = {}
+# Computed zone_pct floats only — never cache full OHLC DataFrames.
+# Keyed (ticker, date, lookback_days) → pct or None (negative cache).
+_ZONE_PCT_CACHE: dict[tuple[str, str, int], float | None] = {}
 
 
+def _reset_zone_pct_cache() -> None:
+    _ZONE_PCT_CACHE.clear()
+
+
+# Back-compat alias for chrono wiring that still calls the old name.
 def _reset_zone_daily_past_cache() -> None:
-    _ZONE_DAILY_PAST_CACHE.clear()
+    _reset_zone_pct_cache()
 
 
 def _zone_ladder_mult_below(zone_pct: float, ladder: list[tuple[float, float]]) -> float:
@@ -4777,34 +4784,26 @@ def _zone_confluence_count(ctx: Mapping[str, Any]) -> int:
     return 0
 
 
-def _get_daily_past_for_zone(ticker: str, date_str: str) -> Any | None:
-    """1d OHLC past as of date_str — chrono cache peek first, else one download."""
+def _peek_chrono_daily_past_for_zone(ticker: str, date_str: str) -> Any | None:
+    """
+    Peek chrono OHLC cache for 1d past only — never downloads, never stores the frame.
+    Weekly (and other non-1d) trades miss here when no 1d key was warmed.
+    """
     sym = str(ticker or "").strip().upper()
     ds = str(date_str or "").strip()[:10]
     if not sym or not ds:
         return None
-    key = (sym, ds)
-    if key in _ZONE_DAILY_PAST_CACHE:
-        return _ZONE_DAILY_PAST_CACHE[key]
     yf_t = f"{sym}=X" if len(sym) == 6 and sym.isalpha() else sym
-    past = None
     try:
         with _chrono_ohlc_cache_lock:
             hit = _chrono_ohlc_cache.get((yf_t.strip().upper(), "1d", ds))
             if hit is not None and isinstance(hit, tuple) and hit:
                 past = hit[0]
+                if past is not None and not getattr(past, "empty", True):
+                    return past
     except Exception:  # noqa: BLE001
-        past = None
-    if past is None or getattr(past, "empty", True):
-        try:
-            past, _fut = _get_ohlcv_download_impl(yf_t, "1d", ds, chrono_yfinance=True)
-        except Exception:  # noqa: BLE001
-            past = None
-    if past is None or getattr(past, "empty", True):
-        _ZONE_DAILY_PAST_CACHE[key] = None
         return None
-    _ZONE_DAILY_PAST_CACHE[key] = past
-    return past
+    return None
 
 
 def _zone_pct_from_daily_lookback(
@@ -4816,39 +4815,59 @@ def _zone_pct_from_daily_lookback(
     """
     zone_pct = 100 * (entry - low_N) / (high_N - low_N) over last N calendar
     days of DAILY bars (trade timeframe ignored).
+
+    Cache-only: peeks chrono 1d OHLC; on miss returns None (no download).
+    Memoises the computed float (or None), never the DataFrame.
     """
-    past = _get_daily_past_for_zone(ticker, date_str)
+    sym = str(ticker or "").strip().upper()
+    ds = str(date_str or "").strip()[:10]
+    lb = max(1, int(lookback_days))
+    if not sym or not ds:
+        return None
+    cache_key = (sym, ds, lb)
+    if cache_key in _ZONE_PCT_CACHE:
+        return _ZONE_PCT_CACHE[cache_key]
+
+    past = _peek_chrono_daily_past_for_zone(sym, ds)
     if past is None or getattr(past, "empty", True):
+        _ZONE_PCT_CACHE[cache_key] = None
         return None
     try:
-        as_of = date.fromisoformat(str(date_str).strip()[:10])
+        as_of = date.fromisoformat(ds)
     except ValueError:
+        _ZONE_PCT_CACHE[cache_key] = None
         return None
-    cutoff = as_of - timedelta(days=max(1, int(lookback_days)))
+    cutoff = as_of - timedelta(days=lb)
     try:
         idx = past.index
-        # Normalize to dates for comparison
         mask = idx.normalize() >= pd.Timestamp(cutoff)
         mask &= idx.normalize() <= pd.Timestamp(as_of)
         window = past.loc[mask]
     except Exception:  # noqa: BLE001
         try:
-            window = past.tail(max(1, int(lookback_days)))
+            window = past.tail(lb)
         except Exception:  # noqa: BLE001
+            _ZONE_PCT_CACHE[cache_key] = None
             return None
     if window is None or getattr(window, "empty", True):
+        _ZONE_PCT_CACHE[cache_key] = None
         return None
     try:
         hi = float(pd.to_numeric(window["High"], errors="coerce").max())
         lo = float(pd.to_numeric(window["Low"], errors="coerce").min())
         ep = float(entry_price)
     except (TypeError, ValueError, KeyError):
+        _ZONE_PCT_CACHE[cache_key] = None
         return None
     if not (math.isfinite(hi) and math.isfinite(lo) and math.isfinite(ep)):
+        _ZONE_PCT_CACHE[cache_key] = None
         return None
     if hi <= lo or ep <= 0:
+        _ZONE_PCT_CACHE[cache_key] = None
         return None
-    return round(100.0 * (ep - lo) / (hi - lo), 1)
+    zp = round(100.0 * (ep - lo) / (hi - lo), 1)
+    _ZONE_PCT_CACHE[cache_key] = zp
+    return zp
 
 
 def _zone_pct_distribution(samples: list[float]) -> dict[str, Any]:
@@ -5010,11 +5029,15 @@ class _ZoneCurveState:
     trades_taken: int = 0
     trades_blocked: int = 0
     taken_net_r: float = 0.0
+    taken_weighted_r: float = 0.0
     blocked_net_r: float = 0.0
     daily_pnls: dict[str, float] = field(default_factory=dict)
     daily_anchors: dict[str, float] = field(default_factory=dict)
     max_drawdown_pct_seen: float = 0.0
     zone_pct_samples: list[float] = field(default_factory=list)
+    # Group-D recompute coverage (lookback configs only).
+    zone_recompute_attempts: int = 0
+    zone_recompute_misses: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -5028,11 +5051,14 @@ class _ZoneCurveState:
             "trades_taken": int(self.trades_taken),
             "trades_blocked": int(self.trades_blocked),
             "taken_net_r": round(float(self.taken_net_r), 6),
+            "taken_weighted_r": round(float(self.taken_weighted_r), 6),
             "blocked_net_r": round(float(self.blocked_net_r), 6),
             "daily_pnls": dict(self.daily_pnls),
             "daily_anchors": dict(self.daily_anchors),
             "max_drawdown_pct_seen": round(float(self.max_drawdown_pct_seen), 4),
             "zone_pct_samples": [round(float(x), 2) for x in self.zone_pct_samples[-5000:]],
+            "zone_recompute_attempts": int(self.zone_recompute_attempts),
+            "zone_recompute_misses": int(self.zone_recompute_misses),
         }
 
     @classmethod
@@ -5049,11 +5075,14 @@ class _ZoneCurveState:
             trades_taken=int(raw.get("trades_taken", 0) or 0),
             trades_blocked=int(raw.get("trades_blocked", 0) or 0),
             taken_net_r=float(raw.get("taken_net_r", 0) or 0),
+            taken_weighted_r=float(raw.get("taken_weighted_r", 0) or 0),
             blocked_net_r=float(raw.get("blocked_net_r", 0) or 0),
             daily_pnls={str(k): float(v) for k, v in (raw.get("daily_pnls") or {}).items()},
             daily_anchors={str(k): float(v) for k, v in (raw.get("daily_anchors") or {}).items()},
             max_drawdown_pct_seen=float(raw.get("max_drawdown_pct_seen", 0) or 0),
             zone_pct_samples=[float(x) for x in (raw.get("zone_pct_samples") or [])],
+            zone_recompute_attempts=int(raw.get("zone_recompute_attempts", 0) or 0),
+            zone_recompute_misses=int(raw.get("zone_recompute_misses", 0) or 0),
         )
 
 
@@ -5069,10 +5098,15 @@ class _ShadowZoneRunner:
             return
         start = float(STARTING_CAPITAL)
         for name, cfg in SHADOW_ZONE_CONFIGS:
+            cfg_copy = dict(cfg)
+            if "ladder" in cfg_copy:
+                cfg_copy["ladder"] = list(cfg_copy["ladder"])
+            if "ladder_up" in cfg_copy:
+                cfg_copy["ladder_up"] = list(cfg_copy["ladder_up"])
             self.curves[name] = _ZoneCurveState(
                 curve_id=name,
-                cfg=dict(cfg),
-                group=str(cfg.get("group") or ""),
+                cfg=cfg_copy,
+                group=str(cfg_copy.get("group") or ""),
                 capital=start,
                 peak_capital=start,
                 day_anchor=start,
@@ -5129,8 +5163,14 @@ class _ShadowZoneRunner:
                 entry = float(ctx.get("entry_price") or 0)
             except (TypeError, ValueError):
                 entry = 0.0
+            st.zone_recompute_attempts += 1
             recomputed = _zone_pct_from_daily_lookback(ticker, date_str, entry, lb)
-            return recomputed if recomputed is not None else existing_f
+            if recomputed is None:
+                # Do NOT fall back to existing zone_pct — that would silently
+                # duplicate zone_lb_current under poor 1d-cache coverage.
+                st.zone_recompute_misses += 1
+                return None
+            return recomputed
         return existing_f
 
     def process_trade(self, ctx: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
@@ -5183,7 +5223,9 @@ class _ShadowZoneRunner:
                 # Zone mult stacks on top of existing A+B (pnl_dollars already throttled).
                 capital_pnl = round(float(pnl_real) * float(mult), 2)
                 st.trades_taken += 1
-                st.taken_net_r += float(trade_r) * float(mult)
+                # R = pnl/risk is size-invariant; do not multiply by sizing mult.
+                st.taken_net_r += float(trade_r)
+                st.taken_weighted_r += float(trade_r) * float(mult)
                 st.capital += capital_pnl
                 st.day_pnl += capital_pnl
                 if st.capital > st.peak_capital:
@@ -5235,12 +5277,26 @@ class _ShadowZoneRunner:
             "trades_blocked": int(st.trades_blocked),
             "net_r": round(float(st.taken_net_r), 4),
             "r_per_trade": round(float(st.taken_net_r) / taken, 4) if taken > 0 else 0.0,
+            "net_r_weighted": round(float(st.taken_weighted_r), 4),
+            "r_per_trade_weighted": (
+                round(float(st.taken_weighted_r) / taken, 4) if taken > 0 else 0.0
+            ),
             "blocked_net_r": round(float(st.blocked_net_r), 4),
         }
         if st.group == "D":
             summary["zone_pct_distribution"] = _zone_pct_distribution(st.zone_pct_samples)
+            attempts = int(st.zone_recompute_attempts)
+            misses = int(st.zone_recompute_misses)
+            # use_existing control has attempts=0; lookback curves report coverage.
+            if attempts > 0:
+                summary["zone_recompute_unavailable_pct"] = round(
+                    100.0 * misses / attempts, 2
+                )
+            else:
+                summary["zone_recompute_unavailable_pct"] = 0.0
+            summary["zone_recompute_attempts"] = attempts
+            summary["zone_recompute_misses"] = misses
         return summary
-
     def summaries(self) -> dict[str, dict[str, Any]]:
         return {cid: self._curve_summary(st) for cid, st in self.curves.items()}
 
