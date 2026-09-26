@@ -402,6 +402,13 @@ SHADOW_FILTER_ROLLING_N = 20
 # (no new forward sims). Live trail uses the row's pnl_dollars.
 SHADOW_TRAIL_SUMMARY_ENABLED = True
 
+# Entry-features JSONL for offline hold models.
+# Chrono always writes entry_features_{job_id}.jsonl (bounded by run length).
+# Continuous loop must NOT write a never-rotating file — that pattern filled the
+# Railway volume twice via shadow_strategy_trades.jsonl. Default off; chrono is
+# the modelling corpus.
+ENTRY_FEATURES_CONTINUOUS_ENABLED = False
+
 # ---------------------------------------------------------------------------
 # Shadow exit TYPE variants — write-only forward sims (real curve unchanged).
 #
@@ -14965,7 +14972,8 @@ def continuous_backtest_loop() -> None:
                         ):
                             if "scores" not in result:
                                 _attach_entry_scores_to_trade_row(result)
-                            append_entry_feature_record(result, job_id="continuous")
+                            if ENTRY_FEATURES_CONTINUOUS_ENABLED:
+                                append_entry_feature_record(result, job_id="continuous")
                         count = append_result(result)
                         added = count > prev_len
 

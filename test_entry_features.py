@@ -156,3 +156,10 @@ def test_completion_rejects_label_leak_in_features(tmp_path, monkeypatch):
         assert False, "expected AssertionError"
     except AssertionError as e:
         assert "overlap" in str(e).lower() or "nights_held" in str(e)
+
+
+def test_continuous_entry_features_gated_off_by_default():
+    """Continuous loop must not write a never-rotating JSONL (volume-fill risk)."""
+    import continuous_backtester as cb
+
+    assert cb.ENTRY_FEATURES_CONTINUOUS_ENABLED is False
