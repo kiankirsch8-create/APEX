@@ -398,6 +398,38 @@ SHADOW_FILTER_ROLLING_N = 20
 SHADOW_TRAIL_SUMMARY_ENABLED = True
 
 # ---------------------------------------------------------------------------
+# Shadow exit TYPE variants — write-only forward sims (real curve unchanged).
+#
+# Context: R-trail activation (shadow_trail_at_*) disagrees across windows
+# (2.50R best on 4a6f3034, 1.50R best on 0f19c0a2). These add exit TYPES we do
+# not yet have (fixed R, BE-then-run, partial+trail, time stop, ATR trail).
+# Per-strategy slice needs no new code — strategy_id is already on each trade.
+# ---------------------------------------------------------------------------
+SHADOW_EXIT_ENABLED = True
+SHADOW_EXIT_CONFIGS: list[tuple[str, dict[str, Any]]] = [
+    # fixed R targets, no trailing
+    ("exit_fixed_1r", {"type": "fixed_r", "r": 1.0}),
+    ("exit_fixed_2r", {"type": "fixed_r", "r": 2.0}),
+    ("exit_fixed_3r", {"type": "fixed_r", "r": 3.0}),
+    ("exit_fixed_5r", {"type": "fixed_r", "r": 5.0}),
+    # breakeven then run
+    ("exit_be_at_1r", {"type": "breakeven", "trigger_r": 1.0}),
+    ("exit_be_at_1_5r", {"type": "breakeven", "trigger_r": 1.5}),
+    # partial close then trail
+    (
+        "exit_half_at_2r",
+        {"type": "partial", "close_pct": 50, "at_r": 2.0, "then_trail_r": 1.5},
+    ),
+    # time stops
+    ("exit_time_5d", {"type": "time", "max_nights": 5}),
+    ("exit_time_10d", {"type": "time", "max_nights": 10}),
+    ("exit_time_20d", {"type": "time", "max_nights": 20}),
+    # ATR trail instead of R trail
+    ("exit_atr_trail_2", {"type": "atr_trail", "mult": 2.0}),
+    ("exit_atr_trail_3", {"type": "atr_trail", "mult": 3.0}),
+]
+
+# ---------------------------------------------------------------------------
 # Funded-rule shadows: open-position book required (real curve unchanged).
 # Chrono realizes trades on entry day; these layers synthesize holds via
 # entry_date + nights_held and mark-to-market with daily closes.
@@ -4764,6 +4796,256 @@ def _persist_shadow_trail_summary_state(
     runner: _ShadowTrailSummaryRunner,
 ) -> None:
     chrono_data["shadow_trail_summary_state"] = runner.to_persistence()
+
+
+@dataclass
+class _ExitCurveState:
+    curve_id: str
+    capital: float
+    peak_capital: float
+    day_anchor: float
+    day_pnl: float = 0.0
+    trades: int = 0
+    fallback_trades: int = 0
+    daily_pnls: dict[str, float] = field(default_factory=dict)
+    daily_anchors: dict[str, float] = field(default_factory=dict)
+    max_drawdown_pct_seen: float = 0.0
+    nights_samples: list[float] = field(default_factory=list)
+    total_swap_paid: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "curve_id": self.curve_id,
+            "capital": round(float(self.capital), 2),
+            "peak_capital": round(float(self.peak_capital), 2),
+            "day_anchor": round(float(self.day_anchor), 2),
+            "day_pnl": round(float(self.day_pnl), 2),
+            "trades": int(self.trades),
+            "fallback_trades": int(self.fallback_trades),
+            "daily_pnls": dict(self.daily_pnls),
+            "daily_anchors": dict(self.daily_anchors),
+            "max_drawdown_pct_seen": round(float(self.max_drawdown_pct_seen), 4),
+            "nights_samples": [round(float(x), 4) for x in self.nights_samples],
+            "total_swap_paid": round(float(self.total_swap_paid), 2),
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "_ExitCurveState":
+        start = float(STARTING_CAPITAL)
+        nights_raw = raw.get("nights_samples") or []
+        nights: list[float] = []
+        if isinstance(nights_raw, list):
+            for x in nights_raw:
+                try:
+                    nights.append(float(x))
+                except (TypeError, ValueError):
+                    continue
+        return cls(
+            curve_id=str(raw.get("curve_id") or ""),
+            capital=float(raw.get("capital", start) or start),
+            peak_capital=float(raw.get("peak_capital", start) or start),
+            day_anchor=float(raw.get("day_anchor", start) or start),
+            day_pnl=float(raw.get("day_pnl", 0) or 0),
+            trades=int(raw.get("trades", 0) or 0),
+            fallback_trades=int(raw.get("fallback_trades", 0) or 0),
+            daily_pnls={str(k): float(v) for k, v in (raw.get("daily_pnls") or {}).items()},
+            daily_anchors={str(k): float(v) for k, v in (raw.get("daily_anchors") or {}).items()},
+            max_drawdown_pct_seen=float(raw.get("max_drawdown_pct_seen", 0) or 0),
+            nights_samples=nights,
+            total_swap_paid=float(raw.get("total_swap_paid", 0) or 0),
+        )
+
+
+class _ShadowExitRunner:
+    """
+    Capital curves from write-only ``shadow_exit`` forward-sim variants.
+    Tracks median nights held and total swap paid per config (time stops differ).
+    """
+
+    LIVE_KEY = "exit_live"
+
+    def __init__(self) -> None:
+        self.curves: dict[str, _ExitCurveState] = {}
+        self._init_curves()
+
+    def _init_curves(self) -> None:
+        if not SHADOW_EXIT_ENABLED:
+            return
+        start = float(STARTING_CAPITAL)
+        self.curves[self.LIVE_KEY] = _ExitCurveState(
+            curve_id=self.LIVE_KEY,
+            capital=start,
+            peak_capital=start,
+            day_anchor=start,
+        )
+        for name, _cfg in SHADOW_EXIT_CONFIGS:
+            self.curves[name] = _ExitCurveState(
+                curve_id=name,
+                capital=start,
+                peak_capital=start,
+                day_anchor=start,
+            )
+
+    @classmethod
+    def from_chrono(cls, chrono_data: Mapping[str, Any] | None) -> "_ShadowExitRunner":
+        runner = cls()
+        if not SHADOW_EXIT_ENABLED or not chrono_data:
+            return runner
+        saved = chrono_data.get("shadow_exit_state")
+        if not isinstance(saved, dict):
+            return runner
+        curves_raw = saved.get("curves")
+        if not isinstance(curves_raw, dict):
+            return runner
+        for cid, raw in curves_raw.items():
+            if cid in runner.curves and isinstance(raw, dict):
+                runner.curves[cid] = _ExitCurveState.from_dict(raw)
+        return runner
+
+    def to_persistence(self) -> dict[str, Any]:
+        return {"curves": {cid: st.to_dict() for cid, st in self.curves.items()}}
+
+    def on_new_day(self, date_str: str) -> None:  # noqa: ARG002
+        for st in self.curves.values():
+            st.day_anchor = float(st.capital)
+            st.day_pnl = 0.0
+
+    def finalize_day(self, date_str: str) -> None:
+        ds = str(date_str or "")[:10]
+        for st in self.curves.values():
+            st.daily_pnls[ds] = round(float(st.day_pnl), 2)
+            st.daily_anchors[ds] = round(float(st.day_anchor), 2)
+
+    def _apply(
+        self,
+        st: _ExitCurveState,
+        pnl: float,
+        *,
+        nights: float | None = None,
+        swap: float | None = None,
+    ) -> None:
+        st.trades += 1
+        st.capital += pnl
+        st.day_pnl += pnl
+        if st.capital > st.peak_capital:
+            st.peak_capital = st.capital
+        if st.peak_capital > 0:
+            dd = (st.peak_capital - st.capital) / st.peak_capital * 100.0
+            if dd > st.max_drawdown_pct_seen:
+                st.max_drawdown_pct_seen = float(dd)
+        if nights is not None:
+            try:
+                st.nights_samples.append(float(nights))
+            except (TypeError, ValueError):
+                pass
+        if swap is not None:
+            try:
+                st.total_swap_paid += float(swap)
+            except (TypeError, ValueError):
+                pass
+
+    def process_trade(self, row: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Consume ``row['shadow_exit']``; return None (map already on the row)."""
+        if not SHADOW_EXIT_ENABLED or not self.curves:
+            return None
+        if row.get("skipped") or row.get("skip_trade"):
+            return None
+        if str(row.get("outcome") or "").strip().upper() not in ("WIN", "LOSS"):
+            return None
+        if row.get("shadow_class") or row.get("shadow_instrument"):
+            return None
+
+        live_st = self.curves.get(self.LIVE_KEY)
+        if live_st is not None:
+            self._apply(
+                live_st,
+                float(row.get("pnl_dollars") or 0),
+                nights=float(row.get("nights_held") or 0) or None,
+                swap=float(row.get("swap_amount") or 0) if row.get("swap_amount") is not None else None,
+            )
+
+        exit_map = row.get("shadow_exit")
+        if not isinstance(exit_map, dict):
+            exit_map = {}
+        for name, _cfg in SHADOW_EXIT_CONFIGS:
+            st = self.curves.get(name)
+            if st is None:
+                continue
+            payload = exit_map.get(name)
+            if isinstance(payload, dict) and payload.get("pnl_dollars") is not None:
+                try:
+                    pnl = float(payload["pnl_dollars"])
+                except (TypeError, ValueError):
+                    pnl = float(row.get("pnl_dollars") or 0)
+                    st.fallback_trades += 1
+                    self._apply(st, pnl)
+                    continue
+                nights_v: float | None
+                swap_v: float | None
+                try:
+                    nights_v = float(payload["nights_held"]) if payload.get("nights_held") is not None else None
+                except (TypeError, ValueError):
+                    nights_v = None
+                try:
+                    swap_v = float(payload["swap_amount"]) if payload.get("swap_amount") is not None else None
+                except (TypeError, ValueError):
+                    swap_v = None
+                self._apply(st, pnl, nights=nights_v, swap=swap_v)
+            else:
+                pnl = float(row.get("pnl_dollars") or 0)
+                st.fallback_trades += 1
+                self._apply(st, pnl)
+        return None
+
+    def _curve_summary(self, st: _ExitCurveState) -> dict[str, Any]:
+        peak = float(st.peak_capital or STARTING_CAPITAL)
+        cap = float(st.capital or STARTING_CAPITAL)
+        worst_day_pct = 0.0
+        positive_months = 0
+        month_pnls: dict[str, float] = {}
+        for ds, dp in st.daily_pnls.items():
+            anchor = float(st.daily_anchors.get(ds, st.day_anchor or STARTING_CAPITAL))
+            day_pct = (float(dp) / anchor * 100.0) if anchor > 0 else 0.0
+            if day_pct < worst_day_pct:
+                worst_day_pct = day_pct
+            ym = ds[:7]
+            month_pnls[ym] = month_pnls.get(ym, 0.0) + float(dp)
+        for mp in month_pnls.values():
+            if mp > 0:
+                positive_months += 1
+        nights = list(st.nights_samples)
+        if nights:
+            nights_sorted = sorted(nights)
+            mid = len(nights_sorted) // 2
+            if len(nights_sorted) % 2 == 1:
+                median_nights = float(nights_sorted[mid])
+            else:
+                median_nights = 0.5 * (nights_sorted[mid - 1] + nights_sorted[mid])
+        else:
+            median_nights = None
+        return {
+            "final_capital": round(cap, 2),
+            "peak_capital": round(peak, 2),
+            "max_drawdown_pct": round(float(st.max_drawdown_pct_seen), 2),
+            "worst_day_pct": round(float(worst_day_pct), 2),
+            "positive_months": int(positive_months),
+            "trades": int(st.trades),
+            "fallback_trades": int(st.fallback_trades),
+            "median_nights_held": (
+                round(float(median_nights), 2) if median_nights is not None else None
+            ),
+            "total_swap_paid": round(float(st.total_swap_paid), 2),
+        }
+
+    def summaries(self) -> dict[str, dict[str, Any]]:
+        return {cid: self._curve_summary(st) for cid, st in self.curves.items()}
+
+
+def _persist_shadow_exit_state(
+    chrono_data: dict[str, Any],
+    runner: _ShadowExitRunner,
+) -> None:
+    chrono_data["shadow_exit_state"] = runner.to_persistence()
 
 
 def _shadow_pos_key(ticker: str, timeframe: str, strategy_id: str) -> str:
@@ -10311,6 +10593,291 @@ def _shadow_trail_null_fields() -> dict[str, Any]:
     return {name: None for name, _ in _SHADOW_TRAIL_ACTIVATE_RS}
 
 
+def _shadow_exit_null_map() -> dict[str, None]:
+    return {name: None for name, _ in SHADOW_EXIT_CONFIGS}
+
+
+def _shadow_exit_max_candles(timeframe: str, max_nights: float) -> int:
+    """Convert max nights → candle count for the trade timeframe."""
+    tf_d = float(_tf_days(timeframe) or 1.0)
+    if tf_d <= 0:
+        tf_d = 1.0
+    return max(1, int(math.ceil(float(max_nights) / tf_d)))
+
+
+def _simulate_shadow_exit_variant(
+    *,
+    direction: str,
+    entry: float,
+    stop_loss: float,
+    forward_df: pd.DataFrame,
+    atr: float,
+    timeframe: str,
+    cfg: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """
+    Candle walk for one shadow exit TYPE. Returns raw sim fields
+    (exit_price, exit_reason, candles_to_exit, pnl_pct) before costs/swap.
+    """
+    if forward_df is None or getattr(forward_df, "empty", True):
+        return None
+    d = str(direction or "").strip().upper()
+    if d not in ("LONG", "SHORT"):
+        return None
+    try:
+        entry_price = float(entry)
+        normal_stop = float(stop_loss)
+    except (TypeError, ValueError):
+        return None
+    risk = abs(entry_price - normal_stop)
+    if entry_price <= 0 or risk <= 0:
+        return None
+    atr_use = float(atr or 0) or risk
+    if atr_use <= 0:
+        atr_use = abs(entry_price) * 0.001
+    typ = str(cfg.get("type") or "").strip().lower()
+    sign = 1.0 if d == "LONG" else -1.0
+
+    current_stop = normal_stop
+    rem = 1.0
+    realized = 0.0  # dollar move × unit size=1 (scaled later via pnl_pct)
+    exit_price = entry_price
+    exit_reason = "Window ended"
+    candle_count = 0
+    peak_hi = entry_price
+    peak_lo = entry_price
+    be_armed = False
+    partial_done = False
+    trail_r = 0.0
+
+    target_r = float(cfg.get("r") or 0) if typ == "fixed_r" else None
+    target_px = (
+        entry_price + sign * risk * float(target_r) if target_r is not None else None
+    )
+    be_trigger_r = float(cfg.get("trigger_r") or 0) if typ == "breakeven" else None
+    be_trigger_px = (
+        entry_price + sign * risk * float(be_trigger_r)
+        if be_trigger_r is not None
+        else None
+    )
+    partial_at_r = float(cfg.get("at_r") or 0) if typ == "partial" else None
+    partial_px = (
+        entry_price + sign * risk * float(partial_at_r)
+        if partial_at_r is not None
+        else None
+    )
+    close_frac = (
+        max(0.0, min(1.0, float(cfg.get("close_pct") or 0) / 100.0))
+        if typ == "partial"
+        else 0.0
+    )
+    if typ == "partial":
+        trail_r = float(cfg.get("then_trail_r") or 0)
+    max_candles: int | None = None
+    if typ == "time":
+        max_candles = _shadow_exit_max_candles(timeframe, float(cfg.get("max_nights") or 1))
+    atr_mult = float(cfg.get("mult") or 0) if typ == "atr_trail" else None
+
+    def _px_move(px: float) -> float:
+        return (px - entry_price) if d == "LONG" else (entry_price - px)
+
+    def _close_frac(frac: float, px: float) -> None:
+        nonlocal rem, realized
+        if frac <= 0 or rem <= 0:
+            return
+        take = min(1.0, float(frac))
+        realized += rem * take * _px_move(px)
+        rem = max(0.0, rem * (1.0 - take))
+
+    rows = list(forward_df.iterrows())
+    for _i, (_, candle) in enumerate(rows):
+        candle_count += 1
+        try:
+            high = float(candle.get("High", entry_price))
+            low = float(candle.get("Low", entry_price))
+            close = float(candle.get("Close", entry_price))
+        except (TypeError, ValueError):
+            continue
+        if not (math.isfinite(high) and math.isfinite(low) and math.isfinite(close)):
+            continue
+
+        peak_hi = max(peak_hi, high, close)
+        peak_lo = min(peak_lo, low, close)
+
+        # Update trails before stop checks (use prior peak including this bar's extreme).
+        if typ == "atr_trail" and atr_mult is not None and atr_mult > 0:
+            if d == "LONG":
+                prop = peak_hi - atr_mult * atr_use
+                if prop > current_stop:
+                    current_stop = prop
+            else:
+                prop = peak_lo + atr_mult * atr_use
+                if prop < current_stop:
+                    current_stop = prop
+        elif typ == "partial" and partial_done and trail_r > 0 and rem > 0:
+            if d == "LONG":
+                prop = peak_hi - trail_r * risk
+                if prop > current_stop:
+                    current_stop = prop
+            else:
+                prop = peak_lo + trail_r * risk
+                if prop < current_stop:
+                    current_stop = prop
+
+        # 1) Stop
+        if d == "LONG" and low <= current_stop and rem > 0:
+            realized += rem * (current_stop - entry_price)
+            rem = 0.0
+            exit_price = current_stop
+            if typ == "breakeven" and be_armed:
+                exit_reason = "BREAKEVEN_STOP"
+            elif typ in ("atr_trail", "partial") and current_stop != normal_stop:
+                exit_reason = "TRAIL_STOP"
+            else:
+                exit_reason = "STOP"
+            break
+        if d == "SHORT" and high >= current_stop and rem > 0:
+            realized += rem * (entry_price - current_stop)
+            rem = 0.0
+            exit_price = current_stop
+            if typ == "breakeven" and be_armed:
+                exit_reason = "BREAKEVEN_STOP"
+            elif typ in ("atr_trail", "partial") and current_stop != normal_stop:
+                exit_reason = "TRAIL_STOP"
+            else:
+                exit_reason = "STOP"
+            break
+
+        # 2) Type-specific rules
+        if typ == "fixed_r" and target_px is not None and rem > 0:
+            hit = (d == "LONG" and high >= target_px) or (d == "SHORT" and low <= target_px)
+            if hit:
+                _close_frac(1.0, target_px)
+                exit_price = target_px
+                exit_reason = f"FIXED_{str(target_r).replace('.', '_')}R"
+                break
+
+        if typ == "breakeven" and not be_armed and be_trigger_px is not None:
+            hit = (d == "LONG" and high >= be_trigger_px) or (
+                d == "SHORT" and low <= be_trigger_px
+            )
+            if hit:
+                be_armed = True
+                current_stop = entry_price  # lock breakeven; then run
+
+        if typ == "partial" and not partial_done and partial_px is not None and rem > 0:
+            hit = (d == "LONG" and high >= partial_px) or (
+                d == "SHORT" and low <= partial_px
+            )
+            if hit:
+                _close_frac(close_frac, partial_px)
+                partial_done = True
+                current_stop = entry_price  # BE remaining, then R-trail
+                if rem <= 1e-12:
+                    exit_price = partial_px
+                    exit_reason = f"PARTIAL_{int(round(close_frac * 100))}PCT"
+                    break
+
+        if typ == "time" and max_candles is not None and candle_count >= max_candles and rem > 0:
+            _close_frac(1.0, close)
+            exit_price = close
+            exit_reason = f"TIME_{int(cfg.get('max_nights') or 0)}N"
+            break
+
+    if rem > 1e-12:
+        # Window ended — mark remaining at last close
+        try:
+            last_close = float(forward_df.iloc[-1].get("Close", entry_price))
+        except Exception:  # noqa: BLE001
+            last_close = entry_price
+        if not math.isfinite(last_close):
+            last_close = entry_price
+        _close_frac(1.0, last_close)
+        exit_price = last_close
+        if exit_reason == "Window ended":
+            exit_reason = "Window ended"
+        if candle_count <= 0:
+            candle_count = len(rows)
+
+    # Unit-size pnl_pct: realized move / entry (matches evaluate_forward_candles scale
+    # when position_size multiplies both sides in cost application).
+    raw_pct = (realized / entry_price) if entry_price > 0 else 0.0
+    return {
+        "exit_price": float(exit_price),
+        "exit_reason": str(exit_reason),
+        "candles_to_exit": int(candle_count),
+        "pnl_pct": float(raw_pct),
+        "outcome": "WIN" if raw_pct > 0 else ("LOSS" if raw_pct < 0 else "FLAT"),
+    }
+
+
+def _shadow_exit_fields(
+    *,
+    direction: str,
+    entry: float,
+    stop_loss: float,
+    forward_df: pd.DataFrame,
+    position_size: float = 0.0,
+    leveraged_exposure: float = 0.0,
+    timeframe: str = "",
+    atr: float = 0.0,
+    ticker: str = "",
+) -> dict[str, Any]:
+    """
+    Replay the forward path under each SHADOW_EXIT_CONFIGS rule.
+    Write-only nested map — never feeds live exits/sizing.
+    """
+    if not SHADOW_EXIT_ENABLED:
+        return {}
+    try:
+        out: dict[str, Any] = {}
+        for name, cfg in SHADOW_EXIT_CONFIGS:
+            sim = _simulate_shadow_exit_variant(
+                direction=direction,
+                entry=entry,
+                stop_loss=stop_loss,
+                forward_df=forward_df,
+                atr=atr,
+                timeframe=timeframe,
+                cfg=cfg,
+            )
+            if sim is None:
+                out[name] = None
+                continue
+            raw_pct = float(sim.get("pnl_pct", 0) or 0)
+            candles = int(sim.get("candles_to_exit", 0) or 0)
+            pnl_d, pnl_pct, _gross, cost_f = _apply_realistic_costs(
+                ticker=ticker,
+                direction=direction,
+                timeframe=timeframe,
+                position_size=position_size,
+                entry=entry,
+                leveraged_exposure=leveraged_exposure,
+                raw_pct=raw_pct,
+                candles_to_exit=candles,
+            )
+            nights = float((cost_f or {}).get("nights_held", 0) or 0)
+            if nights <= 0:
+                nights = max(0.0, float(candles) * _tf_days(timeframe))
+            swap_amt = float((cost_f or {}).get("swap_amount", 0) or 0)
+            out[name] = {
+                "exit_price": sim.get("exit_price"),
+                "exit_reason": sim.get("exit_reason"),
+                "pnl_dollars": pnl_d,
+                "pnl_pct": pnl_pct,
+                "candles_to_exit": candles,
+                "nights_held": round(float(nights), 2),
+                "swap_amount": round(float(swap_amt), 2),
+            }
+        return out
+    except Exception as e:  # noqa: BLE001
+        log(
+            f"[SHADOW EXIT] {str(ticker or '').strip().upper()}: {e}",
+            level="warning",
+        )
+        return _shadow_exit_null_map()
+
+
 def _shadow_stop_null_map() -> dict[str, None]:
     return {name: None for name, _ in SHADOW_STOP_CONFIGS}
 
@@ -12119,6 +12686,17 @@ def _python_forced_layer2_trade(
             ticker=sym,
             period_mode=str(ai.get("period_mode") or period_mode),
         ),
+        "shadow_exit": _shadow_exit_fields(
+            direction=direction,
+            entry=entry,
+            stop_loss=normal_stop_v75,
+            forward_df=fut,
+            position_size=position_size,
+            leveraged_exposure=leveraged_exposure,
+            timeframe=tf_key,
+            atr=float(atr_ref or v75_meta.get("entry_atr", 0) or 0),
+            ticker=sym,
+        ),
         "shadow_stop": _shadow_stop_placement_fields(
             direction=direction,
             entry=entry,
@@ -13239,6 +13817,17 @@ def run_one_backtest(
             ticker=sym,
             period_mode=str(ai.get("period_mode") or period_mode),
         )
+        _shadow_exit_map = _shadow_exit_fields(
+            direction=direction,
+            entry=entry,
+            stop_loss=normal_stop_v75,
+            forward_df=fut,
+            position_size=position_size,
+            leveraged_exposure=leveraged_exposure,
+            timeframe=tf_key,
+            atr=float(ind.get("atr", 0) or v75_meta.get("entry_atr", 0) or 0),
+            ticker=sym,
+        )
 
         cond_snap = (
             _trade_condition_snapshot_fields(analysis_date, past, ind)
@@ -13460,6 +14049,7 @@ def run_one_backtest(
                 ),
             ),
             **_shadow_trail_fields,
+            "shadow_exit": _shadow_exit_map,
             "shadow_stop": _shadow_stop_map,
             **_sizing_health_shadow_fields(
                 confidence=str(ai.get("confidence", confidence) or ""),
@@ -15054,6 +15644,7 @@ def run_chronological_backtest(
         skip_runner = _ShadowSkipThrottledRunner.from_chrono(chrono_data)
         filter_runner = _ShadowFilterRunner.from_chrono(chrono_data)
         trail_summary_runner = _ShadowTrailSummaryRunner.from_chrono(chrono_data)
+        exit_runner = _ShadowExitRunner.from_chrono(chrono_data)
         pcap_runner = _ShadowPortfolioCapRunner.from_chrono(chrono_data)
         eqstop_runner = _ShadowEquityDailyStopRunner.from_chrono(chrono_data)
         zone_runner = _ShadowZoneRunner.from_chrono(chrono_data)
@@ -15119,6 +15710,7 @@ def run_chronological_backtest(
                 skip_runner.on_new_day(date_str)
                 filter_runner.on_new_day(date_str)
                 trail_summary_runner.on_new_day(date_str)
+                exit_runner.on_new_day(date_str)
                 pcap_runner.on_new_day(date_str)
                 eqstop_runner.on_new_day(date_str)
                 zone_runner.on_new_day(date_str)
@@ -15833,6 +16425,7 @@ def run_chronological_backtest(
                             if _filter_map:
                                 row["shadow_filter"] = _filter_map
                             trail_summary_runner.process_trade(row)
+                            exit_runner.process_trade(row)
                             _funded_ctx = _shadow_funded_trade_ctx_from_row(row)
                             _pcap_map = pcap_runner.process_trade(_funded_ctx)
                             if _pcap_map:
@@ -15921,6 +16514,7 @@ def run_chronological_backtest(
                             _persist_shadow_skip_state(chrono_data, skip_runner)
                             _persist_shadow_filter_state(chrono_data, filter_runner)
                             _persist_shadow_trail_summary_state(chrono_data, trail_summary_runner)
+                            _persist_shadow_exit_state(chrono_data, exit_runner)
                             _persist_shadow_portfolio_cap_state(chrono_data, pcap_runner)
                             _persist_shadow_equity_daily_stop_state(chrono_data, eqstop_runner)
                             _persist_shadow_zone_state(chrono_data, zone_runner)
@@ -15960,6 +16554,7 @@ def run_chronological_backtest(
             skip_runner.finalize_day(date_str)
             filter_runner.finalize_day(date_str)
             trail_summary_runner.finalize_day(date_str)
+            exit_runner.finalize_day(date_str)
             pcap_runner.finalize_day(date_str)
             _eq_tickers: set[str] = set()
             for _st in eqstop_runner.curves.values():
@@ -16012,6 +16607,7 @@ def run_chronological_backtest(
             _persist_shadow_skip_state(chrono_data, skip_runner)
             _persist_shadow_filter_state(chrono_data, filter_runner)
             _persist_shadow_trail_summary_state(chrono_data, trail_summary_runner)
+            _persist_shadow_exit_state(chrono_data, exit_runner)
             _persist_shadow_portfolio_cap_state(chrono_data, pcap_runner)
             _persist_shadow_equity_daily_stop_state(chrono_data, eqstop_runner)
             _persist_shadow_zone_state(chrono_data, zone_runner)
@@ -16085,6 +16681,8 @@ def run_chronological_backtest(
             chrono_data["shadow_filter_summary"] = filter_runner.summaries()
         if SHADOW_TRAIL_SUMMARY_ENABLED:
             chrono_data["shadow_trail_summary"] = trail_summary_runner.summaries()
+        if SHADOW_EXIT_ENABLED:
+            chrono_data["shadow_exit_summary"] = exit_runner.summaries()
         if SHADOW_PORTFOLIO_CAP_ENABLED:
             chrono_data["shadow_portfolio_cap_summary"] = pcap_runner.summaries()
         if SHADOW_EQUITY_DAILY_STOP_ENABLED:
@@ -16100,6 +16698,7 @@ def run_chronological_backtest(
         _persist_shadow_skip_state(chrono_data, skip_runner)
         _persist_shadow_filter_state(chrono_data, filter_runner)
         _persist_shadow_trail_summary_state(chrono_data, trail_summary_runner)
+        _persist_shadow_exit_state(chrono_data, exit_runner)
         _persist_shadow_portfolio_cap_state(chrono_data, pcap_runner)
         _persist_shadow_equity_daily_stop_state(chrono_data, eqstop_runner)
         _persist_shadow_zone_state(chrono_data, zone_runner)
