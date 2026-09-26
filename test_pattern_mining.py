@@ -175,11 +175,93 @@ def test_max_conjunction_depth_capped():
     assert any(len(c.conditions) == 3 for c in cands)
 
 
+def test_mine_numeric_is_hypothesis_driven():
+    assert len(pm.MINE_NUMERIC) == 9
+    assert pm.MINE_NUMERIC == (
+        "zone_position_pct",
+        "strategy_confluence_count",
+        "ab_throttle",
+        "trend_strength",
+        "entry_atr_vs_avg",
+        "sys_followthrough_last20",
+        "st_dist_to_high_atr",
+        "mc_carry_to_vol",
+        "cs_dispersion",
+    )
+
+
+def test_max_candidates_refuses_without_truncating():
+    # Many viable atoms → combinations exceed a tiny ceiling
+    atoms = [pm.Condition(f"f{i}", "==", "x") for i in range(20)]
+    build = [
+        pm.TradeRow(
+            trade_date=date(2023, 1, 1) + timedelta(days=i % 400),
+            features={f"f{j}": "x" for j in range(20)},
+            labels={"pnl_r_net": 0.2, "outcome": "WIN"},
+        )
+        for i in range(150)
+    ]
+    try:
+        pm.generate_candidates(atoms, build, max_depth=3, max_candidates=10)
+        assert False, "expected SystemExit"
+    except SystemExit as e:
+        msg = str(e)
+        assert "REFUSED" in msg
+        assert "10" in msg
+        assert "MINE_NUMERIC" in msg or "max-depth" in msg
+
+
+def test_atom_masks_precomputed_and_conjunction_and():
+    atoms = [
+        pm.Condition("zone_position_pct", "<", 30),
+        pm.Condition("strategy_confluence_count", "==", 2),
+    ]
+    build = [
+        pm.TradeRow(
+            trade_date=date(2023, 1, 1),
+            features={"zone_position_pct": 10, "strategy_confluence_count": 2},
+            labels={"pnl_r_net": 0.2, "outcome": "WIN"},
+        ),
+        pm.TradeRow(
+            trade_date=date(2023, 1, 2),
+            features={"zone_position_pct": 50, "strategy_confluence_count": 2},
+            labels={"pnl_r_net": 0.2, "outcome": "WIN"},
+        ),
+        pm.TradeRow(
+            trade_date=date(2023, 1, 3),
+            features={"zone_position_pct": 10, "strategy_confluence_count": 1},
+            labels={"pnl_r_net": 0.2, "outcome": "WIN"},
+        ),
+    ]
+    masks = pm.precompute_atom_masks(atoms, build)
+    assert len(masks) == 2
+    assert masks[0].tolist() == [True, False, True]
+    assert masks[1].tolist() == [True, True, False]
+    assert (masks[0] & masks[1]).tolist() == [True, False, False]
+
+
 def test_report_header_states_expected_false_positives():
     header = pm.format_report_header(40)
     assert "Candidates tested: 40" in header
-    assert "expect ~2.0 false positives" in header or "~2.0" in header
-    assert "0.05" in header
+    assert "after BUILD" in header
+    assert "after TIER1" in header
+    assert "after SEALED" in header
+    # 40 * 0.05 = 2, 40 * 0.0025 = 0.1, 40 * 0.000125 = 0.005
+    assert "~2" in header
+    assert "0.05^2" in header
+    assert "0.05^3" in header
+
+
+def test_stage_lines_compare_survivors_to_chance():
+    line_b = pm.format_stage_line("BUILD", 412, 5000)
+    line_t = pm.format_stage_line("TIER1", 31, 5000)
+    line_s = pm.format_stage_line("SEALED", 3, 5000)
+    assert "BUILD" in line_b and "412" in line_b and "expected by chance ~250" in line_b
+    assert "TIER1" in line_t and "31" in line_t and "expected by chance ~12.5" in line_t
+    assert "SEALED" in line_s and "3" in line_s and "expected by chance ~0.625" in line_s
+    assert pm.expected_false_positives(40, "BUILD") == 2.0
+    assert abs(pm.expected_false_positives(40, "TIER1") - 0.1) < 1e-12
+    assert abs(pm.expected_false_positives(40, "SEALED") - 0.005) < 1e-12
 
 
 def test_sorted_by_tier1_not_build():
@@ -203,8 +285,6 @@ def test_sorted_by_tier1_not_build():
                 labels={"pnl_r_net": 0.25, "outcome": "WIN"},
             )
         )
-    # Add some low-zone high-R for A but fewer / worse average after dilution — 
-    # actually A matches none of zone=30. So A fails TIER1 min trades.
     # Give A 120 matching trades with lower R:
     for i in range(120):
         tier1.append(
@@ -216,8 +296,6 @@ def test_sorted_by_tier1_not_build():
         )
     confirmed = pm.confirm_tier1([(c_a, build_a), (c_b, build_b)], tier1)
     assert len(confirmed) >= 1
-    # B (zone<40) matches all 240 trades → higher volume; A matches 120 at 0.16R
-    # Ensure sort key is TIER1 r_per_trade descending
     for i in range(len(confirmed) - 1):
         assert confirmed[i][2].r_per_trade >= confirmed[i + 1][2].r_per_trade
 
@@ -252,9 +330,37 @@ def test_end_to_end_run_mining_without_unseal(tmp_path: Path):
     out = tmp_path / "report.json"
     payload = pm.run_mining(input_arg=str(tmp_path), unseal=False, output=out)
     assert payload["unseal"] is False
-    assert "expected_false_positives" in payload
+    assert isinstance(payload["expected_false_positives"], dict)
+    assert "BUILD" in payload["expected_false_positives"]
+    assert "TIER1" in payload["expected_false_positives"]
+    assert "SEALED" in payload["expected_false_positives"]
+    n = payload["n_candidates_tested"]
+    assert payload["expected_false_positives"]["BUILD"] == round(n * 0.05, 4)
+    assert payload["expected_false_positives"]["TIER1"] == round(n * 0.05 ** 2, 4)
+    assert payload["expected_false_positives"]["SEALED"] == round(n * 0.05 ** 3, 4)
     assert payload["n_candidates_tested"] >= 1
+    assert payload["n_sealed_survivors"] is None
     assert out.is_file()
     # sealed not in survivors without unseal
     for s in payload["survivors"]:
         assert "SEALED" not in s
+
+
+def test_end_to_end_stage_lines_with_unseal(tmp_path: Path, capsys):
+    build_rows = _dated_rows(
+        date(2023, 1, 2), 150, zone=15.0, confluence=2, r=0.3, end_exclusive=pm.BUILD_END
+    )
+    tier_rows = _dated_rows(
+        date(2024, 6, 3), 150, zone=15.0, confluence=2, r=0.28, end_exclusive=pm.TIER1_END
+    )
+    sealed_rows = _dated_rows(date(2025, 7, 1), 150, zone=15.0, confluence=2, r=0.25)
+    path = tmp_path / "entry_features_y.jsonl"
+    _write_jsonl(path, build_rows + tier_rows + sealed_rows)
+
+    payload = pm.run_mining(input_arg=str(tmp_path), unseal=True, output=None)
+    captured = capsys.readouterr()
+    assert "BUILD" in captured.out and "expected by chance" in captured.out
+    assert "TIER1" in captured.out
+    assert "SEALED" in captured.out
+    assert payload["n_sealed_survivors"] is not None
+    assert payload["n_sealed_survivors"] >= 0

@@ -11,8 +11,10 @@ This harness:
   * Searches only on BUILD; confirms on TIER1; SEALED is readable only with
     an explicit ``--unseal`` (logged loudly).
   * Uses pre-registered thresholds (not tuned after seeing results).
-  * Reports n_candidates and expected false positives (n * 0.05).
-  * Caps conjunction depth at three conditions.
+  * Reports staged expected false positives (n*0.05 / n*0.05^2 / n*0.05^3)
+    beside survivor counts at BUILD, TIER1, and SEALED.
+  * Caps conjunction depth at three; refuses generation above MAX_CANDIDATES
+    (no silent truncation — a truncated search is a biased search).
   * Does NOT import continuous_backtester and NEVER writes under /data.
 
 Usage:
@@ -30,6 +32,8 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
+
+import numpy as np
 
 # Feature/label catalogs only — never continuous_backtester.
 from entry_features import ENTRY_FEATURE_KEYS, ENTRY_LABEL_KEYS
@@ -50,33 +54,19 @@ MIN_TRADES_PER_WINDOW = 100
 MIN_R_PER_TRADE = 0.15  # swap alone ~0.07R; system ~-0.038R net → +0.05R is worthless
 FALSE_POSITIVE_RATE = 0.05  # for expected-FP header
 MAX_CONJUNCTION_DEPTH = 3
+MAX_CANDIDATES = 5000  # hard ceiling — refuse, never silently truncate
 
-# Fields mined for atomic conditions (actionable subset — not every score).
+# Hypothesis-driven numeric fields only (not a fishing expedition).
 MINE_NUMERIC: tuple[str, ...] = (
     "zone_position_pct",
-    "trend_strength",
-    "macro_score",
-    "macro_rate_diff",
-    "conviction_score",
-    "st_layer2_score",
     "strategy_confluence_count",
-    "entry_atr_vs_avg",
-    "risk_pct_of_price",
     "ab_throttle",
-    "sys_winrate_last20",
+    "trend_strength",
+    "entry_atr_vs_avg",
     "sys_followthrough_last20",
-    "strat_health_last3",
-    "st_health_last3",
-    "weekly_candle_age",
-    "event_days_to_next",
-    "event_days_since_last",
-    "cs_dispersion",
-    "cs_ccy_rank_spread",
     "st_dist_to_high_atr",
-    "st_dist_to_low_atr",
-    "st_range_compression",
     "mc_carry_to_vol",
-    "mc_rate_diff_delta20",
+    "cs_dispersion",
 )
 
 MINE_CATEGORICAL: tuple[str, ...] = (
@@ -444,42 +434,83 @@ def atomic_conditions_from_build(build: Sequence[TradeRow]) -> list[Condition]:
     return atoms
 
 
+def precompute_atom_masks(
+    atoms: Sequence[Condition],
+    build: Sequence[TradeRow],
+) -> list[np.ndarray]:
+    """One boolean mask per atom over BUILD — evaluated once, reused for ANDs."""
+    return [
+        np.fromiter(
+            (atom.matches(t.features) for t in build),
+            dtype=bool,
+            count=len(build),
+        )
+        for atom in atoms
+    ]
+
+
+def _combo_is_contradictory(combo: Sequence[Condition]) -> bool:
+    """Skip wasted == collisions on the same field."""
+    eqs = [c for c in combo if c.op == "=="]
+    if not eqs:
+        return False
+    # Duplicate (field, value) after case-fold → redundant, not contradictory; allow.
+    # Two == on same field with different values → empty set.
+    eq_fields = [c.field for c in eqs]
+    return len(eq_fields) != len(set(eq_fields))
+
+
 def generate_candidates(
     atoms: Sequence[Condition],
     build: Sequence[TradeRow],
     *,
     max_depth: int = MAX_CONJUNCTION_DEPTH,
+    max_candidates: int = MAX_CANDIDATES,
 ) -> list[Candidate]:
     """
     All conjunctions of depth 1..max_depth whose BUILD support ≥ min trades.
 
-    Depth is hard-capped at three — deeper conjunctions almost always overfit.
+    Depth is hard-capped at three. Support is computed via precomputed boolean
+    masks (elementwise AND), not by re-scanning trades per candidate.
+
+    If the supported candidate count would exceed ``max_candidates``, raises
+    SystemExit naming the count — never silently truncates (a truncated search
+    is a biased search).
     """
     depth = max(1, min(int(max_depth), MAX_CONJUNCTION_DEPTH))
-    # Pre-filter atoms that alone have enough support (speeds pairs/triples).
-    viable_atoms: list[Condition] = []
-    for atom in atoms:
-        n = sum(1 for t in build if atom.matches(t.features))
-        if n >= MIN_TRADES_PER_WINDOW:
-            viable_atoms.append(atom)
+    if not atoms or not build:
+        return []
+
+    masks = precompute_atom_masks(atoms, build)
+    # Pre-filter atoms that alone have enough support.
+    viable_idx: list[int] = [
+        i for i, m in enumerate(masks) if int(m.sum()) >= MIN_TRADES_PER_WINDOW
+    ]
 
     candidates: list[Candidate] = []
     for k in range(1, depth + 1):
-        for combo in itertools.combinations(viable_atoms, k):
-            # Skip contradictory same-field pairs (a < 1 AND a > 2 etc. still ok;
-            # identical field with == different values is wasted).
-            fields = [c.field for c in combo]
-            eqs = [c for c in combo if c.op == "=="]
-            if len({(c.field, str(c.value).upper()) for c in eqs}) < len(eqs):
+        for idxs in itertools.combinations(viable_idx, k):
+            combo = tuple(atoms[i] for i in idxs)
+            if _combo_is_contradictory(combo):
                 continue
-            # Two == on same field with different values → empty.
-            eq_fields = [c.field for c in eqs]
-            if len(eq_fields) != len(set(eq_fields)):
-                continue
-            cand = Candidate(conditions=tuple(combo))
-            n = sum(1 for t in build if cand.matches(t.features))
-            if n >= MIN_TRADES_PER_WINDOW:
-                candidates.append(cand)
+            conj = masks[idxs[0]]
+            for i in idxs[1:]:
+                conj = conj & masks[i]
+            if int(conj.sum()) >= MIN_TRADES_PER_WINDOW:
+                candidates.append(Candidate(conditions=combo))
+                if len(candidates) > max_candidates:
+                    raise SystemExit(
+                        f"REFUSED: candidate generation produced > {max_candidates} "
+                        f"supported conjunctions (count so far {len(candidates)}). "
+                        f"Narrow MINE_NUMERIC or lower --max-depth. "
+                        f"Do not raise MAX_CANDIDATES to paper over a fishing expedition."
+                    )
+    if len(candidates) > max_candidates:
+        # Defensive: exact equality at the boundary is allowed; over is refused above.
+        raise SystemExit(
+            f"REFUSED: {len(candidates)} candidates exceeds MAX_CANDIDATES="
+            f"{max_candidates}. Narrow MINE_NUMERIC or lower --max-depth."
+        )
     return candidates
 
 
@@ -534,6 +565,11 @@ def evaluate_sealed(
     return out
 
 
+def count_sealed_survivors(sealed_results: Sequence[Mapping[str, Any]]) -> int:
+    """How many TIER1-confirmed candidates also pass SEALED thresholds."""
+    return sum(1 for row in sealed_results if row.get("SEALED", {}).get("passes_thresholds"))
+
+
 def _stats_dict(st: WindowStats) -> dict[str, Any]:
     return {
         "window": st.window,
@@ -552,8 +588,39 @@ def _stats_dict(st: WindowStats) -> dict[str, Any]:
 # ── Reporting ────────────────────────────────────────────────────────────────
 
 
+def expected_false_positives(n_candidates: int, stage: str) -> float:
+    """
+    Sequential multiple-testing expectation under independent α=0.05 filters.
+
+      BUILD  → n * 0.05
+      TIER1  → n * 0.05^2
+      SEALED → n * 0.05^3
+    """
+    stage_u = stage.upper()
+    if stage_u == WINDOW_BUILD:
+        power = 1
+    elif stage_u == WINDOW_TIER1:
+        power = 2
+    elif stage_u == WINDOW_SEALED:
+        power = 3
+    else:
+        raise ValueError(f"unknown stage {stage!r}")
+    return float(n_candidates) * (FALSE_POSITIVE_RATE ** power)
+
+
+def format_stage_line(stage: str, n_survivors: int, n_candidates: int) -> str:
+    expected = expected_false_positives(n_candidates, stage)
+    # Align like: "BUILD  survivors 412   expected by chance ~250"
+    return (
+        f"{stage:<6} survivors {n_survivors:>4}   "
+        f"expected by chance ~{expected:g}"
+    )
+
+
 def format_report_header(n_candidates: int) -> str:
-    expected_fp = n_candidates * FALSE_POSITIVE_RATE
+    exp_build = expected_false_positives(n_candidates, WINDOW_BUILD)
+    exp_tier1 = expected_false_positives(n_candidates, WINDOW_TIER1)
+    exp_sealed = expected_false_positives(n_candidates, WINDOW_SEALED)
     return (
         f"=== PATTERN MINING REPORT ===\n"
         f"Windows: BUILD < {BUILD_END.isoformat()} | "
@@ -562,10 +629,12 @@ def format_report_header(n_candidates: int) -> str:
         f"Thresholds (pre-registered): min_trades={MIN_TRADES_PER_WINDOW}, "
         f"min_r_per_trade={MIN_R_PER_TRADE}, both halves of each window must be > 0 R\n"
         f"Candidates tested: {n_candidates}\n"
-        f"Expected false positives at α={FALSE_POSITIVE_RATE}: "
-        f"~{expected_fp:.1f}  "
-        f"(n_candidates * {FALSE_POSITIVE_RATE})\n"
+        f"Expected false positives (sequential α={FALSE_POSITIVE_RATE}):\n"
+        f"  after BUILD:  ~{exp_build:g}   (n * {FALSE_POSITIVE_RATE})\n"
+        f"  after TIER1:  ~{exp_tier1:g}   (n * {FALSE_POSITIVE_RATE}^2)\n"
+        f"  after SEALED: ~{exp_sealed:g}   (n * {FALSE_POSITIVE_RATE}^3)\n"
         f"Max conjunction depth: {MAX_CONJUNCTION_DEPTH}\n"
+        f"Max candidates: {MAX_CANDIDATES} (refuse if exceeded — no silent truncate)\n"
         f"Sorted by: TIER1 r_per_trade (NOT BUILD)\n"
     )
 
@@ -648,20 +717,28 @@ def run_mining(
     print(header)
 
     build_hits = search_build(candidates, build)
+    print(format_stage_line(WINDOW_BUILD, len(build_hits), n_cand))
     _log(f"BUILD survivors (pre-TIER1): {len(build_hits)}")
 
     confirmed = confirm_tier1(build_hits, tier1)
+    print(format_stage_line(WINDOW_TIER1, len(confirmed), n_cand))
     _log(f"TIER1-confirmed survivors: {len(confirmed)}")
 
-    print(
-        f"\nSurvivors after BUILD+TIER1: {len(confirmed)}  "
-        f"(remember: expect ~{n_cand * FALSE_POSITIVE_RATE:.1f} false positives "
-        f"from {n_cand} candidates)\n"
-    )
-
     sealed_results: list[dict[str, Any]] | None = None
+    n_sealed_survivors: int | None = None
     if unseal:
         sealed_results = evaluate_sealed(confirmed, sealed)
+        n_sealed_survivors = count_sealed_survivors(sealed_results)
+        print(format_stage_line(WINDOW_SEALED, n_sealed_survivors, n_cand))
+        _log(f"SEALED survivors (pass thresholds): {n_sealed_survivors}")
+    else:
+        print(
+            f"{WINDOW_SEALED:<6} survivors  n/a   "
+            f"expected by chance ~{expected_false_positives(n_cand, WINDOW_SEALED):g}  "
+            f"(pass --unseal to evaluate; one-shot only)"
+        )
+
+    print()
 
     for i, (cand, bstat, tstat) in enumerate(confirmed, start=1):
         sstat = None
@@ -688,6 +765,7 @@ def run_mining(
             "must_be_positive_in": "both halves of each window",
             "false_positive_rate": FALSE_POSITIVE_RATE,
             "max_conjunction_depth": MAX_CONJUNCTION_DEPTH,
+            "max_candidates": MAX_CANDIDATES,
         },
         "windows": {
             "BUILD": f"< {BUILD_END.isoformat()}",
@@ -695,9 +773,14 @@ def run_mining(
             "SEALED": f">= {TIER1_END.isoformat()}",
         },
         "n_candidates_tested": n_cand,
-        "expected_false_positives": round(n_cand * FALSE_POSITIVE_RATE, 2),
+        "expected_false_positives": {
+            "BUILD": round(expected_false_positives(n_cand, WINDOW_BUILD), 4),
+            "TIER1": round(expected_false_positives(n_cand, WINDOW_TIER1), 4),
+            "SEALED": round(expected_false_positives(n_cand, WINDOW_SEALED), 4),
+        },
         "n_build_survivors": len(build_hits),
         "n_tier1_confirmed": len(confirmed),
+        "n_sealed_survivors": n_sealed_survivors,
         "unseal": bool(unseal),
         "survivors": [],
     }
