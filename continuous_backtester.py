@@ -71,6 +71,13 @@ from regime_engine import compute_pair_regime
 from utils import DATA_DIR, env, load_json, log, save_json, utcnow_iso
 
 import shadow_instruments as _si
+from entry_scores import (
+    ENTRY_SCORE_KEYS,
+    attach_entry_scores,
+    build_scores_summary,
+    log_unavailable_entry_scores,
+    reset_entry_score_stats,
+)
 
 set_backtest_mode(True)
 
@@ -5765,6 +5772,98 @@ def _peek_chrono_daily_past_for_zone(ticker: str, date_str: str) -> Any | None:
     except Exception:  # noqa: BLE001
         return None
     return None
+
+
+# ── Entry-time scores: daily OHLC store (write-only scoring; no behaviour change) ──
+_ENTRY_SCORE_DAILY_OHLC: dict[str, pd.DataFrame] = {}
+_ENTRY_SCORE_DAILY_LOCK = threading.Lock()
+
+
+def _entry_score_forex_universe() -> tuple[str, ...]:
+    """Forex pairs from CHRONO_TICKERS (exclude non-6-letter symbols like QQQ)."""
+    out: list[str] = []
+    for t in CHRONO_TICKERS:
+        u = str(t).strip().upper()
+        if len(u) == 6 and u.isalpha():
+            out.append(u)
+    return tuple(out)
+
+
+def _entry_score_get_daily_ohlc(ticker: str, as_of: date) -> pd.DataFrame | None:
+    """
+    Daily OHLC for ``ticker`` with bars ≤ ``as_of`` only (no lookahead).
+
+    Prefer chrono 1d cache peek; otherwise download once per ticker into a module
+    store and slice. Never returns future bars relative to ``as_of``.
+    """
+    sym = str(ticker or "").strip().upper()
+    if not sym:
+        return None
+    ds = as_of.isoformat()
+
+    peeked = _peek_chrono_daily_past_for_zone(sym, ds)
+    if peeked is not None and not getattr(peeked, "empty", True):
+        try:
+            frame = peeked.copy()
+            if not isinstance(frame.index, pd.DatetimeIndex):
+                frame.index = pd.to_datetime(frame.index)
+            day_end = pd.Timestamp(as_of) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+            frame = frame[frame.index <= day_end]
+            if frame is not None and not frame.empty:
+                return frame
+        except Exception:  # noqa: BLE001
+            pass
+
+    with _ENTRY_SCORE_DAILY_LOCK:
+        cached = _ENTRY_SCORE_DAILY_OHLC.get(sym)
+    if cached is not None and not cached.empty:
+        try:
+            day_end = pd.Timestamp(as_of) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+            frame = cached[cached.index <= day_end]
+            if frame is not None and not frame.empty and len(frame) >= 30:
+                return frame
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Download a long daily history once; store full frame; callers slice by as_of.
+    yf_t = f"{sym}=X" if len(sym) == 6 and sym.isalpha() else sym
+    start_d = date(2019, 1, 1)
+    end_d = as_of + timedelta(days=1)
+    try:
+        raw = safe_yf_fetch(yf_t, start_d.isoformat(), end_d.isoformat(), "1d")
+    except Exception:  # noqa: BLE001
+        raw = None
+    if raw is None or getattr(raw, "empty", True):
+        return None
+    try:
+        frame = raw.copy()
+        if not isinstance(frame.index, pd.DatetimeIndex):
+            frame.index = pd.to_datetime(frame.index)
+        frame = frame.sort_index()
+    except Exception:  # noqa: BLE001
+        return None
+    with _ENTRY_SCORE_DAILY_LOCK:
+        prev = _ENTRY_SCORE_DAILY_OHLC.get(sym)
+        if prev is None or len(frame) >= len(prev):
+            _ENTRY_SCORE_DAILY_OHLC[sym] = frame
+        else:
+            frame = prev
+    day_end = pd.Timestamp(as_of) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+    sliced = frame[frame.index <= day_end]
+    return sliced if sliced is not None and not sliced.empty else None
+
+
+def _attach_entry_scores_to_trade_row(row: dict[str, Any]) -> None:
+    """Write-only: attach ``scores`` map; never alters entries/sizing/exits."""
+    try:
+        attach_entry_scores(
+            row,
+            get_daily_ohlc=_entry_score_get_daily_ohlc,
+            universe=_entry_score_forex_universe(),
+        )
+    except Exception as e:  # noqa: BLE001
+        log(f"[ENTRY SCORES] attach failed: {e}", level="warning")
+        row.setdefault("scores", {k: None for k in ENTRY_SCORE_KEYS})
 
 
 def _zone_pct_from_daily_lookback(
@@ -13999,6 +14098,8 @@ def continuous_backtest_loop() -> None:
     global CHRONO_RUNNING
     log("[Loop] Starting continuous backtest loop", level="info")
     _log_group1_startup_blocks()
+    reset_entry_score_stats()
+    log_unavailable_entry_scores()
     tests_since_improve = 0
     loop_completed_tests = 0
 
@@ -14099,6 +14200,13 @@ def continuous_backtest_loop() -> None:
                             )
 
                         prev_len = len(_load_results_list())
+                        if (
+                            isinstance(result, dict)
+                            and not result.get("skipped")
+                            and str(result.get("outcome", "")).upper() in ("WIN", "LOSS")
+                            and "scores" not in result
+                        ):
+                            _attach_entry_scores_to_trade_row(result)
                         count = append_result(result)
                         added = count > prev_len
 
@@ -14692,6 +14800,8 @@ def run_chronological_backtest(
     _log_group1_startup_blocks()
     _reset_group1_skip_log_state()
     _reset_shadow_regime_state(clear_prev=True)
+    reset_entry_score_stats()
+    log_unavailable_entry_scores()
 
     chrono_data: dict[str, Any]
     if chrono_path.is_file():
@@ -15640,6 +15750,7 @@ def run_chronological_backtest(
                             _zone_map = zone_runner.process_trade(_shadow_zone_trade_ctx_from_row(row))
                             if _zone_map:
                                 row["shadow_zone"] = _zone_map
+                            _attach_entry_scores_to_trade_row(row)
                             day_trades.append(row)
                             day_pnl += pnl
                             capital += pnl
@@ -15881,6 +15992,7 @@ def run_chronological_backtest(
             chrono_data["shadow_equity_daily_stop_summary"] = eqstop_runner.summaries()
         if SHADOW_ZONE_ENABLED:
             chrono_data["shadow_zone_summary"] = zone_runner.summaries()
+        chrono_data["scores_summary"] = build_scores_summary(all_trades)
         if SHADOW_BLOCKED_PAIRS:
             chrono_data["shadow_instrument_summary"] = _si.compute_summary(job_id)
         _persist_shadow_guard_state(chrono_data, shadow_runner)
