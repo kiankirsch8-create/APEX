@@ -391,6 +391,29 @@ SHADOW_FILTER_ROLLING_N = 20
 SHADOW_TRAIL_SUMMARY_ENABLED = True
 
 # ---------------------------------------------------------------------------
+# Funded-rule shadows: open-position book required (real curve unchanged).
+# Chrono realizes trades on entry day; these layers synthesize holds via
+# entry_date + nights_held and mark-to-market with daily closes.
+# ---------------------------------------------------------------------------
+SHADOW_PORTFOLIO_CAP_ENABLED = True
+SHADOW_PORTFOLIO_CAP_CONFIGS: list[tuple[str, dict[str, Any]]] = [
+    ("pcap_2pct", {"max_open_risk_pct": 2.0}),
+    ("pcap_3pct", {"max_open_risk_pct": 3.0}),
+    ("pcap_5pct", {"max_open_risk_pct": 5.0}),
+    ("pcap_8pct", {"max_open_risk_pct": 8.0}),
+    ("pcap_3pct_corr", {"max_open_risk_pct": 3.0, "correlation_group": True}),
+]
+
+SHADOW_EQUITY_DAILY_STOP_ENABLED = True
+SHADOW_EQUITY_DAILY_STOP_CONFIGS: list[tuple[str, dict[str, Any]]] = [
+    ("eqstop_3", {"daily_equity_stop_pct": 3.0}),
+    ("eqstop_4", {"daily_equity_stop_pct": 4.0}),
+    ("eqstop_5", {"daily_equity_stop_pct": 5.0}),
+]
+# Unguarded real-curve observation threshold for the funded-challenge question.
+SHADOW_EQUITY_BREACH_REPORT_PCT = 5.0
+
+# ---------------------------------------------------------------------------
 # Zone-based shadow sizing / filters (real curve unchanged).
 # Uses zone_position_pct + zone_label — NOT price_zone (hardcoded EQUILIBRIUM on
 # the Python Layer-2 path). LONG-only; multiplier stacks on existing A+B PnL.
@@ -4736,6 +4759,944 @@ def _persist_shadow_trail_summary_state(
     chrono_data["shadow_trail_summary_state"] = runner.to_persistence()
 
 
+def _shadow_pos_key(ticker: str, timeframe: str, strategy_id: str) -> str:
+    return (
+        f"{str(ticker or '').strip().upper()}|"
+        f"{str(timeframe or '').strip().lower()}|"
+        f"{str(strategy_id or '').strip().upper()}"
+    )
+
+
+def _shadow_expire_date(entry_date: str, nights_held: float) -> str:
+    try:
+        ed = date.fromisoformat(str(entry_date).strip()[:10])
+    except ValueError:
+        return str(entry_date).strip()[:10]
+    nights = max(0, int(round(float(nights_held or 0))))
+    return (ed + timedelta(days=nights)).isoformat()
+
+
+# Mark-to-market closes for equity daily stop: memoised, cache-only (no download).
+# Keyed (ticker, date) → close or None (negative cache). Misses are counted and
+# summarised once per run — a silently under-marked book yields false "no breach".
+_SHADOW_MARK_CACHE: dict[tuple[str, str], float | None] = {}
+_SHADOW_MARK_STATS: dict[str, int | bool] = {
+    "lookups": 0,
+    "hits": 0,
+    "misses": 0,
+    "summary_logged": False,
+}
+
+
+def _reset_shadow_mark_cache() -> None:
+    _SHADOW_MARK_CACHE.clear()
+    _SHADOW_MARK_STATS["lookups"] = 0
+    _SHADOW_MARK_STATS["hits"] = 0
+    _SHADOW_MARK_STATS["misses"] = 0
+    _SHADOW_MARK_STATS["summary_logged"] = False
+
+
+def _shadow_mark_cache_put(ticker: str, date_str: str, price: float | None) -> None:
+    sym = str(ticker or "").strip().upper()
+    ds = str(date_str or "").strip()[:10]
+    if not sym or not ds:
+        return
+    if price is None:
+        _SHADOW_MARK_CACHE[(sym, ds)] = None
+        return
+    try:
+        v = float(price)
+    except (TypeError, ValueError):
+        _SHADOW_MARK_CACHE[(sym, ds)] = None
+        return
+    if math.isfinite(v) and v > 0:
+        _SHADOW_MARK_CACHE[(sym, ds)] = v
+    else:
+        _SHADOW_MARK_CACHE[(sym, ds)] = None
+
+
+def _shadow_mark_miss_summary_log(*, force: bool = False) -> None:
+    if _SHADOW_MARK_STATS["summary_logged"] and not force:
+        return
+    misses = int(_SHADOW_MARK_STATS["misses"] or 0)
+    lookups = int(_SHADOW_MARK_STATS["lookups"] or 0)
+    if misses <= 0 and not force:
+        return
+    _SHADOW_MARK_STATS["summary_logged"] = True
+    pct = (100.0 * misses / lookups) if lookups > 0 else 0.0
+    log(
+        f"[SHADOW EQSTOP] Mark cache summary: {misses}/{lookups} unavailable "
+        f"({pct:.1f}%) — cache-only, no download. "
+        f"If material, equity breach numbers are unreliable (under-marked book "
+        f"→ false 'no breach').",
+        level="error" if pct >= 5.0 else "warning",
+    )
+
+
+def _shadow_mark_unavailable_pct() -> float:
+    lookups = int(_SHADOW_MARK_STATS["lookups"] or 0)
+    misses = int(_SHADOW_MARK_STATS["misses"] or 0)
+    if lookups <= 0:
+        return 0.0
+    return round(100.0 * misses / lookups, 2)
+
+
+def _eqstop_log_mark_coverage_at_run_start(
+    tickers: list[str],
+    start_date: str,
+    end_date: str,
+) -> dict[str, Any]:
+    """
+    Probe how many (ticker, weekday) marks the chrono OHLC cache can already serve
+    for the planned window — no downloads. Coverage is known before the run.
+    """
+    try:
+        d0 = date.fromisoformat(str(start_date).strip()[:10])
+        d1 = date.fromisoformat(str(end_date).strip()[:10])
+    except ValueError:
+        log(
+            "[SHADOW EQSTOP] Mark coverage at run start: invalid date window",
+            level="warning",
+        )
+        return {"needed": 0, "available": 0, "pct": 0.0}
+    syms = sorted({str(t).strip().upper() for t in tickers if str(t).strip()})
+    needed = 0
+    available = 0
+    cur = d0
+    while cur <= d1:
+        if cur.weekday() < 5:
+            ds = cur.isoformat()
+            for sym in syms:
+                needed += 1
+                closes = _peek_chrono_cached_closes(sym, ds)
+                if closes:
+                    try:
+                        v = float(closes[-1])
+                        if math.isfinite(v) and v > 0:
+                            available += 1
+                            # Seed memo so later lookups avoid repeat peeks.
+                            _shadow_mark_cache_put(sym, ds, v)
+                    except (TypeError, ValueError):
+                        pass
+        cur += timedelta(days=1)
+    pct = round(100.0 * available / needed, 2) if needed > 0 else 0.0
+    log(
+        f"[SHADOW EQSTOP] Mark coverage at run start: {available}/{needed} "
+        f"({pct:.1f}%) from chrono OHLC cache across {len(syms)} tickers "
+        f"{start_date}→{end_date} (cache-only; misses will not download)",
+        level="info" if pct >= 80.0 else "warning",
+    )
+    return {"needed": needed, "available": available, "pct": pct, "tickers": len(syms)}
+
+
+def _shadow_mark_close_price(ticker: str, date_str: str) -> float | None:
+    """
+    Day's mark close for ``ticker`` as of ``date_str``.
+
+    Cache-only: prefer module memo, then chrono OHLC peek. Never downloads.
+    Misses are memoised as None and counted for the run-level summary.
+    """
+    sym = str(ticker or "").strip().upper()
+    ds = str(date_str or "").strip()[:10]
+    if not sym or not ds:
+        return None
+    key = (sym, ds)
+    if key in _SHADOW_MARK_CACHE:
+        _SHADOW_MARK_STATS["lookups"] = int(_SHADOW_MARK_STATS["lookups"] or 0) + 1
+        cached = _SHADOW_MARK_CACHE[key]
+        if cached is None:
+            _SHADOW_MARK_STATS["misses"] = int(_SHADOW_MARK_STATS["misses"] or 0) + 1
+        else:
+            _SHADOW_MARK_STATS["hits"] = int(_SHADOW_MARK_STATS["hits"] or 0) + 1
+        return cached
+
+    _SHADOW_MARK_STATS["lookups"] = int(_SHADOW_MARK_STATS["lookups"] or 0) + 1
+    closes = _peek_chrono_cached_closes(sym, ds)
+    if closes:
+        try:
+            v = float(closes[-1])
+            if math.isfinite(v) and v > 0:
+                _SHADOW_MARK_CACHE[key] = v
+                _SHADOW_MARK_STATS["hits"] = int(_SHADOW_MARK_STATS["hits"] or 0) + 1
+                return v
+        except (TypeError, ValueError):
+            pass
+    _SHADOW_MARK_CACHE[key] = None
+    _SHADOW_MARK_STATS["misses"] = int(_SHADOW_MARK_STATS["misses"] or 0) + 1
+    return None
+
+
+def _shadow_mtm_dollars(
+    *,
+    direction: str,
+    entry_price: float,
+    position_size: float,
+    mark: float,
+) -> float:
+    d = str(direction or "").strip().upper()
+    e = float(entry_price)
+    ps = float(position_size)
+    m = float(mark)
+    if ps <= 0 or e <= 0 or m <= 0:
+        return 0.0
+    if d == "LONG":
+        return ps * (m - e)
+    if d == "SHORT":
+        return ps * (e - m)
+    return 0.0
+
+
+@dataclass
+class _FundedOpenPos:
+    key: str
+    ticker: str
+    timeframe: str
+    strategy_id: str
+    direction: str
+    entry_date: str
+    expire_date: str
+    entry_price: float
+    position_size: float
+    risk_at_stop: float
+    pnl_dollars: float
+    currencies: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "key": self.key,
+            "ticker": self.ticker,
+            "timeframe": self.timeframe,
+            "strategy_id": self.strategy_id,
+            "direction": self.direction,
+            "entry_date": self.entry_date,
+            "expire_date": self.expire_date,
+            "entry_price": float(self.entry_price),
+            "position_size": float(self.position_size),
+            "risk_at_stop": float(self.risk_at_stop),
+            "pnl_dollars": float(self.pnl_dollars),
+            "currencies": list(self.currencies),
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "_FundedOpenPos":
+        curs = raw.get("currencies") or []
+        return cls(
+            key=str(raw.get("key") or ""),
+            ticker=str(raw.get("ticker") or "").strip().upper(),
+            timeframe=str(raw.get("timeframe") or "").strip().lower(),
+            strategy_id=str(raw.get("strategy_id") or "").strip().upper(),
+            direction=str(raw.get("direction") or "").strip().upper(),
+            entry_date=str(raw.get("entry_date") or "")[:10],
+            expire_date=str(raw.get("expire_date") or "")[:10],
+            entry_price=float(raw.get("entry_price") or 0),
+            position_size=float(raw.get("position_size") or 0),
+            risk_at_stop=float(raw.get("risk_at_stop") or 0),
+            pnl_dollars=float(raw.get("pnl_dollars") or 0),
+            currencies=tuple(str(c).strip().upper() for c in curs),
+        )
+
+
+def _funded_open_from_ctx(ctx: Mapping[str, Any]) -> _FundedOpenPos | None:
+    ticker = str(ctx.get("ticker") or "").strip().upper()
+    timeframe = str(ctx.get("timeframe") or "").strip().lower()
+    sid = str(ctx.get("strategy_id") or "").strip().upper()
+    direction = str(ctx.get("direction") or "").strip().upper()
+    entry_date = str(ctx.get("date") or "")[:10]
+    if not ticker or not entry_date or direction not in ("LONG", "SHORT"):
+        return None
+    try:
+        entry_price = float(ctx.get("entry_price") or 0)
+        position_size = float(ctx.get("position_size") or 0)
+        risk = float(ctx.get("max_risk_dollars") or 0)
+        nights = float(ctx.get("nights_held") or 0)
+        pnl = float(ctx.get("pnl_dollars") or 0)
+    except (TypeError, ValueError):
+        return None
+    if entry_price <= 0 or position_size <= 0 or risk <= 0:
+        return None
+    curs = tuple(get_currencies(ticker))
+    key = _shadow_pos_key(ticker, timeframe, sid)
+    return _FundedOpenPos(
+        key=key,
+        ticker=ticker,
+        timeframe=timeframe,
+        strategy_id=sid,
+        direction=direction,
+        entry_date=entry_date,
+        expire_date=_shadow_expire_date(entry_date, nights),
+        entry_price=entry_price,
+        position_size=position_size,
+        risk_at_stop=risk,
+        pnl_dollars=pnl,
+        currencies=curs,
+    )
+
+
+def _book_mtm(
+    book: Mapping[str, _FundedOpenPos],
+    close_prices: Mapping[str, float],
+) -> tuple[float, int]:
+    """Return (mtm_dollars, missing_mark_count)."""
+    total = 0.0
+    missing = 0
+    for pos in book.values():
+        mark = close_prices.get(pos.ticker)
+        if mark is None:
+            missing += 1
+            continue
+        total += _shadow_mtm_dollars(
+            direction=pos.direction,
+            entry_price=pos.entry_price,
+            position_size=pos.position_size,
+            mark=float(mark),
+        )
+    return float(total), int(missing)
+
+
+def _expire_book(
+    book: dict[str, _FundedOpenPos],
+    date_str: str,
+) -> list[_FundedOpenPos]:
+    """Remove positions with expire_date <= date_str; return expired list."""
+    ds = str(date_str or "")[:10]
+    expired: list[_FundedOpenPos] = []
+    for key, pos in list(book.items()):
+        if pos.expire_date and pos.expire_date <= ds:
+            expired.append(pos)
+            book.pop(key, None)
+    return expired
+
+
+def _gather_close_prices(
+    tickers: set[str],
+    date_str: str,
+    provided: Mapping[str, float] | None = None,
+) -> dict[str, float]:
+    out: dict[str, float] = {}
+    ds = str(date_str or "").strip()[:10]
+    if provided:
+        for t, px in provided.items():
+            try:
+                v = float(px)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(v) and v > 0:
+                tu = str(t).strip().upper()
+                out[tu] = v
+                _shadow_mark_cache_put(tu, ds, v)
+    for t in tickers:
+        tu = str(t).strip().upper()
+        if tu in out:
+            continue
+        px = _shadow_mark_close_price(tu, ds)
+        if px is not None:
+            out[tu] = float(px)
+    return out
+
+
+@dataclass
+class _PcapCurveState:
+    curve_id: str
+    max_open_risk_pct: float
+    correlation_group: bool
+    capital: float
+    peak_capital: float
+    day_anchor: float
+    day_pnl: float = 0.0
+    trades_taken: int = 0
+    trades_blocked: int = 0
+    blocked_by_overall: int = 0
+    blocked_by_corr: int = 0
+    book: dict[str, _FundedOpenPos] = field(default_factory=dict)
+    daily_pnls: dict[str, float] = field(default_factory=dict)
+    daily_anchors: dict[str, float] = field(default_factory=dict)
+    max_drawdown_pct_seen: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "curve_id": self.curve_id,
+            "max_open_risk_pct": float(self.max_open_risk_pct),
+            "correlation_group": bool(self.correlation_group),
+            "capital": round(float(self.capital), 2),
+            "peak_capital": round(float(self.peak_capital), 2),
+            "day_anchor": round(float(self.day_anchor), 2),
+            "day_pnl": round(float(self.day_pnl), 2),
+            "trades_taken": int(self.trades_taken),
+            "trades_blocked": int(self.trades_blocked),
+            "blocked_by_overall": int(self.blocked_by_overall),
+            "blocked_by_corr": int(self.blocked_by_corr),
+            "book": {k: v.to_dict() for k, v in self.book.items()},
+            "daily_pnls": dict(self.daily_pnls),
+            "daily_anchors": dict(self.daily_anchors),
+            "max_drawdown_pct_seen": round(float(self.max_drawdown_pct_seen), 4),
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "_PcapCurveState":
+        start = float(STARTING_CAPITAL)
+        book_raw = raw.get("book") or {}
+        book: dict[str, _FundedOpenPos] = {}
+        if isinstance(book_raw, dict):
+            for k, v in book_raw.items():
+                if isinstance(v, dict):
+                    book[str(k)] = _FundedOpenPos.from_dict(v)
+        return cls(
+            curve_id=str(raw.get("curve_id") or ""),
+            max_open_risk_pct=float(raw.get("max_open_risk_pct") or 0),
+            correlation_group=bool(raw.get("correlation_group", False)),
+            capital=float(raw.get("capital", start) or start),
+            peak_capital=float(raw.get("peak_capital", start) or start),
+            day_anchor=float(raw.get("day_anchor", start) or start),
+            day_pnl=float(raw.get("day_pnl", 0) or 0),
+            trades_taken=int(raw.get("trades_taken", 0) or 0),
+            trades_blocked=int(raw.get("trades_blocked", 0) or 0),
+            blocked_by_overall=int(raw.get("blocked_by_overall", 0) or 0),
+            blocked_by_corr=int(raw.get("blocked_by_corr", 0) or 0),
+            book=book,
+            daily_pnls={str(k): float(v) for k, v in (raw.get("daily_pnls") or {}).items()},
+            daily_anchors={str(k): float(v) for k, v in (raw.get("daily_anchors") or {}).items()},
+            max_drawdown_pct_seen=float(raw.get("max_drawdown_pct_seen", 0) or 0),
+        )
+
+
+class _ShadowPortfolioCapRunner:
+    """FundedNext-style aggregate open risk-at-stop caps (real curve untouched)."""
+
+    def __init__(self) -> None:
+        self.curves: dict[str, _PcapCurveState] = {}
+        self._init_curves()
+
+    def _init_curves(self) -> None:
+        if not SHADOW_PORTFOLIO_CAP_ENABLED:
+            return
+        start = float(STARTING_CAPITAL)
+        for name, cfg in SHADOW_PORTFOLIO_CAP_CONFIGS:
+            self.curves[name] = _PcapCurveState(
+                curve_id=name,
+                max_open_risk_pct=float(cfg.get("max_open_risk_pct") or 0),
+                correlation_group=bool(cfg.get("correlation_group", False)),
+                capital=start,
+                peak_capital=start,
+                day_anchor=start,
+            )
+
+    @classmethod
+    def from_chrono(cls, chrono_data: Mapping[str, Any] | None) -> "_ShadowPortfolioCapRunner":
+        runner = cls()
+        if not SHADOW_PORTFOLIO_CAP_ENABLED or not chrono_data:
+            return runner
+        saved = chrono_data.get("shadow_portfolio_cap_state")
+        if not isinstance(saved, dict):
+            return runner
+        curves_raw = saved.get("curves")
+        if not isinstance(curves_raw, dict):
+            return runner
+        for cid, raw in curves_raw.items():
+            if cid in runner.curves and isinstance(raw, dict):
+                runner.curves[cid] = _PcapCurveState.from_dict(raw)
+        return runner
+
+    def to_persistence(self) -> dict[str, Any]:
+        return {"curves": {cid: st.to_dict() for cid, st in self.curves.items()}}
+
+    def on_new_day(self, date_str: str) -> None:
+        for st in self.curves.values():
+            _expire_book(st.book, date_str)
+            st.day_anchor = float(st.capital)
+            st.day_pnl = 0.0
+
+    def finalize_day(self, date_str: str) -> None:
+        ds = str(date_str or "")[:10]
+        for st in self.curves.values():
+            _expire_book(st.book, ds)
+            st.daily_pnls[ds] = round(float(st.day_pnl), 2)
+            st.daily_anchors[ds] = round(float(st.day_anchor), 2)
+
+    def _cap_dollars(self, st: _PcapCurveState) -> float:
+        eq = max(float(st.capital), 1.0)
+        return eq * float(st.max_open_risk_pct) / 100.0
+
+    def _check_cap(
+        self,
+        st: _PcapCurveState,
+        candidate: _FundedOpenPos,
+    ) -> tuple[bool, str]:
+        """Return (allowed, bound_reason). bound_reason empty if allowed."""
+        cap = self._cap_dollars(st)
+        open_risk = sum(float(p.risk_at_stop) for p in st.book.values())
+        new_risk = float(candidate.risk_at_stop)
+        overall_breach = open_risk + new_risk > cap + 1e-9
+
+        corr_bound = ""
+        if st.correlation_group and candidate.currencies:
+            for cur in candidate.currencies:
+                grp = sum(
+                    float(p.risk_at_stop)
+                    for p in st.book.values()
+                    if cur in p.currencies
+                )
+                if grp + new_risk > cap + 1e-9:
+                    corr_bound = f"corr_{cur}"
+                    break
+
+        if overall_breach:
+            # Prefer the more specific currency-group reason when concentration
+            # is what actually packed the book (six AUD tickets, etc.).
+            if corr_bound:
+                return False, corr_bound
+            return False, "overall"
+        if corr_bound:
+            return False, corr_bound
+        return True, ""
+
+    def process_trade(self, ctx: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+        if not SHADOW_PORTFOLIO_CAP_ENABLED or not self.curves:
+            return {}
+        if ctx.get("skipped") or str(ctx.get("outcome") or "").strip().upper() not in ("WIN", "LOSS"):
+            return {}
+        if ctx.get("shadow_class") or ctx.get("shadow_instrument"):
+            return {}
+        candidate = _funded_open_from_ctx(ctx)
+        if candidate is None:
+            return {}
+        date_str = candidate.entry_date
+        pnl = float(candidate.pnl_dollars)
+        out: dict[str, dict[str, Any]] = {}
+
+        for cid, st in self.curves.items():
+            _expire_book(st.book, date_str)
+            allowed, bound = self._check_cap(st, candidate)
+            if not allowed:
+                st.trades_blocked += 1
+                if bound == "overall":
+                    st.blocked_by_overall += 1
+                elif bound.startswith("corr_"):
+                    st.blocked_by_corr += 1
+                out[cid] = {
+                    "taken": False,
+                    "blocked": True,
+                    "pnl": 0.0,
+                    "bound": bound,
+                    "open_risk": round(sum(float(p.risk_at_stop) for p in st.book.values()), 2),
+                    "open_n": len(st.book),
+                }
+                continue
+
+            st.trades_taken += 1
+            st.capital += pnl
+            st.day_pnl += pnl
+            if st.capital > st.peak_capital:
+                st.peak_capital = st.capital
+            if st.peak_capital > 0:
+                dd = (st.peak_capital - st.capital) / st.peak_capital * 100.0
+                if dd > st.max_drawdown_pct_seen:
+                    st.max_drawdown_pct_seen = float(dd)
+            # Replace same key if re-entered; keep latest.
+            st.book[candidate.key] = candidate
+            out[cid] = {
+                "taken": True,
+                "blocked": False,
+                "pnl": round(pnl, 2),
+                "bound": "",
+                "open_risk": round(sum(float(p.risk_at_stop) for p in st.book.values()), 2),
+                "open_n": len(st.book),
+            }
+        return out
+
+    def _curve_summary(self, st: _PcapCurveState) -> dict[str, Any]:
+        peak = float(st.peak_capital or STARTING_CAPITAL)
+        cap = float(st.capital or STARTING_CAPITAL)
+        worst_day_pct = 0.0
+        positive_months = 0
+        month_pnls: dict[str, float] = {}
+        for ds, dp in st.daily_pnls.items():
+            anchor = float(st.daily_anchors.get(ds, st.day_anchor or STARTING_CAPITAL))
+            day_pct = (float(dp) / anchor * 100.0) if anchor > 0 else 0.0
+            if day_pct < worst_day_pct:
+                worst_day_pct = day_pct
+            ym = ds[:7]
+            month_pnls[ym] = month_pnls.get(ym, 0.0) + float(dp)
+        for mp in month_pnls.values():
+            if mp > 0:
+                positive_months += 1
+        return {
+            "final_capital": round(cap, 2),
+            "peak_capital": round(peak, 2),
+            "max_drawdown_pct": round(float(st.max_drawdown_pct_seen), 2),
+            "worst_day_pct": round(float(worst_day_pct), 2),
+            "positive_months": int(positive_months),
+            "trades_taken": int(st.trades_taken),
+            "trades_blocked": int(st.trades_blocked),
+            "blocked_by_overall": int(st.blocked_by_overall),
+            "blocked_by_corr": int(st.blocked_by_corr),
+            "max_open_risk_pct": float(st.max_open_risk_pct),
+            "correlation_group": bool(st.correlation_group),
+            "open_positions_end": len(st.book),
+        }
+
+    def summaries(self) -> dict[str, dict[str, Any]]:
+        return {cid: self._curve_summary(st) for cid, st in self.curves.items()}
+
+
+def _persist_shadow_portfolio_cap_state(
+    chrono_data: dict[str, Any],
+    runner: _ShadowPortfolioCapRunner,
+) -> None:
+    chrono_data["shadow_portfolio_cap_state"] = runner.to_persistence()
+
+
+@dataclass
+class _EqStopCurveState:
+    curve_id: str
+    daily_equity_stop_pct: float
+    capital: float
+    peak_capital: float
+    day_anchor: float
+    day_realized_pnl: float = 0.0
+    day_stopped: bool = False
+    trades_taken: int = 0
+    trades_blocked: int = 0
+    book: dict[str, _FundedOpenPos] = field(default_factory=dict)
+    daily_pnls: dict[str, float] = field(default_factory=dict)
+    daily_anchors: dict[str, float] = field(default_factory=dict)
+    max_drawdown_pct_seen: float = 0.0
+    # Days the curve's own stop threshold was breached (blocks new entries).
+    equity_breach_dates: list[str] = field(default_factory=list)
+    # Essential FundedNext report: days equity loss hit SHADOW_EQUITY_BREACH_REPORT_PCT.
+    equity_5pct_breach_dates: list[str] = field(default_factory=list)
+    mtm_missing_days: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "curve_id": self.curve_id,
+            "daily_equity_stop_pct": float(self.daily_equity_stop_pct),
+            "capital": round(float(self.capital), 2),
+            "peak_capital": round(float(self.peak_capital), 2),
+            "day_anchor": round(float(self.day_anchor), 2),
+            "day_realized_pnl": round(float(self.day_realized_pnl), 2),
+            "day_stopped": bool(self.day_stopped),
+            "trades_taken": int(self.trades_taken),
+            "trades_blocked": int(self.trades_blocked),
+            "book": {k: v.to_dict() for k, v in self.book.items()},
+            "daily_pnls": dict(self.daily_pnls),
+            "daily_anchors": dict(self.daily_anchors),
+            "max_drawdown_pct_seen": round(float(self.max_drawdown_pct_seen), 4),
+            "equity_breach_dates": list(self.equity_breach_dates),
+            "equity_5pct_breach_dates": list(self.equity_5pct_breach_dates),
+            "mtm_missing_days": int(self.mtm_missing_days),
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "_EqStopCurveState":
+        start = float(STARTING_CAPITAL)
+        book_raw = raw.get("book") or {}
+        book: dict[str, _FundedOpenPos] = {}
+        if isinstance(book_raw, dict):
+            for k, v in book_raw.items():
+                if isinstance(v, dict):
+                    book[str(k)] = _FundedOpenPos.from_dict(v)
+        return cls(
+            curve_id=str(raw.get("curve_id") or ""),
+            daily_equity_stop_pct=float(raw.get("daily_equity_stop_pct") or 0),
+            capital=float(raw.get("capital", start) or start),
+            peak_capital=float(raw.get("peak_capital", start) or start),
+            day_anchor=float(raw.get("day_anchor", start) or start),
+            day_realized_pnl=float(raw.get("day_realized_pnl", 0) or 0),
+            day_stopped=bool(raw.get("day_stopped", False)),
+            trades_taken=int(raw.get("trades_taken", 0) or 0),
+            trades_blocked=int(raw.get("trades_blocked", 0) or 0),
+            book=book,
+            daily_pnls={str(k): float(v) for k, v in (raw.get("daily_pnls") or {}).items()},
+            daily_anchors={str(k): float(v) for k, v in (raw.get("daily_anchors") or {}).items()},
+            max_drawdown_pct_seen=float(raw.get("max_drawdown_pct_seen", 0) or 0),
+            equity_breach_dates=[str(x) for x in (raw.get("equity_breach_dates") or [])],
+            equity_5pct_breach_dates=[
+                str(x) for x in (raw.get("equity_5pct_breach_dates") or [])
+            ],
+            mtm_missing_days=int(raw.get("mtm_missing_days", 0) or 0),
+        )
+
+
+class _ShadowEquityDailyStopRunner:
+    """
+    Daily equity stop = realized + MTM of synthetic open book vs day-start equity.
+    On breach: no new entries for the rest of the day (do not force-close).
+    Also observes the unguarded real curve for 5% equity breaches.
+    """
+
+    REAL_KEY = "real_unguarded"
+
+    def __init__(self) -> None:
+        self.curves: dict[str, _EqStopCurveState] = {}
+        self._init_curves()
+
+    def _init_curves(self) -> None:
+        if not SHADOW_EQUITY_DAILY_STOP_ENABLED:
+            return
+        start = float(STARTING_CAPITAL)
+        for name, cfg in SHADOW_EQUITY_DAILY_STOP_CONFIGS:
+            self.curves[name] = _EqStopCurveState(
+                curve_id=name,
+                daily_equity_stop_pct=float(cfg.get("daily_equity_stop_pct") or 0),
+                capital=start,
+                peak_capital=start,
+                day_anchor=start,
+            )
+        # Observation-only: always takes; reports 5% equity breaches.
+        self.curves[self.REAL_KEY] = _EqStopCurveState(
+            curve_id=self.REAL_KEY,
+            daily_equity_stop_pct=float(SHADOW_EQUITY_BREACH_REPORT_PCT),
+            capital=start,
+            peak_capital=start,
+            day_anchor=start,
+        )
+
+    @classmethod
+    def from_chrono(cls, chrono_data: Mapping[str, Any] | None) -> "_ShadowEquityDailyStopRunner":
+        runner = cls()
+        if not SHADOW_EQUITY_DAILY_STOP_ENABLED or not chrono_data:
+            return runner
+        saved = chrono_data.get("shadow_equity_daily_stop_state")
+        if not isinstance(saved, dict):
+            return runner
+        curves_raw = saved.get("curves")
+        if not isinstance(curves_raw, dict):
+            return runner
+        for cid, raw in curves_raw.items():
+            if cid in runner.curves and isinstance(raw, dict):
+                runner.curves[cid] = _EqStopCurveState.from_dict(raw)
+        return runner
+
+    def to_persistence(self) -> dict[str, Any]:
+        return {"curves": {cid: st.to_dict() for cid, st in self.curves.items()}}
+
+    def _realize_expired(self, st: _EqStopCurveState, date_str: str) -> None:
+        expired = _expire_book(st.book, date_str)
+        for pos in expired:
+            st.capital += float(pos.pnl_dollars)
+            st.day_realized_pnl += float(pos.pnl_dollars)
+            if st.capital > st.peak_capital:
+                st.peak_capital = st.capital
+            if st.peak_capital > 0:
+                dd = (st.peak_capital - st.capital) / st.peak_capital * 100.0
+                if dd > st.max_drawdown_pct_seen:
+                    st.max_drawdown_pct_seen = float(dd)
+
+    def _equity_day_pnl(
+        self,
+        st: _EqStopCurveState,
+        close_prices: Mapping[str, float],
+    ) -> tuple[float, int]:
+        mtm, missing = _book_mtm(st.book, close_prices)
+        return float(st.day_realized_pnl) + float(mtm), missing
+
+    def _day_equity_pct(
+        self,
+        st: _EqStopCurveState,
+        close_prices: Mapping[str, float],
+    ) -> tuple[float, float, int]:
+        """Return (day_pnl_dollars, day_pnl_pct, missing_mark_count)."""
+        day_pnl, missing = self._equity_day_pnl(st, close_prices)
+        anchor = float(st.day_anchor) if st.day_anchor else float(STARTING_CAPITAL)
+        if anchor <= 0:
+            return day_pnl, 0.0, missing
+        return day_pnl, day_pnl / anchor * 100.0, missing
+
+    def _would_breach_pct(
+        self,
+        st: _EqStopCurveState,
+        close_prices: Mapping[str, float],
+        stop_pct: float,
+    ) -> tuple[bool, float, int]:
+        day_pnl, pct, missing = self._day_equity_pct(st, close_prices)
+        return pct <= -float(stop_pct), day_pnl, missing
+
+    def _record_breaches(
+        self,
+        st: _EqStopCurveState,
+        date_str: str,
+        close_prices: Mapping[str, float],
+    ) -> tuple[bool, float, int]:
+        """
+        Record own-stop and 5% equity breaches. Returns
+        (own_stop_breached, day_pnl, missing).
+        """
+        ds = str(date_str)[:10]
+        own_breached, day_pnl, missing = self._would_breach_pct(
+            st, close_prices, float(st.daily_equity_stop_pct)
+        )
+        five_breached, _, _ = self._would_breach_pct(
+            st, close_prices, float(SHADOW_EQUITY_BREACH_REPORT_PCT)
+        )
+        if own_breached and ds not in st.equity_breach_dates:
+            st.equity_breach_dates.append(ds)
+        if five_breached and ds not in st.equity_5pct_breach_dates:
+            st.equity_5pct_breach_dates.append(ds)
+        return own_breached, day_pnl, missing
+
+    def on_new_day(
+        self,
+        date_str: str,
+        *,
+        close_prices: Mapping[str, float] | None = None,
+    ) -> None:
+        for st in self.curves.values():
+            # Anchor BEFORE realizing so expiring PnL counts against day D
+            # (measured vs equity the day started with), not into the anchor.
+            st.day_anchor = float(st.capital)
+            st.day_realized_pnl = 0.0
+            self._realize_expired(st, date_str)
+            st.day_stopped = False
+            # Breach check: realized (incl. today's expiries) + MTM of remaining.
+            tickers = {p.ticker for p in st.book.values()}
+            prices = _gather_close_prices(tickers, date_str, close_prices)
+            breached, _dp, missing = self._record_breaches(st, date_str, prices)
+            if missing and st.book:
+                st.mtm_missing_days += 1
+            if breached and st.curve_id != self.REAL_KEY:
+                st.day_stopped = True
+
+    def finalize_day(
+        self,
+        date_str: str,
+        *,
+        close_prices: Mapping[str, float] | None = None,
+    ) -> None:
+        ds = str(date_str or "")[:10]
+        for st in self.curves.values():
+            # EOD: realize same-day / due expiries first so closed PnL is
+            # realized (not MTM), then mark remaining overnight opens.
+            self._realize_expired(st, ds)
+            tickers = {p.ticker for p in st.book.values()}
+            prices = _gather_close_prices(tickers, ds, close_prices)
+            _breached, day_pnl, missing = self._record_breaches(st, ds, prices)
+            if missing and st.book:
+                st.mtm_missing_days += 1
+            st.daily_pnls[ds] = round(float(day_pnl), 2)
+            st.daily_anchors[ds] = round(float(st.day_anchor), 2)
+
+    def process_trade(
+        self,
+        ctx: Mapping[str, Any],
+        *,
+        close_prices: Mapping[str, float] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        if not SHADOW_EQUITY_DAILY_STOP_ENABLED or not self.curves:
+            return {}
+        if ctx.get("skipped") or str(ctx.get("outcome") or "").strip().upper() not in ("WIN", "LOSS"):
+            return {}
+        if ctx.get("shadow_class") or ctx.get("shadow_instrument"):
+            return {}
+        candidate = _funded_open_from_ctx(ctx)
+        if candidate is None:
+            return {}
+        date_str = candidate.entry_date
+        out: dict[str, dict[str, Any]] = {}
+
+        for cid, st in self.curves.items():
+            is_real = cid == self.REAL_KEY
+            self._realize_expired(st, date_str)
+            tickers = {p.ticker for p in st.book.values()} | {candidate.ticker}
+            prices = _gather_close_prices(tickers, date_str, close_prices)
+            breached, day_pnl, missing = self._record_breaches(st, date_str, prices)
+            if missing and st.book:
+                st.mtm_missing_days += 1
+            if breached and not is_real:
+                st.day_stopped = True
+
+            if (not is_real) and st.day_stopped:
+                st.trades_blocked += 1
+                out[cid] = {
+                    "taken": False,
+                    "blocked": True,
+                    "pnl": 0.0,
+                    "day_equity_pnl": round(day_pnl, 2),
+                    "day_stopped": True,
+                }
+                continue
+
+            # Take: open synthetic position; PnL realizes at expire (not now).
+            st.trades_taken += 1
+            st.book[candidate.key] = candidate
+            out[cid] = {
+                "taken": True,
+                "blocked": False,
+                "pnl": 0.0,  # floating until expire
+                "day_equity_pnl": round(day_pnl, 2),
+                "day_stopped": bool(st.day_stopped),
+                "expire_date": candidate.expire_date,
+            }
+        return out
+
+    def _curve_summary(self, st: _EqStopCurveState) -> dict[str, Any]:
+        peak = float(st.peak_capital or STARTING_CAPITAL)
+        cap = float(st.capital or STARTING_CAPITAL)
+        # Include floating MTM at end if book still open (use last known capital only).
+        worst_day_pct = 0.0
+        positive_months = 0
+        month_pnls: dict[str, float] = {}
+        for ds, dp in st.daily_pnls.items():
+            anchor = float(st.daily_anchors.get(ds, st.day_anchor or STARTING_CAPITAL))
+            day_pct = (float(dp) / anchor * 100.0) if anchor > 0 else 0.0
+            if day_pct < worst_day_pct:
+                worst_day_pct = day_pct
+            ym = ds[:7]
+            month_pnls[ym] = month_pnls.get(ym, 0.0) + float(dp)
+        for mp in month_pnls.values():
+            if mp > 0:
+                positive_months += 1
+        unavail = _shadow_mark_unavailable_pct()
+        return {
+            "final_capital": round(cap, 2),
+            "peak_capital": round(peak, 2),
+            "max_drawdown_pct": round(float(st.max_drawdown_pct_seen), 2),
+            "worst_day_pct": round(float(worst_day_pct), 2),
+            "positive_months": int(positive_months),
+            "trades_taken": int(st.trades_taken),
+            "trades_blocked": int(st.trades_blocked),
+            "daily_equity_stop_pct": float(st.daily_equity_stop_pct),
+            "equity_breach_days": len(st.equity_breach_dates),
+            "equity_breach_dates": list(st.equity_breach_dates),
+            # Essential funded-challenge output (always vs 5%, all curves + real).
+            "equity_5pct_breach_days": len(st.equity_5pct_breach_dates),
+            "equity_5pct_breach_dates": list(st.equity_5pct_breach_dates),
+            "mtm_missing_days": int(st.mtm_missing_days),
+            "mtm_unavailable_pct": float(unavail),
+            "open_positions_end": len(st.book),
+            "is_real_unguarded": st.curve_id == self.REAL_KEY,
+        }
+
+    def summaries(self) -> dict[str, dict[str, Any]]:
+        _shadow_mark_miss_summary_log(force=True)
+        return {cid: self._curve_summary(st) for cid, st in self.curves.items()}
+
+
+def _persist_shadow_equity_daily_stop_state(
+    chrono_data: dict[str, Any],
+    runner: _ShadowEquityDailyStopRunner,
+) -> None:
+    chrono_data["shadow_equity_daily_stop_state"] = runner.to_persistence()
+
+
+def _shadow_funded_trade_ctx_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "date": row.get("date"),
+        "ticker": row.get("ticker"),
+        "timeframe": row.get("timeframe"),
+        "strategy_id": row.get("strategy_id"),
+        "direction": str(row.get("direction") or "").strip().upper(),
+        "entry_price": float(row.get("entry_price") or 0),
+        "position_size": float(row.get("position_size") or 0),
+        "max_risk_dollars": float(row.get("max_risk_dollars") or 0),
+        "nights_held": float(row.get("nights_held") or 0),
+        "pnl_dollars": float(row.get("pnl_dollars") or 0),
+        "outcome": row.get("outcome"),
+        "skipped": bool(row.get("skipped") or row.get("skip_trade")),
+        "shadow_class": row.get("shadow_class"),
+        "shadow_instrument": row.get("shadow_instrument"),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Zone shadow helpers + runner
 # ---------------------------------------------------------------------------
@@ -5328,7 +6289,6 @@ def _shadow_zone_trade_ctx_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
         "shadow_class": row.get("shadow_class"),
         "shadow_instrument": row.get("shadow_instrument"),
     }
-
 
 def _sizing_health_shadow_fields(
     *,
@@ -13885,8 +14845,17 @@ def run_chronological_backtest(
         skip_runner = _ShadowSkipThrottledRunner.from_chrono(chrono_data)
         filter_runner = _ShadowFilterRunner.from_chrono(chrono_data)
         trail_summary_runner = _ShadowTrailSummaryRunner.from_chrono(chrono_data)
+        pcap_runner = _ShadowPortfolioCapRunner.from_chrono(chrono_data)
+        eqstop_runner = _ShadowEquityDailyStopRunner.from_chrono(chrono_data)
         zone_runner = _ShadowZoneRunner.from_chrono(chrono_data)
         _reset_zone_daily_past_cache()
+        _reset_shadow_mark_cache()
+        if SHADOW_EQUITY_DAILY_STOP_ENABLED:
+            _eqstop_log_mark_coverage_at_run_start(
+                tickers,
+                str(chrono_data.get("start_date") or start_date),
+                str(chrono_data.get("end_date") or end_date),
+            )
         shadow_runner.set_median_nights_by_tf(
             _compute_median_nights_by_tf(list(chrono_data.get("all_trades") or []))
         )
@@ -13941,6 +14910,8 @@ def run_chronological_backtest(
                 skip_runner.on_new_day(date_str)
                 filter_runner.on_new_day(date_str)
                 trail_summary_runner.on_new_day(date_str)
+                pcap_runner.on_new_day(date_str)
+                eqstop_runner.on_new_day(date_str)
                 zone_runner.on_new_day(date_str)
             finalize_day_only = False
             resume_idx = 0
@@ -14653,6 +15624,19 @@ def run_chronological_backtest(
                             if _filter_map:
                                 row["shadow_filter"] = _filter_map
                             trail_summary_runner.process_trade(row)
+                            _funded_ctx = _shadow_funded_trade_ctx_from_row(row)
+                            _pcap_map = pcap_runner.process_trade(_funded_ctx)
+                            if _pcap_map:
+                                row["shadow_portfolio_cap"] = _pcap_map
+                            _eq_closes = {}
+                            _eq_px = _shadow_mark_close_price(str(row.get("ticker") or ""), date_str)
+                            if _eq_px is not None:
+                                _eq_closes[str(row.get("ticker") or "").strip().upper()] = _eq_px
+                            _eqstop_map = eqstop_runner.process_trade(
+                                _funded_ctx, close_prices=_eq_closes or None
+                            )
+                            if _eqstop_map:
+                                row["shadow_equity_daily_stop"] = _eqstop_map
                             _zone_map = zone_runner.process_trade(_shadow_zone_trade_ctx_from_row(row))
                             if _zone_map:
                                 row["shadow_zone"] = _zone_map
@@ -14727,6 +15711,8 @@ def run_chronological_backtest(
                             _persist_shadow_skip_state(chrono_data, skip_runner)
                             _persist_shadow_filter_state(chrono_data, filter_runner)
                             _persist_shadow_trail_summary_state(chrono_data, trail_summary_runner)
+                            _persist_shadow_portfolio_cap_state(chrono_data, pcap_runner)
+                            _persist_shadow_equity_daily_stop_state(chrono_data, eqstop_runner)
                             _persist_shadow_zone_state(chrono_data, zone_runner)
                             chrono_data["current_date"] = date_str
                             chrono_data["status"] = "running"
@@ -14764,6 +15750,12 @@ def run_chronological_backtest(
             skip_runner.finalize_day(date_str)
             filter_runner.finalize_day(date_str)
             trail_summary_runner.finalize_day(date_str)
+            pcap_runner.finalize_day(date_str)
+            _eq_tickers: set[str] = set()
+            for _st in eqstop_runner.curves.values():
+                _eq_tickers.update(p.ticker for p in _st.book.values())
+            _eq_eod_closes = _gather_close_prices(_eq_tickers, date_str)
+            eqstop_runner.finalize_day(date_str, close_prices=_eq_eod_closes)
             zone_runner.finalize_day(date_str)
 
             daily_summary = {
@@ -14810,6 +15802,8 @@ def run_chronological_backtest(
             _persist_shadow_skip_state(chrono_data, skip_runner)
             _persist_shadow_filter_state(chrono_data, filter_runner)
             _persist_shadow_trail_summary_state(chrono_data, trail_summary_runner)
+            _persist_shadow_portfolio_cap_state(chrono_data, pcap_runner)
+            _persist_shadow_equity_daily_stop_state(chrono_data, eqstop_runner)
             _persist_shadow_zone_state(chrono_data, zone_runner)
             save_json(chrono_path, chrono_data)
 
@@ -14881,6 +15875,10 @@ def run_chronological_backtest(
             chrono_data["shadow_filter_summary"] = filter_runner.summaries()
         if SHADOW_TRAIL_SUMMARY_ENABLED:
             chrono_data["shadow_trail_summary"] = trail_summary_runner.summaries()
+        if SHADOW_PORTFOLIO_CAP_ENABLED:
+            chrono_data["shadow_portfolio_cap_summary"] = pcap_runner.summaries()
+        if SHADOW_EQUITY_DAILY_STOP_ENABLED:
+            chrono_data["shadow_equity_daily_stop_summary"] = eqstop_runner.summaries()
         if SHADOW_ZONE_ENABLED:
             chrono_data["shadow_zone_summary"] = zone_runner.summaries()
         if SHADOW_BLOCKED_PAIRS:
@@ -14891,6 +15889,8 @@ def run_chronological_backtest(
         _persist_shadow_skip_state(chrono_data, skip_runner)
         _persist_shadow_filter_state(chrono_data, filter_runner)
         _persist_shadow_trail_summary_state(chrono_data, trail_summary_runner)
+        _persist_shadow_portfolio_cap_state(chrono_data, pcap_runner)
+        _persist_shadow_equity_daily_stop_state(chrono_data, eqstop_runner)
         _persist_shadow_zone_state(chrono_data, zone_runner)
         chrono_data["v74_metrics"] = _v74_chrono_trade_metrics(all_trades)
         _assert_swap_financing_modeled(all_trades, context=f"Chrono {job_id}")
