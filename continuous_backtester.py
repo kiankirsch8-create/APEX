@@ -1845,6 +1845,8 @@ def _apply_realistic_costs(
 ) -> tuple[float, float, float, dict[str, float]]:
     """Return (net_pnl_dollars, net_pnl_pct, gross_pnl_pct, cost_fields).
 
+    ``raw_pct`` is a FRACTION of notional (e.g. 0.0595 for +5.95%), matching
+    ``evaluate_forward_candles`` / shadow trail sims — NOT a percent value.
     Costs are expressed as a fraction of notional so they stay unit-consistent with
     pnl_dollars = leveraged_exposure * raw_pct.
     """
@@ -10799,8 +10801,14 @@ def _simulate_shadow_exit_variant(
         if candle_count <= 0:
             candle_count = len(rows)
 
-    # Unit-size pnl_pct: realized move / entry (matches evaluate_forward_candles scale
-    # when position_size multiplies both sides in cost application).
+    # ``pnl_pct`` / raw_pct convention (FRACTION, not percent):
+    #   evaluate_forward_candles returns pnl_pct = realized / (position_size * entry)
+    #   which equals price_move / entry for a full exit (e.g. 0.0595 for +5.95%).
+    #   _apply_realistic_costs expects that same fraction:
+    #     gross_dollars = leveraged_exposure * raw_pct
+    #     gross_pct_display = raw_pct * 100.0
+    #   Unit-size walk here: realized accumulates rem * price_move, so
+    #   realized / entry_price matches evaluate_forward_candles' fraction.
     raw_pct = (realized / entry_price) if entry_price > 0 else 0.0
     return {
         "exit_price": float(exit_price),
@@ -10809,6 +10817,52 @@ def _simulate_shadow_exit_variant(
         "pnl_pct": float(raw_pct),
         "outcome": "WIN" if raw_pct > 0 else ("LOSS" if raw_pct < 0 else "FLAT"),
     }
+
+
+_SHADOW_EXIT_SCALE_WARNED = False
+
+
+def _shadow_exit_magnitude_sanity(
+    *,
+    out: Mapping[str, Any],
+    reference_pnl_dollars: float | None,
+    ticker: str,
+) -> None:
+    """
+    One-shot runtime check: on a winning live trade, exit_fixed_5r dollar PnL
+    should be the same order of magnitude as the real curve — not ~100x smaller
+    (the symptom if raw_pct were wrongly treated as percent vs fraction).
+    """
+    global _SHADOW_EXIT_SCALE_WARNED
+    if _SHADOW_EXIT_SCALE_WARNED:
+        return
+    if reference_pnl_dollars is None:
+        return
+    try:
+        live = float(reference_pnl_dollars)
+    except (TypeError, ValueError):
+        return
+    if live <= 0:
+        return
+    payload = out.get("exit_fixed_5r") if isinstance(out, Mapping) else None
+    if not isinstance(payload, dict) or payload.get("pnl_dollars") is None:
+        return
+    try:
+        shadow = float(payload["pnl_dollars"])
+    except (TypeError, ValueError):
+        return
+    if shadow <= 0:
+        return
+    # Same order: ratio within [0.05, 20]. A 100x scale bug lands near 0.01.
+    ratio = shadow / live
+    if ratio < 0.05 or ratio > 20.0:
+        _SHADOW_EXIT_SCALE_WARNED = True
+        log(
+            f"[SHADOW EXIT] scale sanity: exit_fixed_5r pnl=${shadow:.2f} vs live "
+            f"${live:.2f} (ratio={ratio:.4f}) on {str(ticker or '?').upper()} — "
+            f"expected same order of magnitude; check raw_pct FRACTION convention",
+            level="warning",
+        )
 
 
 def _shadow_exit_fields(
@@ -10822,10 +10876,14 @@ def _shadow_exit_fields(
     timeframe: str = "",
     atr: float = 0.0,
     ticker: str = "",
+    reference_pnl_dollars: float | None = None,
 ) -> dict[str, Any]:
     """
     Replay the forward path under each SHADOW_EXIT_CONFIGS rule.
     Write-only nested map — never feeds live exits/sizing.
+
+    Passes ``pnl_pct`` from the sim into ``_apply_realistic_costs`` as a
+    FRACTION (same convention as ``evaluate_forward_candles``).
     """
     if not SHADOW_EXIT_ENABLED:
         return {}
@@ -10869,6 +10927,11 @@ def _shadow_exit_fields(
                 "nights_held": round(float(nights), 2),
                 "swap_amount": round(float(swap_amt), 2),
             }
+        _shadow_exit_magnitude_sanity(
+            out=out,
+            reference_pnl_dollars=reference_pnl_dollars,
+            ticker=ticker,
+        )
         return out
     except Exception as e:  # noqa: BLE001
         log(
@@ -12696,6 +12759,7 @@ def _python_forced_layer2_trade(
             timeframe=tf_key,
             atr=float(atr_ref or v75_meta.get("entry_atr", 0) or 0),
             ticker=sym,
+            reference_pnl_dollars=float(pnl_dollars or 0),
         ),
         "shadow_stop": _shadow_stop_placement_fields(
             direction=direction,
@@ -13827,6 +13891,7 @@ def run_one_backtest(
             timeframe=tf_key,
             atr=float(ind.get("atr", 0) or v75_meta.get("entry_atr", 0) or 0),
             ticker=sym,
+            reference_pnl_dollars=float(pnl_dollars or 0),
         )
 
         cond_snap = (

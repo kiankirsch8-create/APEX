@@ -81,10 +81,7 @@ def test_time_stop_nights_differ_and_swap() -> None:
     t20 = out["exit_time_20d"]
     assert t5 is not None and t20 is not None
     assert float(t5["nights_held"]) < float(t20["nights_held"])
-    # Swap differs with nights (absolute values depend on rate differential sign).
-    assert abs(float(t5["swap_amount"])) < abs(float(t20["swap_amount"])) or (
-        float(t5["nights_held"]) < float(t20["nights_held"])
-    )
+    assert abs(float(t5["swap_amount"])) < abs(float(t20["swap_amount"]))
     assert "TIME_5N" in str(t5["exit_reason"])
     assert "TIME_20N" in str(t20["exit_reason"])
 
@@ -237,3 +234,109 @@ def test_shadow_exit_fields_map_keys() -> None:
         assert v is None or (
             "pnl_dollars" in v and "nights_held" in v and "swap_amount" in v
         )
+
+
+def test_raw_pct_scale_matches_evaluate_forward() -> None:
+    """
+    raw_pct is a FRACTION (price_move / entry), same as evaluate_forward_candles.
+
+    _apply_realistic_costs does gross = exposure * raw_pct and
+    gross_pct_display = raw_pct * 100 — so percent would inflate dollars 100x.
+    """
+    entry, stop = 1.1000, 1.0900
+    # Unreachable targets (5R = 1.15); both engines exit at window-end close.
+    exit_close = 1.1150
+    df = pd.DataFrame(
+        [
+            {"Open": 1.1000, "High": 1.1160, "Low": 1.1140, "Close": exit_close},
+        ]
+    )
+    ps = 100_000.0
+    expected = (exit_close - entry) / entry
+
+    fwd = cb.evaluate_forward_candles(
+        "LONG",
+        entry,
+        stop,
+        0.0,
+        0.0,
+        0.0,
+        df,
+        "",
+        position_size=ps,
+        timeframe="1d",
+        atr=0.005,
+        ticker="EURUSD",
+        trail_activate_r=5.0,
+        trail_regime="TRENDING",
+        macro_bias_adjusted="STRONG_TAILWIND",
+    )
+    sim = cb._simulate_shadow_exit_variant(
+        direction="LONG",
+        entry=entry,
+        stop_loss=stop,
+        forward_df=df,
+        atr=0.005,
+        timeframe="1d",
+        cfg={"type": "fixed_r", "r": 5.0},
+    )
+    assert sim is not None
+    assert abs(float(fwd["exit_price"]) - exit_close) < 1e-9
+    assert abs(float(sim["exit_price"]) - exit_close) < 1e-9
+    # evaluate_forward rounds pnl_pct to 6 dp; sim keeps full float.
+    assert abs(float(sim["pnl_pct"]) - expected) < 1e-9
+    assert abs(round(float(sim["pnl_pct"]), 6) - float(fwd["pnl_pct"])) < 1e-9
+    assert abs(float(fwd["pnl_pct"]) - round(expected, 6)) < 1e-9
+
+    # Costs: fraction → ~ps * move dollars; percent would be ~100x.
+    lev = ps * entry
+    pnl_d, _, _, cf = cb._apply_realistic_costs(
+        ticker="EURUSD",
+        direction="LONG",
+        timeframe="1d",
+        position_size=ps,
+        entry=entry,
+        leveraged_exposure=lev,
+        raw_pct=float(sim["pnl_pct"]),
+        candles_to_exit=1,
+    )
+    true_gross = ps * (exit_close - entry)
+    assert abs(float(cf["gross_pnl_dollars"]) - true_gross) < 0.02
+    assert abs(pnl_d) > abs(true_gross) * 0.5  # same order after costs
+    # Explicit anti-percent check: if raw_pct were percent, gross ≈ 100 * true.
+    assert abs(float(cf["gross_pnl_dollars"])) < abs(true_gross) * 2.0
+
+
+def test_exit_fixed_5r_magnitude_vs_live() -> None:
+    """Winning fixed-5R shadow PnL must be same order as a live win — not 1% of it."""
+    entry, stop = 1.1000, 1.0900
+    # Path that hits 5R (=1.15) cleanly.
+    df = pd.DataFrame(
+        [
+            {"Open": 1.100, "High": 1.101, "Low": 1.099, "Close": 1.100},
+            {"Open": 1.120, "High": 1.151, "Low": 1.119, "Close": 1.150},
+        ]
+    )
+    ps = 100_000.0
+    lev = ps * entry
+    live_pnl = 800.0  # typical winning live trade dollars
+    out = cb._shadow_exit_fields(
+        direction="LONG",
+        entry=entry,
+        stop_loss=stop,
+        forward_df=df,
+        position_size=ps,
+        leveraged_exposure=lev,
+        timeframe="1d",
+        atr=0.005,
+        ticker="EURUSD",
+        reference_pnl_dollars=live_pnl,
+    )
+    fixed5 = out["exit_fixed_5r"]
+    assert fixed5 is not None
+    shadow = float(fixed5["pnl_dollars"])
+    assert shadow > 0
+    ratio = shadow / live_pnl
+    assert 0.05 <= ratio <= 20.0, f"scale bug? shadow={shadow} live={live_pnl} ratio={ratio}"
+    # Gross at 5R ≈ ps * 0.05 = 5000 before costs — same order as live hundreds/thousands.
+    assert shadow > 100.0
