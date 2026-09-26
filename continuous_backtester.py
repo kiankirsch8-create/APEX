@@ -413,6 +413,64 @@ SHADOW_EQUITY_DAILY_STOP_CONFIGS: list[tuple[str, dict[str, Any]]] = [
 # Unguarded real-curve observation threshold for the funded-challenge question.
 SHADOW_EQUITY_BREACH_REPORT_PCT = 5.0
 
+# ---------------------------------------------------------------------------
+# Zone-based shadow sizing / filters (real curve unchanged).
+# Uses zone_position_pct + zone_label — NOT price_zone (hardcoded EQUILIBRIUM on
+# the Python Layer-2 path). LONG-only; multiplier stacks on existing A+B PnL.
+# ---------------------------------------------------------------------------
+SHADOW_ZONE_ENABLED = True
+_ZONE_DISC_LADDER: list[tuple[float, float]] = [(50.0, 1.25), (30.0, 1.75), (20.0, 2.5)]
+_ZONE_PREM_LADDER_UP: list[tuple[float, float]] = [(50.0, 1.25), (70.0, 1.75), (80.0, 2.5)]
+
+SHADOW_ZONE_CONFIGS: list[tuple[str, dict[str, Any]]] = [
+    # A — sizing by depth
+    ("zone_size_disc_15", {"below": 40, "mult": 1.5, "group": "A"}),
+    ("zone_size_disc_20", {"below": 40, "mult": 2.0, "group": "A"}),
+    ("zone_size_disc_deep_25", {"below": 25, "mult": 2.5, "group": "A"}),
+    ("zone_size_disc_ladder", {"ladder": list(_ZONE_DISC_LADDER), "group": "A"}),
+    ("zone_size_prem_15", {"above": 70, "mult": 1.5, "group": "A"}),
+    ("zone_size_prem_ladder", {"ladder_up": list(_ZONE_PREM_LADDER_UP), "group": "A"}),
+    # B — filtering
+    ("zone_only_disc", {"take_only_below": 50, "group": "B"}),
+    ("zone_only_disc_deep", {"take_only_below": 30, "group": "B"}),
+    ("zone_only_prem", {"take_only_above": 70, "group": "B"}),
+    ("zone_skip_extreme_prem", {"skip_above": 90, "group": "B"}),
+    ("zone_skip_extreme_disc", {"skip_below": 10, "group": "B"}),
+    # C — zone × confidence / confluence
+    ("zone_conf_gate", {"above": 70, "require_confluence": 2, "group": "C"}),
+    ("zone_conf_gate_strict", {"above": 70, "require_confluence": 3, "group": "C"}),
+    ("zone_conf_inverse", {"below": 50, "require_confluence": 2, "group": "C"}),
+    (
+        "zone_conf_size",
+        {
+            "below": 50,
+            "conf_min": 2,
+            "mult": 2.0,
+            "above": 70,
+            "weak_mult": 0.5,
+            "group": "C",
+        },
+    ),
+    # D — recompute zone from daily OHLC lookback + disc ladder
+    ("zone_lb_7", {"lookback_days": 7, "ladder": list(_ZONE_DISC_LADDER), "group": "D"}),
+    ("zone_lb_14", {"lookback_days": 14, "ladder": list(_ZONE_DISC_LADDER), "group": "D"}),
+    ("zone_lb_30", {"lookback_days": 30, "ladder": list(_ZONE_DISC_LADDER), "group": "D"}),
+    ("zone_lb_current", {"use_existing": True, "ladder": list(_ZONE_DISC_LADDER), "group": "D"}),
+    # E — interactions
+    (
+        "zone_disc_x_unthrottled",
+        {"ladder": list(_ZONE_DISC_LADDER), "only_if_ab_throttle": 1.0, "group": "E"},
+    ),
+    (
+        "zone_disc_x_weekly",
+        {"ladder": list(_ZONE_DISC_LADDER), "only_timeframe": "1w", "group": "E"},
+    ),
+    (
+        "zone_disc_x_nonjpy",
+        {"ladder": list(_ZONE_DISC_LADDER), "exclude_jpy": True, "group": "E"},
+    ),
+]
+
 # Static high-impact event calendar (2021-2026). Full table in high_impact_events_data.py.
 from high_impact_events_data import HIGH_IMPACT_EVENTS
 
@@ -5638,6 +5696,599 @@ def _shadow_funded_trade_ctx_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
         "shadow_instrument": row.get("shadow_instrument"),
     }
 
+
+# ---------------------------------------------------------------------------
+# Zone shadow helpers + runner
+# ---------------------------------------------------------------------------
+
+# Computed zone_pct floats only — never cache full OHLC DataFrames.
+# Keyed (ticker, date, lookback_days) → pct or None (negative cache).
+_ZONE_PCT_CACHE: dict[tuple[str, str, int], float | None] = {}
+
+
+def _reset_zone_pct_cache() -> None:
+    _ZONE_PCT_CACHE.clear()
+
+
+# Back-compat alias for chrono wiring that still calls the old name.
+def _reset_zone_daily_past_cache() -> None:
+    _reset_zone_pct_cache()
+
+
+def _zone_ladder_mult_below(zone_pct: float, ladder: list[tuple[float, float]]) -> float:
+    """Tightest (lowest) matching below-threshold rung wins."""
+    matches = [(float(thr), float(m)) for thr, m in ladder if float(zone_pct) < float(thr)]
+    if not matches:
+        return 1.0
+    return float(min(matches, key=lambda x: x[0])[1])
+
+
+def _zone_ladder_mult_above(zone_pct: float, ladder_up: list[tuple[float, float]]) -> float:
+    """Highest matching above-threshold rung wins."""
+    matches = [(float(thr), float(m)) for thr, m in ladder_up if float(zone_pct) > float(thr)]
+    if not matches:
+        return 1.0
+    return float(max(matches, key=lambda x: x[0])[1])
+
+
+def _zone_confluence_count(ctx: Mapping[str, Any]) -> int:
+    for key in ("strategy_confluence_count", "confluence_points"):
+        try:
+            v = int(ctx.get(key) or 0)
+            if v > 0:
+                return v
+        except (TypeError, ValueError):
+            pass
+    confs = ctx.get("confluences")
+    if isinstance(confs, list):
+        return len(confs)
+    return 0
+
+
+def _peek_chrono_daily_past_for_zone(ticker: str, date_str: str) -> Any | None:
+    """
+    Peek chrono OHLC cache for 1d past only — never downloads, never stores the frame.
+    Weekly (and other non-1d) trades miss here when no 1d key was warmed.
+    """
+    sym = str(ticker or "").strip().upper()
+    ds = str(date_str or "").strip()[:10]
+    if not sym or not ds:
+        return None
+    yf_t = f"{sym}=X" if len(sym) == 6 and sym.isalpha() else sym
+    try:
+        with _chrono_ohlc_cache_lock:
+            hit = _chrono_ohlc_cache.get((yf_t.strip().upper(), "1d", ds))
+            if hit is not None and isinstance(hit, tuple) and hit:
+                past = hit[0]
+                if past is not None and not getattr(past, "empty", True):
+                    return past
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def _zone_pct_from_daily_lookback(
+    ticker: str,
+    date_str: str,
+    entry_price: float,
+    lookback_days: int,
+) -> float | None:
+    """
+    zone_pct = 100 * (entry - low_N) / (high_N - low_N) over last N calendar
+    days of DAILY bars (trade timeframe ignored).
+
+    Cache-only: peeks chrono 1d OHLC; on miss returns None (no download).
+    Memoises the computed float (or None), never the DataFrame.
+    """
+    sym = str(ticker or "").strip().upper()
+    ds = str(date_str or "").strip()[:10]
+    lb = max(1, int(lookback_days))
+    if not sym or not ds:
+        return None
+    cache_key = (sym, ds, lb)
+    if cache_key in _ZONE_PCT_CACHE:
+        return _ZONE_PCT_CACHE[cache_key]
+
+    past = _peek_chrono_daily_past_for_zone(sym, ds)
+    if past is None or getattr(past, "empty", True):
+        _ZONE_PCT_CACHE[cache_key] = None
+        return None
+    try:
+        as_of = date.fromisoformat(ds)
+    except ValueError:
+        _ZONE_PCT_CACHE[cache_key] = None
+        return None
+    cutoff = as_of - timedelta(days=lb)
+    try:
+        idx = past.index
+        mask = idx.normalize() >= pd.Timestamp(cutoff)
+        mask &= idx.normalize() <= pd.Timestamp(as_of)
+        window = past.loc[mask]
+    except Exception:  # noqa: BLE001
+        try:
+            window = past.tail(lb)
+        except Exception:  # noqa: BLE001
+            _ZONE_PCT_CACHE[cache_key] = None
+            return None
+    if window is None or getattr(window, "empty", True):
+        _ZONE_PCT_CACHE[cache_key] = None
+        return None
+    try:
+        hi = float(pd.to_numeric(window["High"], errors="coerce").max())
+        lo = float(pd.to_numeric(window["Low"], errors="coerce").min())
+        ep = float(entry_price)
+    except (TypeError, ValueError, KeyError):
+        _ZONE_PCT_CACHE[cache_key] = None
+        return None
+    if not (math.isfinite(hi) and math.isfinite(lo) and math.isfinite(ep)):
+        _ZONE_PCT_CACHE[cache_key] = None
+        return None
+    if hi <= lo or ep <= 0:
+        _ZONE_PCT_CACHE[cache_key] = None
+        return None
+    zp = round(100.0 * (ep - lo) / (hi - lo), 1)
+    _ZONE_PCT_CACHE[cache_key] = zp
+    return zp
+
+
+def _zone_pct_distribution(samples: list[float]) -> dict[str, Any]:
+    if not samples:
+        return {
+            "n": 0,
+            "mean": None,
+            "p25": None,
+            "p50": None,
+            "p75": None,
+            "min": None,
+            "max": None,
+            "buckets": {},
+        }
+    xs = sorted(float(x) for x in samples)
+    n = len(xs)
+
+    def _pctile(p: float) -> float:
+        if n == 1:
+            return xs[0]
+        i = (n - 1) * p
+        lo = int(math.floor(i))
+        hi = int(math.ceil(i))
+        if lo == hi:
+            return xs[lo]
+        return xs[lo] * (hi - i) + xs[hi] * (i - lo)
+
+    buckets: dict[str, int] = {
+        "0_10": 0,
+        "10_20": 0,
+        "20_30": 0,
+        "30_50": 0,
+        "50_70": 0,
+        "70_80": 0,
+        "80_90": 0,
+        "90_100": 0,
+    }
+    for v in xs:
+        if v < 10:
+            buckets["0_10"] += 1
+        elif v < 20:
+            buckets["10_20"] += 1
+        elif v < 30:
+            buckets["20_30"] += 1
+        elif v < 50:
+            buckets["30_50"] += 1
+        elif v < 70:
+            buckets["50_70"] += 1
+        elif v < 80:
+            buckets["70_80"] += 1
+        elif v < 90:
+            buckets["80_90"] += 1
+        else:
+            buckets["90_100"] += 1
+    return {
+        "n": n,
+        "mean": round(sum(xs) / n, 2),
+        "p25": round(_pctile(0.25), 2),
+        "p50": round(_pctile(0.50), 2),
+        "p75": round(_pctile(0.75), 2),
+        "min": round(xs[0], 2),
+        "max": round(xs[-1], 2),
+        "buckets": buckets,
+    }
+
+
+def _resolve_zone_shadow_decision(
+    cfg: Mapping[str, Any],
+    *,
+    zone_pct: float,
+    confluence: int,
+    direction: str,
+    timeframe: str,
+    ticker: str,
+    ab_throttle: float,
+) -> tuple[bool, float, str]:
+    """
+    Return (take, size_mult, reason). LONG-only: shorts always blocked.
+    """
+    if str(direction or "").strip().upper() != "LONG":
+        return False, 1.0, "short_blocked"
+
+    zp = float(zone_pct)
+    mult = 1.0
+    reason = "take"
+
+    # Interaction gates (E) — block before sizing when predicate fails.
+    if cfg.get("only_if_ab_throttle") is not None:
+        want = float(cfg["only_if_ab_throttle"])
+        if abs(float(ab_throttle) - want) > 1e-9:
+            return False, 1.0, "ab_throttle_mismatch"
+    if cfg.get("only_timeframe"):
+        if str(timeframe or "").strip().lower() != str(cfg["only_timeframe"]).strip().lower():
+            return False, 1.0, "timeframe_mismatch"
+    if cfg.get("exclude_jpy"):
+        if "JPY" in str(ticker or "").strip().upper():
+            return False, 1.0, "jpy_excluded"
+
+    # B — hard filters
+    if cfg.get("take_only_below") is not None and zp >= float(cfg["take_only_below"]):
+        return False, 1.0, "take_only_below"
+    if cfg.get("take_only_above") is not None and zp <= float(cfg["take_only_above"]):
+        return False, 1.0, "take_only_above"
+    if cfg.get("skip_above") is not None and zp > float(cfg["skip_above"]):
+        return False, 1.0, "skip_above"
+    if cfg.get("skip_below") is not None and zp < float(cfg["skip_below"]):
+        return False, 1.0, "skip_below"
+
+    # C — confluence gates
+    if cfg.get("require_confluence") is not None:
+        need = int(cfg["require_confluence"])
+        if cfg.get("above") is not None and zp > float(cfg["above"]) and confluence < need:
+            return False, 1.0, "conf_gate_above"
+        if cfg.get("below") is not None and zp < float(cfg["below"]) and confluence < need:
+            return False, 1.0, "conf_gate_below"
+        # Gate-only configs (no mult): done
+        if cfg.get("mult") is None and cfg.get("ladder") is None and cfg.get("ladder_up") is None:
+            if cfg.get("weak_mult") is None and cfg.get("conf_min") is None:
+                return True, 1.0, "conf_gate_pass"
+
+    # C — zone_conf_size style
+    if cfg.get("conf_min") is not None and cfg.get("mult") is not None:
+        if zp < float(cfg.get("below", 50)) and confluence >= int(cfg["conf_min"]):
+            mult = float(cfg["mult"])
+            reason = "conf_size_boost"
+        elif cfg.get("above") is not None and zp > float(cfg["above"]):
+            mult = float(cfg.get("weak_mult", 0.5))
+            reason = "conf_size_weak"
+        return True, float(mult), reason
+
+    # A / D / E — sizing
+    if cfg.get("ladder") is not None:
+        mult = _zone_ladder_mult_below(zp, list(cfg["ladder"]))
+        reason = "ladder" if mult != 1.0 else "ladder_flat"
+    elif cfg.get("ladder_up") is not None:
+        mult = _zone_ladder_mult_above(zp, list(cfg["ladder_up"]))
+        reason = "ladder_up" if mult != 1.0 else "ladder_up_flat"
+    elif cfg.get("below") is not None and cfg.get("mult") is not None:
+        if zp < float(cfg["below"]):
+            mult = float(cfg["mult"])
+            reason = "below_boost"
+    elif cfg.get("above") is not None and cfg.get("mult") is not None:
+        if zp > float(cfg["above"]):
+            mult = float(cfg["mult"])
+            reason = "above_boost"
+
+    return True, float(mult), reason
+
+
+@dataclass
+class _ZoneCurveState:
+    curve_id: str
+    cfg: dict[str, Any]
+    group: str
+    capital: float
+    peak_capital: float
+    day_anchor: float
+    day_pnl: float = 0.0
+    trades_taken: int = 0
+    trades_blocked: int = 0
+    taken_net_r: float = 0.0
+    taken_weighted_r: float = 0.0
+    blocked_net_r: float = 0.0
+    daily_pnls: dict[str, float] = field(default_factory=dict)
+    daily_anchors: dict[str, float] = field(default_factory=dict)
+    max_drawdown_pct_seen: float = 0.0
+    zone_pct_samples: list[float] = field(default_factory=list)
+    # Group-D recompute coverage (lookback configs only).
+    zone_recompute_attempts: int = 0
+    zone_recompute_misses: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "curve_id": self.curve_id,
+            "cfg": dict(self.cfg),
+            "group": self.group,
+            "capital": round(float(self.capital), 2),
+            "peak_capital": round(float(self.peak_capital), 2),
+            "day_anchor": round(float(self.day_anchor), 2),
+            "day_pnl": round(float(self.day_pnl), 2),
+            "trades_taken": int(self.trades_taken),
+            "trades_blocked": int(self.trades_blocked),
+            "taken_net_r": round(float(self.taken_net_r), 6),
+            "taken_weighted_r": round(float(self.taken_weighted_r), 6),
+            "blocked_net_r": round(float(self.blocked_net_r), 6),
+            "daily_pnls": dict(self.daily_pnls),
+            "daily_anchors": dict(self.daily_anchors),
+            "max_drawdown_pct_seen": round(float(self.max_drawdown_pct_seen), 4),
+            "zone_pct_samples": [round(float(x), 2) for x in self.zone_pct_samples[-5000:]],
+            "zone_recompute_attempts": int(self.zone_recompute_attempts),
+            "zone_recompute_misses": int(self.zone_recompute_misses),
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "_ZoneCurveState":
+        start = float(STARTING_CAPITAL)
+        return cls(
+            curve_id=str(raw.get("curve_id") or ""),
+            cfg=dict(raw.get("cfg") or {}),
+            group=str(raw.get("group") or ""),
+            capital=float(raw.get("capital", start) or start),
+            peak_capital=float(raw.get("peak_capital", start) or start),
+            day_anchor=float(raw.get("day_anchor", start) or start),
+            day_pnl=float(raw.get("day_pnl", 0) or 0),
+            trades_taken=int(raw.get("trades_taken", 0) or 0),
+            trades_blocked=int(raw.get("trades_blocked", 0) or 0),
+            taken_net_r=float(raw.get("taken_net_r", 0) or 0),
+            taken_weighted_r=float(raw.get("taken_weighted_r", 0) or 0),
+            blocked_net_r=float(raw.get("blocked_net_r", 0) or 0),
+            daily_pnls={str(k): float(v) for k, v in (raw.get("daily_pnls") or {}).items()},
+            daily_anchors={str(k): float(v) for k, v in (raw.get("daily_anchors") or {}).items()},
+            max_drawdown_pct_seen=float(raw.get("max_drawdown_pct_seen", 0) or 0),
+            zone_pct_samples=[float(x) for x in (raw.get("zone_pct_samples") or [])],
+            zone_recompute_attempts=int(raw.get("zone_recompute_attempts", 0) or 0),
+            zone_recompute_misses=int(raw.get("zone_recompute_misses", 0) or 0),
+        )
+
+
+class _ShadowZoneRunner:
+    """Zone-position sizing/filter shadows (real curve untouched). LONG-only."""
+
+    def __init__(self) -> None:
+        self.curves: dict[str, _ZoneCurveState] = {}
+        self._init_curves()
+
+    def _init_curves(self) -> None:
+        if not SHADOW_ZONE_ENABLED:
+            return
+        start = float(STARTING_CAPITAL)
+        for name, cfg in SHADOW_ZONE_CONFIGS:
+            cfg_copy = dict(cfg)
+            if "ladder" in cfg_copy:
+                cfg_copy["ladder"] = list(cfg_copy["ladder"])
+            if "ladder_up" in cfg_copy:
+                cfg_copy["ladder_up"] = list(cfg_copy["ladder_up"])
+            self.curves[name] = _ZoneCurveState(
+                curve_id=name,
+                cfg=cfg_copy,
+                group=str(cfg_copy.get("group") or ""),
+                capital=start,
+                peak_capital=start,
+                day_anchor=start,
+            )
+
+    @classmethod
+    def from_chrono(cls, chrono_data: Mapping[str, Any] | None) -> "_ShadowZoneRunner":
+        runner = cls()
+        if not SHADOW_ZONE_ENABLED or not chrono_data:
+            return runner
+        saved = chrono_data.get("shadow_zone_state")
+        if not isinstance(saved, dict):
+            return runner
+        curves_raw = saved.get("curves")
+        if not isinstance(curves_raw, dict):
+            return runner
+        for cid, raw in curves_raw.items():
+            if cid in runner.curves and isinstance(raw, dict):
+                restored = _ZoneCurveState.from_dict(raw)
+                # Keep current cfg definition (configs may change across revs).
+                restored.cfg = dict(runner.curves[cid].cfg)
+                restored.group = runner.curves[cid].group
+                runner.curves[cid] = restored
+        return runner
+
+    def to_persistence(self) -> dict[str, Any]:
+        return {"curves": {cid: st.to_dict() for cid, st in self.curves.items()}}
+
+    def on_new_day(self, date_str: str) -> None:
+        for st in self.curves.values():
+            st.day_anchor = float(st.capital)
+            st.day_pnl = 0.0
+
+    def finalize_day(self, date_str: str) -> None:
+        ds = str(date_str or "")[:10]
+        for st in self.curves.values():
+            st.daily_pnls[ds] = round(float(st.day_pnl), 2)
+            st.daily_anchors[ds] = round(float(st.day_anchor), 2)
+
+    def _effective_zone_pct(self, st: _ZoneCurveState, ctx: Mapping[str, Any]) -> float | None:
+        cfg = st.cfg
+        existing = ctx.get("zone_position_pct")
+        try:
+            existing_f = float(existing) if existing is not None else None
+        except (TypeError, ValueError):
+            existing_f = None
+        if cfg.get("use_existing"):
+            return existing_f
+        if cfg.get("lookback_days") is not None:
+            lb = int(cfg["lookback_days"])
+            ticker = str(ctx.get("ticker") or "")
+            date_str = str(ctx.get("date") or "")[:10]
+            try:
+                entry = float(ctx.get("entry_price") or 0)
+            except (TypeError, ValueError):
+                entry = 0.0
+            st.zone_recompute_attempts += 1
+            recomputed = _zone_pct_from_daily_lookback(ticker, date_str, entry, lb)
+            if recomputed is None:
+                # Do NOT fall back to existing zone_pct — that would silently
+                # duplicate zone_lb_current under poor 1d-cache coverage.
+                st.zone_recompute_misses += 1
+                return None
+            return recomputed
+        return existing_f
+
+    def process_trade(self, ctx: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+        if not SHADOW_ZONE_ENABLED or not self.curves:
+            return {}
+        if ctx.get("skipped") or str(ctx.get("outcome") or "").strip().upper() not in ("WIN", "LOSS"):
+            return {}
+        if ctx.get("shadow_class") or ctx.get("shadow_instrument"):
+            return {}
+
+        direction = str(ctx.get("direction") or "").strip().upper()
+        timeframe = str(ctx.get("timeframe") or "").strip().lower()
+        ticker = str(ctx.get("ticker") or "").strip().upper()
+        pnl_real = float(ctx.get("pnl_dollars") or 0)  # already includes A+B
+        trade_r = float(ctx.get("pnl_r_net") or 0)
+        ab = float(ctx.get("ab_throttle") or 1.0)
+        if ab <= 0:
+            ab = 1.0
+        confluence = _zone_confluence_count(ctx)
+        out: dict[str, dict[str, Any]] = {}
+
+        for cid, st in self.curves.items():
+            zp = self._effective_zone_pct(st, ctx)
+            if zp is None:
+                st.trades_blocked += 1
+                st.blocked_net_r += float(trade_r)
+                out[cid] = {
+                    "taken": False,
+                    "blocked": True,
+                    "pnl": 0.0,
+                    "mult": 1.0,
+                    "zone_pct": None,
+                    "reason": "zone_pct_missing",
+                }
+                continue
+
+            if st.group == "D":
+                st.zone_pct_samples.append(float(zp))
+
+            take, mult, reason = _resolve_zone_shadow_decision(
+                st.cfg,
+                zone_pct=float(zp),
+                confluence=confluence,
+                direction=direction,
+                timeframe=timeframe,
+                ticker=ticker,
+                ab_throttle=ab,
+            )
+            if take:
+                # Zone mult stacks on top of existing A+B (pnl_dollars already throttled).
+                capital_pnl = round(float(pnl_real) * float(mult), 2)
+                st.trades_taken += 1
+                # R = pnl/risk is size-invariant; do not multiply by sizing mult.
+                st.taken_net_r += float(trade_r)
+                st.taken_weighted_r += float(trade_r) * float(mult)
+                st.capital += capital_pnl
+                st.day_pnl += capital_pnl
+                if st.capital > st.peak_capital:
+                    st.peak_capital = st.capital
+                if st.peak_capital > 0:
+                    dd = (st.peak_capital - st.capital) / st.peak_capital * 100.0
+                    if dd > st.max_drawdown_pct_seen:
+                        st.max_drawdown_pct_seen = float(dd)
+            else:
+                capital_pnl = 0.0
+                st.trades_blocked += 1
+                st.blocked_net_r += float(trade_r)
+
+            out[cid] = {
+                "taken": bool(take),
+                "blocked": not take,
+                "pnl": float(capital_pnl),
+                "mult": round(float(mult), 4),
+                "zone_pct": round(float(zp), 2),
+                "reason": reason,
+            }
+        return out
+
+    def _curve_summary(self, st: _ZoneCurveState) -> dict[str, Any]:
+        peak = float(st.peak_capital or STARTING_CAPITAL)
+        cap = float(st.capital or STARTING_CAPITAL)
+        worst_day_pct = 0.0
+        positive_months = 0
+        month_pnls: dict[str, float] = {}
+        for ds, dp in st.daily_pnls.items():
+            anchor = float(st.daily_anchors.get(ds, st.day_anchor or STARTING_CAPITAL))
+            day_pct = (float(dp) / anchor * 100.0) if anchor > 0 else 0.0
+            if day_pct < worst_day_pct:
+                worst_day_pct = day_pct
+            ym = ds[:7]
+            month_pnls[ym] = month_pnls.get(ym, 0.0) + float(dp)
+        for mp in month_pnls.values():
+            if mp > 0:
+                positive_months += 1
+        taken = int(st.trades_taken)
+        summary: dict[str, Any] = {
+            "group": st.group,
+            "final_capital": round(cap, 2),
+            "peak_capital": round(peak, 2),
+            "max_drawdown_pct": round(float(st.max_drawdown_pct_seen), 2),
+            "worst_day_pct": round(float(worst_day_pct), 2),
+            "positive_months": int(positive_months),
+            "trades_taken": taken,
+            "trades_blocked": int(st.trades_blocked),
+            "net_r": round(float(st.taken_net_r), 4),
+            "r_per_trade": round(float(st.taken_net_r) / taken, 4) if taken > 0 else 0.0,
+            "net_r_weighted": round(float(st.taken_weighted_r), 4),
+            "r_per_trade_weighted": (
+                round(float(st.taken_weighted_r) / taken, 4) if taken > 0 else 0.0
+            ),
+            "blocked_net_r": round(float(st.blocked_net_r), 4),
+        }
+        if st.group == "D":
+            summary["zone_pct_distribution"] = _zone_pct_distribution(st.zone_pct_samples)
+            attempts = int(st.zone_recompute_attempts)
+            misses = int(st.zone_recompute_misses)
+            # use_existing control has attempts=0; lookback curves report coverage.
+            if attempts > 0:
+                summary["zone_recompute_unavailable_pct"] = round(
+                    100.0 * misses / attempts, 2
+                )
+            else:
+                summary["zone_recompute_unavailable_pct"] = 0.0
+            summary["zone_recompute_attempts"] = attempts
+            summary["zone_recompute_misses"] = misses
+        return summary
+    def summaries(self) -> dict[str, dict[str, Any]]:
+        return {cid: self._curve_summary(st) for cid, st in self.curves.items()}
+
+
+def _persist_shadow_zone_state(
+    chrono_data: dict[str, Any],
+    runner: _ShadowZoneRunner,
+) -> None:
+    chrono_data["shadow_zone_state"] = runner.to_persistence()
+
+
+def _shadow_zone_trade_ctx_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "date": row.get("date"),
+        "ticker": row.get("ticker"),
+        "timeframe": row.get("timeframe"),
+        "direction": str(row.get("direction") or "").strip().upper(),
+        "outcome": row.get("outcome"),
+        "skipped": bool(row.get("skipped") or row.get("skip_trade")),
+        "pnl_dollars": float(row.get("pnl_dollars") or 0),
+        "pnl_r_net": float(row.get("pnl_r_net") or 0),
+        "ab_throttle": float(row.get("ab_throttle") or 1.0),
+        "entry_price": float(row.get("entry_price") or 0),
+        "zone_position_pct": row.get("zone_position_pct", row.get("zone_pct")),
+        "zone_label": row.get("zone_label"),
+        "strategy_confluence_count": row.get("strategy_confluence_count"),
+        "confluence_points": row.get("confluence_points"),
+        "confluences": row.get("confluences"),
+        "shadow_class": row.get("shadow_class"),
+        "shadow_instrument": row.get("shadow_instrument"),
+    }
 
 def _sizing_health_shadow_fields(
     *,
@@ -14196,6 +14847,8 @@ def run_chronological_backtest(
         trail_summary_runner = _ShadowTrailSummaryRunner.from_chrono(chrono_data)
         pcap_runner = _ShadowPortfolioCapRunner.from_chrono(chrono_data)
         eqstop_runner = _ShadowEquityDailyStopRunner.from_chrono(chrono_data)
+        zone_runner = _ShadowZoneRunner.from_chrono(chrono_data)
+        _reset_zone_daily_past_cache()
         _reset_shadow_mark_cache()
         if SHADOW_EQUITY_DAILY_STOP_ENABLED:
             _eqstop_log_mark_coverage_at_run_start(
@@ -14259,6 +14912,7 @@ def run_chronological_backtest(
                 trail_summary_runner.on_new_day(date_str)
                 pcap_runner.on_new_day(date_str)
                 eqstop_runner.on_new_day(date_str)
+                zone_runner.on_new_day(date_str)
             finalize_day_only = False
             resume_idx = 0
             v71_pi_s = v71_ti_s = v71_tj_s = 0
@@ -14983,6 +15637,9 @@ def run_chronological_backtest(
                             )
                             if _eqstop_map:
                                 row["shadow_equity_daily_stop"] = _eqstop_map
+                            _zone_map = zone_runner.process_trade(_shadow_zone_trade_ctx_from_row(row))
+                            if _zone_map:
+                                row["shadow_zone"] = _zone_map
                             day_trades.append(row)
                             day_pnl += pnl
                             capital += pnl
@@ -15056,6 +15713,7 @@ def run_chronological_backtest(
                             _persist_shadow_trail_summary_state(chrono_data, trail_summary_runner)
                             _persist_shadow_portfolio_cap_state(chrono_data, pcap_runner)
                             _persist_shadow_equity_daily_stop_state(chrono_data, eqstop_runner)
+                            _persist_shadow_zone_state(chrono_data, zone_runner)
                             chrono_data["current_date"] = date_str
                             chrono_data["status"] = "running"
                             save_json(chrono_path, chrono_data)
@@ -15098,6 +15756,7 @@ def run_chronological_backtest(
                 _eq_tickers.update(p.ticker for p in _st.book.values())
             _eq_eod_closes = _gather_close_prices(_eq_tickers, date_str)
             eqstop_runner.finalize_day(date_str, close_prices=_eq_eod_closes)
+            zone_runner.finalize_day(date_str)
 
             daily_summary = {
                 "date": date_str,
@@ -15145,6 +15804,7 @@ def run_chronological_backtest(
             _persist_shadow_trail_summary_state(chrono_data, trail_summary_runner)
             _persist_shadow_portfolio_cap_state(chrono_data, pcap_runner)
             _persist_shadow_equity_daily_stop_state(chrono_data, eqstop_runner)
+            _persist_shadow_zone_state(chrono_data, zone_runner)
             save_json(chrono_path, chrono_data)
 
             log(
@@ -15219,6 +15879,8 @@ def run_chronological_backtest(
             chrono_data["shadow_portfolio_cap_summary"] = pcap_runner.summaries()
         if SHADOW_EQUITY_DAILY_STOP_ENABLED:
             chrono_data["shadow_equity_daily_stop_summary"] = eqstop_runner.summaries()
+        if SHADOW_ZONE_ENABLED:
+            chrono_data["shadow_zone_summary"] = zone_runner.summaries()
         if SHADOW_BLOCKED_PAIRS:
             chrono_data["shadow_instrument_summary"] = _si.compute_summary(job_id)
         _persist_shadow_guard_state(chrono_data, shadow_runner)
@@ -15229,6 +15891,7 @@ def run_chronological_backtest(
         _persist_shadow_trail_summary_state(chrono_data, trail_summary_runner)
         _persist_shadow_portfolio_cap_state(chrono_data, pcap_runner)
         _persist_shadow_equity_daily_stop_state(chrono_data, eqstop_runner)
+        _persist_shadow_zone_state(chrono_data, zone_runner)
         chrono_data["v74_metrics"] = _v74_chrono_trade_metrics(all_trades)
         _assert_swap_financing_modeled(all_trades, context=f"Chrono {job_id}")
         save_json(chrono_path, chrono_data)
