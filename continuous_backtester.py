@@ -5775,8 +5775,80 @@ def _peek_chrono_daily_past_for_zone(ticker: str, date_str: str) -> Any | None:
 
 
 # ── Entry-time scores: daily OHLC store (write-only scoring; no behaviour change) ──
-_ENTRY_SCORE_DAILY_OHLC: dict[str, pd.DataFrame] = {}
+# Value: (OHLC frame, last bar date). Keyed by symbol only — must re-download when
+# as_of exceeds last bar date (otherwise early-run frames poison later scores).
+_ENTRY_SCORE_DAILY_OHLC: dict[str, tuple[pd.DataFrame, date]] = {}
 _ENTRY_SCORE_DAILY_LOCK = threading.Lock()
+# (sym, as_of) pairs where a refresh still could not reach as_of — no retry loop.
+_ENTRY_SCORE_OHLC_UNAVAILABLE: set[tuple[str, date]] = set()
+_ENTRY_SCORE_OHLC_STATS: dict[str, int] = {
+    "lookups": 0,
+    "misses": 0,
+}
+
+
+def _reset_entry_score_daily_cache() -> None:
+    """Clear daily OHLC store + unavailable marks + miss counters (run start)."""
+    with _ENTRY_SCORE_DAILY_LOCK:
+        _ENTRY_SCORE_DAILY_OHLC.clear()
+        _ENTRY_SCORE_OHLC_UNAVAILABLE.clear()
+        _ENTRY_SCORE_OHLC_STATS["lookups"] = 0
+        _ENTRY_SCORE_OHLC_STATS["misses"] = 0
+
+
+def _entry_score_stale_or_missing_pct() -> float:
+    """Share of OHLC lookups that returned None (stale/unrefreshable/missing)."""
+    with _ENTRY_SCORE_DAILY_LOCK:
+        lookups = int(_ENTRY_SCORE_OHLC_STATS["lookups"] or 0)
+        misses = int(_ENTRY_SCORE_OHLC_STATS["misses"] or 0)
+    if lookups <= 0:
+        return 0.0
+    return round(100.0 * misses / lookups, 2)
+
+
+def _entry_score_ohlc_last_date(frame: pd.DataFrame) -> date | None:
+    if frame is None or getattr(frame, "empty", True):
+        return None
+    try:
+        idx = frame.index
+        if not isinstance(idx, pd.DatetimeIndex):
+            idx = pd.to_datetime(idx)
+        ts = idx.max()
+        if hasattr(ts, "date"):
+            return ts.date()
+        return pd.Timestamp(ts).date()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _entry_score_slice_as_of(frame: pd.DataFrame, as_of: date) -> pd.DataFrame | None:
+    try:
+        if not isinstance(frame.index, pd.DatetimeIndex):
+            frame = frame.copy()
+            frame.index = pd.to_datetime(frame.index)
+        day_end = pd.Timestamp(as_of) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+        sliced = frame[frame.index <= day_end]
+    except Exception:  # noqa: BLE001
+        return None
+    if sliced is None or sliced.empty:
+        return None
+    return sliced
+
+
+def _entry_score_store_put(sym: str, frame: pd.DataFrame) -> date | None:
+    """Store frame with its last bar date; return that date (or None)."""
+    last = _entry_score_ohlc_last_date(frame)
+    if last is None:
+        return None
+    with _ENTRY_SCORE_DAILY_LOCK:
+        _ENTRY_SCORE_DAILY_OHLC[sym] = (frame, last)
+    return last
+
+
+def _entry_score_mark_unavailable(sym: str, as_of: date) -> None:
+    with _ENTRY_SCORE_DAILY_LOCK:
+        _ENTRY_SCORE_OHLC_UNAVAILABLE.add((sym, as_of))
+        _ENTRY_SCORE_OHLC_STATS["misses"] = int(_ENTRY_SCORE_OHLC_STATS["misses"] or 0) + 1
 
 
 def _entry_score_forex_universe() -> tuple[str, ...]:
@@ -5789,43 +5861,8 @@ def _entry_score_forex_universe() -> tuple[str, ...]:
     return tuple(out)
 
 
-def _entry_score_get_daily_ohlc(ticker: str, as_of: date) -> pd.DataFrame | None:
-    """
-    Daily OHLC for ``ticker`` with bars ≤ ``as_of`` only (no lookahead).
-
-    Prefer chrono 1d cache peek; otherwise download once per ticker into a module
-    store and slice. Never returns future bars relative to ``as_of``.
-    """
-    sym = str(ticker or "").strip().upper()
-    if not sym:
-        return None
-    ds = as_of.isoformat()
-
-    peeked = _peek_chrono_daily_past_for_zone(sym, ds)
-    if peeked is not None and not getattr(peeked, "empty", True):
-        try:
-            frame = peeked.copy()
-            if not isinstance(frame.index, pd.DatetimeIndex):
-                frame.index = pd.to_datetime(frame.index)
-            day_end = pd.Timestamp(as_of) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
-            frame = frame[frame.index <= day_end]
-            if frame is not None and not frame.empty:
-                return frame
-        except Exception:  # noqa: BLE001
-            pass
-
-    with _ENTRY_SCORE_DAILY_LOCK:
-        cached = _ENTRY_SCORE_DAILY_OHLC.get(sym)
-    if cached is not None and not cached.empty:
-        try:
-            day_end = pd.Timestamp(as_of) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
-            frame = cached[cached.index <= day_end]
-            if frame is not None and not frame.empty and len(frame) >= 30:
-                return frame
-        except Exception:  # noqa: BLE001
-            pass
-
-    # Download a long daily history once; store full frame; callers slice by as_of.
+def _entry_score_download_daily(sym: str, as_of: date) -> pd.DataFrame | None:
+    """Download daily OHLC ending at as_of+1 day; return sorted frame or None."""
     yf_t = f"{sym}=X" if len(sym) == 6 and sym.isalpha() else sym
     start_d = date(2019, 1, 1)
     end_d = as_of + timedelta(days=1)
@@ -5839,18 +5876,78 @@ def _entry_score_get_daily_ohlc(ticker: str, as_of: date) -> pd.DataFrame | None
         frame = raw.copy()
         if not isinstance(frame.index, pd.DatetimeIndex):
             frame.index = pd.to_datetime(frame.index)
-        frame = frame.sort_index()
+        return frame.sort_index()
     except Exception:  # noqa: BLE001
         return None
+
+
+def _entry_score_get_daily_ohlc(ticker: str, as_of: date) -> pd.DataFrame | None:
+    """
+    Daily OHLC for ``ticker`` with bars ≤ ``as_of`` only (no lookahead).
+
+    Prefer chrono 1d cache peek; otherwise use the module store. The store records
+    each frame's last bar date — if ``as_of`` is past that, re-download once.
+    If a refresh still cannot reach ``as_of``, mark (sym, as_of) unavailable and
+    return None (no retry loop). Never returns a stale early-run frame for a
+    later ``as_of``.
+    """
+    sym = str(ticker or "").strip().upper()
+    if not sym:
+        return None
+
     with _ENTRY_SCORE_DAILY_LOCK:
-        prev = _ENTRY_SCORE_DAILY_OHLC.get(sym)
-        if prev is None or len(frame) >= len(prev):
-            _ENTRY_SCORE_DAILY_OHLC[sym] = frame
-        else:
-            frame = prev
-    day_end = pd.Timestamp(as_of) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
-    sliced = frame[frame.index <= day_end]
-    return sliced if sliced is not None and not sliced.empty else None
+        _ENTRY_SCORE_OHLC_STATS["lookups"] = int(_ENTRY_SCORE_OHLC_STATS["lookups"] or 0) + 1
+        if (sym, as_of) in _ENTRY_SCORE_OHLC_UNAVAILABLE:
+            _ENTRY_SCORE_OHLC_STATS["misses"] = int(_ENTRY_SCORE_OHLC_STATS["misses"] or 0) + 1
+            return None
+
+    ds = as_of.isoformat()
+    peeked = _peek_chrono_daily_past_for_zone(sym, ds)
+    if peeked is not None and not getattr(peeked, "empty", True):
+        try:
+            frame = peeked.copy()
+            sliced = _entry_score_slice_as_of(frame, as_of)
+            if sliced is not None and not sliced.empty:
+                return sliced
+        except Exception:  # noqa: BLE001
+            pass
+
+    with _ENTRY_SCORE_DAILY_LOCK:
+        cached = _ENTRY_SCORE_DAILY_OHLC.get(sym)
+    if cached is not None:
+        frame, stored_last = cached
+        if as_of <= stored_last:
+            sliced = _entry_score_slice_as_of(frame, as_of)
+            if sliced is not None and not sliced.empty and len(sliced) >= 30:
+                return sliced
+        # as_of > stored_last (or slice unusable) → must re-download; do not
+        # return the stale full-frame slice.
+    else:
+        stored_last = None
+
+    frame = _entry_score_download_daily(sym, as_of)
+    if frame is None or frame.empty:
+        _entry_score_mark_unavailable(sym, as_of)
+        return None
+
+    last = _entry_score_store_put(sym, frame)
+    if last is None or last < as_of:
+        # Refresh still does not reach as_of (weekend / holiday / delisted).
+        _entry_score_mark_unavailable(sym, as_of)
+        return None
+
+    sliced = _entry_score_slice_as_of(frame, as_of)
+    if sliced is None or sliced.empty:
+        _entry_score_mark_unavailable(sym, as_of)
+        return None
+    return sliced
+
+
+def _build_entry_scores_summary(trades: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Per-score stats plus ``entry_score_stale_or_missing_pct`` coverage field."""
+    summary: dict[str, Any] = build_scores_summary(trades)
+    summary["entry_score_stale_or_missing_pct"] = _entry_score_stale_or_missing_pct()
+    return summary
 
 
 def _attach_entry_scores_to_trade_row(row: dict[str, Any]) -> None:
@@ -14100,6 +14197,7 @@ def continuous_backtest_loop() -> None:
     _log_group1_startup_blocks()
     reset_entry_score_stats()
     log_unavailable_entry_scores()
+    _reset_entry_score_daily_cache()
     tests_since_improve = 0
     loop_completed_tests = 0
 
@@ -14802,6 +14900,7 @@ def run_chronological_backtest(
     _reset_shadow_regime_state(clear_prev=True)
     reset_entry_score_stats()
     log_unavailable_entry_scores()
+    _reset_entry_score_daily_cache()
 
     chrono_data: dict[str, Any]
     if chrono_path.is_file():
@@ -15992,7 +16091,7 @@ def run_chronological_backtest(
             chrono_data["shadow_equity_daily_stop_summary"] = eqstop_runner.summaries()
         if SHADOW_ZONE_ENABLED:
             chrono_data["shadow_zone_summary"] = zone_runner.summaries()
-        chrono_data["scores_summary"] = build_scores_summary(all_trades)
+        chrono_data["scores_summary"] = _build_entry_scores_summary(all_trades)
         if SHADOW_BLOCKED_PAIRS:
             chrono_data["shadow_instrument_summary"] = _si.compute_summary(job_id)
         _persist_shadow_guard_state(chrono_data, shadow_runner)
