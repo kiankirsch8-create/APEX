@@ -78,6 +78,11 @@ from entry_scores import (
     log_unavailable_entry_scores,
     reset_entry_score_stats,
 )
+from entry_features import (
+    append_entry_feature_record,
+    assert_entry_features_file_ok,
+    assert_feature_label_keys_disjoint,
+)
 
 set_backtest_mode(True)
 
@@ -396,6 +401,13 @@ SHADOW_FILTER_ROLLING_N = 20
 # Trail activation capital curves from existing per-trade shadow_trail_* fields
 # (no new forward sims). Live trail uses the row's pnl_dollars.
 SHADOW_TRAIL_SUMMARY_ENABLED = True
+
+# Entry-features JSONL for offline hold models.
+# Chrono always writes entry_features_{job_id}.jsonl (bounded by run length).
+# Continuous loop must NOT write a never-rotating file — that pattern filled the
+# Railway volume twice via shadow_strategy_trades.jsonl. Default off; chrono is
+# the modelling corpus.
+ENTRY_FEATURES_CONTINUOUS_ENABLED = False
 
 # ---------------------------------------------------------------------------
 # Shadow exit TYPE variants — write-only forward sims (real curve unchanged).
@@ -14957,9 +14969,11 @@ def continuous_backtest_loop() -> None:
                             isinstance(result, dict)
                             and not result.get("skipped")
                             and str(result.get("outcome", "")).upper() in ("WIN", "LOSS")
-                            and "scores" not in result
                         ):
-                            _attach_entry_scores_to_trade_row(result)
+                            if "scores" not in result:
+                                _attach_entry_scores_to_trade_row(result)
+                            if ENTRY_FEATURES_CONTINUOUS_ENABLED:
+                                append_entry_feature_record(result, job_id="continuous")
                         count = append_result(result)
                         added = count > prev_len
 
@@ -15556,6 +15570,7 @@ def run_chronological_backtest(
     reset_entry_score_stats()
     log_unavailable_entry_scores()
     _reset_entry_score_daily_cache()
+    assert_feature_label_keys_disjoint()
 
     chrono_data: dict[str, Any]
     if chrono_path.is_file():
@@ -16508,6 +16523,7 @@ def run_chronological_backtest(
                             if _zone_map:
                                 row["shadow_zone"] = _zone_map
                             _attach_entry_scores_to_trade_row(row)
+                            append_entry_feature_record(row, job_id=job_id)
                             day_trades.append(row)
                             day_pnl += pnl
                             capital += pnl
@@ -16755,6 +16771,9 @@ def run_chronological_backtest(
         if SHADOW_ZONE_ENABLED:
             chrono_data["shadow_zone_summary"] = zone_runner.summaries()
         chrono_data["scores_summary"] = _build_entry_scores_summary(all_trades)
+        chrono_data["entry_features_file"] = str(
+            assert_entry_features_file_ok(job_id).get("path") or ""
+        )
         if SHADOW_BLOCKED_PAIRS:
             chrono_data["shadow_instrument_summary"] = _si.compute_summary(job_id)
         _persist_shadow_guard_state(chrono_data, shadow_runner)
