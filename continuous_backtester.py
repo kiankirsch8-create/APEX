@@ -7738,11 +7738,13 @@ def export_results_json_array(dest: Path | None = None) -> Path:
     return out
 
 
-def append_result(result: dict[str, Any]) -> int:
+def observe_result(result: dict[str, Any], *, persist: bool = True) -> tuple[bool, int]:
     """
-    Append one backtest row if (ticker, date, timeframe) is new.
-    Sole writer to ``RESULTS_FILE`` (append-only JSONL — O(1) per call).
-    Returns new length or prior length if duplicate; 0 on hard failure.
+    Dedup a backtest row against the in-memory RESULTS_FILE index.
+
+    Returns ``(added, results_count)``. When ``persist`` is True (default), a new
+    row is appended to ``RESULTS_FILE``. When False, the key is still marked seen
+    so callers can drive live loop logic without growing the JSONL.
     """
     global _seen_result_keys, _results_count
     try:
@@ -7752,27 +7754,41 @@ def append_result(result: dict[str, Any]) -> int:
 
             key = _result_dedup_key(result)
             if key and key in _seen_result_keys:
-                return _results_count
-
-            line = json.dumps(result, default=str, separators=(",", ":")) + "\n"
-            with open(RESULTS_FILE, "a", encoding="utf-8") as f:
-                f.write(line)
+                return False, _results_count
 
             if key:
                 _seen_result_keys.add(key)
-            _results_count += 1
-            n = _results_count
-            log(
-                f"[IO] Appended result #{n}: {result.get('ticker')} "
-                f"{result.get('outcome', 'SKIP')}",
-                level="info",
-            )
-            return n
+
+            if persist:
+                line = json.dumps(result, default=str, separators=(",", ":")) + "\n"
+                with open(RESULTS_FILE, "a", encoding="utf-8") as f:
+                    f.write(line)
+                _results_count += 1
+                n = _results_count
+                log(
+                    f"[IO] Appended result #{n}: {result.get('ticker')} "
+                    f"{result.get('outcome', 'SKIP')}",
+                    level="info",
+                )
+                return True, n
+
+            # Not persisting — still a "new" observation for loop side-effects.
+            return True, _results_count
 
     except Exception as e:  # noqa: BLE001
-        log(f"[IO] append_result error: {e}", level="error")
+        log(f"[IO] observe_result error: {e}", level="error")
         log(traceback.format_exc(), level="error")
-        return 0
+        return False, 0
+
+
+def append_result(result: dict[str, Any]) -> int:
+    """
+    Append one backtest row if (ticker, date, timeframe) is new.
+    Sole writer to ``RESULTS_FILE`` (append-only JSONL — O(1) per call).
+    Returns new length or prior length if duplicate; 0 on hard failure.
+    """
+    added, n = observe_result(result, persist=True)
+    return n
 
 
 def _atr_series_wilder(df: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -15144,7 +15160,6 @@ def continuous_backtest_loop() -> None:
                                 level="info",
                             )
 
-                        prev_len = len(_load_results_list())
                         if (
                             isinstance(result, dict)
                             and not result.get("skipped")
@@ -15154,11 +15169,10 @@ def continuous_backtest_loop() -> None:
                                 _attach_entry_scores_to_trade_row(result)
                             if ENTRY_FEATURES_CONTINUOUS_ENABLED:
                                 append_entry_feature_record(result, job_id="continuous")
-                        if BACKTEST_RESULTS_LOG_ENABLED:
-                            count = append_result(result)
-                        else:
-                            count = prev_len
-                        added = count > prev_len
+                        # Dedup + live side-effects always; JSONL write only when enabled.
+                        added, count = observe_result(
+                            result, persist=BACKTEST_RESULTS_LOG_ENABLED
+                        )
 
                         if added:
                             if result.get("skipped"):
@@ -15171,7 +15185,8 @@ def continuous_backtest_loop() -> None:
                                 outcome = result.get("outcome", "?")
                                 pnl = float(result.get("pnl_dollars", 0) or 0)
                                 log(
-                                    f"[Loop] #{count} {ticker} {tf} {date}: {outcome} ${pnl:.2f}",
+                                    f"[Loop] #{count if BACKTEST_RESULTS_LOG_ENABLED else lc} "
+                                    f"{ticker} {tf} {date}: {outcome} ${pnl:.2f}",
                                     level="info",
                                 )
                                 if str(outcome).upper() in ("WIN", "LOSS"):
@@ -15186,7 +15201,13 @@ def continuous_backtest_loop() -> None:
                                     tests_since_improve = 0
                                     should_improve = True
 
-                        if added and count > 0 and count % 5 == 0:
+                        # Stats are derived from RESULTS_FILE — only refresh when we write it.
+                        if (
+                            added
+                            and BACKTEST_RESULTS_LOG_ENABLED
+                            and count > 0
+                            and count % 5 == 0
+                        ):
                             all_results = _load_results_list()
                             stats = calculate_stats(all_results)
                             save_json(STATS_FILE, stats)

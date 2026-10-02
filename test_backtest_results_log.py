@@ -111,3 +111,28 @@ def test_no_eurusd_single_pair_fallback_after_probe() -> None:
     src = inspect.getsource(cb.run_chronological_backtest)
     assert 'tickers = ["EURUSD"]' not in src
     assert "if not tickers:\n                tickers = [\"EURUSD\"]" not in src
+
+
+def test_observe_result_persist_false_still_marks_new(tmp_path: Any, monkeypatch: Any) -> None:
+    """JSONL gate must not kill dedup/`added` for continuous-loop side effects."""
+    monkeypatch.setattr(cb, "RESULTS_FILE", tmp_path / "backtest_results.jsonl")
+    monkeypatch.setattr(cb, "_seen_result_keys", None)
+    monkeypatch.setattr(cb, "_results_count", 0)
+    row = {"ticker": "EURUSD", "date": "2024-01-02", "timeframe": "1d", "outcome": "WIN"}
+    added1, n1 = cb.observe_result(row, persist=False)
+    added2, n2 = cb.observe_result(row, persist=False)
+    assert added1 is True
+    assert added2 is False
+    assert n1 == 0 and n2 == 0
+    assert not (tmp_path / "backtest_results.jsonl").exists()
+
+
+def test_observe_result_persist_true_writes_jsonl(tmp_path: Any, monkeypatch: Any) -> None:
+    monkeypatch.setattr(cb, "RESULTS_FILE", tmp_path / "backtest_results.jsonl")
+    monkeypatch.setattr(cb, "_seen_result_keys", None)
+    monkeypatch.setattr(cb, "_results_count", 0)
+    row = {"ticker": "GBPUSD", "date": "2024-01-03", "timeframe": "1d", "outcome": "LOSS"}
+    added, n = cb.observe_result(row, persist=True)
+    assert added is True and n == 1
+    text = (tmp_path / "backtest_results.jsonl").read_text(encoding="utf-8")
+    assert "GBPUSD" in text
