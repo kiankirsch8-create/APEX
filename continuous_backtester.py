@@ -8274,6 +8274,12 @@ def build_strategy_conditions_report(strategy_id: str) -> dict[str, Any]:
 _CHRONO_YF_EXCLUDED: set[str] = set()
 _CHRONO_YF_PROBE_LOGGED: set[str] = set()
 
+# If more than this fraction of tickers fail the startup Yahoo probe, treat it as a
+# data-source outage (keep the original universe) — not as a universe finding.
+YF_STARTUP_PROBE_FAIL_FRAC = 0.5
+YF_STARTUP_PROBE_RETRIES = 2
+YF_STARTUP_PROBE_RETRY_DELAY_SEC = 1.0
+
 
 def chrono_yf_symbol(sym: str) -> str:
     """Map APEX ticker → Yahoo symbol (shadow yf map, non-forex specs, or FX =X)."""
@@ -8291,24 +8297,25 @@ def chrono_yf_symbol(sym: str) -> str:
 
 
 def _probe_yf_symbol_resolves(yf_sym: str, *, ref_date: str | None = None) -> bool:
-    """One-shot Yahoo probe — daily bars in a recent window."""
+    """Yahoo probe with a short retry — one empty/failed request is weak evidence."""
     try:
         end_d = datetime.strptime((ref_date or date.today().isoformat())[:10], "%Y-%m-%d").date()
     except ValueError:
         end_d = date.today()
     start_d = end_d - timedelta(days=45)
-    df = safe_yf_download(
-        yf_sym,
-        start_d.isoformat(),
-        (end_d + timedelta(days=1)).isoformat(),
-        "1d",
-        retries=1,
-    )
-    try:
-        n = len(df) if df is not None else 0
-    except Exception:  # noqa: BLE001
-        n = 0
-    return n >= 5
+    start_s = start_d.isoformat()
+    end_s = (end_d + timedelta(days=1)).isoformat()
+    for attempt in range(YF_STARTUP_PROBE_RETRIES):
+        df = safe_yf_download(yf_sym, start_s, end_s, "1d", retries=1)
+        try:
+            n = len(df) if df is not None else 0
+        except Exception:  # noqa: BLE001
+            n = 0
+        if n >= 5:
+            return True
+        if attempt + 1 < YF_STARTUP_PROBE_RETRIES:
+            time.sleep(YF_STARTUP_PROBE_RETRY_DELAY_SEC)
+    return False
 
 
 def filter_chrono_tickers_after_yf_probe(
@@ -8316,29 +8323,97 @@ def filter_chrono_tickers_after_yf_probe(
     *,
     ref_date: str | None = None,
     context: str = "chrono",
-) -> list[str]:
+) -> tuple[list[str], dict[str, Any]]:
     """
-    Probe each ticker once at run start; exclude symbols that do not resolve at Yahoo.
+    Probe each ticker at run start; exclude symbols that do not resolve at Yahoo.
+
+    If more than ``YF_STARTUP_PROBE_FAIL_FRAC`` of tickers fail, treat it as a
+    probe/data-source failure: keep the ORIGINAL list unchanged and do not
+    populate the run-exclusion set. A bad probe must not silently redefine the
+    universe (and must never collapse to a single-pair fallback).
     """
     global _CHRONO_YF_EXCLUDED
+    original = [str(sym or "").strip().upper() for sym in tickers if str(sym or "").strip()]
+    if not original:
+        info: dict[str, Any] = {
+            "probed": 0,
+            "kept": 0,
+            "excluded": 0,
+            "probe_failure": False,
+            "excluded_tickers": [],
+            "kept_tickers": [],
+        }
+        log(
+            f"[YF STARTUP] {context}: probed=0 kept=0 excluded=0 "
+            f"(empty input — no universe to probe)",
+            level="error",
+        )
+        return [], info
+
     kept: list[str] = []
-    for sym in tickers:
-        s = str(sym or "").strip().upper()
-        if not s:
-            continue
+    failed: list[str] = []
+    failed_yf: dict[str, str] = {}
+    for s in original:
         yf_sym = chrono_yf_symbol(s)
         if _probe_yf_symbol_resolves(yf_sym, ref_date=ref_date):
-            kept.append(sym)
-            continue
+            kept.append(s)
+        else:
+            failed.append(s)
+            failed_yf[s] = yf_sym
+
+    n_total = len(original)
+    n_fail = len(failed)
+    n_kept = len(kept)
+    fail_frac = n_fail / float(n_total)
+    probe_failure = fail_frac > YF_STARTUP_PROBE_FAIL_FRAC
+
+    if probe_failure:
+        log(
+            f"[YF STARTUP] ERROR: {context} probe failed for {n_fail}/{n_total} tickers "
+            f"({fail_frac:.0%} > {YF_STARTUP_PROBE_FAIL_FRAC:.0%}) — treating as "
+            f"data-source outage; keeping ORIGINAL universe of {n_total} tickers unchanged",
+            level="error",
+        )
+        info = {
+            "probed": n_total,
+            "kept": n_total,
+            "excluded": 0,
+            "probe_failure": True,
+            "failed_probe_count": n_fail,
+            "excluded_tickers": [],
+            "kept_tickers": list(original),
+            "failed_sample": {k: failed_yf[k] for k in failed[:20]},
+        }
+        log(
+            f"[YF STARTUP] {context}: kept={n_total} excluded=0 of {n_total} "
+            f"(probe_failure=True — original universe retained)",
+            level="info",
+        )
+        return list(original), info
+
+    for s in failed:
         _CHRONO_YF_EXCLUDED.add(s)
         if s not in _CHRONO_YF_PROBE_LOGGED:
             _CHRONO_YF_PROBE_LOGGED.add(s)
             log(
                 f"[YF STARTUP] ERROR: {context} ticker {s} "
-                f"(Yahoo {yf_sym}) does not resolve — excluded for this run",
+                f"(Yahoo {failed_yf[s]}) does not resolve — excluded for this run",
                 level="error",
             )
-    return kept
+
+    info = {
+        "probed": n_total,
+        "kept": n_kept,
+        "excluded": n_fail,
+        "probe_failure": False,
+        "excluded_tickers": list(failed),
+        "kept_tickers": list(kept),
+    }
+    log(
+        f"[YF STARTUP] {context}: kept={n_kept} excluded={n_fail} of {n_total}",
+        level="info",
+    )
+    return kept, info
 
 
 def safe_yf_fetch(
@@ -15793,7 +15868,10 @@ def run_chronological_backtest(
 
         tickers = list(CHRONO_TICKERS)
         if not tickers:
-            tickers = ["EURUSD"]
+            log(
+                f"[Chrono {job_id}] ERROR: CHRONO_TICKERS is empty — refusing single-pair fallback",
+                level="error",
+            )
 
         def _shadow_yf_probe(yf_sym: str, start_s: str, end_s: str, interval: str) -> Any:
             return safe_yf_download(yf_sym, start_s, end_s, interval)
@@ -15825,13 +15903,12 @@ def run_chronological_backtest(
             _CHRONO_YF_EXCLUDED.clear()
             _CHRONO_YF_PROBE_LOGGED.clear()
             reset_cost_swap_run_warnings()
-            tickers = filter_chrono_tickers_after_yf_probe(
+            tickers, yf_probe_info = filter_chrono_tickers_after_yf_probe(
                 tickers,
                 ref_date=start_date,
                 context=f"chrono job {job_id}",
             )
-            if not tickers:
-                tickers = ["EURUSD"]
+            chrono_data["yf_startup_probe"] = yf_probe_info
             _si.reset_run_state()
             if _si.job_instruments_path(job_id).is_file():
                 _si.rebuild_histories(job_id)
