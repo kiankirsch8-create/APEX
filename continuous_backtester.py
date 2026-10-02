@@ -409,6 +409,10 @@ SHADOW_TRAIL_SUMMARY_ENABLED = True
 # the modelling corpus.
 ENTRY_FEATURES_CONTINUOUS_ENABLED = False
 
+# Continuous loop must NOT append to never-rotating backtest_results.jsonl (volume-fill risk).
+# Chrono still uses append_result; analysis corpus is chrono + entry_features JSONL.
+BACKTEST_RESULTS_LOG_ENABLED = False
+
 # ---------------------------------------------------------------------------
 # Shadow exit TYPE variants — write-only forward sims (real curve unchanged).
 #
@@ -1782,6 +1786,30 @@ def _tf_days(timeframe: str) -> float:
     return {"1w": 7.0, "1d": 1.0, "4h": 4 / 24, "1h": 1 / 24, "30m": 0.5 / 24, "15m": 0.25 / 24}.get(tf, 1.0)
 
 
+_SWAP_WARNED_TICKERS: set[str] = set()
+_COST_SPREAD_WARNED_TICKERS: set[str] = set()
+
+
+def reset_cost_swap_run_warnings() -> None:
+    """Clear per-run once-only cost/swap warning sets (chrono job start)."""
+    _SWAP_WARNED_TICKERS.clear()
+    _COST_SPREAD_WARNED_TICKERS.clear()
+
+
+def _warn_swap_once(tkr: str, message: str) -> None:
+    if tkr in _SWAP_WARNED_TICKERS:
+        return
+    _SWAP_WARNED_TICKERS.add(tkr)
+    log(message, level="warn")
+
+
+def _warn_cost_spread_once(tkr: str, message: str) -> None:
+    if tkr in _COST_SPREAD_WARNED_TICKERS:
+        return
+    _COST_SPREAD_WARNED_TICKERS.add(tkr)
+    log(message, level="warn")
+
+
 def _estimate_swap_amount(
     *,
     ticker: str,
@@ -1794,14 +1822,17 @@ def _estimate_swap_amount(
         return 0.0
     tkr = str(ticker or "").strip().upper()
     if len(tkr) != 6 or not tkr.isalpha():
-        log(f"[SWAP] no rate table entry for {tkr} — non-forex or invalid symbol", level="warn")
+        _warn_swap_once(
+            tkr,
+            f"[SWAP] no rate table entry for {tkr} — non-forex or invalid symbol",
+        )
         return 0.0
     base, quote = tkr[:3], tkr[3:6]
     if base not in SWAP_RATES or quote not in SWAP_RATES:
         missing = [c for c in (base, quote) if c not in SWAP_RATES]
-        log(
+        _warn_swap_once(
+            tkr,
             f"[SWAP] no rate table entry for {tkr} — missing {','.join(missing)}",
-            level="warn",
         )
         return 0.0
     carry = (SWAP_RATES[base] - SWAP_RATES[quote]) / 100.0
@@ -1883,7 +1914,10 @@ def _apply_realistic_costs(
     pip = _pip_size(tkr)
     spr = SPREAD_PIPS.get(tkr, SPREAD_DEFAULT_PIPS)
     if tkr not in SPREAD_PIPS:
-        log(f"[COST] no spread entry for {tkr}, using default {SPREAD_DEFAULT_PIPS}p", level="warn")
+        _warn_cost_spread_once(
+            tkr,
+            f"[COST] no spread entry for {tkr}, using default {SPREAD_DEFAULT_PIPS}p",
+        )
     spread_cost = leveraged_exposure * ((spr * pip) / entry)
     slip_cost = leveraged_exposure * ((SLIPPAGE_PIPS_ROUNDTURN * pip) / entry)
     comm_cost = COMMISSION_PER_LOT_ROUNDTURN * (position_size / 100000.0)
@@ -7704,11 +7738,13 @@ def export_results_json_array(dest: Path | None = None) -> Path:
     return out
 
 
-def append_result(result: dict[str, Any]) -> int:
+def observe_result(result: dict[str, Any], *, persist: bool = True) -> tuple[bool, int]:
     """
-    Append one backtest row if (ticker, date, timeframe) is new.
-    Sole writer to ``RESULTS_FILE`` (append-only JSONL — O(1) per call).
-    Returns new length or prior length if duplicate; 0 on hard failure.
+    Dedup a backtest row against the in-memory RESULTS_FILE index.
+
+    Returns ``(added, results_count)``. When ``persist`` is True (default), a new
+    row is appended to ``RESULTS_FILE``. When False, the key is still marked seen
+    so callers can drive live loop logic without growing the JSONL.
     """
     global _seen_result_keys, _results_count
     try:
@@ -7718,27 +7754,41 @@ def append_result(result: dict[str, Any]) -> int:
 
             key = _result_dedup_key(result)
             if key and key in _seen_result_keys:
-                return _results_count
-
-            line = json.dumps(result, default=str, separators=(",", ":")) + "\n"
-            with open(RESULTS_FILE, "a", encoding="utf-8") as f:
-                f.write(line)
+                return False, _results_count
 
             if key:
                 _seen_result_keys.add(key)
-            _results_count += 1
-            n = _results_count
-            log(
-                f"[IO] Appended result #{n}: {result.get('ticker')} "
-                f"{result.get('outcome', 'SKIP')}",
-                level="info",
-            )
-            return n
+
+            if persist:
+                line = json.dumps(result, default=str, separators=(",", ":")) + "\n"
+                with open(RESULTS_FILE, "a", encoding="utf-8") as f:
+                    f.write(line)
+                _results_count += 1
+                n = _results_count
+                log(
+                    f"[IO] Appended result #{n}: {result.get('ticker')} "
+                    f"{result.get('outcome', 'SKIP')}",
+                    level="info",
+                )
+                return True, n
+
+            # Not persisting — still a "new" observation for loop side-effects.
+            return True, _results_count
 
     except Exception as e:  # noqa: BLE001
-        log(f"[IO] append_result error: {e}", level="error")
+        log(f"[IO] observe_result error: {e}", level="error")
         log(traceback.format_exc(), level="error")
-        return 0
+        return False, 0
+
+
+def append_result(result: dict[str, Any]) -> int:
+    """
+    Append one backtest row if (ticker, date, timeframe) is new.
+    Sole writer to ``RESULTS_FILE`` (append-only JSONL — O(1) per call).
+    Returns new length or prior length if duplicate; 0 on hard failure.
+    """
+    added, n = observe_result(result, persist=True)
+    return n
 
 
 def _atr_series_wilder(df: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -8237,6 +8287,151 @@ def build_strategy_conditions_report(strategy_id: str) -> dict[str, Any]:
     return {"strategy_id": sid, "buckets": breakdown, "bucket_count": len(breakdown)}
 
 
+_CHRONO_YF_EXCLUDED: set[str] = set()
+_CHRONO_YF_PROBE_LOGGED: set[str] = set()
+
+# If more than this fraction of tickers fail the startup Yahoo probe, treat it as a
+# data-source outage (keep the original universe) — not as a universe finding.
+YF_STARTUP_PROBE_FAIL_FRAC = 0.5
+YF_STARTUP_PROBE_RETRIES = 2
+YF_STARTUP_PROBE_RETRY_DELAY_SEC = 1.0
+
+
+def chrono_yf_symbol(sym: str) -> str:
+    """Map APEX ticker → Yahoo symbol (shadow yf map, non-forex specs, or FX =X)."""
+    s = str(sym or "").strip().upper()
+    if not s:
+        return s
+    yf_map = _si._shadow_universe.get("yf_by_ticker", {})
+    if s in yf_map:
+        return str(yf_map[s])
+    if _si.SHADOW_NONFX_ENABLED and s in _si.SHADOW_NONFX_SPECS:
+        return str(_si.SHADOW_NONFX_SPECS[s]["source"])
+    if len(s) == 6 and s.isalpha() and s not in _si.SHADOW_NONFX_SPECS:
+        return f"{s}=X"
+    return s
+
+
+def _probe_yf_symbol_resolves(yf_sym: str, *, ref_date: str | None = None) -> bool:
+    """Yahoo probe with a short retry — one empty/failed request is weak evidence."""
+    try:
+        end_d = datetime.strptime((ref_date or date.today().isoformat())[:10], "%Y-%m-%d").date()
+    except ValueError:
+        end_d = date.today()
+    start_d = end_d - timedelta(days=45)
+    start_s = start_d.isoformat()
+    end_s = (end_d + timedelta(days=1)).isoformat()
+    for attempt in range(YF_STARTUP_PROBE_RETRIES):
+        df = safe_yf_download(yf_sym, start_s, end_s, "1d", retries=1)
+        try:
+            n = len(df) if df is not None else 0
+        except Exception:  # noqa: BLE001
+            n = 0
+        if n >= 5:
+            return True
+        if attempt + 1 < YF_STARTUP_PROBE_RETRIES:
+            time.sleep(YF_STARTUP_PROBE_RETRY_DELAY_SEC)
+    return False
+
+
+def filter_chrono_tickers_after_yf_probe(
+    tickers: list[str],
+    *,
+    ref_date: str | None = None,
+    context: str = "chrono",
+) -> tuple[list[str], dict[str, Any]]:
+    """
+    Probe each ticker at run start; exclude symbols that do not resolve at Yahoo.
+
+    If more than ``YF_STARTUP_PROBE_FAIL_FRAC`` of tickers fail, treat it as a
+    probe/data-source failure: keep the ORIGINAL list unchanged and do not
+    populate the run-exclusion set. A bad probe must not silently redefine the
+    universe (and must never collapse to a single-pair fallback).
+    """
+    global _CHRONO_YF_EXCLUDED
+    original = [str(sym or "").strip().upper() for sym in tickers if str(sym or "").strip()]
+    if not original:
+        info: dict[str, Any] = {
+            "probed": 0,
+            "kept": 0,
+            "excluded": 0,
+            "probe_failure": False,
+            "excluded_tickers": [],
+            "kept_tickers": [],
+        }
+        log(
+            f"[YF STARTUP] {context}: probed=0 kept=0 excluded=0 "
+            f"(empty input — no universe to probe)",
+            level="error",
+        )
+        return [], info
+
+    kept: list[str] = []
+    failed: list[str] = []
+    failed_yf: dict[str, str] = {}
+    for s in original:
+        yf_sym = chrono_yf_symbol(s)
+        if _probe_yf_symbol_resolves(yf_sym, ref_date=ref_date):
+            kept.append(s)
+        else:
+            failed.append(s)
+            failed_yf[s] = yf_sym
+
+    n_total = len(original)
+    n_fail = len(failed)
+    n_kept = len(kept)
+    fail_frac = n_fail / float(n_total)
+    probe_failure = fail_frac > YF_STARTUP_PROBE_FAIL_FRAC
+
+    if probe_failure:
+        log(
+            f"[YF STARTUP] ERROR: {context} probe failed for {n_fail}/{n_total} tickers "
+            f"({fail_frac:.0%} > {YF_STARTUP_PROBE_FAIL_FRAC:.0%}) — treating as "
+            f"data-source outage; keeping ORIGINAL universe of {n_total} tickers unchanged",
+            level="error",
+        )
+        info = {
+            "probed": n_total,
+            "kept": n_total,
+            "excluded": 0,
+            "probe_failure": True,
+            "failed_probe_count": n_fail,
+            "excluded_tickers": [],
+            "kept_tickers": list(original),
+            "failed_sample": {k: failed_yf[k] for k in failed[:20]},
+        }
+        log(
+            f"[YF STARTUP] {context}: kept={n_total} excluded=0 of {n_total} "
+            f"(probe_failure=True — original universe retained)",
+            level="info",
+        )
+        return list(original), info
+
+    for s in failed:
+        _CHRONO_YF_EXCLUDED.add(s)
+        if s not in _CHRONO_YF_PROBE_LOGGED:
+            _CHRONO_YF_PROBE_LOGGED.add(s)
+            log(
+                f"[YF STARTUP] ERROR: {context} ticker {s} "
+                f"(Yahoo {failed_yf[s]}) does not resolve — excluded for this run",
+                level="error",
+            )
+
+    info = {
+        "probed": n_total,
+        "kept": n_kept,
+        "excluded": n_fail,
+        "probe_failure": False,
+        "excluded_tickers": list(failed),
+        "kept_tickers": list(kept),
+    }
+    log(
+        f"[YF STARTUP] {context}: kept={n_kept} excluded={n_fail} of {n_total}",
+        level="info",
+    )
+    return kept, info
+
+
 def safe_yf_fetch(
     yf_ticker: str,
     start: str,
@@ -8431,8 +8626,9 @@ def _chrono_prefetch_ohlc_for_phase_matrix(
 
             def _warm_one(sym: str) -> None:
                 s = (sym or "").strip().upper()
-                is_fx = len(s) == 6 and s.isalpha()
-                yf_t = s + "=X" if is_fx else s
+                if s in _CHRONO_YF_EXCLUDED:
+                    return
+                yf_t = chrono_yf_symbol(s)
                 ck = (yf_t.strip().upper(), tf_key_pf, date_str.strip()[:10])
                 try:
                     past_f, fut_f = _get_ohlcv_download_impl(
@@ -14964,7 +15160,6 @@ def continuous_backtest_loop() -> None:
                                 level="info",
                             )
 
-                        prev_len = len(_load_results_list())
                         if (
                             isinstance(result, dict)
                             and not result.get("skipped")
@@ -14974,8 +15169,10 @@ def continuous_backtest_loop() -> None:
                                 _attach_entry_scores_to_trade_row(result)
                             if ENTRY_FEATURES_CONTINUOUS_ENABLED:
                                 append_entry_feature_record(result, job_id="continuous")
-                        count = append_result(result)
-                        added = count > prev_len
+                        # Dedup + live side-effects always; JSONL write only when enabled.
+                        added, count = observe_result(
+                            result, persist=BACKTEST_RESULTS_LOG_ENABLED
+                        )
 
                         if added:
                             if result.get("skipped"):
@@ -14988,7 +15185,8 @@ def continuous_backtest_loop() -> None:
                                 outcome = result.get("outcome", "?")
                                 pnl = float(result.get("pnl_dollars", 0) or 0)
                                 log(
-                                    f"[Loop] #{count} {ticker} {tf} {date}: {outcome} ${pnl:.2f}",
+                                    f"[Loop] #{count if BACKTEST_RESULTS_LOG_ENABLED else lc} "
+                                    f"{ticker} {tf} {date}: {outcome} ${pnl:.2f}",
                                     level="info",
                                 )
                                 if str(outcome).upper() in ("WIN", "LOSS"):
@@ -15003,7 +15201,13 @@ def continuous_backtest_loop() -> None:
                                     tests_since_improve = 0
                                     should_improve = True
 
-                        if added and count > 0 and count % 5 == 0:
+                        # Stats are derived from RESULTS_FILE — only refresh when we write it.
+                        if (
+                            added
+                            and BACKTEST_RESULTS_LOG_ENABLED
+                            and count > 0
+                            and count % 5 == 0
+                        ):
                             all_results = _load_results_list()
                             stats = calculate_stats(all_results)
                             save_json(STATS_FILE, stats)
@@ -15685,7 +15889,10 @@ def run_chronological_backtest(
 
         tickers = list(CHRONO_TICKERS)
         if not tickers:
-            tickers = ["EURUSD"]
+            log(
+                f"[Chrono {job_id}] ERROR: CHRONO_TICKERS is empty — refusing single-pair fallback",
+                level="error",
+            )
 
         def _shadow_yf_probe(yf_sym: str, start_s: str, end_s: str, interval: str) -> Any:
             return safe_yf_download(yf_sym, start_s, end_s, interval)
@@ -15714,6 +15921,15 @@ def run_chronological_backtest(
             for extra in _si.extra_chrono_tickers():
                 if extra not in tickers:
                     tickers.append(extra)
+            _CHRONO_YF_EXCLUDED.clear()
+            _CHRONO_YF_PROBE_LOGGED.clear()
+            reset_cost_swap_run_warnings()
+            tickers, yf_probe_info = filter_chrono_tickers_after_yf_probe(
+                tickers,
+                ref_date=start_date,
+                context=f"chrono job {job_id}",
+            )
+            chrono_data["yf_startup_probe"] = yf_probe_info
             _si.reset_run_state()
             if _si.job_instruments_path(job_id).is_file():
                 _si.rebuild_histories(job_id)

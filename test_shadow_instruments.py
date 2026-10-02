@@ -85,14 +85,14 @@ def test_compute_summary_streams_jsonl(tmp_path: Path, monkeypatch: Any) -> None
 
 def test_instrument_sizing_contracts() -> None:
     ai: dict = {"stop_loss": 99.0}
-    spec = si.SHADOW_INSTRUMENTS["ES"]
+    spec = si.SHADOW_NONFX_SPECS["ES"]
     si.apply_instrument_sizing(ai, spec=spec, entry=100.0, risk_dollars=100.0)
     assert ai["_instrument_contracts"] > 0
     assert ai["_max_risk_dollars"] == 100.0
 
 
 def test_cfd_financing_sign_long_pays_short_receives() -> None:
-    spec = dict(si.SHADOW_INSTRUMENTS["XAUUSD"])
+    spec = dict(si.SHADOW_NONFX_SPECS["XAUUSD"])
     notional = 100_000.0
     nights = 10.0
     long_net, _, long_costs = si.apply_instrument_costs(
@@ -129,6 +129,37 @@ def test_fx_pair_candidates_majors_only() -> None:
         for pair in pairs
     )
     assert "USDMXN" not in pairs
+
+
+def test_nonfx_shadow_disabled_by_default(monkeypatch: Any) -> None:
+    assert si.SHADOW_NONFX_ENABLED is False
+    assert si.SHADOW_INSTRUMENTS == {}
+    monkeypatch.setattr(si, "PART1_DATA_EXCLUDED_FX", frozenset())
+    nonfx_calls: list[str] = []
+
+    def fake_nonfx(ticker: str, *args: Any, **kwargs: Any) -> tuple[bool, str, bool]:
+        nonfx_calls.append(ticker)
+        return True, "ok", False
+
+    monkeypatch.setattr(si, "_test_non_forex_ohlc", fake_nonfx)
+    monkeypatch.setattr(
+        si,
+        "_probe_fx_ohlc_cached",
+        lambda *a, **k: (False, "nope", False),
+    )
+    monkeypatch.setattr(si, "time", type("T", (), {"sleep": staticmethod(lambda _: None)})())
+    discovery = si.init_shadow_universe(
+        start_date="2021-01-01",
+        end_date="2025-01-01",
+        blocked_pairs=frozenset(),
+        excluded_pairs=frozenset(),
+        real_chrono_tickers=frozenset(),
+        yf_download_fn=lambda *a, **k: None,
+        hourly_earliest_fn=lambda: date(2020, 1, 1),
+        enabled=True,
+    )
+    assert nonfx_calls == []
+    assert discovery["non_forex_loaded"] == 0
 
 
 def test_extra_fx_disabled_by_default(monkeypatch: Any) -> None:
