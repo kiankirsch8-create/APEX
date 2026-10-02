@@ -409,6 +409,10 @@ SHADOW_TRAIL_SUMMARY_ENABLED = True
 # the modelling corpus.
 ENTRY_FEATURES_CONTINUOUS_ENABLED = False
 
+# Continuous loop must NOT append to never-rotating backtest_results.jsonl (volume-fill risk).
+# Chrono still uses append_result; analysis corpus is chrono + entry_features JSONL.
+BACKTEST_RESULTS_LOG_ENABLED = False
+
 # ---------------------------------------------------------------------------
 # Shadow exit TYPE variants — write-only forward sims (real curve unchanged).
 #
@@ -1782,6 +1786,30 @@ def _tf_days(timeframe: str) -> float:
     return {"1w": 7.0, "1d": 1.0, "4h": 4 / 24, "1h": 1 / 24, "30m": 0.5 / 24, "15m": 0.25 / 24}.get(tf, 1.0)
 
 
+_SWAP_WARNED_TICKERS: set[str] = set()
+_COST_SPREAD_WARNED_TICKERS: set[str] = set()
+
+
+def reset_cost_swap_run_warnings() -> None:
+    """Clear per-run once-only cost/swap warning sets (chrono job start)."""
+    _SWAP_WARNED_TICKERS.clear()
+    _COST_SPREAD_WARNED_TICKERS.clear()
+
+
+def _warn_swap_once(tkr: str, message: str) -> None:
+    if tkr in _SWAP_WARNED_TICKERS:
+        return
+    _SWAP_WARNED_TICKERS.add(tkr)
+    log(message, level="warn")
+
+
+def _warn_cost_spread_once(tkr: str, message: str) -> None:
+    if tkr in _COST_SPREAD_WARNED_TICKERS:
+        return
+    _COST_SPREAD_WARNED_TICKERS.add(tkr)
+    log(message, level="warn")
+
+
 def _estimate_swap_amount(
     *,
     ticker: str,
@@ -1794,14 +1822,17 @@ def _estimate_swap_amount(
         return 0.0
     tkr = str(ticker or "").strip().upper()
     if len(tkr) != 6 or not tkr.isalpha():
-        log(f"[SWAP] no rate table entry for {tkr} — non-forex or invalid symbol", level="warn")
+        _warn_swap_once(
+            tkr,
+            f"[SWAP] no rate table entry for {tkr} — non-forex or invalid symbol",
+        )
         return 0.0
     base, quote = tkr[:3], tkr[3:6]
     if base not in SWAP_RATES or quote not in SWAP_RATES:
         missing = [c for c in (base, quote) if c not in SWAP_RATES]
-        log(
+        _warn_swap_once(
+            tkr,
             f"[SWAP] no rate table entry for {tkr} — missing {','.join(missing)}",
-            level="warn",
         )
         return 0.0
     carry = (SWAP_RATES[base] - SWAP_RATES[quote]) / 100.0
@@ -1883,7 +1914,10 @@ def _apply_realistic_costs(
     pip = _pip_size(tkr)
     spr = SPREAD_PIPS.get(tkr, SPREAD_DEFAULT_PIPS)
     if tkr not in SPREAD_PIPS:
-        log(f"[COST] no spread entry for {tkr}, using default {SPREAD_DEFAULT_PIPS}p", level="warn")
+        _warn_cost_spread_once(
+            tkr,
+            f"[COST] no spread entry for {tkr}, using default {SPREAD_DEFAULT_PIPS}p",
+        )
     spread_cost = leveraged_exposure * ((spr * pip) / entry)
     slip_cost = leveraged_exposure * ((SLIPPAGE_PIPS_ROUNDTURN * pip) / entry)
     comm_cost = COMMISSION_PER_LOT_ROUNDTURN * (position_size / 100000.0)
@@ -8237,6 +8271,76 @@ def build_strategy_conditions_report(strategy_id: str) -> dict[str, Any]:
     return {"strategy_id": sid, "buckets": breakdown, "bucket_count": len(breakdown)}
 
 
+_CHRONO_YF_EXCLUDED: set[str] = set()
+_CHRONO_YF_PROBE_LOGGED: set[str] = set()
+
+
+def chrono_yf_symbol(sym: str) -> str:
+    """Map APEX ticker → Yahoo symbol (shadow yf map, non-forex specs, or FX =X)."""
+    s = str(sym or "").strip().upper()
+    if not s:
+        return s
+    yf_map = _si._shadow_universe.get("yf_by_ticker", {})
+    if s in yf_map:
+        return str(yf_map[s])
+    if _si.SHADOW_NONFX_ENABLED and s in _si.SHADOW_NONFX_SPECS:
+        return str(_si.SHADOW_NONFX_SPECS[s]["source"])
+    if len(s) == 6 and s.isalpha() and s not in _si.SHADOW_NONFX_SPECS:
+        return f"{s}=X"
+    return s
+
+
+def _probe_yf_symbol_resolves(yf_sym: str, *, ref_date: str | None = None) -> bool:
+    """One-shot Yahoo probe — daily bars in a recent window."""
+    try:
+        end_d = datetime.strptime((ref_date or date.today().isoformat())[:10], "%Y-%m-%d").date()
+    except ValueError:
+        end_d = date.today()
+    start_d = end_d - timedelta(days=45)
+    df = safe_yf_download(
+        yf_sym,
+        start_d.isoformat(),
+        (end_d + timedelta(days=1)).isoformat(),
+        "1d",
+        retries=1,
+    )
+    try:
+        n = len(df) if df is not None else 0
+    except Exception:  # noqa: BLE001
+        n = 0
+    return n >= 5
+
+
+def filter_chrono_tickers_after_yf_probe(
+    tickers: list[str],
+    *,
+    ref_date: str | None = None,
+    context: str = "chrono",
+) -> list[str]:
+    """
+    Probe each ticker once at run start; exclude symbols that do not resolve at Yahoo.
+    """
+    global _CHRONO_YF_EXCLUDED
+    kept: list[str] = []
+    for sym in tickers:
+        s = str(sym or "").strip().upper()
+        if not s:
+            continue
+        yf_sym = chrono_yf_symbol(s)
+        if _probe_yf_symbol_resolves(yf_sym, ref_date=ref_date):
+            kept.append(sym)
+            continue
+        _CHRONO_YF_EXCLUDED.add(s)
+        if s not in _CHRONO_YF_PROBE_LOGGED:
+            _CHRONO_YF_PROBE_LOGGED.add(s)
+            log(
+                f"[YF STARTUP] ERROR: {context} ticker {s} "
+                f"(Yahoo {yf_sym}) does not resolve — excluded for this run",
+                level="error",
+            )
+    return kept
+
+
 def safe_yf_fetch(
     yf_ticker: str,
     start: str,
@@ -8431,8 +8535,9 @@ def _chrono_prefetch_ohlc_for_phase_matrix(
 
             def _warm_one(sym: str) -> None:
                 s = (sym or "").strip().upper()
-                is_fx = len(s) == 6 and s.isalpha()
-                yf_t = s + "=X" if is_fx else s
+                if s in _CHRONO_YF_EXCLUDED:
+                    return
+                yf_t = chrono_yf_symbol(s)
                 ck = (yf_t.strip().upper(), tf_key_pf, date_str.strip()[:10])
                 try:
                     past_f, fut_f = _get_ohlcv_download_impl(
@@ -14974,7 +15079,10 @@ def continuous_backtest_loop() -> None:
                                 _attach_entry_scores_to_trade_row(result)
                             if ENTRY_FEATURES_CONTINUOUS_ENABLED:
                                 append_entry_feature_record(result, job_id="continuous")
-                        count = append_result(result)
+                        if BACKTEST_RESULTS_LOG_ENABLED:
+                            count = append_result(result)
+                        else:
+                            count = prev_len
                         added = count > prev_len
 
                         if added:
@@ -15714,6 +15822,16 @@ def run_chronological_backtest(
             for extra in _si.extra_chrono_tickers():
                 if extra not in tickers:
                     tickers.append(extra)
+            _CHRONO_YF_EXCLUDED.clear()
+            _CHRONO_YF_PROBE_LOGGED.clear()
+            reset_cost_swap_run_warnings()
+            tickers = filter_chrono_tickers_after_yf_probe(
+                tickers,
+                ref_date=start_date,
+                context=f"chrono job {job_id}",
+            )
+            if not tickers:
+                tickers = ["EURUSD"]
             _si.reset_run_state()
             if _si.job_instruments_path(job_id).is_file():
                 _si.rebuild_histories(job_id)

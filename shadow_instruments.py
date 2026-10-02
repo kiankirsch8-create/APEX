@@ -14,7 +14,10 @@ from typing import Any, Iterator, Mapping
 from utils import DATA_DIR, log
 
 # ── ESTIMATED non-forex specs (correct here only) ─────────────────────────────
-SHADOW_INSTRUMENTS: dict[str, dict[str, Any]] = {
+# Disabled until Yahoo symbols + cost model are verified — see job 712e9f9d logs.
+SHADOW_NONFX_ENABLED = False
+
+SHADOW_NONFX_SPECS: dict[str, dict[str, Any]] = {
     "XAUUSD": {
         "source": "GC=F",
         "contract_size": 100,
@@ -50,6 +53,15 @@ SHADOW_INSTRUMENTS: dict[str, dict[str, Any]] = {
         "commission_per_contract": 2.50,
     },
 }
+
+# Active non-forex shadow universe (empty while SHADOW_NONFX_ENABLED is False).
+SHADOW_INSTRUMENTS: dict[str, dict[str, Any]] = (
+    dict(SHADOW_NONFX_SPECS) if SHADOW_NONFX_ENABLED else {}
+)
+
+
+def _active_nonfx_specs() -> dict[str, dict[str, Any]]:
+    return dict(SHADOW_NONFX_SPECS) if SHADOW_NONFX_ENABLED else {}
 
 SHADOW_INSTRUMENTS_FILE = DATA_DIR / "shadow_instruments.jsonl"  # legacy; prefer per-job path
 SHADOW_BLOCKED_PAIRS_FILE = DATA_DIR / "shadow_blocked_pairs.jsonl"  # legacy; prefer per-job path
@@ -228,8 +240,8 @@ def yf_symbol_for(sym: str) -> str:
     yf_map = _shadow_universe.get("yf_by_ticker", {})
     if sym_u in yf_map:
         return str(yf_map[sym_u])
-    if sym_u in SHADOW_INSTRUMENTS:
-        return str(SHADOW_INSTRUMENTS[sym_u]["source"])
+    if sym_u in SHADOW_NONFX_SPECS and SHADOW_NONFX_ENABLED:
+        return str(SHADOW_NONFX_SPECS[sym_u]["source"])
     if len(sym_u) == 6 and sym_u.isalpha():
         return f"{sym_u}=X"
     return sym_u
@@ -237,8 +249,8 @@ def yf_symbol_for(sym: str) -> str:
 
 def instrument_spec_for(sym: str) -> dict[str, Any] | None:
     sym_u = str(sym).strip().upper()
-    if sym_u in SHADOW_INSTRUMENTS:
-        return dict(SHADOW_INSTRUMENTS[sym_u])
+    if sym_u in SHADOW_NONFX_SPECS and SHADOW_NONFX_ENABLED:
+        return dict(SHADOW_NONFX_SPECS[sym_u])
     return None
 
 
@@ -407,7 +419,7 @@ def persist_shadow_trade(row: dict[str, Any], *, job_id: str) -> None:
     reason = shadow_reason_for_ticker(sym) or out.get("shadow_reason")
     if reason:
         out["shadow_reason"] = reason
-    out["spec_estimated"] = bool(sym in SHADOW_INSTRUMENTS)
+    out["spec_estimated"] = bool(SHADOW_NONFX_ENABLED and sym in SHADOW_NONFX_SPECS)
     mrd = float(out.get("max_risk_dollars", 0) or 0)
     pnl = float(out.get("pnl_dollars", 0) or 0)
     out["pnl_r"] = round(pnl / mrd, 6) if mrd > 0 else 0.0
@@ -438,7 +450,7 @@ def trade_fields_for_row(sym: str) -> dict[str, Any]:
     fields: dict[str, Any] = {
         "shadow_instrument": str(sym).strip().upper(),
         "shadow_class": sc,
-        "spec_estimated": sym in SHADOW_INSTRUMENTS,
+        "spec_estimated": bool(SHADOW_NONFX_ENABLED and sym in SHADOW_NONFX_SPECS),
     }
     reason = shadow_reason_for_ticker(sym)
     if reason:
@@ -464,7 +476,7 @@ def assert_blocked_pairs_have_trades(
         t
         for t in blocked_pairs
         if str(t).strip().upper() in loaded
-        and str(t).strip().upper() not in SHADOW_INSTRUMENTS
+        and str(t).strip().upper() not in SHADOW_NONFX_SPECS
     )
     if not expected:
         return []
@@ -796,7 +808,7 @@ def init_shadow_universe(
         "tickers": set(),
         "class_by_ticker": {},
         "yf_by_ticker": {},
-        "spec_by_ticker": {k: dict(v) for k, v in SHADOW_INSTRUMENTS.items()},
+        "spec_by_ticker": {k: dict(v) for k, v in _active_nonfx_specs().items()},
         "reason_by_ticker": {},
         "failed": {},
         "provisional_futures": set(),
@@ -830,7 +842,7 @@ def init_shadow_universe(
 
     part1 = set(blocked_pairs) | set(PART1_DATA_EXCLUDED_FX)
     for pair in sorted(part1):
-        if pair in SHADOW_INSTRUMENTS:
+        if pair in SHADOW_NONFX_SPECS:
             continue
         tested += 1
         ok, reason, probed = _probe_fx_ohlc_cached(
@@ -910,7 +922,7 @@ def init_shadow_universe(
         _save_probe_cache(probe_cache)
 
     loaded_nf = 0
-    for ticker, spec in SHADOW_INSTRUMENTS.items():
+    for ticker, spec in _active_nonfx_specs().items():
         tested += 1
         ok, reason, provisional = _test_non_forex_ohlc(
             ticker,
@@ -1009,6 +1021,8 @@ def restore_universe_from_saved(
     yf_by: dict[str, str] = {}
     reason_by: dict[str, str] = {}
     for sym in loaded:
+        if not SHADOW_NONFX_ENABLED and sym in SHADOW_NONFX_SPECS:
+            continue
         tickers.add(sym)
         if sym in blocked_pairs or sym in PART1_DATA_EXCLUDED_FX:
             class_by[sym] = "blocked_fx"
@@ -1017,9 +1031,9 @@ def restore_universe_from_saved(
                 reason_by[sym] = "BLOCKED_PAIR"
             else:
                 reason_by[sym] = "EXCLUDED_PAIR"
-        elif sym in SHADOW_INSTRUMENTS:
+        elif sym in SHADOW_NONFX_SPECS and SHADOW_NONFX_ENABLED:
             class_by[sym] = "index_future" if sym in ("ES", "NQ") else "commodity"
-            yf_by[sym] = str(SHADOW_INSTRUMENTS[sym]["source"])
+            yf_by[sym] = str(SHADOW_NONFX_SPECS[sym]["source"])
             reason_by[sym] = "INDEX_FUTURE" if sym in ("ES", "NQ") else "COMMODITY"
         else:
             class_by[sym] = "extra_fx"
@@ -1032,7 +1046,7 @@ def restore_universe_from_saved(
         "tickers": tickers,
         "class_by_ticker": class_by,
         "yf_by_ticker": yf_by,
-        "spec_by_ticker": {k: dict(v) for k, v in SHADOW_INSTRUMENTS.items()},
+        "spec_by_ticker": {k: dict(v) for k, v in _active_nonfx_specs().items()},
         "reason_by_ticker": reason_by,
         "failed": dict(discovery.get("failed_sample") or {}),
         "provisional_futures": provisional,
