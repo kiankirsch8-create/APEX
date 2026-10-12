@@ -7,7 +7,10 @@ import continuous_backtester as cb
 
 
 def test_shadow_guard_config_count() -> None:
-    assert len(cb.SHADOW_GUARD_CONFIGS) == 23
+    # 23 classic + 3 Group E simple variants (A/B/C)
+    assert len(cb.SHADOW_GUARD_CONFIGS) == 26
+    for vid in cb.SHADOW_SIMPLE_GUARD_VARIANT_IDS:
+        assert vid in cb.SHADOW_GUARD_CONFIGS
 
 
 def test_shadow_runner_parallel_curves() -> None:
@@ -27,10 +30,13 @@ def test_shadow_runner_parallel_curves() -> None:
     maps = runner.process_trade(ctx)
     assert "ramp40_025" in maps
     assert "full_stack" in maps
+    assert "variant_a_step" in maps
+    assert "variant_b_smooth_taper" in maps
+    assert "variant_c_full_stack" in maps
     assert "compound_050_bare" in maps
     assert "compound_050_full" in maps
     guard, compound, event = cb._split_shadow_trade_maps(maps)
-    assert len(guard) == 23
+    assert len(guard) == 26
     assert len(compound) == len(cb.SHADOW_COMPOUND_RISK_FRACTIONS) * 2
     assert len(event) == len(cb.SHADOW_EVENT_CONFIGS)
     assert maps["ramp40_025"]["blocked"] is False

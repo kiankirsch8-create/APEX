@@ -226,7 +226,13 @@ DRY_RUN = os.environ.get("APEX_V76_PRIVATE_DRY_RUN", "true").strip().lower() in 
 # Keep PROFILE="private" for live capital. Funded multipliers are also computed
 # as write-only ``shadow_funded_*`` fields for forward evidence — do not point
 # real capital at PROFILE="funded" until that evidence is reviewed.
+#
+# Group E / PR13 — funded compounds at 0.20–0.30% risk fraction. The full
+# guardrail stack stays shadow-first (``apply_live_guardrails=False``) until
+# forward evidence lands; never go live with bare compounding (no guardrails).
 PROFILE = "private"  # "private" | "funded"
+FUNDED_COMPOUND_RISK_MIN = 0.002  # 0.20%
+FUNDED_COMPOUND_RISK_MAX = 0.003  # 0.30%
 PROFILES: dict[str, dict[str, Any]] = {
     "private": {
         "cold_start_min_trades": 0,  # disabled
@@ -240,6 +246,7 @@ PROFILES: dict[str, dict[str, Any]] = {
         "warmup_multiplier": 1.0,
         "compounding_enabled": False,
         "compound_risk_fraction": None,
+        "apply_live_guardrails": True,  # no-op via None/0/empty levers above
     },
     "funded": {
         "cold_start_min_trades": 5,
@@ -251,12 +258,28 @@ PROFILES: dict[str, dict[str, Any]] = {
         "dry_run_after_losing_days": 3,
         "warmup_days": 40,
         "warmup_multiplier": 0.25,
-        # Shadow compound_020_full: -7.63% max DD / -1.71% worst day with guardrails.
+        # Compounding in the 0.20–0.30% band; bundle with full stack when live
+        # guardrails are eventually enabled. Bare 0.20% failed (~10.54% DD).
         "compounding_enabled": True,
         "compound_risk_fraction": 0.002,  # 0.20% of current equity per trade
+        # Change B — full stack does not drive live sizing until evidence reviewed.
+        "apply_live_guardrails": False,
     },
 }
 CFG: dict[str, Any] = PROFILES[PROFILE]
+
+
+def clamp_funded_compound_fraction(frac: float | None) -> float | None:
+    """Clamp a risk fraction into the funded 0.20–0.30% band (or None)."""
+    if frac is None:
+        return None
+    try:
+        f = float(frac)
+    except (TypeError, ValueError):
+        return None
+    if f <= 0:
+        return None
+    return max(FUNDED_COMPOUND_RISK_MIN, min(FUNDED_COMPOUND_RISK_MAX, f))
 
 SCAN_HOURS = at.SCAN_HOURS
 TIMEFRAMES: tuple[str, ...] = ("1w", "1d", "4h")
@@ -955,6 +978,22 @@ def _resolve_guard_mode(
     return "NORMAL"
 
 
+def _compound_risk_from_cfg(cfg: Mapping[str, Any], equity: float) -> float | None:
+    """Equity × clamped compound fraction when compounding is enabled; else None."""
+    if not cfg.get("compounding_enabled"):
+        return None
+    frac = clamp_funded_compound_fraction(cfg.get("compound_risk_fraction"))
+    if frac is None:
+        return None
+    try:
+        eq = float(equity)
+    except (TypeError, ValueError):
+        return None
+    if eq <= 0:
+        return None
+    return round(eq * float(frac), 2)
+
+
 def apply_cfg_guardrails(
     plan: TradePlan,
     *,
@@ -965,8 +1004,11 @@ def apply_cfg_guardrails(
     scan_d: date,
 ) -> dict[str, Any]:
     """
-    Apply CFG guardrails on top of A+B-throttled ``plan.risk_usd``.
-    Private profile (None/0/empty) is a no-op. Returns log fields + allow flag.
+    Apply CFG compounding / guardrails on top of A+B-throttled ``plan.risk_usd``.
+
+    Private profile (None/0/empty levers) is a no-op on size. Funded profile
+    compounds at the configured fraction; the full guardrail stack applies to
+    live sizing only when ``apply_live_guardrails`` is True (shadow-first default).
     """
     _ensure_live_sizing_health_rebuilt()
     post_ab = float(plan.risk_usd or 0)
@@ -983,6 +1025,7 @@ def apply_cfg_guardrails(
     except (TypeError, ValueError):
         day_real = 0.0
 
+    live_guards = bool(CFG.get("apply_live_guardrails", True))
     m = _cfg_guardrail_multipliers(
         cfg=CFG,
         st=st,
@@ -990,44 +1033,52 @@ def apply_cfg_guardrails(
         equity=eq,
         scan_d=scan_d,
     )
-    risk = post_ab * m["warmup_mult"] * m["cold_start_mult"] * m["dd_ladder_mult"]
 
-    # Per-trade loss cap: reduce size only — never widen the stop.
-    cap_pct = CFG.get("per_trade_loss_cap_pct")
+    # Base risk: compounding (funded) replaces post-AB dollars when enabled.
+    compound_risk = _compound_risk_from_cfg(CFG, eq)
+    compound_applied = compound_risk is not None
+    base_risk = float(compound_risk) if compound_applied else post_ab
+
+    risk = float(base_risk)
     cap_applied = 1.0
-    if cap_pct is not None and eq > 0:
-        try:
-            max_risk = eq * float(cap_pct) / 100.0
-        except (TypeError, ValueError):
-            max_risk = risk
-        if max_risk >= 0 and risk > max_risk and risk > 0:
-            cap_applied = max_risk / risk
-            risk = max_risk
+    daily_stopped = False
+    if live_guards:
+        risk = base_risk * m["warmup_mult"] * m["cold_start_mult"] * m["dd_ladder_mult"]
+        # Per-trade loss cap: reduce size only — never widen the stop.
+        cap_pct = CFG.get("per_trade_loss_cap_pct")
+        if cap_pct is not None and eq > 0:
+            try:
+                max_risk = eq * float(cap_pct) / 100.0
+            except (TypeError, ValueError):
+                max_risk = risk
+            if max_risk >= 0 and risk > max_risk and risk > 0:
+                cap_applied = max_risk / risk
+                risk = max_risk
+        stop_pct = CFG.get("daily_loss_stop_pct")
+        if stop_pct is not None and anchor > 0:
+            try:
+                thresh = -float(stop_pct) / 100.0 * anchor
+            except (TypeError, ValueError):
+                thresh = None
+            if thresh is not None and day_real <= thresh:
+                daily_stopped = True
 
     plan.risk_usd = round(float(risk), 2)
     try:
         base_pct = float(plan.risk_pct or 0)
     except (TypeError, ValueError):
         base_pct = 0.0
-    # Scale pct by post-AB → final ratio when post_ab > 0
-    if post_ab > 0:
+    # Scale pct by post-AB → final ratio when post_ab > 0 (compounding overwrites).
+    if compound_applied and eq > 0:
+        plan.risk_pct = float(risk) / eq
+    elif post_ab > 0:
         plan.risk_pct = base_pct * (float(risk) / post_ab)
     plan.ai["max_risk_dollars"] = round(float(risk), 2)
 
-    daily_stopped = False
-    stop_pct = CFG.get("daily_loss_stop_pct")
-    if stop_pct is not None and anchor > 0:
-        try:
-            thresh = -float(stop_pct) / 100.0 * anchor
-        except (TypeError, ValueError):
-            thresh = None
-        if thresh is not None and day_real <= thresh:
-            daily_stopped = True
-
     mode = _resolve_guard_mode(
         daily_stopped=daily_stopped,
-        ladder_level=int(m["dd_ladder_level"]),
-        warmup_mult=float(m["warmup_mult"]),
+        ladder_level=int(m["dd_ladder_level"]) if live_guards else 0,
+        warmup_mult=float(m["warmup_mult"]) if live_guards else 1.0,
     )
     allow = not daily_stopped
 
@@ -1035,10 +1086,10 @@ def apply_cfg_guardrails(
         "guard_profile": PROFILE,
         "guard_mode": mode,
         "guard_allow_new_orders": bool(allow),
-        "guard_warmup_mult": float(m["warmup_mult"]),
-        "guard_cold_start_mult": float(m["cold_start_mult"]),
-        "guard_dd_ladder_mult": float(m["dd_ladder_mult"]),
-        "guard_dd_ladder_level": int(m["dd_ladder_level"]),
+        "guard_warmup_mult": float(m["warmup_mult"]) if live_guards else 1.0,
+        "guard_cold_start_mult": float(m["cold_start_mult"]) if live_guards else 1.0,
+        "guard_dd_ladder_mult": float(m["dd_ladder_mult"]) if live_guards else 1.0,
+        "guard_dd_ladder_level": int(m["dd_ladder_level"]) if live_guards else 0,
         "guard_dd_pct": m["dd_pct"],
         "guard_peak_equity": m["peak_equity"],
         "guard_loss_cap_mult": round(float(cap_applied), 6),
@@ -1048,6 +1099,14 @@ def apply_cfg_guardrails(
         "guard_day_anchor": round(anchor, 2),
         "guard_daily_stopped": bool(daily_stopped),
         "guard_strat_closed_n": int(m["strat_closed_n"]),
+        "guard_apply_live": bool(live_guards),
+        "compounding_applied": bool(compound_applied),
+        "compound_risk_fraction": (
+            clamp_funded_compound_fraction(CFG.get("compound_risk_fraction"))
+            if compound_applied
+            else None
+        ),
+        "compound_risk_usd": round(float(compound_risk), 2) if compound_risk is not None else None,
         "max_risk_dollars": round(float(risk), 2),
         "final_risk_pct": plan.risk_pct,
     }
@@ -1055,23 +1114,30 @@ def apply_cfg_guardrails(
     plan.ai["guard_mode"] = mode
     plan.ai["max_risk_dollars"] = round(float(risk), 2)
 
-    # Shadow-only funded profile measurement (never applied when PROFILE != funded).
-    if PROFILE != "funded":
+    # Shadow-only funded stack measurement (guards + compound-with-stack).
+    # Always write when PROFILE != funded, OR when funded but live guards are off.
+    if PROFILE != "funded" or not live_guards:
+        fcfg = PROFILES["funded"]
         sm = _cfg_guardrail_multipliers(
-            cfg=PROFILES["funded"],
+            cfg=fcfg,
             st=st,
             strategy_id=plan.strategy_id,
             equity=eq,
             scan_d=scan_d,
         )
-        shadow_risk = post_ab * sm["warmup_mult"] * sm["cold_start_mult"] * sm["dd_ladder_mult"]
-        fcap = PROFILES["funded"].get("per_trade_loss_cap_pct")
+        shadow_base = _compound_risk_from_cfg(fcfg, eq)
+        if shadow_base is None:
+            shadow_base = post_ab
+        shadow_risk = (
+            float(shadow_base) * sm["warmup_mult"] * sm["cold_start_mult"] * sm["dd_ladder_mult"]
+        )
+        fcap = fcfg.get("per_trade_loss_cap_pct")
         if fcap is not None and eq > 0:
             try:
                 shadow_risk = min(shadow_risk, eq * float(fcap) / 100.0)
             except (TypeError, ValueError):
                 pass
-        f_stop = PROFILES["funded"].get("daily_loss_stop_pct")
+        f_stop = fcfg.get("daily_loss_stop_pct")
         shadow_daily = False
         if f_stop is not None and anchor > 0:
             try:
@@ -1090,6 +1156,8 @@ def apply_cfg_guardrails(
             "shadow_funded_dd_ladder_mult": float(sm["dd_ladder_mult"]),
             "shadow_funded_final_risk": round(float(shadow_risk), 2),
             "shadow_funded_daily_stopped": bool(shadow_daily),
+            "shadow_funded_compound_risk": round(float(shadow_base), 2),
+            "shadow_funded_bundled": True,
         }
         fields.update(shadow)
         plan.log_fields.update(shadow)

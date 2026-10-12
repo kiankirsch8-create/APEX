@@ -315,10 +315,51 @@ SHADOW_GUARD_CONFIGS: dict[str, dict[str, Any]] = {
         "per_trade_loss_cap_pct": 1.5,
         "daily_loss_stop_pct": 3.0,
     },
+    # Group E / PR13 — simple guardrail variants (shadow only; own equity curves).
+    # Variant A: stepped daily + total-DD cuts; best-setups-only at hard DD.
+    "variant_a_step": {
+        "variant": "simple_step",
+        "daily_cut_pct": 4.0,
+        "daily_cut_mult": 0.5,
+        "daily_flatten_pct": 4.6,
+        "dd_cut_pct": 8.5,
+        "dd_cut_mult": 0.5,
+        "dd_hard_pct": 9.0,
+        "dd_hard_mult": 0.25,
+        "best_setups_only": True,
+        "best_setups_min_confidence": "HIGH",
+    },
+    # Variant B: smooth size taper vs drawdown (no hard steps).
+    "variant_b_smooth_taper": {
+        "variant": "smooth_dd_taper",
+        "dd_taper_start_pct": 3.0,
+        "dd_taper_end_pct": 10.0,
+        "dd_taper_floor": 0.25,
+    },
+    # Variant C: full planned stack (explicit comparison twin of full_stack).
+    "variant_c_full_stack": {
+        "variant": "full_stack",
+        "warmup_days": 40,
+        "warmup_multiplier": 0.25,
+        "cold_start_min_trades": 5,
+        "cold_start_multiplier": 0.25,
+        "dd_ladder": [(5.0, 0.5), (8.0, 0.25)],
+        "per_trade_loss_cap_pct": 1.5,
+        "daily_loss_stop_pct": 3.0,
+    },
 }
+
+# Explicit comparison set for Group E (each records its own equity curve).
+SHADOW_SIMPLE_GUARD_VARIANT_IDS: tuple[str, ...] = (
+    "variant_a_step",
+    "variant_b_smooth_taper",
+    "variant_c_full_stack",
+)
 
 SHADOW_COMPOUND_RISK_FRACTIONS: list[float] = [0.001, 0.0015, 0.002, 0.003, 0.005]
 # 0.10%, 0.15%, 0.20%, 0.30%, 0.50% of current equity per trade
+# Funded live band (never bare): 0.20% and 0.30% with full_stack.
+FUNDED_COMPOUND_SHADOW_FRACTIONS: tuple[float, ...] = (0.002, 0.003)
 SHADOW_FULL_STACK_CFG: dict[str, Any] = dict(SHADOW_GUARD_CONFIGS["full_stack"])
 
 # Broker minimum lot — shadow curves only. Real curve unchanged for comparability.
@@ -2801,6 +2842,148 @@ def _resolve_guard_mode(
     return "NORMAL"
 
 
+def _day_loss_pct(day_realized_pnl: float, day_anchor: float) -> float:
+    """Positive percent when the day is down vs anchor (0 if flat/up or bad inputs)."""
+    try:
+        anchor = float(day_anchor)
+        pnl = float(day_realized_pnl)
+    except (TypeError, ValueError):
+        return 0.0
+    if anchor <= 0 or pnl >= 0:
+        return 0.0
+    return max(0.0, (-pnl / anchor) * 100.0)
+
+
+def _dd_pct(capital: float, peak_capital: float) -> float:
+    try:
+        peak = float(peak_capital or capital or 0)
+        eq = float(capital or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if peak <= 0:
+        return 0.0
+    return max(0.0, (peak - eq) / peak * 100.0)
+
+
+def _smooth_dd_taper_mult(
+    dd_pct: float,
+    *,
+    start_pct: float,
+    end_pct: float,
+    floor: float,
+) -> float:
+    """Linear size taper from 1.0 at ``start_pct`` DD down to ``floor`` at ``end_pct``."""
+    s = float(start_pct)
+    e = float(end_pct)
+    f = max(0.0, min(1.0, float(floor)))
+    d = float(dd_pct)
+    if e <= s:
+        return f if d >= e else 1.0
+    if d <= s:
+        return 1.0
+    if d >= e:
+        return f
+    t = (d - s) / (e - s)
+    return float(1.0 + t * (f - 1.0))
+
+
+def _compute_simple_step_guard(
+    *,
+    cfg: Mapping[str, Any],
+    capital: float,
+    peak_capital: float,
+    day_realized_pnl: float,
+    day_anchor: float,
+    confidence: str,
+) -> dict[str, Any]:
+    """
+    Variant A — stepped daily + total-DD cuts.
+    ~4% day loss → cut size; ~4.6% → flatten for the day; 8.5% DD → cut;
+    9% DD → cut harder + best-setups-only (HIGH by default).
+    """
+    day_loss = _day_loss_pct(day_realized_pnl, day_anchor)
+    dd = _dd_pct(capital, peak_capital)
+    daily_cut = float(cfg.get("daily_cut_pct") or 4.0)
+    daily_flat = float(cfg.get("daily_flatten_pct") or 4.6)
+    dd_cut = float(cfg.get("dd_cut_pct") or 8.5)
+    dd_hard = float(cfg.get("dd_hard_pct") or 9.0)
+    daily_cut_m = float(cfg.get("daily_cut_mult") or 0.5)
+    dd_cut_m = float(cfg.get("dd_cut_mult") or 0.5)
+    dd_hard_m = float(cfg.get("dd_hard_mult") or 0.25)
+
+    blocked = day_loss >= daily_flat
+    daily_m = 1.0
+    if not blocked and day_loss >= daily_cut:
+        daily_m = daily_cut_m
+
+    ladder_m = 1.0
+    ladder_level = 0
+    best_only = False
+    if dd >= dd_hard:
+        ladder_m = dd_hard_m
+        ladder_level = 2
+        best_only = bool(cfg.get("best_setups_only", True))
+    elif dd >= dd_cut:
+        ladder_m = dd_cut_m
+        ladder_level = 1
+
+    if best_only and not blocked:
+        min_conf = str(cfg.get("best_setups_min_confidence") or "HIGH").strip().upper()
+        conf_u = str(confidence or "").strip().upper()
+        rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+        if rank.get(conf_u, -1) < rank.get(min_conf, 2):
+            blocked = True
+
+    total = daily_m * ladder_m
+    mode = "DAILY_STOPPED" if day_loss >= daily_flat else _resolve_guard_mode(
+        daily_stopped=False,
+        ladder_level=ladder_level,
+        warmup_mult=1.0,
+    )
+    if best_only and mode == "NORMAL":
+        mode = "BEST_SETUPS"
+    return {
+        "guard_warmup_mult": 1.0,
+        "guard_cold_start_mult": 1.0,
+        "guard_ladder_mult": float(ladder_m),
+        "guard_loss_cap_mult": float(daily_m),
+        "guard_total_mult": round(float(total), 6),
+        "guard_mode": mode,
+        "guard_blocked": bool(blocked),
+        "guard_variant": "simple_step",
+        "guard_dd_pct": round(dd, 4),
+        "guard_day_loss_pct": round(day_loss, 4),
+    }
+
+
+def _compute_smooth_taper_guard(
+    *,
+    cfg: Mapping[str, Any],
+    capital: float,
+    peak_capital: float,
+) -> dict[str, Any]:
+    """Variant B — smooth size taper vs drawdown (no hard flatten steps)."""
+    dd = _dd_pct(capital, peak_capital)
+    taper = _smooth_dd_taper_mult(
+        dd,
+        start_pct=float(cfg.get("dd_taper_start_pct") or 3.0),
+        end_pct=float(cfg.get("dd_taper_end_pct") or 10.0),
+        floor=float(cfg.get("dd_taper_floor") or 0.25),
+    )
+    mode = "TAPER" if taper < 1.0 - 1e-12 else "NORMAL"
+    return {
+        "guard_warmup_mult": 1.0,
+        "guard_cold_start_mult": 1.0,
+        "guard_ladder_mult": float(taper),
+        "guard_loss_cap_mult": 1.0,
+        "guard_total_mult": round(float(taper), 6),
+        "guard_mode": mode,
+        "guard_blocked": False,
+        "guard_variant": "smooth_dd_taper",
+        "guard_dd_pct": round(dd, 4),
+    }
+
+
 def _compute_cfg_guard_multipliers(
     *,
     cfg: Mapping[str, Any],
@@ -2813,9 +2996,27 @@ def _compute_cfg_guard_multipliers(
     day_anchor: float,
     strat_pnl_history: Mapping[str, Any],
     baseline_max_risk_dollars: float,
+    confidence: str = "",
 ) -> dict[str, Any]:
     """Compute guard multipliers without mutating sizing. Returns log fields + guard_blocked."""
     merged = _merged_guard_cfg(cfg)
+    variant = str(merged.get("variant") or "").strip().lower()
+    if variant == "simple_step":
+        return _compute_simple_step_guard(
+            cfg=merged,
+            capital=capital,
+            peak_capital=peak_capital,
+            day_realized_pnl=day_realized_pnl,
+            day_anchor=day_anchor,
+            confidence=confidence,
+        )
+    if variant == "smooth_dd_taper":
+        return _compute_smooth_taper_guard(
+            cfg=merged,
+            capital=capital,
+            peak_capital=peak_capital,
+        )
+
     warmup_m = 1.0
     cold_m = 1.0
     ladder_m = 1.0
@@ -2883,6 +3084,7 @@ def _compute_cfg_guard_multipliers(
         "guard_total_mult": round(float(guard_total), 6),
         "guard_mode": mode,
         "guard_blocked": bool(daily_stopped),
+        "guard_variant": variant or "classic",
     }
 
 
@@ -3180,6 +3382,7 @@ class _ShadowGuardRunner:
                     day_anchor=st.day_anchor,
                     strat_pnl_history=st.strat_pnl_history,
                     baseline_max_risk_dollars=pre_ab_mrd * ab_real,
+                    confidence=conf,
                 )
                 if guard_row.get("guard_blocked"):
                     blocked = True
@@ -3248,6 +3451,7 @@ class _ShadowGuardRunner:
                         day_anchor=st.day_anchor,
                         strat_pnl_history=st.strat_pnl_history,
                         baseline_max_risk_dollars=pre_ab_mrd * ab_real * risk_ratio,
+                        confidence=conf,
                     )
                     if guard_row.get("guard_blocked"):
                         blocked = True
