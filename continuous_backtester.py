@@ -872,7 +872,8 @@ BLOCKED_STRATEGIES_GROUP1: frozenset[str] = frozenset(
         "B06_TRIANGLE_BREAKOUT",  # 37.5% WR, -$546, W/L 1.27 — below threshold
     },
 )
-COMPOUNDING_ENABLED = False
+# Group F run parameters — compounding on for the long chrono window.
+COMPOUNDING_ENABLED = True
 BLOCK_CONTINUATION_LONGS_IN_STRONG_TAILWIND = True
 BLOCK_STRONG_TAILWIND_LONGS_IN_BAD_PERIOD = True
 STALE_TAILWIND_LONG_VETO = False
@@ -937,9 +938,12 @@ BATCH_SIZE = 10
 BACKTEST_CLAUDE_MAX_TOKENS = 1200
 CLAUDE_HTTP_TIMEOUT_SEC = 25.0
 
-# Chronological walk-forward backtest (API-triggered; separate from rolling loop)
-CHRONO_START_DATE = "2024-01-01"
-CHRONO_END_DATE = "2026-05-17"
+# Chronological walk-forward backtest (API-triggered; separate from rolling loop).
+# Group F: 2018-01 → early-2026, leaving a tail of unseen data for one re-run.
+CHRONO_START_DATE = "2018-01-01"
+CHRONO_END_DATE = "2026-02-28"
+# Daily history must reach this date; pairs without bars are logged and skipped.
+CHRONO_HISTORY_FROM_DATE = "2018-01-01"
 # Permanently drop 4h at scan level: yfinance only serves ~730d of intraday, so 4h
 # silently activates mid-run and has been the only losing timeframe. Keep strategies.
 # (PR #103 — reaffirmed on main for Railway redeploy)
@@ -8332,6 +8336,79 @@ def _probe_yf_symbol_resolves(yf_sym: str, *, ref_date: str | None = None) -> bo
         if attempt + 1 < YF_STARTUP_PROBE_RETRIES:
             time.sleep(YF_STARTUP_PROBE_RETRY_DELAY_SEC)
     return False
+
+
+def _probe_yf_has_history_from(
+    yf_sym: str,
+    *,
+    history_from: str = CHRONO_HISTORY_FROM_DATE,
+) -> bool:
+    """
+    True if Yahoo returns daily bars near ``history_from`` (Group F — 2018 check).
+
+    Logs nothing; caller logs and skips pairs that fail.
+    """
+    try:
+        start_d = datetime.strptime(str(history_from).strip()[:10], "%Y-%m-%d").date()
+    except ValueError:
+        start_d = date(2018, 1, 1)
+    end_d = start_d + timedelta(days=90)
+    start_s = start_d.isoformat()
+    end_s = end_d.isoformat()
+    for attempt in range(YF_STARTUP_PROBE_RETRIES):
+        df = safe_yf_download(yf_sym, start_s, end_s, "1d", retries=1)
+        try:
+            n = len(df) if df is not None else 0
+        except Exception:  # noqa: BLE001
+            n = 0
+        if n >= 5:
+            return True
+        if attempt + 1 < YF_STARTUP_PROBE_RETRIES:
+            time.sleep(YF_STARTUP_PROBE_RETRY_DELAY_SEC)
+    return False
+
+
+def filter_chrono_tickers_for_history_from(
+    tickers: list[str],
+    *,
+    history_from: str = CHRONO_HISTORY_FROM_DATE,
+    context: str = "chrono",
+) -> tuple[list[str], dict[str, Any]]:
+    """
+    Keep only tickers with daily history from ``history_from``.
+
+    Log and skip pairs with no early history — do not fail the whole run.
+    Unlike the recent-resolve probe, a high fail rate here does NOT restore the
+    original universe (missing 2018 history is a per-pair fact, not an outage).
+    """
+    original = [str(sym or "").strip().upper() for sym in tickers if str(sym or "").strip()]
+    kept: list[str] = []
+    skipped: list[str] = []
+    for s in original:
+        yf_sym = chrono_yf_symbol(s)
+        if _probe_yf_has_history_from(yf_sym, history_from=history_from):
+            kept.append(s)
+        else:
+            skipped.append(s)
+            log(
+                f"[YF HISTORY] {context}: {s} (Yahoo {yf_sym}) has no daily bars "
+                f"from {history_from} — skipped for this run",
+                level="warning",
+            )
+    info: dict[str, Any] = {
+        "history_from": str(history_from)[:10],
+        "probed": len(original),
+        "kept": len(kept),
+        "skipped": len(skipped),
+        "skipped_tickers": list(skipped),
+        "kept_tickers": list(kept),
+    }
+    log(
+        f"[YF HISTORY] {context}: kept={len(kept)} skipped={len(skipped)} "
+        f"of {len(original)} (history_from={history_from})",
+        level="info",
+    )
+    return kept, info
 
 
 def filter_chrono_tickers_after_yf_probe(
@@ -15930,6 +16007,19 @@ def run_chronological_backtest(
                 context=f"chrono job {job_id}",
             )
             chrono_data["yf_startup_probe"] = yf_probe_info
+            # Group F: confirm daily history from CHRONO_HISTORY_FROM_DATE (2018);
+            # log + skip pairs with no early bars rather than failing the run.
+            try:
+                start_for_hist = datetime.strptime(str(start_date).strip()[:10], "%Y-%m-%d").date()
+            except ValueError:
+                start_for_hist = None
+            if start_for_hist is not None and start_for_hist <= date(2018, 6, 1):
+                tickers, hist_info = filter_chrono_tickers_for_history_from(
+                    tickers,
+                    history_from=CHRONO_HISTORY_FROM_DATE,
+                    context=f"chrono job {job_id}",
+                )
+                chrono_data["yf_history_from_probe"] = hist_info
             _si.reset_run_state()
             if _si.job_instruments_path(job_id).is_file():
                 _si.rebuild_histories(job_id)

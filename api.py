@@ -26,6 +26,7 @@ import analyzer
 import backtest_analyzer
 import chart_analyzer_v2
 import chart_vision
+import chrono_analysis
 import continuous_backtester
 import dashboard_helpers
 import funded_simulator
@@ -1337,6 +1338,48 @@ async def get_chrono_export(job_id: str) -> PlainTextResponse:
     if txt is None:
         raise HTTPException(status_code=404, detail="Job not found or no export available")
     return PlainTextResponse(txt, media_type="text/plain; charset=utf-8")
+
+
+@app.post("/api/chrono/{job_id}/analyze")
+async def post_chrono_analyze(
+    job_id: str,
+    step_days: int = Query(default=5, ge=1, le=60, description="FTMO rolling-start step (trading days)"),
+) -> dict[str, Any]:
+    """
+    Server-side compact analysis (Group F). Reads the job on Railway volume and
+    writes small JSON result files — never ships the full run file.
+    """
+    jid = job_id.strip()
+    try:
+        manifest = chrono_analysis.run_chrono_analysis(jid, ftmo_step_days=int(step_days))
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Job not found") from None
+    except Exception as e:  # noqa: BLE001
+        log(f"[Chrono Analysis] failed for {jid}: {e}", level="error")
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {e}") from e
+    return manifest
+
+
+@app.get("/api/chrono/{job_id}/analysis")
+async def get_chrono_analysis(job_id: str) -> dict[str, Any]:
+    """Return the latest compact analysis manifest + file payloads (small)."""
+    jid = job_id.strip()
+    man_path = chrono_analysis.analysis_manifest_path(jid)
+    if not man_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="Analysis not found — POST /api/chrono/{job_id}/analyze first",
+        )
+    manifest = load_json(man_path, default=None)
+    if not isinstance(manifest, dict):
+        raise HTTPException(status_code=404, detail="Analysis not found")
+    out_dir = chrono_analysis.analysis_dir(jid)
+    payloads: dict[str, Any] = {}
+    for key, fname in (manifest.get("files") or {}).items():
+        fp = out_dir / str(fname)
+        if fp.is_file():
+            payloads[key] = load_json(fp, default={})
+    return {"manifest": manifest, "results": payloads}
 
 
 @app.get("/api/chrono/{job_id}")
