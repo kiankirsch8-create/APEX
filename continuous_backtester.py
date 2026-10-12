@@ -342,7 +342,7 @@ LOT_FLOOR_REF_ACCOUNT = 10000.0  # position_size on the real curve is sized for 
 SHADOW_STOP_ENABLED = True
 SHADOW_STOP_CONFIGS: list[tuple[str, dict[str, Any]]] = [
     # controls
-    ("fixed_current", {"mode": "fixed_pct", "mult": 1.00}),  # baseline
+    ("fixed_current", {"mode": "fixed_pct", "mult": 1.00}),  # baseline (pre-liquidity)
     ("fixed_075", {"mode": "fixed_pct", "mult": 0.75}),
     ("fixed_125", {"mode": "fixed_pct", "mult": 1.25}),
     ("fixed_200", {"mode": "fixed_pct", "mult": 2.00}),
@@ -355,9 +355,16 @@ SHADOW_STOP_CONFIGS: list[tuple[str, dict[str, Any]]] = [
     ("swing_10", {"mode": "swing", "lookback": 10, "buffer_atr": 0.0}),
     ("swing_20", {"mode": "swing", "lookback": 20, "buffer_atr": 0.0}),
     ("swing_20_buf", {"mode": "swing", "lookback": 20, "buffer_atr": 0.25}),
+    # Group D / PR11 — compare liquidity placements (shadow only)
+    ("prev_higher_low", {"mode": "prev_higher_low", "lookback": 40, "buffer_atr": 0.0}),
+    ("nearest_liquidity", {"mode": "nearest_liquidity", "lookback": 40, "buffer_atr": 0.0}),
     # hybrid — never tighter than volatility allows
     ("max_atr15_swing", {"mode": "max", "of": ["atr_1_5", "swing_20_buf"]}),
 ]
+# Real-curve initial stop at previous higher-low (long) / lower-high (short).
+LIQUIDITY_STOP_ENABLED = True
+LIQUIDITY_STOP_LOOKBACK = 40
+LIQUIDITY_STOP_BUFFER_ATR = 0.0
 SHADOW_STOP_MIN_LOT_ACCTS: tuple[int, ...] = (25_000, 50_000, 100_000)
 SHADOW_STOP_CFG_BY_NAME: dict[str, dict[str, Any]] = {
     name: dict(cfg) for name, cfg in SHADOW_STOP_CONFIGS
@@ -3774,6 +3781,33 @@ def _shadow_stop_price_for_cfg(
             entry=e,
             past=past,
             lookback=int(cfg.get("lookback") or 20),
+            buffer_atr=float(cfg.get("buffer_atr") or 0),
+            atr=float(atr),
+        )
+
+    if mode == "prev_higher_low":
+        if d == "LONG":
+            return previous_higher_low_price(
+                past,
+                entry=e,
+                lookback=int(cfg.get("lookback") or 40),
+                buffer_atr=float(cfg.get("buffer_atr") or 0),
+                atr=float(atr),
+            )
+        return previous_lower_high_price(
+            past,
+            entry=e,
+            lookback=int(cfg.get("lookback") or 40),
+            buffer_atr=float(cfg.get("buffer_atr") or 0),
+            atr=float(atr),
+        )
+
+    if mode == "nearest_liquidity":
+        return nearest_liquidity_stop_price(
+            past,
+            direction=d,
+            entry=e,
+            lookback=int(cfg.get("lookback") or 40),
             buffer_atr=float(cfg.get("buffer_atr") or 0),
             atr=float(atr),
         )
@@ -8211,7 +8245,31 @@ def _v75_entry_guards(
                 meta,
             )
 
-    ns = validate_stop_loss(float(entry), float(normal_stop), d, tf_u)
+    stop_in = float(normal_stop)
+    meta["stop_source"] = "model"
+    meta["liquidity_stop_price"] = None
+    if LIQUIDITY_STOP_ENABLED:
+        liq = liquidity_initial_stop_price(
+            past,
+            direction=d,
+            entry=float(entry),
+            atr=float(cur_atr or 0),
+        )
+        if liq is not None:
+            meta["liquidity_stop_price"] = round(float(liq), 5)
+            # Prefer liquidity level when it is a valid structural stop (never tighten
+            # past the model stop in a way that increases size — wider stop OK).
+            e = float(entry)
+            if d == "LONG" and float(liq) < e:
+                # Use the wider of model vs liquidity (further from entry).
+                if stop_in >= e or float(liq) <= stop_in:
+                    stop_in = float(liq)
+                    meta["stop_source"] = "prev_higher_low"
+            elif d == "SHORT" and float(liq) > e:
+                if stop_in <= e or float(liq) >= stop_in:
+                    stop_in = float(liq)
+                    meta["stop_source"] = "prev_lower_high"
+    ns = validate_stop_loss(float(entry), stop_in, d, tf_u)
     meta["normal_stop_price"] = round(ns, 5)
     buf = _v75_buffer_stop_price(ns, float(entry), d, cur_atr)
     meta["buffer_stop_price"] = round(buf, 5)
@@ -9977,6 +10035,154 @@ def get_last_swing_low(
     return _last_swing_low_from_series(lows)
 
 
+def _swing_pivot_lows(lows: list[float]) -> list[tuple[int, float]]:
+    """Local pivot lows (index, price) — strict neighbour comparison."""
+    out: list[tuple[int, float]] = []
+    for i in range(1, len(lows) - 1):
+        if lows[i] < lows[i - 1] and lows[i] < lows[i + 1]:
+            out.append((i, float(lows[i])))
+    return out
+
+
+def _swing_pivot_highs(highs: list[float]) -> list[tuple[int, float]]:
+    out: list[tuple[int, float]] = []
+    for i in range(1, len(highs) - 1):
+        if highs[i] > highs[i - 1] and highs[i] > highs[i + 1]:
+            out.append((i, float(highs[i])))
+    return out
+
+
+def previous_higher_low_price(
+    past: Any,
+    *,
+    entry: float,
+    lookback: int = 40,
+    buffer_atr: float = 0.0,
+    atr: float = 0.0,
+) -> float | None:
+    """
+    Previous higher-low for a LONG: the most recent pivot low that is higher than
+    the prior pivot low (HH/HL structure). Stop sits below that level (optional ATR buffer).
+    """
+    if past is None or getattr(past, "empty", True):
+        return None
+    try:
+        hist = past.iloc[:-1] if len(past) >= 2 else past
+        window = hist.tail(max(5, int(lookback)))
+        lows = pd.to_numeric(window["Low"], errors="coerce").dropna().astype(float).tolist()
+        pivots = _swing_pivot_lows(lows)
+        if len(pivots) < 2:
+            return None
+        # Walk newest→oldest; find first pivot that is a higher-low vs its predecessor.
+        for j in range(len(pivots) - 1, 0, -1):
+            _i1, p1 = pivots[j]
+            _i0, p0 = pivots[j - 1]
+            if p1 > p0:
+                buf = float(buffer_atr or 0) * float(atr or 0)
+                stop = float(p1) - buf
+                e = float(entry)
+                if math.isfinite(stop) and stop < e:
+                    return stop
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def previous_lower_high_price(
+    past: Any,
+    *,
+    entry: float,
+    lookback: int = 40,
+    buffer_atr: float = 0.0,
+    atr: float = 0.0,
+) -> float | None:
+    """Symmetric SHORT stop: previous lower-high (LH structure)."""
+    if past is None or getattr(past, "empty", True):
+        return None
+    try:
+        hist = past.iloc[:-1] if len(past) >= 2 else past
+        window = hist.tail(max(5, int(lookback)))
+        highs = pd.to_numeric(window["High"], errors="coerce").dropna().astype(float).tolist()
+        pivots = _swing_pivot_highs(highs)
+        if len(pivots) < 2:
+            return None
+        for j in range(len(pivots) - 1, 0, -1):
+            _i1, p1 = pivots[j]
+            _i0, p0 = pivots[j - 1]
+            if p1 < p0:
+                buf = float(buffer_atr or 0) * float(atr or 0)
+                stop = float(p1) + buf
+                e = float(entry)
+                if math.isfinite(stop) and stop > e:
+                    return stop
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def nearest_liquidity_stop_price(
+    past: Any,
+    *,
+    direction: str,
+    entry: float,
+    lookback: int = 40,
+    buffer_atr: float = 0.0,
+    atr: float = 0.0,
+) -> float | None:
+    """Nearest swing liquidity: closest pivot low below entry (long) / high above (short)."""
+    if past is None or getattr(past, "empty", True):
+        return None
+    d = str(direction or "").strip().upper()
+    e = float(entry)
+    buf = float(buffer_atr or 0) * float(atr or 0)
+    try:
+        hist = past.iloc[:-1] if len(past) >= 2 else past
+        window = hist.tail(max(5, int(lookback)))
+        if d == "LONG":
+            lows = pd.to_numeric(window["Low"], errors="coerce").dropna().astype(float).tolist()
+            pivots = [p for _i, p in _swing_pivot_lows(lows) if p < e]
+            if not pivots:
+                return None
+            swing = max(pivots)  # nearest below entry
+            stop = float(swing) - buf
+            return stop if stop < e else None
+        if d == "SHORT":
+            highs = pd.to_numeric(window["High"], errors="coerce").dropna().astype(float).tolist()
+            pivots = [p for _i, p in _swing_pivot_highs(highs) if p > e]
+            if not pivots:
+                return None
+            swing = min(pivots)
+            stop = float(swing) + buf
+            return stop if stop > e else None
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def liquidity_initial_stop_price(
+    past: Any,
+    *,
+    direction: str,
+    entry: float,
+    lookback: int | None = None,
+    buffer_atr: float | None = None,
+    atr: float = 0.0,
+) -> float | None:
+    """Real-curve liquidity stop: prev higher-low (long) / prev lower-high (short)."""
+    lb = int(lookback if lookback is not None else LIQUIDITY_STOP_LOOKBACK)
+    buf = float(buffer_atr if buffer_atr is not None else LIQUIDITY_STOP_BUFFER_ATR)
+    d = str(direction or "").strip().upper()
+    if d == "LONG":
+        return previous_higher_low_price(
+            past, entry=float(entry), lookback=lb, buffer_atr=buf, atr=float(atr or 0)
+        )
+    if d == "SHORT":
+        return previous_lower_high_price(
+            past, entry=float(entry), lookback=lb, buffer_atr=buf, atr=float(atr or 0)
+        )
+    return None
+
+
 def _trend_continuation_forward_sim(
     direction: str,
     entry: float,
@@ -10507,6 +10713,28 @@ def evaluate_forward_candles(
                     if ns < current_stop:
                         trailing_activated = True
                     current_stop = ns
+
+        # Liquidity trail — ratchet to newer higher-lows / lower-highs; never against position.
+        if LIQUIDITY_STOP_ENABLED and rem > 0 and i >= 2:
+            try:
+                l0 = float(rows[i - 2][1].get("Low", low))
+                l1 = float(rows[i - 1][1].get("Low", low))
+                h0 = float(rows[i - 2][1].get("High", high))
+                h1 = float(rows[i - 1][1].get("High", high))
+            except (TypeError, ValueError, IndexError):
+                l0 = l1 = low
+                h0 = h1 = high
+            buf_l = float(LIQUIDITY_STOP_BUFFER_ATR or 0) * atr_use
+            if d == "LONG" and l1 < l0 and l1 < low:
+                prop = l1 - buf_l
+                if prop > current_stop and prop < entry_price:
+                    current_stop = prop
+                    trailing_activated = True
+            elif d == "SHORT" and h1 > h0 and h1 > high:
+                prop = h1 + buf_l
+                if prop < current_stop and prop > entry_price:
+                    current_stop = prop
+                    trailing_activated = True
 
         if d == "LONG":
             if low <= current_stop and rem > 0:
