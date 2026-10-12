@@ -235,6 +235,10 @@ _SYS_WIN_HISTORY: list[bool] = []
 # A+B sizing throttle — applied at open when True (matches apex_trader_v76_private live engine).
 APPLY_AB_THROTTLE = True
 _AB_THROTTLE_FACTOR = 0.18
+# When True: if A+B would size-down (ab_throttle < 1), skip the trade instead of
+# taking it at 18%. Virtual full-size outcome still feeds A+B histories so the
+# throttle can release after recovery (Group D / PR10; was shadow skip_all_throttled).
+SKIP_ALL_THROTTLED = True
 
 # CFG guardrails — shadow-only in chrono backtests (real run stays unguarded).
 # See APEX_shadow_spec_funded.md for the full configuration matrix.
@@ -2673,6 +2677,8 @@ def _apply_ab_throttle_to_ai_sizing(
     """
     Apply A+B throttle to ``ai`` sizing fields after all other multipliers.
     When ``APPLY_AB_THROTTLE`` is False, records 1.0 multipliers without scaling.
+    When ``SKIP_ALL_THROTTLED`` and throttle < 1, keep full size and set
+    ``ai["_ab_skip"]=True`` so the caller can skip capital while simulating full-size.
     """
     mult_a, mult_b, ab_throttle = _compute_ab_throttle_at_open(
         strategy_id=strategy_id,
@@ -2684,16 +2690,25 @@ def _apply_ab_throttle_to_ai_sizing(
     baseline_mrd = float(ai.get("_max_risk_dollars", 0) or 0)
     baseline_rp = float(ai.get("_account_risk_pct", 0) or 0)
 
+    ai["_ab_skip"] = False
     if APPLY_AB_THROTTLE and ab_throttle != 1.0:
-        ai["_position_size"] = round(baseline_ps * ab_throttle, 2)
-        ai["_leveraged_exposure"] = round(baseline_le * ab_throttle, 2)
-        ai["_max_risk_dollars"] = round(baseline_mrd * ab_throttle, 2)
-        ai["_account_risk_pct"] = baseline_rp * ab_throttle
         ai["_ab_throttle"] = ab_throttle
         ai["_ab_mult_a"] = mult_a
         ai["_ab_mult_b"] = mult_b
         ai.pop("_ab_mult_a_unapplied", None)
         ai.pop("_ab_mult_b_unapplied", None)
+        if SKIP_ALL_THROTTLED:
+            # Full-size retained for virtual sim / A+B history; do not take at 18%.
+            ai["_ab_skip"] = True
+            ai["_position_size"] = round(baseline_ps, 2)
+            ai["_leveraged_exposure"] = round(baseline_le, 2)
+            ai["_max_risk_dollars"] = round(baseline_mrd, 2)
+            ai["_account_risk_pct"] = baseline_rp
+        else:
+            ai["_position_size"] = round(baseline_ps * ab_throttle, 2)
+            ai["_leveraged_exposure"] = round(baseline_le * ab_throttle, 2)
+            ai["_max_risk_dollars"] = round(baseline_mrd * ab_throttle, 2)
+            ai["_account_risk_pct"] = baseline_rp * ab_throttle
     elif APPLY_AB_THROTTLE:
         ai["_ab_throttle"] = ab_throttle
         ai["_ab_mult_a"] = mult_a
@@ -2712,12 +2727,74 @@ def _apply_ab_throttle_to_ai_sizing(
         "ab_mult_a": float(ai["_ab_mult_a"]),
         "ab_mult_b": float(ai["_ab_mult_b"]),
         "ab_throttle": float(ai["_ab_throttle"]),
+        "ab_skip": bool(ai.get("_ab_skip")),
     }
     if "_ab_mult_a_unapplied" in ai:
         out["ab_mult_a_unapplied"] = float(ai["_ab_mult_a_unapplied"])
     if "_ab_mult_b_unapplied" in ai:
         out["ab_mult_b_unapplied"] = float(ai["_ab_mult_b_unapplied"])
     return out
+
+
+def _record_ab_history_from_virtual_throttle(
+    *,
+    strategy_id: str,
+    confidence: str,
+    macro_bias: str,
+    outcome: str,
+    pnl_dollars_full: float,
+) -> None:
+    """
+    Feed A+B histories from a throttled-skip's full-size virtual outcome.
+
+    Capital is unchanged; only rolling histories update so the throttle can release.
+    """
+    oc = str(outcome or "").strip().upper()
+    if oc not in ("WIN", "LOSS"):
+        return
+    sid = str(strategy_id or "").strip().upper()
+    pnl = float(pnl_dollars_full or 0)
+    row = {
+        "strategy_id": sid,
+        "confidence": str(confidence or "").strip().upper(),
+        "macro_bias": str(macro_bias or "").strip().upper(),
+        "outcome": oc,
+        "pnl_dollars": pnl,
+        "skipped": False,
+        "direction": "LONG",
+        "ticker": "",
+        "timeframe": "",
+    }
+    _record_st_medium_from_row(row)
+    _record_health_signals_from_row(row)
+
+
+def _ab_throttle_skip_row_from_taken(
+    taken: dict[str, Any],
+    *,
+    skip_reason: str,
+) -> dict[str, Any]:
+    """Convert a fully-simulated taken row into a capital-neutral throttle skip."""
+    row = dict(taken)
+    pnl_full = float(row.get("pnl_dollars", 0) or 0)
+    risk = float(row.get("max_risk_dollars", 0) or 0)
+    outcome = str(row.get("outcome") or "").strip().upper()
+    if outcome not in ("WIN", "LOSS"):
+        outcome = "WIN" if pnl_full > 0 else "LOSS"
+    r_mult = round(pnl_full / risk, 6) if risk > 0 else 0.0
+    row["skipped"] = True
+    row["skip_trade"] = True
+    row["skip_reason"] = skip_reason[:500]
+    row["outcome"] = "SKIPPED"
+    row["verdict"] = "SKIP"
+    row["pnl_dollars"] = 0.0
+    row["pnl_pct"] = 0.0
+    row["correct"] = False
+    row["virtual_outcome"] = outcome
+    row["virtual_pnl_r"] = r_mult
+    row["virtual_pnl_dollars"] = round(pnl_full, 2)
+    row["ab_throttle_skip"] = True
+    return row
 
 
 def _trading_days_inclusive(start: date, end: date) -> int:
@@ -13010,7 +13087,7 @@ def _python_forced_layer2_trade(
             }
         )
 
-    return {
+    taken: dict[str, Any] = {
         "date": analysis_date,
         "ticker": sym,
         "timeframe": timeframe,
@@ -13200,6 +13277,28 @@ def _python_forced_layer2_trade(
         ),
         **_si.trade_fields_for_row(sym),
     }
+    if bool(ai.get("_ab_skip")):
+        thr = float(ai.get("_ab_throttle", 1.0) or 1.0)
+        reason = (
+            f"[AB_THROTTLE_SKIP] ab_throttle={thr:.4f} — skip instead of size-down; "
+            f"virtual full-size outcome feeds A+B"
+        )
+        skip_row = _ab_throttle_skip_row_from_taken(taken, skip_reason=reason)
+        _record_ab_history_from_virtual_throttle(
+            strategy_id=strat_id,
+            confidence=confidence,
+            macro_bias=str(ai.get("macro_bias", "") or ""),
+            outcome=str(skip_row.get("virtual_outcome") or ""),
+            pnl_dollars_full=float(skip_row.get("virtual_pnl_dollars") or 0),
+        )
+        log(
+            f"[AB_THROTTLE_SKIP] {sym} {strat_id} thr={thr:.4f} "
+            f"virtual={skip_row.get('virtual_outcome')} "
+            f"R={skip_row.get('virtual_pnl_r')}",
+            level="info",
+        )
+        return skip_row
+    return taken
 
 
 def _invoke_shadow_strategies_hook(hook: dict[str, Any]) -> None:
@@ -14389,7 +14488,7 @@ def run_one_backtest(
         if not isinstance(td, dict):
             td = {}
 
-        return {
+        taken_l1: dict[str, Any] = {
             "date": analysis_date,
             "ticker": sym,
             "timeframe": timeframe,
@@ -14536,6 +14635,28 @@ def run_one_backtest(
             ),
             **_si.trade_fields_for_row(sym),
         }
+        if bool(ai.get("_ab_skip")):
+            thr = float(ai.get("_ab_throttle", 1.0) or 1.0)
+            reason = (
+                f"[AB_THROTTLE_SKIP] ab_throttle={thr:.4f} — skip instead of size-down; "
+                f"virtual full-size outcome feeds A+B"
+            )
+            skip_row = _ab_throttle_skip_row_from_taken(taken_l1, skip_reason=reason)
+            _record_ab_history_from_virtual_throttle(
+                strategy_id=strategy_id_norm,
+                confidence=str(ai.get("confidence", confidence) or ""),
+                macro_bias=str(ai.get("macro_bias", "") or ""),
+                outcome=str(skip_row.get("virtual_outcome") or ""),
+                pnl_dollars_full=float(skip_row.get("virtual_pnl_dollars") or 0),
+            )
+            log(
+                f"[AB_THROTTLE_SKIP] {sym} {strategy_id_norm} thr={thr:.4f} "
+                f"virtual={skip_row.get('virtual_outcome')} "
+                f"R={skip_row.get('virtual_pnl_r')}",
+                level="info",
+            )
+            return skip_row
+        return taken_l1
 
     except Exception as e:  # noqa: BLE001
         log(f"[ContinuousBacktest] Error {ticker} {analysis_date}: {e}", level="warning")
@@ -16733,7 +16854,30 @@ def run_chronological_backtest(
                                     "skip_reason": str(res.get("skip_reason", "") or ""),
                                     "verdict": res.get("verdict"),
                                     "direction": str(res.get("direction") or "NONE"),
+                                    "strategy_id": str(res.get("strategy_id") or ""),
                                 }
+                                # Preserve miner / throttle-skip virtual fields from the scan row.
+                                for _vk in (
+                                    "virtual_outcome",
+                                    "virtual_pnl_r",
+                                    "virtual_pnl_dollars",
+                                    "virtual_exit_reason",
+                                    "virtual_exit_price",
+                                    "virtual_candles_to_exit",
+                                    "ab_throttle_skip",
+                                    "ab_throttle",
+                                    "ab_mult_a",
+                                    "ab_mult_b",
+                                    "entry_price",
+                                    "stop_loss",
+                                    "tp1",
+                                    "tp2",
+                                    "tp3",
+                                    "confidence",
+                                    "macro_bias",
+                                ):
+                                    if _vk in res:
+                                        row[_vk] = res.get(_vk)
                                 row.update(
                                     _v73_regime_row_fields(
                                         {

@@ -275,6 +275,10 @@ _LIVE_STRAT_TRADE_COUNT: dict[str, int] = {}  # total closed (excl. pyramid adds
 _LIVE_SIZING_HEALTH_REBUILT: bool = False
 _LIVE_SIZING_HEALTH_MAXLEN: int = 50
 _AB_THROTTLE_FACTOR: float = 0.18
+# Match continuous_backtester.SKIP_ALL_THROTTLED — skip instead of sizing to 18%,
+# and feed virtual full-size outcomes into A+B so the throttle can release.
+SKIP_ALL_THROTTLED: bool = True
+VIRTUAL_THROTTLE_OPENS_KEY = "virtual_throttle_opens"
 
 # Deep live log + remote API snapshot (VPS: ``APEX_DATA_DIR`` / ``C:\Apex``; Railway: set ``APEX_LIVE_V76_DIR``).
 _LOG_RING_MAX = 8000
@@ -754,6 +758,8 @@ def apply_ab_sizing_throttle(plan: TradePlan) -> dict[str, Any]:
     """
     Apply A+B sizing throttle to ``plan.risk_usd`` AFTER all existing multipliers.
     Both factors can stack (0.18 × 0.18). Short histories (<3) do not throttle.
+    When ``SKIP_ALL_THROTTLED`` and throttle < 1, keep full risk and set
+    ``ab_skip=True`` so the order path skips the live fill.
     Returns fields for decision / forensic logging.
     """
     _ensure_live_sizing_health_rebuilt()
@@ -784,13 +790,17 @@ def apply_ab_sizing_throttle(plan: TradePlan) -> dict[str, Any]:
             b_factor = float(_AB_THROTTLE_FACTOR)
 
     throttle = float(a_factor) * float(b_factor)
-    final_risk = base_risk * throttle
+    ab_skip = bool(SKIP_ALL_THROTTLED and throttle < 1.0 - 1e-12)
+    if ab_skip:
+        final_risk = base_risk  # full size for virtual tracking; do not fill live
+    else:
+        final_risk = base_risk * throttle
     plan.risk_usd = round(final_risk, 2)
     try:
         base_pct = float(plan.risk_pct or 0)
     except (TypeError, ValueError):
         base_pct = 0.0
-    plan.risk_pct = base_pct * throttle
+    plan.risk_pct = base_pct if ab_skip else base_pct * throttle
 
     fields: dict[str, Any] = {
         "sizing_health_strategy_id": sid,
@@ -803,12 +813,169 @@ def apply_ab_sizing_throttle(plan: TradePlan) -> dict[str, Any]:
         "sizing_health_final_risk": round(final_risk, 2),
         "max_risk_dollars": round(final_risk, 2),
         "final_risk_pct": plan.risk_pct,
+        "ab_skip": ab_skip,
+        "ab_throttle_skip": ab_skip,
     }
     plan.log_fields.update(fields)
     plan.ai["sizing_health_throttle"] = float(throttle)
     plan.ai["sizing_health_base_risk"] = round(base_risk, 2)
     plan.ai["max_risk_dollars"] = round(final_risk, 2)
+    plan.ai["_ab_skip"] = ab_skip
+    plan.ai["_ab_throttle"] = float(throttle)
     return fields
+
+
+def _record_live_ab_from_virtual(
+    *,
+    strategy_id: str,
+    confidence: str,
+    macro_bias: str,
+    outcome: str,
+    pnl_dollars: float,
+) -> None:
+    """Feed A+B histories from a virtual throttle close (no capital)."""
+    oc = str(outcome or "").strip().upper()
+    if oc not in ("WIN", "LOSS"):
+        return
+    _record_closed_trade_for_sizing_health(
+        {
+            "strategy_id": strategy_id,
+            "confidence": confidence,
+            "macro_bias": macro_bias,
+            "outcome": oc,
+            "pnl_dollars": float(pnl_dollars or 0),
+            "skipped": False,
+        }
+    )
+
+
+def register_virtual_throttle_open(st: dict[str, Any], plan: TradePlan, throttle_fields: Mapping[str, Any]) -> None:
+    """Persist a paper open so A+B can update when stop/TP would have hit."""
+    opens = st.setdefault(VIRTUAL_THROTTLE_OPENS_KEY, [])
+    if not isinstance(opens, list):
+        opens = []
+        st[VIRTUAL_THROTTLE_OPENS_KEY] = opens
+    opens.append(
+        {
+            "ticker": str(plan.sym).upper(),
+            "timeframe": str(plan.timeframe),
+            "strategy_id": str(plan.strategy_id),
+            "direction": str(plan.direction).upper(),
+            "entry": float(plan.entry),
+            "stop_loss": float(plan.stop_loss),
+            "tp1": float(plan.ai.get("tp1") or plan.log_fields.get("tp1") or 0),
+            "tp2": float(plan.ai.get("tp2") or plan.log_fields.get("tp2") or 0),
+            "tp3": float(plan.ai.get("tp3") or plan.log_fields.get("tp3") or 0),
+            "risk_usd": float(plan.risk_usd or 0),
+            "confidence": str(
+                plan.ai.get("confidence") or plan.log_fields.get("confidence") or ""
+            ),
+            "macro_bias": str(
+                plan.ai.get("macro_bias") or plan.log_fields.get("macro_bias") or ""
+            ),
+            "opened_at": datetime.now(timezone.utc).isoformat(),
+            "ab_throttle": float(throttle_fields.get("sizing_health_throttle") or 0),
+        }
+    )
+
+
+def process_virtual_throttle_opens(st: dict[str, Any], mt5: Any = None) -> int:
+    """
+    Resolve virtual throttle opens against recent bars; feed A+B on exit.
+    Returns number of closes processed.
+    """
+    opens = st.get(VIRTUAL_THROTTLE_OPENS_KEY) or []
+    if not isinstance(opens, list) or not opens:
+        return 0
+    remaining: list[dict[str, Any]] = []
+    closed_n = 0
+    for op in opens:
+        if not isinstance(op, dict):
+            continue
+        resolved = _resolve_virtual_throttle_open(op, mt5=mt5)
+        if resolved is None:
+            remaining.append(op)
+            continue
+        outcome, pnl = resolved
+        _record_live_ab_from_virtual(
+            strategy_id=str(op.get("strategy_id") or ""),
+            confidence=str(op.get("confidence") or ""),
+            macro_bias=str(op.get("macro_bias") or ""),
+            outcome=outcome,
+            pnl_dollars=pnl,
+        )
+        closed_n += 1
+        live_log(
+            "info",
+            "[AB_THROTTLE_SKIP] virtual close → A+B",
+            ticker=op.get("ticker"),
+            strategy_id=op.get("strategy_id"),
+            outcome=outcome,
+            pnl_dollars=round(pnl, 2),
+        )
+    st[VIRTUAL_THROTTLE_OPENS_KEY] = remaining
+    return closed_n
+
+
+def _resolve_virtual_throttle_open(
+    op: Mapping[str, Any],
+    *,
+    mt5: Any = None,
+) -> tuple[str, float] | None:
+    """Return (outcome, pnl_dollars) if stop/TP hit; else None (still open)."""
+    try:
+        entry = float(op.get("entry") or 0)
+        stop = float(op.get("stop_loss") or 0)
+        tp1 = float(op.get("tp1") or 0)
+        risk_usd = float(op.get("risk_usd") or 0)
+    except (TypeError, ValueError):
+        return None
+    direction = str(op.get("direction") or "").upper()
+    if direction not in ("LONG", "SHORT") or entry <= 0 or stop <= 0:
+        return None
+    risk_dist = abs(entry - stop)
+    if risk_dist <= 0:
+        return None
+    sym = str(op.get("ticker") or "").upper()
+    tf = str(op.get("timeframe") or "1d")
+    high = low = None
+    try:
+        if mt5 is not None:
+            broker = at.resolve_sym(mt5, sym) or sym
+            rates = mt5.copy_rates_from_pos(broker, _mt5_tf(tf), 0, 5)
+            if rates is not None and len(rates) > 0:
+                high = float(max(float(r["high"]) for r in rates))
+                low = float(min(float(r["low"]) for r in rates))
+    except Exception:  # noqa: BLE001
+        high = low = None
+    if high is None or low is None:
+        return None
+    if direction == "LONG":
+        if low <= stop:
+            r = (stop - entry) / risk_dist
+            return "LOSS", round(risk_usd * r, 2)
+        if tp1 > 0 and high >= tp1:
+            r = (tp1 - entry) / risk_dist
+            return "WIN", round(risk_usd * r, 2)
+    else:
+        if high >= stop:
+            r = (entry - stop) / risk_dist
+            return "LOSS", round(risk_usd * r, 2)
+        if tp1 > 0 and low <= tp1:
+            r = (entry - tp1) / risk_dist
+            return "WIN", round(risk_usd * r, 2)
+    return None
+
+
+def _mt5_tf(tf: str) -> Any:
+    t = str(tf or "").lower()
+    mapping = {
+        "1w": getattr(at, "TIMEFRAME_W1", None) or 32769,
+        "1d": getattr(at, "TIMEFRAME_D1", None) or 16408,
+        "4h": getattr(at, "TIMEFRAME_H4", None) or 16388,
+        "1h": getattr(at, "TIMEFRAME_H1", None) or 16385,
+    }
+    return mapping.get(t, mapping["1d"])
 
 
 def _parse_iso_date(raw: Any) -> date | None:
@@ -1766,9 +1933,40 @@ def order_send_v76(
         throttle=throttle_fields.get("sizing_health_throttle"),
         base_risk=throttle_fields.get("sizing_health_base_risk"),
         final_risk=throttle_fields.get("sizing_health_final_risk"),
+        ab_skip=throttle_fields.get("ab_skip"),
         confidence=plan.ai.get("confidence") or plan.log_fields.get("confidence"),
         macro_bias=plan.ai.get("macro_bias") or plan.log_fields.get("macro_bias"),
     )
+    if throttle_fields.get("ab_skip"):
+        st_use = st if isinstance(st, dict) else load_v76_state()
+        register_virtual_throttle_open(st_use, plan, throttle_fields)
+        if st is None:
+            save_v76_state(st_use)
+        else:
+            save_v76_state(st_use)
+        row = dict(plan.log_fields)
+        row.update(
+            {
+                "action": "SKIP",
+                "skip_reason": (
+                    f"[AB_THROTTLE_SKIP] ab_throttle="
+                    f"{float(throttle_fields.get('sizing_health_throttle') or 0):.4f} "
+                    f"— skip instead of size-down; virtual open tracks A+B"
+                ),
+                "magic_number": APEX_V76_MAGIC,
+                "ab_throttle_skip": True,
+            }
+        )
+        append_decision_log(row)
+        live_log(
+            "info",
+            "[AB_THROTTLE_SKIP] live fill skipped; virtual open registered",
+            ticker=plan.sym,
+            timeframe=plan.timeframe,
+            strategy_id=plan.strategy_id,
+            throttle=throttle_fields.get("sizing_health_throttle"),
+        )
+        return {"ok": False, "error": "ab_throttle_skip", "dry_run": False, "ab_skip": True}
     guard_fields = apply_cfg_guardrails(
         plan,
         st=st_use,
@@ -2519,6 +2717,11 @@ def run_full_scan_v76() -> None:
         regime=regime_ctx.get("regime"),
         regime_wr10=regime_ctx.get("wr_10"),
     )
+
+    n_virt = process_virtual_throttle_opens(st, mt5=mt5)
+    if n_virt:
+        save_v76_state(st)
+        live_log("info", "[AB_THROTTLE_SKIP] processed virtual closes", closed=n_virt)
 
     _v76_logic.CHRONO_DAY_PREFILTER_SIDS.clear()
     _v76_logic.CHRONO_SYMDIR_TFS.clear()
