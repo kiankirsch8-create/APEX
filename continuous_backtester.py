@@ -15798,7 +15798,7 @@ def run_chronological_backtest(
             "skipped": [],
             "days_processed": 0,
         }
-        save_json(chrono_path, chrono_data)
+        save_json(chrono_path, chrono_data, compact=True)
 
     global CHRONO_RUNNING
     CHRONO_RUNNING = True
@@ -15858,7 +15858,7 @@ def run_chronological_backtest(
             log(f"[Chrono {job_id}] Invalid end_date {end_date}", level="error")
             chrono_data["status"] = "failed"
             chrono_data["error"] = "invalid end_date"
-            save_json(chrono_path, chrono_data)
+            save_json(chrono_path, chrono_data, compact=True)
             return chrono_data
 
         capital = float(chrono_data.get("capital", STARTING_CAPITAL) or STARTING_CAPITAL)
@@ -15884,7 +15884,7 @@ def run_chronological_backtest(
                 log(f"[Chrono {job_id}] Invalid start_date {start_date}", level="error")
                 chrono_data["status"] = "failed"
                 chrono_data["error"] = "invalid start_date"
-                save_json(chrono_path, chrono_data)
+                save_json(chrono_path, chrono_data, compact=True)
                 return chrono_data
 
         tickers = list(CHRONO_TICKERS)
@@ -15978,7 +15978,7 @@ def run_chronological_backtest(
                 chrono_data["status"] = "cancelled"
                 chrono_data["cancel_reason"] = "stop_requested"
                 chrono_data.pop("chrono_intraday", None)
-                save_json(chrono_path, chrono_data)
+                save_json(chrono_path, chrono_data, compact=True)
                 CHRONO_LIVE_STATUS["status"] = "cancelled"
                 return chrono_data
 
@@ -16138,7 +16138,7 @@ def run_chronological_backtest(
                 chrono_data["current_date"] = date_str
                 chrono_data["status"] = "running"
                 chrono_data["days_processed"] = int(chrono_data.get("days_processed", 0) or 0) + 1
-                save_json(chrono_path, chrono_data)
+                save_json(chrono_path, chrono_data, compact=True)
                 log(
                     f"[Chrono {job_id}] {date_str}: HALTED — 0 new trades, "
                     f"capital {capital:.2f}",
@@ -16304,7 +16304,7 @@ def run_chronological_backtest(
                                 )
                                 chrono_data["current_date"] = date_str
                                 chrono_data["status"] = "running"
-                                save_json(chrono_path, chrono_data)
+                                save_json(chrono_path, chrono_data, compact=True)
                                 continue
 
                             cd_ok, cd_reason = check_cooldown(ticker, timeframe, date_str)
@@ -16347,7 +16347,7 @@ def run_chronological_backtest(
                                 )
                                 chrono_data["current_date"] = date_str
                                 chrono_data["status"] = "running"
-                                save_json(chrono_path, chrono_data)
+                                save_json(chrono_path, chrono_data, compact=True)
                                 continue
 
                             tkr_u = str(ticker).strip().upper()
@@ -16385,7 +16385,7 @@ def run_chronological_backtest(
                                 )
                                 chrono_data["current_date"] = date_str
                                 chrono_data["status"] = "running"
-                                save_json(chrono_path, chrono_data)
+                                save_json(chrono_path, chrono_data, compact=True)
                                 continue
 
                             cap_blocked, cap_ccy = _chrono_currency_cap_blocks(ticker, use_4h_pool=use4h_pool)
@@ -16423,7 +16423,7 @@ def run_chronological_backtest(
                                 )
                                 chrono_data["current_date"] = date_str
                                 chrono_data["status"] = "running"
-                                save_json(chrono_path, chrono_data)
+                                save_json(chrono_path, chrono_data, compact=True)
                                 continue
 
                             peak_capital = _update_run_peak_capital(capital, peak_capital)
@@ -16471,7 +16471,7 @@ def run_chronological_backtest(
                                 )
                                 chrono_data["current_date"] = date_str
                                 chrono_data["status"] = "running"
-                                save_json(chrono_path, chrono_data)
+                                save_json(chrono_path, chrono_data, compact=True)
                                 continue
 
                             if res is None:
@@ -16508,7 +16508,7 @@ def run_chronological_backtest(
                                 )
                                 chrono_data["current_date"] = date_str
                                 chrono_data["status"] = "running"
-                                save_json(chrono_path, chrono_data)
+                                save_json(chrono_path, chrono_data, compact=True)
                                 continue
 
                             if res.get("skipped"):
@@ -16579,7 +16579,7 @@ def run_chronological_backtest(
                                 )
                                 chrono_data["current_date"] = date_str
                                 chrono_data["status"] = "running"
-                                save_json(chrono_path, chrono_data)
+                                save_json(chrono_path, chrono_data, compact=True)
                                 continue
 
                             oc = str(res.get("outcome", "") or "")
@@ -16607,7 +16607,7 @@ def run_chronological_backtest(
                                 )
                                 chrono_data["current_date"] = date_str
                                 chrono_data["status"] = "running"
-                                save_json(chrono_path, chrono_data)
+                                save_json(chrono_path, chrono_data, compact=True)
                                 continue
 
                             exec_block = _hard_block_skip_reason(
@@ -16656,7 +16656,7 @@ def run_chronological_backtest(
                                 )
                                 chrono_data["current_date"] = date_str
                                 chrono_data["status"] = "running"
-                                save_json(chrono_path, chrono_data)
+                                save_json(chrono_path, chrono_data, compact=True)
                                 continue
 
                             pnl = float(res.get("pnl_dollars", 0) or 0)
@@ -16698,7 +16698,7 @@ def run_chronological_backtest(
                                 )
                                 chrono_data["current_date"] = date_str
                                 chrono_data["status"] = "running"
-                                save_json(chrono_path, chrono_data)
+                                save_json(chrono_path, chrono_data, compact=True)
                                 continue
 
                             _shadow_maps = shadow_runner.process_trade(_shadow_trade_ctx_from_row(row))
@@ -16817,7 +16817,7 @@ def run_chronological_backtest(
                             _persist_shadow_zone_state(chrono_data, zone_runner)
                             chrono_data["current_date"] = date_str
                             chrono_data["status"] = "running"
-                            save_json(chrono_path, chrono_data)
+                            save_json(chrono_path, chrono_data, compact=True)
 
                         if chrono_abort:
                             break
@@ -16833,7 +16833,7 @@ def run_chronological_backtest(
                 chrono_data["status"] = "cancelled"
                 chrono_data["cancel_reason"] = "stop_requested"
                 chrono_data.pop("chrono_intraday", None)
-                save_json(chrono_path, chrono_data)
+                save_json(chrono_path, chrono_data, compact=True)
                 CHRONO_LIVE_STATUS["status"] = "stopped"
                 return chrono_data
 
@@ -16908,7 +16908,7 @@ def run_chronological_backtest(
             _persist_shadow_portfolio_cap_state(chrono_data, pcap_runner)
             _persist_shadow_equity_daily_stop_state(chrono_data, eqstop_runner)
             _persist_shadow_zone_state(chrono_data, zone_runner)
-            save_json(chrono_path, chrono_data)
+            save_json(chrono_path, chrono_data, compact=True)
 
             log(
                 f"[Chrono {job_id}] {date_str}: {len(day_trades)} trades, "
@@ -17004,7 +17004,7 @@ def run_chronological_backtest(
         _persist_shadow_zone_state(chrono_data, zone_runner)
         chrono_data["v74_metrics"] = _v74_chrono_trade_metrics(all_trades)
         _assert_swap_financing_modeled(all_trades, context=f"Chrono {job_id}")
-        save_json(chrono_path, chrono_data)
+        save_json(chrono_path, chrono_data, compact=True)
         log(
             f"[Chrono {job_id}] Complete. Capital: {capital:.2f}, P&L: {capital - STARTING_CAPITAL:+.2f}",
             level="info",

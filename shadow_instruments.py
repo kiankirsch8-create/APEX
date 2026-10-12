@@ -312,11 +312,18 @@ def _shadow_trade_sort_key(r: Mapping[str, Any]) -> tuple[int, str, str, str]:
     )
 
 
-def _iter_trades_for_job(job_id: str) -> Iterator[dict[str, Any]]:
-    jid = str(job_id or "").strip()
-    if not jid:
-        return
-    path = job_instruments_path(jid)
+def _row_dedupe_key(row: Mapping[str, Any]) -> tuple[Any, ...]:
+    return (
+        str(row.get("ticker", "")).strip().upper(),
+        str(row.get("date", ""))[:10],
+        str(row.get("timeframe", "")).strip().lower(),
+        str(row.get("strategy_id", "")).strip().upper(),
+        str(row.get("outcome", "")).strip().upper(),
+        round(float(row.get("pnl_dollars", 0) or 0), 6),
+    )
+
+
+def _iter_jsonl_rows(path: Path, *, job_id: str) -> Iterator[dict[str, Any]]:
     if not path.is_file():
         return
     try:
@@ -332,10 +339,30 @@ def _iter_trades_for_job(job_id: str) -> Iterator[dict[str, Any]]:
                 if isinstance(row, dict):
                     # Per-job file; still tolerate legacy rows that embedded job_id.
                     row_jid = str(row.get("job_id", "")).strip()
-                    if not row_jid or row_jid == jid:
+                    if not row_jid or row_jid == job_id:
                         yield row
     except OSError as e:
-        log(f"[SHADOW INST] stream error: {e}", level="warning")
+        log(f"[SHADOW INST] stream error {path.name}: {e}", level="warning")
+
+
+def _iter_trades_for_job(job_id: str) -> Iterator[dict[str, Any]]:
+    """
+    Stream shadow trades for a job from instruments + blocked-pairs sidecars.
+
+    Rows are partitioned (not dual-written): blocked_fx → blocked_pairs file,
+    other classes → instruments file. Legacy dual-written jobs are de-duplicated.
+    """
+    jid = str(job_id or "").strip()
+    if not jid:
+        return
+    seen: set[tuple[Any, ...]] = set()
+    for path in (job_instruments_path(jid), job_blocked_pairs_path(jid)):
+        for row in _iter_jsonl_rows(path, job_id=jid):
+            key = _row_dedupe_key(row)
+            if key in seen:
+                continue
+            seen.add(key)
+            yield row
 
 
 def _record_ab_histories(row: Mapping[str, Any], shadow_class: ShadowClass) -> None:
@@ -410,7 +437,21 @@ def shadow_reason_for_ticker(sym: str) -> str | None:
     return None
 
 
+def _is_blocked_pair_row(sc: str, reason: str | None) -> bool:
+    if str(sc or "").strip().lower() == "blocked_fx":
+        return True
+    return str(reason or "").strip().upper() in ("BLOCKED_PAIR", "EXCLUDED_PAIR")
+
+
 def persist_shadow_trade(row: dict[str, Any], *, job_id: str) -> None:
+    """
+    Partition write: blocked/excluded FX → ``shadow_blocked_pairs_*.jsonl`` only;
+    other shadow classes → ``shadow_instruments_*.jsonl`` only.
+
+    Previously every blocked row was dual-written to both files, so with
+    EXTRA_FX/NONFX disabled the two files were byte-identical (~28 MB waste/run)
+    and blocked-pair data could not be trusted as distinct.
+    """
     out = dict(row)
     sym = str(out.get("ticker", "")).strip().upper()
     sc = shadow_class_for_ticker(sym) or str(out.get("shadow_class") or "blocked_fx")
@@ -426,12 +467,10 @@ def persist_shadow_trade(row: dict[str, Any], *, job_id: str) -> None:
     out.setdefault("job_id", job_id)
     if is_provisional_future(sym):
         out["provisional_roll_series"] = True
-    append_trade_row(out, job_id=job_id)
-    if sc == "blocked_fx" or str(out.get("shadow_reason", "")) in (
-        "BLOCKED_PAIR",
-        "EXCLUDED_PAIR",
-    ):
+    if _is_blocked_pair_row(sc, str(reason) if reason else None):
         append_blocked_pair_row(out, job_id=job_id)
+    else:
+        append_trade_row(out, job_id=job_id)
     _record_ab_histories(out, sc)
 
 
