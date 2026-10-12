@@ -11911,6 +11911,224 @@ def _v73_apply_calendar_regime_position_size(
     ai["_leveraged_exposure"] = round(ps * ent, 2)
 
 
+def is_decision_skip_for_virtual(skip_reason: str) -> bool:
+    """
+    True for vetoes of a tradeable setup (virtual outcome is useful for mining).
+
+    Excludes errors / no-data / API failures and blocked-pair skips (shadow
+    instruments already capture those outcomes).
+    """
+    r = str(skip_reason or "").strip().upper()
+    if not r:
+        return False
+    if "[BLOCKED PAIR]" in r or "BLOCKED_PAIRS" in r:
+        return False
+    if any(
+        tok in r
+        for tok in (
+            "INSUFFICIENT",
+            "NO DATA",
+            "NO_DATA",
+            "OHLC",
+            "API",
+            "FORWARD SIMULATION FAILED",
+            "FORWARD WINDOW",
+            "PAST BARS",
+            "EXECUTION ABORT",
+            "SCAN PRODUCED NO RESULT",
+        )
+    ):
+        return False
+    return any(
+        tok in r
+        for tok in (
+            "[BAD PERIOD]",
+            "[ST_BAD_LONG_BLOCK]",
+            "COUNTER-TREND",
+            "TREND BLOCK",
+            "[TREND BLOCK]",
+            "[STALE_TAILWIND_VETO]",
+            "[NEUTRAL+RANGING SKIP]",
+            "[AB_THROTTLE_SKIP]",
+            "[FILTER SKIP]",
+        )
+    )
+
+
+def _virtual_skip_outcome_fields(
+    *,
+    direction: str,
+    entry: float,
+    stop_loss: float,
+    tp1: float,
+    tp2: float,
+    tp3: float,
+    future: Any,
+    strategy_id: str = "",
+    timeframe: str = "",
+    macro_bias: str = "",
+    trail_regime: str = "",
+    trend_strength: float = 0.0,
+    rate_differential: float = 0.0,
+    atr: float = 0.0,
+    buffer_stop_price: float | None = None,
+    ticker: str = "",
+    period_mode: str = "NEUTRAL",
+) -> dict[str, Any]:
+    """
+    Forward-simulate a skipped setup for the miner (virtual_* only).
+
+    Does not touch capital, A+B histories, or any live decision state.
+    """
+    d = str(direction or "").strip().upper()
+    if d not in ("LONG", "SHORT"):
+        return {}
+    try:
+        ent = float(entry)
+        sl = float(stop_loss)
+        t1 = float(tp1)
+        t2 = float(tp2) if tp2 else t1
+        t3 = float(tp3) if tp3 else t2
+    except (TypeError, ValueError):
+        return {}
+    risk = abs(ent - sl)
+    if ent <= 0 or sl <= 0 or risk <= 0:
+        return {}
+    if future is None or getattr(future, "empty", True):
+        return {}
+    tf_key = str(timeframe or "").strip().lower()
+    fwd_n = int(TF_FORWARD_CANDLES.get(tf_key, FORWARD_CANDLES)) if tf_key else FORWARD_CANDLES
+    try:
+        fut = future.head(fwd_n)
+    except Exception:  # noqa: BLE001
+        fut = future
+    if fut is None or getattr(fut, "empty", True):
+        return {}
+    # Nominal size so trailing/partial-exit math runs; capital/histories are untouched.
+    # virtual_pnl_r is price-R (exit vs entry / stop distance), not dollar PnL.
+    try:
+        exit_data = _evaluate_forward_with_trend_continuation(
+            d,
+            ent,
+            sl,
+            t1,
+            t2,
+            t3,
+            fut,
+            str(strategy_id or ""),
+            position_size=10_000.0,
+            leverage=LEVERAGE,
+            timeframe=tf_key,
+            macro_bias=str(macro_bias or ""),
+            macro_bias_adjusted=str(macro_bias or ""),
+            trail_regime=str(trail_regime or ""),
+            trend_strength=float(trend_strength or 0),
+            rate_differential=float(rate_differential or 0),
+            atr=float(atr or 0),
+            buffer_stop_price=buffer_stop_price,
+            ticker=str(ticker or ""),
+            period_mode=str(period_mode or "NEUTRAL"),
+        )
+    except Exception as e:  # noqa: BLE001
+        log(f"[VIRTUAL SKIP] sim failed {ticker} {timeframe}: {e}", level="warning")
+        return {}
+    try:
+        exit_p = float(exit_data.get("exit_price", ent) or ent)
+    except (TypeError, ValueError):
+        exit_p = ent
+    if d == "LONG":
+        raw_r = (exit_p - ent) / risk
+    else:
+        raw_r = (ent - exit_p) / risk
+    # Prefer engine net outcome when present; fall back to price-R sign.
+    outcome = str(exit_data.get("outcome") or "").strip().upper()
+    if outcome not in ("WIN", "LOSS"):
+        if abs(raw_r) < 1e-12:
+            return {}
+        outcome = "WIN" if raw_r > 0 else "LOSS"
+    return {
+        "virtual_outcome": outcome,
+        "virtual_pnl_r": round(float(raw_r), 6),
+        "virtual_exit_reason": str(exit_data.get("exit_reason") or "")[:200],
+        "virtual_exit_price": round(exit_p, 5),
+        "virtual_candles_to_exit": int(exit_data.get("candles_to_exit", 0) or 0),
+    }
+
+
+def attach_virtual_skip_outcome(
+    row: dict[str, Any],
+    *,
+    skip_reason: str,
+    ai: Mapping[str, Any] | None,
+    future: Any,
+    timeframe: str,
+    ticker: str = "",
+    atr: float = 0.0,
+    buffer_stop_price: float | None = None,
+    period_mode: str = "NEUTRAL",
+) -> dict[str, Any]:
+    """Mutate ``row`` with virtual_* when this is a qualifying decision-skip."""
+    if not isinstance(row, dict):
+        return row
+    if not is_decision_skip_for_virtual(skip_reason):
+        return row
+    src = ai if isinstance(ai, Mapping) else {}
+    direction = str(src.get("direction") or row.get("direction") or "").strip().upper()
+    try:
+        entry = float(src.get("entry") or row.get("entry_price") or 0)
+    except (TypeError, ValueError):
+        entry = 0.0
+    try:
+        stop = float(src.get("stop_loss") or row.get("stop_loss") or 0)
+    except (TypeError, ValueError):
+        stop = 0.0
+    try:
+        tp1 = float(src.get("tp1") or row.get("tp1") or 0)
+        tp2 = float(src.get("tp2") or row.get("tp2") or tp1 or 0)
+        tp3 = float(src.get("tp3") or row.get("tp3") or tp2 or 0)
+    except (TypeError, ValueError):
+        return row
+    # If stop/TPs were zeroed by the skip builder, rebuild a minimal 0.5% stop / 1R TP ladder.
+    if entry > 0 and stop <= 0 and direction in ("LONG", "SHORT"):
+        mult = 1 if direction == "LONG" else -1
+        stop = round(entry * (1 - mult * 0.005), 5)
+        risk = abs(entry - stop)
+        tp1 = round(entry + mult * risk * 2.0, 5)
+        tp2 = round(entry + mult * risk * 3.0, 5)
+        tp3 = round(entry + mult * risk * 4.0, 5)
+    fields = _virtual_skip_outcome_fields(
+        direction=direction,
+        entry=entry,
+        stop_loss=stop,
+        tp1=tp1,
+        tp2=tp2,
+        tp3=tp3,
+        future=future,
+        strategy_id=str(src.get("strategy_id") or row.get("strategy_id") or ""),
+        timeframe=timeframe,
+        macro_bias=str(src.get("macro_bias_adjusted") or src.get("macro_bias") or ""),
+        trail_regime=str(src.get("_trail_regime_st") or ""),
+        trend_strength=float(src.get("trend_strength") or 0),
+        rate_differential=float(src.get("macro_rate_diff") or 0),
+        atr=float(atr or src.get("entry_atr") or 0),
+        buffer_stop_price=buffer_stop_price,
+        ticker=str(ticker or row.get("ticker") or ""),
+        period_mode=str(src.get("period_mode") or period_mode or "NEUTRAL"),
+    )
+    if fields:
+        row.update(fields)
+        # Preserve setup levels for the miner (skip builder zeroes them).
+        if entry > 0:
+            row["entry_price"] = round(entry, 5)
+        if stop > 0:
+            row["stop_loss"] = round(stop, 5)
+        if tp1 > 0:
+            row["tp1"] = round(tp1, 5)
+            row["tp2"] = round(tp2, 5)
+            row["tp3"] = round(tp3, 5)
+    return row
+
+
 def _skipped_backtest_row(
     *,
     sym: str,
@@ -11923,8 +12141,13 @@ def _skipped_backtest_row(
     ai: dict[str, Any],
     tf_key: str,
     is_exotic: bool,
+    future: Any = None,
+    attach_virtual: bool | None = None,
+    atr: float = 0.0,
+    buffer_stop_price: float | None = None,
+    period_mode: str = "NEUTRAL",
 ) -> dict[str, Any]:
-    """Row persisted when APEX declines to trade (no forward simulation)."""
+    """Row persisted when APEX declines to trade (optional virtual forward sim)."""
     sid = str(ai.get("strategy_id") or "SKIP").strip().upper()
     intel_summary_stored = str(
         ai.get("intelligence_summary") or ai.get("intel_summary") or "",
@@ -11933,7 +12156,7 @@ def _skipped_backtest_row(
     core_failed = (
         ai.get("core_signals_failed") if isinstance(ai.get("core_signals_failed"), list) else []
     )
-    return {
+    row: dict[str, Any] = {
         "date": analysis_date,
         "ticker": sym,
         "timeframe": timeframe,
@@ -12031,6 +12254,20 @@ def _skipped_backtest_row(
             ),
         ),
     }
+    do_virtual = is_decision_skip_for_virtual(skip_reason) if attach_virtual is None else bool(attach_virtual)
+    if do_virtual and future is not None:
+        attach_virtual_skip_outcome(
+            row,
+            skip_reason=skip_reason,
+            ai=ai,
+            future=future,
+            timeframe=tf_key or timeframe,
+            ticker=sym,
+            atr=atr,
+            buffer_stop_price=buffer_stop_price,
+            period_mode=str(ai.get("period_mode") or period_mode or "NEUTRAL"),
+        )
+    return row
 
 
 def _python_forced_layer2_trade(
@@ -12114,28 +12351,7 @@ def _python_forced_layer2_trade(
             tf_key=tf_key,
             is_exotic=is_exotic,
         )
-    ok_frag, rs_frag = _fragile_bad_period_skip(strat_id, period_mode)
-    if ok_frag:
-        return _skipped_backtest_row(
-            sym=sym,
-            timeframe=timeframe,
-            analysis_date=analysis_date,
-            price=float(price),
-            zone_pct=zone_pct,
-            zone_label=zone_label,
-            skip_reason=rs_frag,
-            ai={
-                "skip_trade": True,
-                "strategy_id": strat_id,
-                "strategy_met": False,
-                "skip_reason": rs_frag,
-                "direction": "NONE",
-                "conviction_score": 0,
-                "period_mode": period_mode,
-            },
-            tf_key=tf_key,
-            is_exotic=is_exotic,
-        )
+    # BAD-period fragile skip deferred until entry/stop/TP exist (virtual outcome).
     meta = best[3] if len(best) > 3 else None
     direction = str(best[1]).strip().upper()
     if direction == "BOTH":
@@ -12340,6 +12556,33 @@ def _python_forced_layer2_trade(
     buffer_stop_v75 = float(v75_meta["buffer_stop_price"] or normal_stop_v75)
     ai["stop_loss"] = normal_stop_v75
 
+    def _l2_decision_skip(reason: str, ai_src: dict[str, Any]) -> dict[str, Any]:
+        return _skipped_backtest_row(
+            sym=sym,
+            timeframe=timeframe,
+            analysis_date=analysis_date,
+            price=float(price),
+            zone_pct=zone_pct,
+            zone_label=zone_label,
+            skip_reason=reason,
+            ai=ai_src,
+            tf_key=tf_key,
+            is_exotic=is_exotic,
+            future=future,
+            atr=float(v75_meta.get("entry_atr", 0) or 0),
+            buffer_stop_price=buffer_stop_v75,
+            period_mode=period_mode,
+        )
+
+    ok_frag, rs_frag = _fragile_bad_period_skip(strat_id, period_mode)
+    if ok_frag:
+        ai2 = dict(ai)
+        ai2["calendar_action"] = str(cal.get("action", "CLEAR"))
+        ai2["calendar_reason"] = str(cal.get("reason", ""))
+        ai2["period_mode"] = period_mode
+        ai2.update(_v73_regime_row_fields(regime_ctx))
+        return _l2_decision_skip(rs_frag, ai2)
+
     sym_xu = sym.strip().upper()
     if strat_id == "M03_RSI_MOMENTUM_CONTINUATION" and sym_xu not in M03_ALLOWED_TICKERS:
         log(f"[M03 BLOCKED] {sym_xu} not in allowed ticker list", level="info")
@@ -12372,18 +12615,7 @@ def _python_forced_layer2_trade(
         ai2["calendar_action"] = str(cal.get("action", "CLEAR"))
         ai2["calendar_reason"] = str(cal.get("reason", ""))
         ai2.update(_v73_regime_row_fields(regime_ctx))
-        return _skipped_backtest_row(
-            sym=sym,
-            timeframe=timeframe,
-            analysis_date=analysis_date,
-            price=float(price),
-            zone_pct=zone_pct,
-            zone_label=zone_label,
-            skip_reason=rs_st_bad,
-            ai=ai2,
-            tf_key=tf_key,
-            is_exotic=is_exotic,
-        )
+        return _l2_decision_skip(rs_st_bad, ai2)
     ok_mom, rs_mom = _momentum_neutral_ranging_skip(
         sym=sym,
         strat_id=strat_id,
@@ -12397,18 +12629,7 @@ def _python_forced_layer2_trade(
         ai2["calendar_action"] = str(cal.get("action", "CLEAR"))
         ai2["calendar_reason"] = str(cal.get("reason", ""))
         ai2.update(_v73_regime_row_fields(regime_ctx))
-        return _skipped_backtest_row(
-            sym=sym,
-            timeframe=timeframe,
-            analysis_date=analysis_date,
-            price=float(price),
-            zone_pct=zone_pct,
-            zone_label=zone_label,
-            skip_reason=rs_mom,
-            ai=ai2,
-            tf_key=tf_key,
-            is_exotic=is_exotic,
-        )
+        return _l2_decision_skip(rs_mom, ai2)
 
     trend_result = cached_apply_trend_filter(
         sym,
@@ -12423,18 +12644,7 @@ def _python_forced_layer2_trade(
         ai2["calendar_reason"] = str(cal.get("reason", ""))
         ai2.update(_v73_regime_row_fields(regime_ctx))
         ai2["skip_reason"] = str(trend_result.get("reason") or "trend block")
-        return _skipped_backtest_row(
-            sym=sym,
-            timeframe=timeframe,
-            analysis_date=analysis_date,
-            price=float(price),
-            zone_pct=zone_pct,
-            zone_label=zone_label,
-            skip_reason=str(trend_result.get("reason") or "trend block"),
-            ai=ai2,
-            tf_key=tf_key,
-            is_exotic=is_exotic,
-        )
+        return _l2_decision_skip(str(trend_result.get("reason") or "trend block"), ai2)
     tr_snap_veto = trend_result.get("trend") or {}
     if not isinstance(tr_snap_veto, dict):
         tr_snap_veto = {}
@@ -12451,18 +12661,7 @@ def _python_forced_layer2_trade(
         ai2["calendar_action"] = str(cal.get("action", "CLEAR"))
         ai2["calendar_reason"] = str(cal.get("reason", ""))
         ai2.update(_v73_regime_row_fields(regime_ctx))
-        return _skipped_backtest_row(
-            sym=sym,
-            timeframe=timeframe,
-            analysis_date=analysis_date,
-            price=float(price),
-            zone_pct=zone_pct,
-            zone_label=zone_label,
-            skip_reason=rs_st_veto,
-            ai=ai2,
-            tf_key=tf_key,
-            is_exotic=is_exotic,
-        )
+        return _l2_decision_skip(rs_st_veto, ai2)
     trend_mult = float(trend_result.get("size_multiplier", 1.0) or 1.0)
 
     sym_u = sym.upper()
@@ -13591,6 +13790,8 @@ def run_one_backtest(
                 ai=merged_ai,
                 tf_key=tf_key,
                 is_exotic=is_exotic,
+                future=future,
+                period_mode=period_mode,
             )
 
         try:
