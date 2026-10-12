@@ -929,9 +929,23 @@ SPREAD_PIPS: dict[str, float] = {
 
 IMPROVE_EVERY = 100
 
-# Parallel rolling batch (I/O-bound jobs). Chrono stays sequential: same-day capital,
-# TRADED_TICKERS_TODAY, and currency caps mutate between scans — parallel chrono would
-# change which trades pass gates and is intentionally not used here.
+# Parallel rolling batch (I/O-bound jobs). Chrono SCAN evaluation stays sequential.
+#
+# Group C / PR7 investigated ThreadPoolExecutor around the chrono day loop
+# (run_one_backtest) with ordered apply. That split is NOT clean today:
+#   • Outer gates (TRADED_TICKERS_TODAY, currency caps, open_positions) depend on
+#     prior same-day fills — a whole-day parallel submit would race those gates.
+#   • run_one_backtest mutates day globals during eval (CHRONO_DAY_PREFILTER_SIDS /
+#     CHRONO_SYMDIR_TFS confluence, JPY storm snapshot) and sizes from live
+#     chrono_balance / day_pnl / STRATEGY_TRADE_COUNT / combo+health histories.
+#   • Capital and A+B histories must be applied in phase→ticker→TF list order;
+#     frozen-balance parallel eval then sequential apply still diverges because
+#     later scans must see post-trade capital for sizing (and period-mode inputs).
+# Safe parallelism already in place: OHLC prefetch only
+# (_chrono_prefetch_ohlc_for_phase_matrix, APEX_PARALLEL_WORKERS).
+# Do not wire chrono scans to ThreadPoolExecutor until eval is split into a pure
+# fetch/prefilter stage and a sequential size→simulate→apply stage that can
+# prove workers=N ≡ workers=1 on final capital + trade set.
 MAX_WORKERS = int(os.environ.get("APEX_PARALLEL_WORKERS", "8"))
 BATCH_SIZE = 10
 BACKTEST_CLAUDE_MAX_TOKENS = 1200
@@ -16427,6 +16441,9 @@ def run_chronological_backtest(
                                 continue
 
                             peak_capital = _update_run_peak_capital(capital, peak_capital)
+                            # Sequential on purpose — see MAX_WORKERS comment (PR7 blocked).
+                            # Do not submit this call to a thread pool: live capital, confluence
+                            # day-globals, and same-day gates make ordered parallel eval unsafe.
                             try:
                                 res = run_one_backtest(
                                     ticker,
