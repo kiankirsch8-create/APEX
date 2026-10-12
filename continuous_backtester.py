@@ -12811,7 +12811,7 @@ def _python_forced_layer2_trade(
             }
         )
 
-    return {
+    row = {
         "date": analysis_date,
         "ticker": sym,
         "timeframe": timeframe,
@@ -13001,6 +13001,9 @@ def _python_forced_layer2_trade(
         ),
         **_si.trade_fields_for_row(sym),
     }
+    if chrono_job:
+        return _strip_chrono_dead_trade_fields(row)
+    return row
 
 
 def _invoke_shadow_strategies_hook(hook: dict[str, Any]) -> None:
@@ -14188,7 +14191,7 @@ def run_one_backtest(
         if not isinstance(td, dict):
             td = {}
 
-        return {
+        trade_row = {
             "date": analysis_date,
             "ticker": sym,
             "timeframe": timeframe,
@@ -14335,6 +14338,9 @@ def run_one_backtest(
             ),
             **_si.trade_fields_for_row(sym),
         }
+        if chrono_yfinance:
+            return _strip_chrono_dead_trade_fields(trade_row)
+        return trade_row
 
     except Exception as e:  # noqa: BLE001
         log(f"[ContinuousBacktest] Error {ticker} {analysis_date}: {e}", level="warning")
@@ -15391,6 +15397,32 @@ def _is_intraday_session_tf(timeframe: str) -> bool:
     return str(timeframe or "").strip().lower() in INTRADAY_SESSION_TFS
 
 
+# Chrono per-trade records only — confirmed zero-information on the Python Layer-2
+# path that produces the bulk of chrono rows:
+#   price_zone        → hardcoded "EQUILIBRIUM" (zone_position_pct / zone_label carry signal)
+#   htf_bias          → "UNKNOWN" / empty on Layer-2
+#   market_structure  → "UNKNOWN" / empty on Layer-2
+#   calendar_action   → not used in post-run analysis (calendar_reason kept when present)
+#   session           → "n/a" for 1d/1w (majority of chrono volume)
+# Live / continuous-loop rows are untouched.
+CHRONO_DEAD_TRADE_FIELDS: frozenset[str] = frozenset(
+    {
+        "calendar_action",
+        "session",
+        "price_zone",
+        "market_structure",
+        "htf_bias",
+    }
+)
+
+
+def _strip_chrono_dead_trade_fields(row: dict[str, Any]) -> dict[str, Any]:
+    """Drop constant/zero-info fields from a chrono trade or skip row (in place)."""
+    for k in CHRONO_DEAD_TRADE_FIELDS:
+        row.pop(k, None)
+    return row
+
+
 def session_tag_fields(
     *,
     timeframe: str,
@@ -15775,6 +15807,12 @@ def run_chronological_backtest(
     log_unavailable_entry_scores()
     _reset_entry_score_daily_cache()
     assert_feature_label_keys_disjoint()
+    try:
+        from shadow_strategies import ensure_shadow_trades_file_real
+
+        ensure_shadow_trades_file_real()
+    except Exception as e:  # noqa: BLE001
+        log(f"[Chrono] ensure_shadow_trades_file_real: {e}", level="warning")
 
     chrono_data: dict[str, Any]
     if chrono_path.is_file():
@@ -16118,7 +16156,7 @@ def run_chronological_backtest(
                     "halt_active": True,
                     **_shadow_null_fields(),
                 }
-                day_skipped.append(halt_row)
+                day_skipped.append(_strip_chrono_dead_trade_fields(halt_row) if isinstance(halt_row, dict) else halt_row)
                 append_result(halt_row)
                 daily_summary = {
                     "date": date_str,
@@ -16280,7 +16318,7 @@ def run_chronological_backtest(
                                     skip_reason=f"Already in open position: {pos_key}",
                                 )
                                 append_result(result)
-                                day_skipped.append(result)
+                                day_skipped.append(_strip_chrono_dead_trade_fields(result) if isinstance(result, dict) else result)
                                 npi, nti, ntj = _v71_next_step(pi, ti, tj)
                                 chrono_data["chrono_intraday"] = {
                                     "date": date_str,
@@ -16323,7 +16361,7 @@ def run_chronological_backtest(
                                     verdict="COOLDOWN",
                                 )
                                 append_result(result)
-                                day_skipped.append(result)
+                                day_skipped.append(_strip_chrono_dead_trade_fields(result) if isinstance(result, dict) else result)
                                 npi, nti, ntj = _v71_next_step(pi, ti, tj)
                                 chrono_data["chrono_intraday"] = {
                                     "date": date_str,
@@ -16361,7 +16399,7 @@ def run_chronological_backtest(
                                     skip_reason="Ticker already traded today on another timeframe",
                                 )
                                 append_result(result)
-                                day_skipped.append(result)
+                                day_skipped.append(_strip_chrono_dead_trade_fields(result) if isinstance(result, dict) else result)
                                 npi, nti, ntj = _v71_next_step(pi, ti, tj)
                                 chrono_data["chrono_intraday"] = {
                                     "date": date_str,
@@ -16399,7 +16437,7 @@ def run_chronological_backtest(
                                     skip_reason=f"Currency cap: {cap_ccy} already has 2 open trades",
                                 )
                                 append_result(result)
-                                day_skipped.append(result)
+                                day_skipped.append(_strip_chrono_dead_trade_fields(result) if isinstance(result, dict) else result)
                                 npi, nti, ntj = _v71_next_step(pi, ti, tj)
                                 chrono_data["chrono_intraday"] = {
                                     "date": date_str,
@@ -16484,7 +16522,7 @@ def run_chronological_backtest(
                                     skip_reason="Scan produced no result (data or execution abort)",
                                 )
                                 append_result(row_none)
-                                day_skipped.append(row_none)
+                                day_skipped.append(_strip_chrono_dead_trade_fields(row_none) if isinstance(row_none, dict) else row_none)
                                 npi, nti, ntj = _v71_next_step(pi, ti, tj)
                                 chrono_data["chrono_intraday"] = {
                                     "date": date_str,
@@ -16554,7 +16592,7 @@ def run_chronological_backtest(
                                             date_str,
                                         )
                                     )
-                                day_skipped.append(row)
+                                day_skipped.append(_strip_chrono_dead_trade_fields(row) if isinstance(row, dict) else row)
                                 append_result(row)
                                 npi, nti, ntj = _v71_next_step(pi, ti, tj)
                                 chrono_data["chrono_intraday"] = {
@@ -16631,7 +16669,7 @@ def run_chronological_backtest(
                                 )
                                 if any(k in res for k in _SHADOW_FIELD_KEYS):
                                     row.update({k: res.get(k) for k in _SHADOW_FIELD_KEYS})
-                                day_skipped.append(row)
+                                day_skipped.append(_strip_chrono_dead_trade_fields(row) if isinstance(row, dict) else row)
                                 append_result(row)
                                 npi, nti, ntj = _v71_next_step(pi, ti, tj)
                                 chrono_data["chrono_intraday"] = {
@@ -16740,7 +16778,7 @@ def run_chronological_backtest(
                                 row["shadow_zone"] = _zone_map
                             _attach_entry_scores_to_trade_row(row)
                             append_entry_feature_record(row, job_id=job_id)
-                            day_trades.append(row)
+                            day_trades.append(_strip_chrono_dead_trade_fields(row) if isinstance(row, dict) else row)
                             day_pnl += pnl
                             capital += pnl
                             peak_capital = _update_run_peak_capital(capital, peak_capital)
