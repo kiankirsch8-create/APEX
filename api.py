@@ -1115,6 +1115,17 @@ async def get_chrono_live() -> dict[str, Any]:
     return continuous_backtester.CHRONO_LIVE_STATUS.copy()
 
 
+@app.get("/api/chrono/heartbeat")
+async def get_chrono_heartbeat() -> dict[str, Any]:
+    """
+    Lightweight daily health check for unattended chrono runs.
+
+    Returns job_id, current_date, days_processed, trades_so_far, free_disk_mb,
+    last_write_iso, and status — safe to hit from a phone/browser once a day.
+    """
+    return continuous_backtester.chrono_heartbeat_payload()
+
+
 def _live_v76_data_dir() -> Any:
     from pathlib import Path
 

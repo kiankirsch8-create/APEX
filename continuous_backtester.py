@@ -32,6 +32,7 @@ import gc
 import json
 import math
 import os
+import shutil
 from collections import defaultdict
 import random
 import re
@@ -1001,6 +1002,9 @@ CHRONO_LIVE_STATUS: dict[str, Any] = {
     "total_tickers": 0,
     "scan_counts": {},
 }
+
+# Halt before a day of writes if free space on DATA_DIR is below this.
+CHRONO_MIN_FREE_DISK_MB = 200.0
 
 # Fairness: how many times each ticker has been scanned this chrono run (session)
 CHRONO_SCAN_COUNTS: dict[str, int] = {}
@@ -15740,6 +15744,109 @@ class ChronoPersistFailed(RuntimeError):
     """Raised when chrono run state cannot be written — caller must halt the run."""
 
 
+def data_dir_free_mb() -> float:
+    """Free space on the filesystem that holds ``DATA_DIR``, in megabytes."""
+    try:
+        path = Path(DATA_DIR)
+        path.mkdir(parents=True, exist_ok=True)
+        usage = shutil.disk_usage(str(path))
+        return float(usage.free) / (1024.0 * 1024.0)
+    except Exception as e:  # noqa: BLE001
+        log(f"[Chrono] disk_usage check failed: {e}", level="warning")
+        return float("inf")
+
+
+def chrono_disk_guard_ok(
+    chrono_data: dict[str, Any],
+    chrono_path: Path,
+    *,
+    job_id: str,
+    min_free_mb: float | None = None,
+) -> bool:
+    """
+    Return True if DATA_DIR has enough free space to continue.
+
+    On low disk: mark failed, persist best-effort, return False (caller must halt).
+    """
+    threshold = float(CHRONO_MIN_FREE_DISK_MB if min_free_mb is None else min_free_mb)
+    free_mb = data_dir_free_mb()
+    if free_mb >= threshold:
+        return True
+    reason = f"low disk ({free_mb:.1f} MB free < {threshold:.0f} MB)"
+    chrono_data["status"] = "failed"
+    chrono_data["error"] = reason
+    chrono_data["free_disk_mb"] = round(free_mb, 1)
+    log(
+        f"[Chrono {job_id}] ERROR: {reason} — halting run before further writes "
+        f"(DATA_DIR={DATA_DIR})",
+        level="error",
+    )
+    CHRONO_LIVE_STATUS["status"] = "failed"
+    try:
+        _persist_chrono(chrono_path, chrono_data, job_id=job_id)
+    except ChronoPersistFailed:
+        # Expected when the disk is truly full — status already set in memory.
+        pass
+    return False
+
+
+def chrono_heartbeat_payload() -> dict[str, Any]:
+    """Lightweight status snapshot for daily remote checks."""
+    active = get_active_chrono()
+    live = dict(CHRONO_LIVE_STATUS)
+    job_id = ""
+    if isinstance(active, dict) and active.get("job_id"):
+        job_id = str(active.get("job_id")).strip()
+    if not job_id:
+        job_id = str(live.get("job_id") or "").strip()
+
+    free_mb = data_dir_free_mb()
+    current_date = live.get("current_date")
+    days_processed = int(live.get("days_processed", 0) or 0)
+    status = str(live.get("status") or "idle")
+    last_write_iso = None
+    trades_so_far = 0
+    capital = live.get("capital")
+
+    if job_id:
+        path = chrono_results_path(job_id)
+        if path.is_file():
+            data = load_json(path, default=None)
+            if isinstance(data, dict):
+                current_date = data.get("current_date") or current_date
+                days_processed = int(data.get("days_processed", days_processed) or days_processed)
+                status = str(data.get("status") or status)
+                last_write_iso = data.get("last_write_iso")
+                capital = data.get("capital", capital)
+                trades = data.get("all_trades") or []
+                trades_so_far = sum(
+                    1
+                    for t in trades
+                    if isinstance(t, dict)
+                    and not t.get("skipped")
+                    and str(t.get("outcome", "")).upper() in ("WIN", "LOSS")
+                )
+                if not last_write_iso:
+                    try:
+                        last_write_iso = datetime.fromtimestamp(
+                            path.stat().st_mtime, tz=timezone.utc
+                        ).isoformat().replace("+00:00", "Z")
+                    except OSError:
+                        last_write_iso = None
+
+    return {
+        "job_id": job_id or None,
+        "current_date": current_date,
+        "days_processed": days_processed,
+        "trades_so_far": trades_so_far,
+        "capital": capital,
+        "free_disk_mb": round(free_mb, 1) if free_mb != float("inf") else None,
+        "last_write_iso": last_write_iso,
+        "status": status,
+        "min_free_disk_mb": CHRONO_MIN_FREE_DISK_MB,
+    }
+
+
 def _persist_chrono(chrono_path: Path, chrono_data: dict[str, Any], *, job_id: str) -> None:
     """
     Persist chrono run state via ``save_json``.
@@ -16008,6 +16115,10 @@ def run_chronological_backtest(
                 chrono_data.pop("chrono_intraday", None)
                 _persist_chrono(chrono_path, chrono_data, job_id=job_id)
                 CHRONO_LIVE_STATUS["status"] = "cancelled"
+                return chrono_data
+
+            # Disk-full guard: halt before opening a new day of writes.
+            if not chrono_disk_guard_ok(chrono_data, chrono_path, job_id=job_id):
                 return chrono_data
 
             date_str = current.strftime("%Y-%m-%d")
