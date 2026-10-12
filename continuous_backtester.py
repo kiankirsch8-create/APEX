@@ -531,6 +531,17 @@ from high_impact_events_data import HIGH_IMPACT_EVENTS
 
 EVENT_LOOKAHEAD_DAYS = 30
 
+# Group D / PR12 — hard block new entries in the 24h before a high-impact event
+# for pairs strongly affected by that event (event currency on either leg).
+# Calendar is day-resolution: block when next matching event is today or tomorrow.
+PRE_EVENT_ENTRY_BLOCK_ENABLED = True
+PRE_EVENT_ENTRY_BLOCK_HOURS = 24
+# Extreme event types that could (later) widen beyond strongly-affected; unused for now
+# except logging — mild pairs are never blocked by this gate.
+PRE_EVENT_EXTREME_TYPES: frozenset[str] = frozenset(
+    {"FOMC", "NFP", "ECB", "BOE", "BOJ", "SNB", "RBA", "RBNZ", "BOC"}
+)
+
 # Entry-only shadow curves testing event proximity rules (real curve unchanged).
 SHADOW_EVENT_CONFIGS: dict[str, dict[str, Any]] = {
     "ev_block_pre1": {"block_pre_days": 1},
@@ -642,6 +653,57 @@ def _days_to_next_event(ticker: str, d: date | str) -> int | None:
             if ev[1] in currencies:
                 return offset
     return None
+
+
+def _next_strongly_affected_event(
+    ticker: str,
+    d: date | str,
+) -> tuple[int, str, str, str] | None:
+    """
+    Next high-impact event whose currency is on either side of ``ticker``.
+
+    Returns (days_ahead, iso_date, currency, event_type) or None.
+    """
+    if isinstance(d, str):
+        try:
+            d = date.fromisoformat(str(d).strip()[:10])
+        except ValueError:
+            return None
+    currencies = set(_event_pair_currencies(ticker))
+    # Day-granularity proxy for a 24h pre-window: event on scan day or next day.
+    max_offset = max(1, int(math.ceil(PRE_EVENT_ENTRY_BLOCK_HOURS / 24.0)))
+    for offset in range(0, max_offset + 1):
+        probe = d + timedelta(days=offset)
+        for ev in _EVENTS_BY_DATE.get(probe.isoformat(), []):
+            if ev[1] in currencies:
+                return offset, ev[0], ev[1], ev[2]
+    return None
+
+
+def strongly_affected_pre_event_entry_block(
+    ticker: str,
+    scan_date: date | str,
+) -> tuple[bool, str]:
+    """
+    True when a new entry should be blocked: high-impact event within ~24h that
+    strongly affects this pair (event currency on either leg). Mild pairs (no
+    matching currency) are never blocked here. Open positions are not touched.
+    """
+    if not PRE_EVENT_ENTRY_BLOCK_ENABLED:
+        return False, ""
+    hit = _next_strongly_affected_event(ticker, scan_date)
+    if hit is None:
+        return False, ""
+    days_ahead, ev_date, cur, etype = hit
+    # Within the 24h pre-window (day proxy: 0 or 1 day ahead).
+    if days_ahead > max(1, int(math.ceil(PRE_EVENT_ENTRY_BLOCK_HOURS / 24.0))):
+        return False, ""
+    sym = str(ticker or "").strip().upper()
+    msg = (
+        f"[PRE_EVENT_24H] skip new entry {sym} — strongly affected by {etype}/{cur} "
+        f"on {ev_date} (t-{days_ahead}d, {PRE_EVENT_ENTRY_BLOCK_HOURS}h window)"
+    )
+    return True, msg
 
 
 def _days_since_last_event(ticker: str, d: date | str) -> int | None:
@@ -13137,6 +13199,30 @@ def run_one_backtest(
                         "conviction_score": 0,
                         "calendar_action": "BLOCK",
                         "calendar_reason": str(hist_cal.get("reason") or ""),
+                        **_v73_regime_row_fields(regime_ctx),
+                    },
+                    tf_key=tf_key,
+                    is_exotic=sym in EXOTIC_REDUCE,
+                )
+            ok_pre, rs_pre = strongly_affected_pre_event_entry_block(sym, scan_d)
+            if ok_pre:
+                log(rs_pre, level="info")
+                return _skipped_backtest_row(
+                    sym=sym,
+                    timeframe=timeframe,
+                    analysis_date=analysis_date.strip(),
+                    price=0.0,
+                    zone_pct=50.0,
+                    zone_label="EQUILIBRIUM",
+                    skip_reason=rs_pre,
+                    ai={
+                        "strategy_id": "SKIP",
+                        "strategy_met": False,
+                        "skip_trade": True,
+                        "direction": "NONE",
+                        "conviction_score": 0,
+                        "calendar_action": "BLOCK",
+                        "calendar_reason": rs_pre,
                         **_v73_regime_row_fields(regime_ctx),
                     },
                     tf_key=tf_key,
