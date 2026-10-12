@@ -24,9 +24,10 @@ STRATEGY_VERSION = "v7.5-emergency-trade-volume"
 # DO NOT CHANGE (contract):
 #   RISK_BY_CONFIDENCE numeric dict entries (v7.4 only adds optional M03 JPY perfect-storm override)
 #   calculate_stats function
-#   File I/O and storage paths (DATA_DIR results)
 # NOTE: append_result / load_all_results intentionally use append-only JSONL
 #   (backtest_results.jsonl) to avoid O(n) full-file rewrite OOMs — record fields unchanged.
+# NOTE: chrono jobs keep small state in chrono_results_<job>.json and append trades/skips
+#   to chrono_trades_<job>.jsonl / chrono_skips_<job>.jsonl (never rewrite the large arrays).
 
 import gc
 import json
@@ -15306,6 +15307,243 @@ def chrono_results_path(job_id: str) -> Path:
     return DATA_DIR / f"chrono_results_{job_id}.json"
 
 
+def chrono_trades_path(job_id: str) -> Path:
+    """Append-only WIN/LOSS trade rows for a chrono job (``chrono_trades_<job>.jsonl``)."""
+    return DATA_DIR / f"chrono_trades_{_safe_chrono_job_id(job_id)}.jsonl"
+
+
+def chrono_skips_path(job_id: str) -> Path:
+    """Append-only skipped rows for a chrono job (``chrono_skips_<job>.jsonl``)."""
+    return DATA_DIR / f"chrono_skips_{_safe_chrono_job_id(job_id)}.jsonl"
+
+
+def _safe_chrono_job_id(job_id: str) -> str:
+    jid = str(job_id or "").strip() or "unknown"
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in jid)
+
+
+def append_chrono_sidecar(path: Path, rows: list[dict[str, Any]]) -> int:
+    """Append JSON objects (one per line). Returns number of rows written."""
+    if not rows:
+        return 0
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    n = 0
+    with open(path, "a", encoding="utf-8") as f:
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            f.write(json.dumps(row, default=str, separators=(",", ":")) + "\n")
+            n += 1
+    return n
+
+
+def load_chrono_sidecar(path: Path) -> list[dict[str, Any]]:
+    """Load an append-only chrono JSONL sidecar (trades or skips)."""
+    path = Path(path)
+    if not path.is_file():
+        return []
+    out: list[dict[str, Any]] = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(obj, dict):
+                    out.append(obj)
+    except OSError as e:
+        log(f"[Chrono] sidecar load error {path}: {e}", level="warning")
+    return out
+
+
+def rewrite_chrono_sidecar(path: Path, rows: list[dict[str, Any]]) -> None:
+    """Atomically rewrite a sidecar (used to drop orphan rows after a failed flush)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        for row in rows:
+            if isinstance(row, dict):
+                f.write(json.dumps(row, default=str, separators=(",", ":")) + "\n")
+    os.replace(tmp, path)
+
+
+def _chrono_row_date(row: dict[str, Any]) -> str:
+    return str(row.get("date") or row.get("entry_date") or "")[:10]
+
+
+def _completed_chrono_dates(chrono_data: Mapping[str, Any] | None) -> set[str]:
+    out: set[str] = set()
+    if not isinstance(chrono_data, Mapping):
+        return out
+    for row in chrono_data.get("daily_pnl") or []:
+        if isinstance(row, dict):
+            ds = str(row.get("date") or "")[:10]
+            if ds:
+                out.add(ds)
+    return out
+
+
+def migrate_chrono_embedded_arrays(job_id: str, chrono_data: dict[str, Any]) -> None:
+    """
+    One-time move of legacy ``all_trades`` / ``skipped`` arrays into JSONL sidecars.
+
+    After migration (or when sidecars already exist), clears the embedded arrays so
+    ``chrono_results_*.json`` stays small and cheap to rewrite.
+    """
+    jid = _safe_chrono_job_id(job_id)
+    trades_p = chrono_trades_path(jid)
+    skips_p = chrono_skips_path(jid)
+    embedded_trades = [t for t in (chrono_data.get("all_trades") or []) if isinstance(t, dict)]
+    embedded_skips = [t for t in (chrono_data.get("skipped") or []) if isinstance(t, dict)]
+    if embedded_trades and not trades_p.is_file():
+        append_chrono_sidecar(trades_p, embedded_trades)
+        log(
+            f"[Chrono {jid}] Migrated {len(embedded_trades)} embedded trades → {trades_p.name}",
+            level="info",
+        )
+    if embedded_skips and not skips_p.is_file():
+        append_chrono_sidecar(skips_p, embedded_skips)
+        log(
+            f"[Chrono {jid}] Migrated {len(embedded_skips)} embedded skips → {skips_p.name}",
+            level="info",
+        )
+    chrono_data["all_trades"] = []
+    chrono_data["skipped"] = []
+
+
+def load_chrono_job_trades(
+    job_id: str,
+    chrono_data: Mapping[str, Any] | None = None,
+    *,
+    completed_dates_only: bool = False,
+) -> list[dict[str, Any]]:
+    """Load trades from sidecar; fall back to embedded ``all_trades`` for legacy jobs."""
+    jid = _safe_chrono_job_id(job_id)
+    path = chrono_trades_path(jid)
+    if path.is_file():
+        rows = load_chrono_sidecar(path)
+    else:
+        data = chrono_data
+        if data is None:
+            data = load_json(chrono_results_path(jid), default={}) or {}
+        rows = [t for t in (data.get("all_trades") or []) if isinstance(t, dict)]
+    if completed_dates_only:
+        done = _completed_chrono_dates(chrono_data)
+        if done:
+            rows = [t for t in rows if _chrono_row_date(t) in done]
+    return rows
+
+
+def load_chrono_job_skips(
+    job_id: str,
+    chrono_data: Mapping[str, Any] | None = None,
+    *,
+    completed_dates_only: bool = False,
+) -> list[dict[str, Any]]:
+    """Load skips from sidecar; fall back to embedded ``skipped`` for legacy jobs."""
+    jid = _safe_chrono_job_id(job_id)
+    path = chrono_skips_path(jid)
+    if path.is_file():
+        rows = load_chrono_sidecar(path)
+    else:
+        data = chrono_data
+        if data is None:
+            data = load_json(chrono_results_path(jid), default={}) or {}
+        rows = [t for t in (data.get("skipped") or []) if isinstance(t, dict)]
+    if completed_dates_only:
+        done = _completed_chrono_dates(chrono_data)
+        if done:
+            rows = [t for t in rows if _chrono_row_date(t) in done]
+    return rows
+
+
+def reconcile_chrono_sidecars(
+    job_id: str,
+    chrono_data: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """
+    Load trades/skips for resume, dropping orphan sidecar rows whose date is not
+    in ``daily_pnl`` (append succeeded but state flush failed).
+    """
+    jid = _safe_chrono_job_id(job_id)
+    done = _completed_chrono_dates(chrono_data)
+    trades = load_chrono_job_trades(jid, chrono_data)
+    skips = load_chrono_job_skips(jid, chrono_data)
+    if not done:
+        return trades, skips
+    trimmed_t = [t for t in trades if _chrono_row_date(t) in done]
+    trimmed_s = [t for t in skips if _chrono_row_date(t) in done]
+    if len(trimmed_t) < len(trades):
+        rewrite_chrono_sidecar(chrono_trades_path(jid), trimmed_t)
+        log(
+            f"[Chrono {jid}] Trimmed {len(trades) - len(trimmed_t)} orphan trade "
+            f"sidecar rows (dates not in daily_pnl)",
+            level="warning",
+        )
+    if len(trimmed_s) < len(skips):
+        rewrite_chrono_sidecar(chrono_skips_path(jid), trimmed_s)
+        log(
+            f"[Chrono {jid}] Trimmed {len(skips) - len(trimmed_s)} orphan skip "
+            f"sidecar rows (dates not in daily_pnl)",
+            level="warning",
+        )
+    return trimmed_t, trimmed_s
+
+
+def flush_chrono_day_sidecars(
+    job_id: str,
+    day_trades: list[dict[str, Any]],
+    day_skipped: list[dict[str, Any]],
+) -> None:
+    """Append one completed day's trades/skips to the JSONL sidecars."""
+    jid = _safe_chrono_job_id(job_id)
+    n_t = append_chrono_sidecar(chrono_trades_path(jid), day_trades)
+    n_s = append_chrono_sidecar(chrono_skips_path(jid), day_skipped)
+    if n_t or n_s:
+        log(
+            f"[Chrono {jid}] Sidecar append trades={n_t} skips={n_s}",
+            level="info",
+        )
+
+
+def _strip_chrono_bulk_arrays(chrono_data: dict[str, Any]) -> None:
+    """Keep main chrono JSON free of the large trade/skip arrays."""
+    chrono_data["all_trades"] = []
+    chrono_data["skipped"] = []
+
+
+def save_chrono_results(chrono_path: Path, chrono_data: dict[str, Any]) -> Path | None:
+    """Persist chrono state without embedding ``all_trades`` / ``skipped``."""
+    _strip_chrono_bulk_arrays(chrono_data)
+    return save_json(chrono_path, chrono_data)
+
+
+def load_chrono_job(job_id: str, *, hydrate: bool = True) -> dict[str, Any] | None:
+    """Load ``chrono_results_<job>.json``, optionally hydrating trades/skips from sidecars."""
+    jid = str(job_id or "").strip()
+    if not jid:
+        return None
+    path = chrono_results_path(jid)
+    if not path.is_file():
+        return None
+    data = load_json(path, default=None)
+    if not isinstance(data, dict):
+        return None
+    if hydrate:
+        # Prefer sidecars; legacy embedded arrays still work via load helpers.
+        data["all_trades"] = load_chrono_job_trades(jid, data)
+        data["skipped"] = load_chrono_job_skips(jid, data)
+    else:
+        _strip_chrono_bulk_arrays(data)
+    return data
+
+
 def _hour_in_session_window(hour: int, start: int, end: int) -> bool:
     """True if UTC hour is inside [start, end) — supports midnight wrap (start > end)."""
     h = int(hour) % 24
@@ -15626,10 +15864,9 @@ def build_chrono_job_export_text(job_id: str) -> str | None:
     jid = (job_id or "").strip()
     if not jid:
         return None
-    path = chrono_results_path(jid)
-    if not path.is_file():
+    data = load_chrono_job(jid, hydrate=True)
+    if not isinstance(data, dict):
         return None
-    data = load_json(path, default=None) or {}
     trades = [
         t
         for t in (data.get("all_trades") or [])
@@ -15747,7 +15984,8 @@ def run_chronological_backtest(
     intraday when the scan date is within 55 days of today). Within each phase every
     ticker is scanned in list order. Uses ``run_one_backtest`` (Layer 2+ Python-forced
     trades skip Claude; Layer 1 uses v7 prompt).
-    Persists to ``chrono_results_{job_id}.json`` under ``DATA_DIR`` (resumable).
+    Persists small state to ``chrono_results_{job_id}.json`` and append-only
+    trade/skip sidecars (``chrono_trades_*.jsonl`` / ``chrono_skips_*.jsonl``).
     """
     global CHRONO_JPY_RISK_DAY
 
@@ -15779,9 +16017,13 @@ def run_chronological_backtest(
     chrono_data: dict[str, Any]
     if chrono_path.is_file():
         chrono_data = load_json(chrono_path, default={}) or {}
+        if not isinstance(chrono_data, dict):
+            chrono_data = {}
+        migrate_chrono_embedded_arrays(job_id, chrono_data)
         if chrono_data.get("status") == "complete":
             log(f"[Chrono {job_id}] Job already complete — returning saved file", level="info")
-            return chrono_data
+            hydrated = load_chrono_job(job_id, hydrate=True)
+            return hydrated if isinstance(hydrated, dict) else chrono_data
     else:
         chrono_data = {
             "job_id": job_id,
@@ -15798,7 +16040,7 @@ def run_chronological_backtest(
             "skipped": [],
             "days_processed": 0,
         }
-        save_json(chrono_path, chrono_data)
+        save_chrono_results(chrono_path, chrono_data)
 
     global CHRONO_RUNNING
     CHRONO_RUNNING = True
@@ -15806,8 +16048,9 @@ def run_chronological_backtest(
     clear_chrono_stop_flag(job_id)
     set_active_chrono(job_id)
     try:
+        trades_acc, skips_acc = reconcile_chrono_sidecars(job_id, chrono_data)
         merge_hist: list[dict[str, Any]] = []
-        merge_hist.extend(x for x in (chrono_data.get("all_trades") or []) if isinstance(x, dict))
+        merge_hist.extend(trades_acc)
         try:
             merge_hist.extend(x for x in load_all_results() if isinstance(x, dict))
         except Exception:  # noqa: BLE001
@@ -15836,6 +16079,7 @@ def run_chronological_backtest(
             ("days_processed", 0),
         ):
             chrono_data.setdefault(_k, _v)
+        _strip_chrono_bulk_arrays(chrono_data)
 
         CHRONO_LIVE_STATUS.update(
             {
@@ -15858,7 +16102,7 @@ def run_chronological_backtest(
             log(f"[Chrono {job_id}] Invalid end_date {end_date}", level="error")
             chrono_data["status"] = "failed"
             chrono_data["error"] = "invalid end_date"
-            save_json(chrono_path, chrono_data)
+            save_chrono_results(chrono_path, chrono_data)
             return chrono_data
 
         capital = float(chrono_data.get("capital", STARTING_CAPITAL) or STARTING_CAPITAL)
@@ -15884,7 +16128,7 @@ def run_chronological_backtest(
                 log(f"[Chrono {job_id}] Invalid start_date {start_date}", level="error")
                 chrono_data["status"] = "failed"
                 chrono_data["error"] = "invalid start_date"
-                save_json(chrono_path, chrono_data)
+                save_chrono_results(chrono_path, chrono_data)
                 return chrono_data
 
         tickers = list(CHRONO_TICKERS)
@@ -15953,7 +16197,7 @@ def run_chronological_backtest(
                 str(chrono_data.get("end_date") or end_date),
             )
         shadow_runner.set_median_nights_by_tf(
-            _compute_median_nights_by_tf(list(chrono_data.get("all_trades") or []))
+            _compute_median_nights_by_tf(list(trades_acc))
         )
 
         intraday_res = chrono_data.get("chrono_intraday")
@@ -15978,8 +16222,10 @@ def run_chronological_backtest(
                 chrono_data["status"] = "cancelled"
                 chrono_data["cancel_reason"] = "stop_requested"
                 chrono_data.pop("chrono_intraday", None)
-                save_json(chrono_path, chrono_data)
+                save_chrono_results(chrono_path, chrono_data)
                 CHRONO_LIVE_STATUS["status"] = "cancelled"
+                chrono_data["all_trades"] = list(trades_acc)
+                chrono_data["skipped"] = list(skips_acc)
                 return chrono_data
 
             date_str = current.strftime("%Y-%m-%d")
@@ -16131,14 +16377,15 @@ def run_chronological_backtest(
                     "halt_active": True,
                 }
                 chrono_data.setdefault("daily_pnl", []).append(daily_summary)
-                chrono_data.setdefault("all_trades", []).extend(day_trades)
-                chrono_data.setdefault("skipped", []).extend(day_skipped)
+                flush_chrono_day_sidecars(job_id, day_trades, day_skipped)
+                trades_acc.extend(day_trades)
+                skips_acc.extend(day_skipped)
                 chrono_data.pop("chrono_intraday", None)
                 chrono_data["capital"] = round(capital, 2)
                 chrono_data["current_date"] = date_str
                 chrono_data["status"] = "running"
                 chrono_data["days_processed"] = int(chrono_data.get("days_processed", 0) or 0) + 1
-                save_json(chrono_path, chrono_data)
+                save_chrono_results(chrono_path, chrono_data)
                 log(
                     f"[Chrono {job_id}] {date_str}: HALTED — 0 new trades, "
                     f"capital {capital:.2f}",
@@ -16192,7 +16439,7 @@ def run_chronological_backtest(
                 global CHRONO_COMPLETED_TRADES_BUFFER
                 CHRONO_COMPLETED_TRADES_BUFFER = [
                     dict(x)
-                    for x in (list(chrono_data.get("all_trades") or []) + list(day_trades))
+                    for x in (list(trades_acc) + list(day_trades))
                     if isinstance(x, dict)
                 ]
                 scan_date = datetime.strptime(date_str, "%Y-%m-%d").date()
@@ -16304,7 +16551,7 @@ def run_chronological_backtest(
                                 )
                                 chrono_data["current_date"] = date_str
                                 chrono_data["status"] = "running"
-                                save_json(chrono_path, chrono_data)
+                                save_chrono_results(chrono_path, chrono_data)
                                 continue
 
                             cd_ok, cd_reason = check_cooldown(ticker, timeframe, date_str)
@@ -16347,7 +16594,7 @@ def run_chronological_backtest(
                                 )
                                 chrono_data["current_date"] = date_str
                                 chrono_data["status"] = "running"
-                                save_json(chrono_path, chrono_data)
+                                save_chrono_results(chrono_path, chrono_data)
                                 continue
 
                             tkr_u = str(ticker).strip().upper()
@@ -16385,7 +16632,7 @@ def run_chronological_backtest(
                                 )
                                 chrono_data["current_date"] = date_str
                                 chrono_data["status"] = "running"
-                                save_json(chrono_path, chrono_data)
+                                save_chrono_results(chrono_path, chrono_data)
                                 continue
 
                             cap_blocked, cap_ccy = _chrono_currency_cap_blocks(ticker, use_4h_pool=use4h_pool)
@@ -16423,7 +16670,7 @@ def run_chronological_backtest(
                                 )
                                 chrono_data["current_date"] = date_str
                                 chrono_data["status"] = "running"
-                                save_json(chrono_path, chrono_data)
+                                save_chrono_results(chrono_path, chrono_data)
                                 continue
 
                             peak_capital = _update_run_peak_capital(capital, peak_capital)
@@ -16471,7 +16718,7 @@ def run_chronological_backtest(
                                 )
                                 chrono_data["current_date"] = date_str
                                 chrono_data["status"] = "running"
-                                save_json(chrono_path, chrono_data)
+                                save_chrono_results(chrono_path, chrono_data)
                                 continue
 
                             if res is None:
@@ -16508,7 +16755,7 @@ def run_chronological_backtest(
                                 )
                                 chrono_data["current_date"] = date_str
                                 chrono_data["status"] = "running"
-                                save_json(chrono_path, chrono_data)
+                                save_chrono_results(chrono_path, chrono_data)
                                 continue
 
                             if res.get("skipped"):
@@ -16579,7 +16826,7 @@ def run_chronological_backtest(
                                 )
                                 chrono_data["current_date"] = date_str
                                 chrono_data["status"] = "running"
-                                save_json(chrono_path, chrono_data)
+                                save_chrono_results(chrono_path, chrono_data)
                                 continue
 
                             oc = str(res.get("outcome", "") or "")
@@ -16607,7 +16854,7 @@ def run_chronological_backtest(
                                 )
                                 chrono_data["current_date"] = date_str
                                 chrono_data["status"] = "running"
-                                save_json(chrono_path, chrono_data)
+                                save_chrono_results(chrono_path, chrono_data)
                                 continue
 
                             exec_block = _hard_block_skip_reason(
@@ -16656,7 +16903,7 @@ def run_chronological_backtest(
                                 )
                                 chrono_data["current_date"] = date_str
                                 chrono_data["status"] = "running"
-                                save_json(chrono_path, chrono_data)
+                                save_chrono_results(chrono_path, chrono_data)
                                 continue
 
                             pnl = float(res.get("pnl_dollars", 0) or 0)
@@ -16698,7 +16945,7 @@ def run_chronological_backtest(
                                 )
                                 chrono_data["current_date"] = date_str
                                 chrono_data["status"] = "running"
-                                save_json(chrono_path, chrono_data)
+                                save_chrono_results(chrono_path, chrono_data)
                                 continue
 
                             _shadow_maps = shadow_runner.process_trade(_shadow_trade_ctx_from_row(row))
@@ -16817,7 +17064,7 @@ def run_chronological_backtest(
                             _persist_shadow_zone_state(chrono_data, zone_runner)
                             chrono_data["current_date"] = date_str
                             chrono_data["status"] = "running"
-                            save_json(chrono_path, chrono_data)
+                            save_chrono_results(chrono_path, chrono_data)
 
                         if chrono_abort:
                             break
@@ -16833,8 +17080,10 @@ def run_chronological_backtest(
                 chrono_data["status"] = "cancelled"
                 chrono_data["cancel_reason"] = "stop_requested"
                 chrono_data.pop("chrono_intraday", None)
-                save_json(chrono_path, chrono_data)
+                save_chrono_results(chrono_path, chrono_data)
                 CHRONO_LIVE_STATUS["status"] = "stopped"
+                chrono_data["all_trades"] = list(trades_acc)
+                chrono_data["skipped"] = list(skips_acc)
                 return chrono_data
 
             scan_date_eod = datetime.strptime(date_str, "%Y-%m-%d").date()
@@ -16874,8 +17123,9 @@ def run_chronological_backtest(
             }
 
             chrono_data.setdefault("daily_pnl", []).append(daily_summary)
-            chrono_data.setdefault("all_trades", []).extend(day_trades)
-            chrono_data.setdefault("skipped", []).extend(day_skipped)
+            flush_chrono_day_sidecars(job_id, day_trades, day_skipped)
+            trades_acc.extend(day_trades)
+            skips_acc.extend(day_skipped)
             chrono_data.pop("chrono_intraday", None)
             _persist_chrono_capital_state(
                 chrono_data,
@@ -16908,7 +17158,7 @@ def run_chronological_backtest(
             _persist_shadow_portfolio_cap_state(chrono_data, pcap_runner)
             _persist_shadow_equity_daily_stop_state(chrono_data, eqstop_runner)
             _persist_shadow_zone_state(chrono_data, zone_runner)
-            save_json(chrono_path, chrono_data)
+            save_chrono_results(chrono_path, chrono_data)
 
             log(
                 f"[Chrono {job_id}] {date_str}: {len(day_trades)} trades, "
@@ -16937,7 +17187,7 @@ def run_chronological_backtest(
             time.sleep(5.0)
             current += timedelta(days=1)
 
-        all_trades: list[dict[str, Any]] = list(chrono_data.get("all_trades") or [])
+        all_trades: list[dict[str, Any]] = list(trades_acc)
         _assert_outcome_matches_net_pnl(all_trades, context=f"Chrono {job_id}")
         wins = [t for t in all_trades if t.get("outcome") == "WIN"]
         losses = [t for t in all_trades if t.get("outcome") == "LOSS"]
@@ -16965,6 +17215,9 @@ def run_chronological_backtest(
             "strategy_performance": _calc_strategy_performance(all_trades),
             "timeframe_performance": _calc_tf_performance(all_trades),
         }
+        chrono_data["trades_file"] = str(chrono_trades_path(job_id))
+        chrono_data["skips_file"] = str(chrono_skips_path(job_id))
+        chrono_data["total_skipped"] = len(skips_acc)
         chrono_data["shadow_guard_summary"] = shadow_runner.guard_summaries()
         chrono_data["shadow_compound_summary"] = shadow_runner.compound_summaries()
         chrono_data["shadow_event_summary"] = shadow_runner.event_summaries()
@@ -17004,11 +17257,13 @@ def run_chronological_backtest(
         _persist_shadow_zone_state(chrono_data, zone_runner)
         chrono_data["v74_metrics"] = _v74_chrono_trade_metrics(all_trades)
         _assert_swap_financing_modeled(all_trades, context=f"Chrono {job_id}")
-        save_json(chrono_path, chrono_data)
+        save_chrono_results(chrono_path, chrono_data)
         log(
             f"[Chrono {job_id}] Complete. Capital: {capital:.2f}, P&L: {capital - STARTING_CAPITAL:+.2f}",
             level="info",
         )
+        chrono_data["all_trades"] = list(all_trades)
+        chrono_data["skipped"] = list(skips_acc)
         return chrono_data
     finally:
         active = get_active_chrono()
