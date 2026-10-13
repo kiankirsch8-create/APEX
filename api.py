@@ -1316,10 +1316,7 @@ async def get_active_chrono_job() -> dict[str, Any]:
 @app.get("/api/chrono/{job_id}/daily")
 async def get_chrono_daily(job_id: str) -> dict[str, Any]:
     """Daily P&L series and summary for equity-curve charts."""
-    chrono_path = continuous_backtester.chrono_results_path(job_id)
-    if not chrono_path.is_file():
-        return {"error": "Job not found"}
-    data = load_json(chrono_path, default=None)
+    data = continuous_backtester.load_chrono_job(job_id, hydrate=False)
     if not isinstance(data, dict):
         return {"error": "Job not found"}
     return {
@@ -1341,10 +1338,7 @@ async def get_chrono_trades(
 ) -> dict[str, Any]:
     """Chrono job trades and skips only (not mixed with rolling /api/results)."""
     jid = job_id.strip()
-    chrono_path = continuous_backtester.chrono_results_path(jid)
-    if not chrono_path.is_file():
-        return {"error": "Job not found", "results": []}
-    data = load_json(chrono_path, default=None)
+    data = continuous_backtester.load_chrono_job(jid, hydrate=True)
     if not isinstance(data, dict):
         return {"error": "Job not found", "results": []}
     trades = list(data.get("all_trades") or []) + list(data.get("skipped") or [])
@@ -1371,11 +1365,8 @@ async def get_chrono_export(job_id: str) -> PlainTextResponse:
 
 @app.get("/api/chrono/{job_id}")
 async def get_chrono_results(job_id: str) -> dict[str, Any]:
-    """Full chronological job payload from the persisted JSON file."""
-    chrono_path = continuous_backtester.chrono_results_path(job_id)
-    if not chrono_path.is_file():
-        return {"error": "Job not found"}
-    data = load_json(chrono_path, default=None)
+    """Full chronological job payload (state JSON + trades/skips from sidecars)."""
+    data = continuous_backtester.load_chrono_job(job_id, hydrate=True)
     if not isinstance(data, dict):
         return {"error": "Job not found"}
     return data
@@ -1392,16 +1383,26 @@ async def list_chrono_jobs() -> dict[str, Any]:
             continue
         if not isinstance(data, dict):
             continue
+        jid = str(data.get("job_id") or "").strip()
+        if not jid:
+            # Fallback: chrono_results_<id>.json
+            name = p.name
+            if name.startswith("chrono_results_") and name.endswith(".json"):
+                jid = name[len("chrono_results_") : -len(".json")]
+        summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
+        total_trades = summary.get("total_trades")
+        if total_trades is None:
+            total_trades = len(continuous_backtester.load_chrono_job_trades(jid, data))
         jobs.append(
             {
-                "job_id": data.get("job_id"),
+                "job_id": data.get("job_id") or jid,
                 "status": data.get("status"),
                 "start_date": data.get("start_date"),
                 "end_date": data.get("end_date"),
                 "current_date": data.get("current_date"),
                 "capital": data.get("capital"),
                 "days_processed": data.get("days_processed", 0),
-                "total_trades": len(data.get("all_trades", []) or []),
+                "total_trades": int(total_trades or 0),
             }
         )
     jobs.sort(key=lambda x: str(x.get("job_id", "")), reverse=True)
