@@ -1078,6 +1078,14 @@ async def start_chrono_backtest(
     background_tasks: BackgroundTasks,
     start_date: str = Query(default=continuous_backtester.CHRONO_START_DATE),
     end_date: str = Query(default=continuous_backtester.CHRONO_END_DATE),
+    job_id: str | None = Query(
+        default=None,
+        description=(
+            "Optional job id for resume. When supplied and chrono_results_<job_id>.json "
+            "exists and is not complete, the existing run continues from saved "
+            "current_date/capital. Omit to mint a new id."
+        ),
+    ),
 ) -> dict[str, Any]:
     """Start a walk-forward chronological backtest (runs in a background thread)."""
     if not env("ANTHROPIC_API_KEY"):
@@ -1091,7 +1099,13 @@ async def start_chrono_backtest(
             continuous_backtester.request_chrono_stop(prev_job_id)
             log(f"[Chrono API] Requested stop for previous job {prev_job_id} before starting new run")
 
-    job_id = str(uuid.uuid4())[:8]
+    job_id = (job_id or "").strip() or str(uuid.uuid4())[:8]
+    chrono_path = continuous_backtester.chrono_results_path(job_id)
+    prior = load_json(chrono_path, default=None) if chrono_path.is_file() else None
+    resuming = (
+        isinstance(prior, dict)
+        and str(prior.get("status") or "").strip().lower() != "complete"
+    )
     background_tasks.add_task(
         _spawn_chronological_backtest,
         start_date.strip(),
@@ -1100,10 +1114,15 @@ async def start_chrono_backtest(
     )
     out: dict[str, Any] = {
         "job_id": job_id,
-        "status": "started",
+        "status": "resumed" if resuming else "started",
         "start_date": start_date,
         "end_date": end_date,
+        "resuming": bool(resuming),
     }
+    if resuming and isinstance(prior, dict):
+        out["resume_capital"] = prior.get("capital")
+        out["resume_current_date"] = prior.get("current_date")
+        out["resume_days_processed"] = prior.get("days_processed", 0)
     if prev_job_id:
         out["previous_job_stop_requested"] = prev_job_id
     return out
