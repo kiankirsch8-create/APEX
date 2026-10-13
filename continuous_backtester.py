@@ -1966,6 +1966,79 @@ def _apply_realistic_costs(
     return round(net, 2), round(net_pct, 2), round(gross_pct, 2), fields
 
 
+def _trade_row_date_str(row: Mapping[str, Any] | None) -> str:
+    """YYYY-MM-DD from a trade/skip row, or '' if missing/unparseable."""
+    if not isinstance(row, Mapping):
+        return ""
+    raw = str(row.get("date") or row.get("entry_date") or "")[:10]
+    if len(raw) != 10:
+        return ""
+    try:
+        datetime.strptime(raw, "%Y-%m-%d")
+    except ValueError:
+        return ""
+    return raw
+
+
+def filter_history_rows_before_date(
+    rows: list[dict[str, Any]],
+    before_date: str,
+) -> list[dict[str, Any]]:
+    """
+    Keep only rows with trade date strictly before ``before_date`` (YYYY-MM-DD).
+
+    Used when seeding A+B / health / combo histories at chrono start/resume so
+    ``backtest_results.jsonl`` rows from later calendar dates cannot look ahead
+    into the simulated past. Rows with missing/invalid dates are dropped.
+    """
+    cutoff = str(before_date or "").strip()[:10]
+    if not cutoff:
+        return []
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        ds = _trade_row_date_str(r)
+        if ds and ds < cutoff:
+            out.append(r)
+    return out
+
+
+def chrono_history_seed_cutoff(
+    chrono_data: Mapping[str, Any],
+    *,
+    start_date: str,
+) -> str:
+    """
+    Simulated date at which the walk will resume (or start).
+
+    Fresh start → ``start_date`` (seed histories empty of same-run / future rows).
+    Resume → day after last ``daily_pnl`` entry, else ``current_date``, else start.
+    """
+    daily = chrono_data.get("daily_pnl") or []
+    if isinstance(daily, list) and daily:
+        last = daily[-1] if isinstance(daily[-1], dict) else None
+        if last is not None:
+            try:
+                last_day = datetime.strptime(str(last.get("date", ""))[:10], "%Y-%m-%d")
+                return (last_day + timedelta(days=1)).strftime("%Y-%m-%d")
+            except (ValueError, TypeError):
+                pass
+    cur = str(chrono_data.get("current_date") or "").strip()[:10]
+    if cur:
+        try:
+            datetime.strptime(cur, "%Y-%m-%d")
+            return cur
+        except ValueError:
+            pass
+    sd = str(start_date or "").strip()[:10]
+    try:
+        datetime.strptime(sd, "%Y-%m-%d")
+        return sd
+    except ValueError:
+        return sd
+
+
 def _rebuild_strategy_trade_counts_from_rows(rows: list[dict[str, Any]]) -> None:
     STRATEGY_TRADE_COUNT.clear()
     for r in rows:
@@ -16236,24 +16309,6 @@ def run_chronological_backtest(
     set_active_chrono(job_id)
     try:
         trades_acc, skips_acc = reconcile_chrono_sidecars(job_id, chrono_data)
-        merge_hist: list[dict[str, Any]] = []
-        merge_hist.extend(trades_acc)
-        try:
-            merge_hist.extend(x for x in load_all_results() if isinstance(x, dict))
-        except Exception:  # noqa: BLE001
-            pass
-        LAST_TRADE_DATES.clear()
-        _rebuild_strategy_trade_counts_from_rows(merge_hist)
-        _rebuild_combo_trade_stats_from_rows(merge_hist)
-        _rebuild_combo_rolling_trades_from_rows(merge_hist)
-        _rebuild_st_medium_history_from_rows(merge_hist)
-        _rebuild_health_signal_histories_from_rows(merge_hist)
-        _v72_load_strategy_status(log_startup=True)
-        # FIX 18 — restore zero-trade priority after restart (same rule as end-of-day)
-        for _z0 in ALL_STRATEGY_IDS:
-            if STRATEGY_TRADE_COUNT.get(_z0, 0) == 0:
-                ZERO_TRADE_STRATEGIES.add(_z0)
-
         for _k, _v in (
             ("daily_pnl", []),
             ("all_trades", []),
@@ -16267,6 +16322,34 @@ def run_chronological_backtest(
         ):
             chrono_data.setdefault(_k, _v)
         _strip_chrono_bulk_arrays(chrono_data)
+
+        # Resolve resume/start cursor BEFORE seeding histories so load_all_results()
+        # rows dated on/after the simulated date cannot look ahead (Group D / PR8).
+        hist_cutoff = chrono_history_seed_cutoff(chrono_data, start_date=start_date)
+        merge_raw: list[dict[str, Any]] = []
+        merge_raw.extend(x for x in trades_acc if isinstance(x, dict))
+        try:
+            merge_raw.extend(x for x in load_all_results() if isinstance(x, dict))
+        except Exception:  # noqa: BLE001
+            pass
+        merge_hist = filter_history_rows_before_date(merge_raw, hist_cutoff)
+        dropped_future = len(merge_raw) - len(merge_hist)
+        log(
+            f"[Chrono {job_id}] History seed cutoff={hist_cutoff} "
+            f"kept={len(merge_hist)} dropped_ge_cutoff={dropped_future}",
+            level="info",
+        )
+        LAST_TRADE_DATES.clear()
+        _rebuild_strategy_trade_counts_from_rows(merge_hist)
+        _rebuild_combo_trade_stats_from_rows(merge_hist)
+        _rebuild_combo_rolling_trades_from_rows(merge_hist)
+        _rebuild_st_medium_history_from_rows(merge_hist)
+        _rebuild_health_signal_histories_from_rows(merge_hist)
+        _v72_load_strategy_status(log_startup=True)
+        # FIX 18 — restore zero-trade priority after restart (same rule as end-of-day)
+        for _z0 in ALL_STRATEGY_IDS:
+            if STRATEGY_TRADE_COUNT.get(_z0, 0) == 0:
+                ZERO_TRADE_STRATEGIES.add(_z0)
 
         CHRONO_LIVE_STATUS.update(
             {
@@ -16317,6 +16400,17 @@ def run_chronological_backtest(
                 chrono_data["error"] = "invalid start_date"
                 _persist_chrono(chrono_path, chrono_data, job_id=job_id)
                 return chrono_data
+        # Keep walk cursor aligned with the history-seed cutoff when both parse.
+        try:
+            cutoff_dt = datetime.strptime(hist_cutoff, "%Y-%m-%d")
+            if current.date() != cutoff_dt.date():
+                log(
+                    f"[Chrono {job_id}] Resume cursor {current.date()} vs hist_cutoff "
+                    f"{hist_cutoff} — using computed cursor",
+                    level="warning",
+                )
+        except ValueError:
+            pass
 
         tickers = list(CHRONO_TICKERS)
         if not tickers:
