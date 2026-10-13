@@ -277,40 +277,54 @@ def test_rebuild_histories_sorts_by_close_ts(tmp_path: Path, monkeypatch: Any) -
     assert hist["last3"] == [-5.0, 10.0]
 
 
-def test_persist_dual_writes_blocked_pairs_file(tmp_path: Path, monkeypatch: Any) -> None:
-    job_id = "dual-write"
+def test_persist_partitions_blocked_vs_instruments(tmp_path: Path, monkeypatch: Any) -> None:
+    """Blocked FX goes only to blocked-pairs file; other classes only to instruments."""
+    import hashlib
+
+    job_id = "partition"
     monkeypatch.setattr(si, "DATA_DIR", tmp_path)
-    si._shadow_universe["class_by_ticker"] = {"AUDUSD": "blocked_fx", "AUDCAD": "blocked_fx"}
+    si._shadow_universe["class_by_ticker"] = {
+        "AUDUSD": "blocked_fx",
+        "AUDCAD": "blocked_fx",
+        "EURTRY": "extra_fx",
+    }
     si._shadow_universe["reason_by_ticker"] = {
         "AUDUSD": "BLOCKED_PAIR",
         "AUDCAD": "EXCLUDED_PAIR",
+        "EURTRY": "EXTRA_FX",
     }
-    si.persist_shadow_trade(
-        {
-            "ticker": "AUDUSD",
-            "outcome": "WIN",
-            "pnl_dollars": 10.0,
-            "max_risk_dollars": 10.0,
-            "strategy_id": "T01",
-        },
-        job_id=job_id,
-    )
-    si.persist_shadow_trade(
-        {
-            "ticker": "AUDCAD",
-            "outcome": "LOSS",
-            "pnl_dollars": -5.0,
-            "max_risk_dollars": 10.0,
-            "strategy_id": "T01",
-        },
-        job_id=job_id,
-    )
-    inst = si.job_instruments_path(job_id).read_text(encoding="utf-8").strip().splitlines()
-    blocked = si.job_blocked_pairs_path(job_id).read_text(encoding="utf-8").strip().splitlines()
-    assert len(inst) == 2
+    for ticker, outcome, pnl in (
+        ("AUDUSD", "WIN", 10.0),
+        ("AUDCAD", "LOSS", -5.0),
+        ("EURTRY", "WIN", 8.0),
+    ):
+        si.persist_shadow_trade(
+            {
+                "ticker": ticker,
+                "outcome": outcome,
+                "pnl_dollars": pnl,
+                "max_risk_dollars": 10.0,
+                "strategy_id": "T01",
+                "date": "2022-01-03",
+                "timeframe": "1d",
+            },
+            job_id=job_id,
+        )
+    inst_path = si.job_instruments_path(job_id)
+    blocked_path = si.job_blocked_pairs_path(job_id)
+    inst = inst_path.read_text(encoding="utf-8").strip().splitlines()
+    blocked = blocked_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(inst) == 1
+    assert json.loads(inst[0])["ticker"] == "EURTRY"
     assert len(blocked) == 2
     reasons = {json.loads(line)["shadow_reason"] for line in blocked}
     assert reasons == {"BLOCKED_PAIR", "EXCLUDED_PAIR"}
+    # Distinct files (the prior dual-write bug made md5 identical).
+    h1 = hashlib.md5(inst_path.read_bytes()).hexdigest()
+    h2 = hashlib.md5(blocked_path.read_bytes()).hexdigest()
+    assert h1 != h2
+    # Union reader still sees all three.
+    assert len(list(si._iter_trades_for_job(job_id))) == 3
 
 
 def test_assert_blocked_pairs_have_trades(tmp_path: Path, monkeypatch: Any) -> None:

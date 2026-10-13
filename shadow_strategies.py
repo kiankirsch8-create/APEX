@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import calendar
 import json
+import os
 import threading
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -23,6 +24,40 @@ from utils import DATA_DIR, log
 
 # ── Output ───────────────────────────────────────────────────────────────────
 SHADOW_TRADES_FILE = DATA_DIR / "shadow_strategy_trades.jsonl"
+
+
+def ensure_shadow_trades_file_real() -> Path:
+    """
+    Ensure ``shadow_strategy_trades.jsonl`` is a real appendable file.
+
+    An emergency disk fix symlinked this path to ``/dev/null``, which silently
+    discarded every per-trade shadow payload. Remove that symlink (or any
+    /dev/null link) so Group D skip-mining has a real corpus.
+    """
+    p = SHADOW_TRADES_FILE
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if p.is_symlink():
+            target = os.readlink(p)
+            if str(target) in ("/dev/null", "nul", "NUL") or str(target).endswith("/null"):
+                log(
+                    f"[SHADOW STRAT] Removing /dev/null symlink at {p} — "
+                    f"restoring real shadow_strategy_trades.jsonl",
+                    level="warning",
+                )
+                p.unlink()
+            else:
+                # Unexpected symlink — still replace so we can append.
+                log(
+                    f"[SHADOW STRAT] Replacing unexpected symlink {p} -> {target}",
+                    level="warning",
+                )
+                p.unlink()
+        if not p.exists():
+            p.touch()
+    except OSError as e:
+        log(f"[SHADOW STRAT] ensure_shadow_trades_file_real: {e}", level="error")
+    return p
 
 # ── Registry ─────────────────────────────────────────────────────────────────
 SHADOW_STRATEGIES: dict[str, Callable[["ShadowStrategyContext"], dict[str, Any] | None]] = {}
@@ -144,6 +179,7 @@ def append_shadow_trade(row: dict[str, Any]) -> int:
     global _shadow_seen_keys, _shadow_trades_count
     try:
         with _shadow_trades_lock:
+            ensure_shadow_trades_file_real()
             _ensure_shadow_trades_index_locked()
             assert _shadow_seen_keys is not None
             key = _shadow_dedup_key(
@@ -154,7 +190,6 @@ def append_shadow_trade(row: dict[str, Any]) -> int:
             )
             if key in _shadow_seen_keys:
                 return _shadow_trades_count
-            SHADOW_TRADES_FILE.parent.mkdir(parents=True, exist_ok=True)
             line = json.dumps(row, default=str, separators=(",", ":")) + "\n"
             with open(SHADOW_TRADES_FILE, "a", encoding="utf-8") as f:
                 f.write(line)
