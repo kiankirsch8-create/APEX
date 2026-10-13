@@ -74,8 +74,12 @@ def log(message: str, level: str = "info") -> None:
     getattr(logger, level.lower(), logger.info)(message)
 
 
-def save_json(path: str | Path, data: Any) -> Path | None:
-    """Write `data` as JSON atomically (temp file + rename). Logs and returns None on failure."""
+def save_json(path: str | Path, data: Any, *, compact: bool = False) -> Path | None:
+    """Write `data` as JSON atomically (temp file + rename). Logs and returns None on failure.
+
+    ``compact=True`` omits indentation (smaller on-disk footprint for large chrono
+    results). Small config files keep ``indent=2`` for debuggability.
+    """
     try:
         p = Path(path)
         if not p.is_absolute():
@@ -83,7 +87,10 @@ def save_json(path: str | Path, data: Any) -> Path | None:
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = str(p) + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, default=str)
+            if compact:
+                json.dump(data, f, indent=None, separators=(",", ":"), default=str)
+            else:
+                json.dump(data, f, indent=2, default=str)
         os.replace(tmp, str(p))
         return p
     except Exception as e:  # noqa: BLE001
