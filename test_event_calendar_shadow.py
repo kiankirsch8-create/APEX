@@ -105,7 +105,7 @@ def test_split_shadow_trade_maps_includes_event() -> None:
         }
     )
     guard, compound, event = cb._split_shadow_trade_maps(maps)
-    assert len(guard) == 23
+    assert len(guard) == len(cb.SHADOW_GUARD_CONFIGS)
     assert len(event) == len(cb.SHADOW_EVENT_CONFIGS)
     assert len(compound) == len(cb.SHADOW_COMPOUND_RISK_FRACTIONS) * 2
 
