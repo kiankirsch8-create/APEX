@@ -15855,7 +15855,7 @@ def _persist_chrono(chrono_path: Path, chrono_data: dict[str, Any], *, job_id: s
     Callers must stop opening new work (no tight retry).
     """
     chrono_data["last_write_iso"] = utcnow_iso()
-    written = save_json(chrono_path, chrono_data)
+    written = save_json(chrono_path, chrono_data, compact=True)
     if written is None:
         chrono_data["status"] = "failed"
         chrono_data["error"] = "persist failed (disk?)"
