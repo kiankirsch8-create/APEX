@@ -228,6 +228,14 @@ MARGIN_LEVEL_MIN_PCT = 400.0  # require margin_level >= 400% when margin is in u
 FREE_MARGIN_MIN_EQUITY_FRAC = 0.25  # require free_margin >= 25% of equity
 MAX_OPEN_POSITIONS = 15
 
+# Live portfolio risk cap — mirrors continuous_backtester ``pcap_3pct`` /
+# ``pcap_3pct_corr`` (SHADOW_PORTFOLIO_CAP_CONFIGS). Caps combined open risk at
+# stop for (a) same pair+direction and (b) correlation / shared-currency groups.
+LIVE_MAX_OPEN_RISK_PCT = 3.0
+LIVE_PAIR_RISK_CAP_ENABLED = True
+# In-cycle opens (incl. DRY_RUN) so stacked 1w/1d/4h in one scan see each other.
+_CYCLE_OPEN_RISK_BOOK: list[dict[str, Any]] = []
+
 # One engine, three profiles. Risk gates read through ``CFG`` only.
 # ``ftmo`` mirrors the validated chrono private sizing curve
 # (RISK_BY_CONFIDENCE HIGH/MED/LOW = 2%/1%/0.5% of current balance + drawdown
@@ -415,6 +423,248 @@ def abort_new_entries_if_max_positions_or_margin(
     finally:
         at.APEX_MAGIC = old_magic
     return None
+
+
+def clear_cycle_open_risk_book() -> None:
+    """Reset in-cycle open-risk book (call at start of each scan cycle)."""
+    _CYCLE_OPEN_RISK_BOOK.clear()
+
+
+def _bt_get_currencies(ticker: str) -> list[str]:
+    """Reuse continuous_backtester.get_currencies so live/backtest agree."""
+    try:
+        from continuous_backtester import get_currencies
+
+        return list(get_currencies(ticker))
+    except Exception:  # noqa: BLE001
+        t = (ticker or "").strip().upper()
+        if len(t) == 6 and t.isalpha():
+            return [t[:3], t[3:]]
+        return []
+
+
+def _bt_correlation_group_ids(ticker: str) -> list[str]:
+    """Named groups from continuous_backtester.CORRELATION_GROUPS."""
+    try:
+        from continuous_backtester import CORRELATION_GROUPS
+    except Exception:  # noqa: BLE001
+        return []
+    tu = (ticker or "").strip().upper()
+    return [
+        str(gid)
+        for gid, members in CORRELATION_GROUPS.items()
+        if tu in {str(m).strip().upper() for m in (members or [])}
+    ]
+
+
+def _open_risk_book_entries(mt5: Any | None) -> list[dict[str, Any]]:
+    """
+    Open risk rows from MT5 ticket meta + in-cycle book.
+
+    Each row: ticker, direction, timeframe, risk_usd, currencies, corr_groups.
+    """
+    rows: list[dict[str, Any]] = []
+    meta = ticket_meta_v76_load()
+    if mt5 is not None:
+        old_magic = at.APEX_MAGIC
+        try:
+            at.APEX_MAGIC = APEX_V76_MAGIC
+            positions = at.open_apex_positions(mt5) or []
+        except Exception:  # noqa: BLE001
+            positions = []
+        finally:
+            at.APEX_MAGIC = old_magic
+        for p in positions:
+            k = str(int(getattr(p, "ticket", 0) or 0))
+            m = meta.get(k) if isinstance(meta, dict) else None
+            if not isinstance(m, dict):
+                m = {}
+            ticker = str(m.get("ticker") or getattr(p, "symbol", "") or "").strip().upper()
+            # Strip broker suffix if meta missing ticker
+            if len(ticker) > 6 and ticker.endswith(("m", "M", ".", "#")):
+                ticker = ticker[:6]
+            direction = str(
+                m.get("direction")
+                or ("LONG" if int(getattr(p, "type", 1) or 1) == 0 else "SHORT")
+            ).strip().upper()
+            try:
+                risk = float(m.get("final_risk_usd", m.get("max_risk_dollars", 0)) or 0)
+            except (TypeError, ValueError):
+                risk = 0.0
+            if risk <= 0 or not ticker or direction not in ("LONG", "SHORT"):
+                continue
+            rows.append(
+                {
+                    "ticker": ticker,
+                    "direction": direction,
+                    "timeframe": str(m.get("tf") or m.get("timeframe") or "").strip().lower(),
+                    "risk_usd": risk,
+                    "currencies": _bt_get_currencies(ticker),
+                    "corr_groups": _bt_correlation_group_ids(ticker),
+                    "source": "mt5",
+                    "ticket": k,
+                }
+            )
+    for r in _CYCLE_OPEN_RISK_BOOK:
+        if isinstance(r, dict):
+            rows.append(dict(r))
+    return rows
+
+
+def apply_pair_correlation_risk_cap(
+    plan: TradePlan,
+    *,
+    balance: float,
+    mt5: Any | None = None,
+) -> dict[str, Any]:
+    """
+    Cap ``plan.risk_usd`` so same-pair+direction and correlation-group open risk
+    stay within ``LIVE_MAX_OPEN_RISK_PCT`` of balance (pcap_3pct_corr parity).
+
+    Returns fields including ``pair_risk_cap_action``:
+    ``allow`` | ``downsize`` | ``skip`` (skip_reason ``pair_risk_cap``).
+    """
+    out: dict[str, Any] = {
+        "pair_risk_cap_enabled": bool(LIVE_PAIR_RISK_CAP_ENABLED),
+        "pair_risk_cap_pct": float(LIVE_MAX_OPEN_RISK_PCT),
+        "pair_risk_cap_action": "allow",
+        "pair_risk_cap_skip": False,
+        "pair_risk_cap_requested": round(float(plan.risk_usd or 0), 2),
+        "pair_risk_cap_final": round(float(plan.risk_usd or 0), 2),
+        "pair_risk_cap_headroom": None,
+        "pair_risk_cap_bound": "",
+        "pair_same_dir_open_risk": 0.0,
+        "pair_corr_open_risk": 0.0,
+    }
+    if not LIVE_PAIR_RISK_CAP_ENABLED:
+        return out
+    try:
+        bal = float(balance)
+    except (TypeError, ValueError):
+        bal = 0.0
+    if bal <= 0:
+        return out
+    try:
+        requested = float(plan.risk_usd or 0)
+    except (TypeError, ValueError):
+        requested = 0.0
+    if requested <= 0:
+        return out
+
+    cap_usd = bal * float(LIVE_MAX_OPEN_RISK_PCT) / 100.0
+    ticker = str(plan.sym or "").strip().upper()
+    direction = str(plan.direction or "").strip().upper()
+    curs = _bt_get_currencies(ticker)
+    groups = _bt_correlation_group_ids(ticker)
+    book = _open_risk_book_entries(mt5)
+
+    same_dir = sum(
+        float(r.get("risk_usd") or 0)
+        for r in book
+        if str(r.get("ticker") or "").upper() == ticker
+        and str(r.get("direction") or "").upper() == direction
+    )
+    # pcap_3pct_corr: shared-currency concentration (continuous_backtester._check_cap)
+    corr_ccy_risk = 0.0
+    corr_bound = ""
+    for cur in curs:
+        grp = sum(
+            float(r.get("risk_usd") or 0)
+            for r in book
+            if cur in (r.get("currencies") or [])
+        )
+        if grp >= corr_ccy_risk:
+            corr_ccy_risk = grp
+            corr_bound = f"corr_{cur}"
+    # Named CORRELATION_GROUPS (same module as backtester)
+    named_risk = 0.0
+    named_bound = ""
+    for gid in groups:
+        grp = sum(
+            float(r.get("risk_usd") or 0)
+            for r in book
+            if gid in (r.get("corr_groups") or [])
+        )
+        if grp >= named_risk:
+            named_risk = grp
+            named_bound = f"group_{gid}"
+
+    headroom_pair = cap_usd - same_dir
+    headroom_ccy = cap_usd - corr_ccy_risk
+    headroom_named = cap_usd - named_risk if groups else headroom_ccy
+    headroom = min(headroom_pair, headroom_ccy, headroom_named)
+
+    bound = "pair_same_dir"
+    if headroom_ccy <= headroom_pair and headroom_ccy <= headroom_named:
+        bound = corr_bound or "corr"
+    elif groups and headroom_named <= headroom_pair and headroom_named <= headroom_ccy:
+        bound = named_bound or "group"
+
+    out["pair_same_dir_open_risk"] = round(float(same_dir), 2)
+    out["pair_corr_open_risk"] = round(float(max(corr_ccy_risk, named_risk)), 2)
+    out["pair_risk_cap_headroom"] = round(float(headroom), 2)
+    out["pair_risk_cap_bound"] = bound
+    out["pair_risk_cap_usd"] = round(float(cap_usd), 2)
+
+    eps = 1e-6
+    if headroom <= eps:
+        out["pair_risk_cap_action"] = "skip"
+        out["pair_risk_cap_skip"] = True
+        out["pair_risk_cap_final"] = 0.0
+        out["skip_reason"] = "pair_risk_cap"
+        plan.risk_usd = 0.0
+        plan.risk_pct = 0.0
+        plan.ai["max_risk_dollars"] = 0.0
+        plan.ai["pair_risk_cap_skip"] = True
+        plan.log_fields["skip_reason"] = "pair_risk_cap"
+        plan.log_fields.update({k: v for k, v in out.items() if k.startswith("pair_risk")})
+        return out
+
+    if requested > headroom + eps:
+        new_risk = round(float(headroom), 2)
+        scale = new_risk / requested if requested > 0 else 0.0
+        try:
+            base_pct = float(plan.risk_pct or 0)
+        except (TypeError, ValueError):
+            base_pct = 0.0
+        plan.risk_usd = new_risk
+        plan.risk_pct = base_pct * scale
+        plan.ai["max_risk_dollars"] = new_risk
+        out["pair_risk_cap_action"] = "downsize"
+        out["pair_risk_cap_final"] = new_risk
+        out["pair_risk_cap_scale"] = round(float(scale), 6)
+        plan.log_fields.update({k: v for k, v in out.items() if k.startswith("pair_risk")})
+        return out
+
+    out["pair_risk_cap_action"] = "allow"
+    out["pair_risk_cap_final"] = round(requested, 2)
+    plan.log_fields.update({k: v for k, v in out.items() if k.startswith("pair_risk")})
+    return out
+
+
+def register_cycle_open_risk(plan: TradePlan) -> None:
+    """Record an accepted open (live or DRY_RUN) into the in-cycle risk book."""
+    try:
+        risk = float(plan.risk_usd or 0)
+    except (TypeError, ValueError):
+        risk = 0.0
+    if risk <= 0:
+        return
+    ticker = str(plan.sym or "").strip().upper()
+    direction = str(plan.direction or "").strip().upper()
+    if not ticker or direction not in ("LONG", "SHORT"):
+        return
+    _CYCLE_OPEN_RISK_BOOK.append(
+        {
+            "ticker": ticker,
+            "direction": direction,
+            "timeframe": str(plan.timeframe or "").strip().lower(),
+            "risk_usd": risk,
+            "currencies": _bt_get_currencies(ticker),
+            "corr_groups": _bt_correlation_group_ids(ticker),
+            "source": "cycle",
+        }
+    )
 
 
 SCAN_HOURS = at.SCAN_HOURS
@@ -2289,6 +2539,67 @@ def order_send_v76(
         )
         return {"ok": False, "error": "daily_loss_stop", "dry_run": False}
 
+    # Portfolio risk cap (pcap_3pct / pcap_3pct_corr): same pair+direction and
+    # correlation / shared-currency groups ≤ LIVE_MAX_OPEN_RISK_PCT of balance.
+    bal_for_cap = float(eq_use) if eq_use > 0 else float(
+        st_use.get("last_balance") or at.STARTING_BALANCE
+    )
+    cap_fields = apply_pair_correlation_risk_cap(plan, balance=bal_for_cap, mt5=mt5)
+    live_log(
+        "info",
+        "[RISK CAP] pair/correlation",
+        ticker=plan.sym,
+        timeframe=plan.timeframe,
+        direction=plan.direction,
+        action=cap_fields.get("pair_risk_cap_action"),
+        bound=cap_fields.get("pair_risk_cap_bound"),
+        requested=cap_fields.get("pair_risk_cap_requested"),
+        final=cap_fields.get("pair_risk_cap_final"),
+        headroom=cap_fields.get("pair_risk_cap_headroom"),
+        same_dir_open=cap_fields.get("pair_same_dir_open_risk"),
+        corr_open=cap_fields.get("pair_corr_open_risk"),
+    )
+    if cap_fields.get("pair_risk_cap_skip"):
+        row = dict(plan.log_fields)
+        row.update(
+            {
+                "action": "SKIP",
+                "skip_reason": "pair_risk_cap",
+                "magic_number": APEX_V76_MAGIC,
+            }
+        )
+        row.update({k: v for k, v in cap_fields.items() if str(k).startswith("pair_risk")})
+        append_decision_log(row)
+        live_log(
+            "warning",
+            "[SKIP] pair_risk_cap",
+            ticker=plan.sym,
+            timeframe=plan.timeframe,
+            strategy_id=plan.strategy_id,
+            direction=plan.direction,
+            bound=cap_fields.get("pair_risk_cap_bound"),
+            same_dir_open=cap_fields.get("pair_same_dir_open_risk"),
+            corr_open=cap_fields.get("pair_corr_open_risk"),
+            headroom=cap_fields.get("pair_risk_cap_headroom"),
+        )
+        return {
+            "ok": False,
+            "error": "pair_risk_cap",
+            "dry_run": False,
+            "pair_risk_cap": True,
+            **{k: v for k, v in cap_fields.items() if str(k).startswith("pair_risk")},
+        }
+    if cap_fields.get("pair_risk_cap_action") == "downsize":
+        live_log(
+            "info",
+            "[RISK CAP] downsized to fit pair/correlation 3% headroom",
+            ticker=plan.sym,
+            timeframe=plan.timeframe,
+            requested=cap_fields.get("pair_risk_cap_requested"),
+            final=cap_fields.get("pair_risk_cap_final"),
+            bound=cap_fields.get("pair_risk_cap_bound"),
+        )
+
     if DRY_RUN:
         tick = mt5.symbol_info_tick(broker_sym) if mt5 else None
         entry = float(tick.ask if plan.direction == "LONG" else tick.bid) if tick else plan.entry
@@ -2305,6 +2616,7 @@ def order_send_v76(
                 "env_dry_run": True,
             }
         )
+        row.update({k: v for k, v in cap_fields.items() if str(k).startswith("pair_risk")})
         dry_meta: dict[str, Any] = {
             "macro_bias": plan.ai.get("macro_bias"),
             "sl": plan.stop_loss,
@@ -2322,6 +2634,7 @@ def order_send_v76(
             row["pyramid_trade"] = True
             row["pyramid_candidate"] = dry_meta.get("pyramid")
         append_decision_log(row)
+        register_cycle_open_risk(plan)
         dry_log = {
             "ticker": plan.sym,
             "timeframe": plan.timeframe,
@@ -2336,10 +2649,19 @@ def order_send_v76(
             "tp3": plan.tp3,
             "trail_regime": plan.trail_regime,
             "guard_mode": mode,
+            "pair_risk_cap_action": cap_fields.get("pair_risk_cap_action"),
         }
         dry_log.update(_sizing_fields_from_ai(plan.ai))
         live_log("info", "[TRADE] DRY_RUN would open", **dry_log)
-        return {"ok": True, "dry_run": True, "volume": lots, "entry": entry, "retcode": "DRY_RUN"}
+        return {
+            "ok": True,
+            "dry_run": True,
+            "volume": lots,
+            "entry": entry,
+            "retcode": "DRY_RUN",
+            "pair_risk_cap_action": cap_fields.get("pair_risk_cap_action"),
+            "risk_usd": round(plan.risk_usd, 2),
+        }
 
     old_magic = at.APEX_MAGIC
     old_comment = at.ORDER_COMMENT
@@ -2390,6 +2712,7 @@ def order_send_v76(
                     float(res.get("entry", plan.entry) or plan.entry),
                 )
                 ticket_meta_v76_save(tm)
+            register_cycle_open_risk(plan)
         lots = float(res.get("volume", 0) or 0)
         retcode = res.get("retcode") if isinstance(res, dict) else None
         row = dict(plan.log_fields)
@@ -2917,6 +3240,7 @@ def run_full_scan_v76() -> None:
         _v76_logic.bind_backtester_parity_state(force_reload_status=False)
     except Exception:  # noqa: BLE001
         pass
+    clear_cycle_open_risk_book()
     st = load_v76_state()
     scan_d = datetime.now(timezone.utc).date()
     analysis_date = scan_d.isoformat()
