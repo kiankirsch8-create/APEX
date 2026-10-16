@@ -332,6 +332,11 @@ def _filling_mode(mt5: Any, sym: str) -> int:
     return mt5.ORDER_FILLING_RETURN
 
 
+# If risk-sized lots are below broker ``volume_min``, flooring UP may oversize the
+# trade. Skip when actual SL risk at ``volume_min`` exceeds intended risk by >50%.
+LOT_MIN_OVERRISK_RATIO: float = 1.5
+
+
 def _normalize_volume(mt5: Any, sym: str, volume: float) -> float:
     info = mt5.symbol_info(sym)
     if info is None:
@@ -357,14 +362,46 @@ def _money_per_lot_to_sl(mt5: Any, sym: str, entry: float, sl: float) -> float |
     return ticks * tick_value
 
 
-def _volume_for_risk(mt5: Any, sym: str, entry: float, sl: float, risk_dollars: float) -> float:
+def _volume_for_risk(
+    mt5: Any,
+    sym: str,
+    entry: float,
+    sl: float,
+    risk_dollars: float,
+) -> tuple[float | None, str | None]:
+    """
+    Size lots from ``risk_dollars`` / SL distance.
+
+    Returns ``(volume, skip_reason)``. When flooring up to the broker minimum
+    would make actual SL risk exceed intended risk by more than 50%, returns
+    ``(None, "lot_min_overrisk")`` so the caller skips instead of over-risking.
+    """
     mpl = _money_per_lot_to_sl(mt5, sym, entry, sl)
     if mpl is None or mpl <= 0:
         log("[MT5] Could not derive money-per-lot; using volume_min", level="warning")
         info = mt5.symbol_info(sym)
-        return float(info.volume_min) if info else 0.01
-    vol = risk_dollars / mpl
-    return _normalize_volume(mt5, sym, vol)
+        return (float(info.volume_min) if info else 0.01), None
+
+    try:
+        intend = float(risk_dollars)
+    except (TypeError, ValueError):
+        return None, "bad_risk_dollars"
+    if intend <= 0:
+        return None, "volume_zero"
+
+    raw = intend / mpl
+    info = mt5.symbol_info(sym)
+    vmin = float(info.volume_min or 0.01) if info is not None else 0.01
+    # Flooring UP to vmin oversizes risk — skip when actual > 1.5× intended.
+    if raw + 1e-12 < vmin:
+        actual_at_min = vmin * mpl
+        if actual_at_min > intend * LOT_MIN_OVERRISK_RATIO:
+            return None, "lot_min_overrisk"
+
+    vol = _normalize_volume(mt5, sym, raw)
+    if vol <= 0:
+        return None, "volume_zero"
+    return vol, None
 
 
 # ---------------------------------------------------------------------------
@@ -409,8 +446,15 @@ def execute_trade(
     if r <= 0:
         return {"ok": False, "error": "zero_stop_distance"}
 
-    vol = _volume_for_risk(mt5, sym, entry, sl, float(risk_dollars))
-    if vol <= 0:
+    vol, vol_skip = _volume_for_risk(mt5, sym, entry, sl, float(risk_dollars))
+    if vol_skip:
+        log(
+            f"[MT5] execute_trade skip reason={vol_skip} sym={sym} "
+            f"risk=${float(risk_dollars):.2f} entry={entry:.5f} sl={sl:.5f}",
+            level="warning",
+        )
+        return {"ok": False, "error": vol_skip, "skip_reason": vol_skip}
+    if vol is None or vol <= 0:
         return {"ok": False, "error": "volume_zero"}
 
     order_type = mt5.ORDER_TYPE_BUY if d == "LONG" else mt5.ORDER_TYPE_SELL
