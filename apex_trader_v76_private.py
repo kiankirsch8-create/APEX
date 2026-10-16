@@ -222,17 +222,21 @@ APEX_V76_MAGIC = int(os.environ.get("APEX_V76_PRIVATE_MAGIC", "760761"))
 ORDER_COMMENT_V76 = os.environ.get("APEX_V76_PRIVATE_ORDER_COMMENT", "APEX76P")
 DRY_RUN = os.environ.get("APEX_V76_PRIVATE_DRY_RUN", "true").strip().lower() in ("1", "true", "yes")
 
-# One engine, two profiles. Risk gates read through ``CFG`` only.
-# Keep PROFILE="private" for live capital. Funded multipliers are also computed
-# as write-only ``shadow_funded_*`` fields for forward evidence — do not point
-# real capital at PROFILE="funded" until that evidence is reviewed.
+# One engine, three profiles. Risk gates read through ``CFG`` only.
+# ``ftmo`` mirrors the validated chrono private sizing curve
+# (RISK_BY_CONFIDENCE HIGH/MED/LOW = 2%/1%/0.5% of current balance + drawdown
+# scale) — NOT the funded 0.20%/trade compound fraction — plus FTMO guardrails ON.
+# Keep ``funded`` shadow-first until its own evidence is reviewed.
 #
 # Group E / PR13 — funded compounds at 0.20–0.30% risk fraction. The full
 # guardrail stack stays shadow-first (``apply_live_guardrails=False``) until
 # forward evidence lands; never go live with bare compounding (no guardrails).
-PROFILE = "private"  # "private" | "funded"
+PROFILE = "ftmo"  # "private" | "funded" | "ftmo"
 FUNDED_COMPOUND_RISK_MIN = 0.002  # 0.20%
 FUNDED_COMPOUND_RISK_MAX = 0.003  # 0.30%
+# FTMO $10k challenge static / daily hard loss limits (USD).
+FTMO_ACCOUNT_LOSS_LIMIT_USD = 1000.0
+FTMO_DAILY_LOSS_LIMIT_USD = 500.0
 PROFILES: dict[str, dict[str, Any]] = {
     "private": {
         "cold_start_min_trades": 0,  # disabled
@@ -246,6 +250,9 @@ PROFILES: dict[str, dict[str, Any]] = {
         "warmup_multiplier": 1.0,
         "compounding_enabled": False,
         "compound_risk_fraction": None,
+        "hard_risk_ceiling_pct": 5.5,  # legacy decision-layer ceil
+        "account_loss_limit_usd": None,
+        "daily_loss_limit_usd": None,
         "apply_live_guardrails": True,  # no-op via None/0/empty levers above
     },
     "funded": {
@@ -262,8 +269,31 @@ PROFILES: dict[str, dict[str, Any]] = {
         # guardrails are eventually enabled. Bare 0.20% failed (~10.54% DD).
         "compounding_enabled": True,
         "compound_risk_fraction": 0.002,  # 0.20% of current equity per trade
+        "hard_risk_ceiling_pct": 5.5,
+        "account_loss_limit_usd": None,
+        "daily_loss_limit_usd": None,
         # Change B — full stack does not drive live sizing until evidence reviewed.
         "apply_live_guardrails": False,
+    },
+    # Validated chrono used ACCOUNT_TYPE=private + RISK_BY_CONFIDENCE on current
+    # capital (not funded 0.2%/trade, not 40-day warmup). Guardrails ON for FTMO.
+    "ftmo": {
+        "cold_start_min_trades": 0,
+        "cold_start_multiplier": 1.0,
+        "per_trade_loss_cap_pct": 2.9,  # hard single-trade ceiling (% of balance)
+        "daily_loss_stop_pct": 4.0,
+        "dd_ladder": [(6.0, 0.5), (8.0, 0.25)],
+        "dry_run_after_losing_days": None,
+        "warmup_days": 0,
+        "warmup_multiplier": 1.0,
+        # Confidence-based sizing stays in the decision layer (RISK_BY_CONFIDENCE);
+        # do NOT replace with funded compound_risk_fraction.
+        "compounding_enabled": False,
+        "compound_risk_fraction": None,
+        "hard_risk_ceiling_pct": 2.9,  # replaces legacy 5.5% for this profile
+        "account_loss_limit_usd": FTMO_ACCOUNT_LOSS_LIMIT_USD,  # $1,000 static
+        "daily_loss_limit_usd": FTMO_DAILY_LOSS_LIMIT_USD,  # $500 daily
+        "apply_live_guardrails": True,
     },
 }
 CFG: dict[str, Any] = PROFILES[PROFILE]
@@ -784,8 +814,26 @@ def apply_ab_sizing_throttle(plan: TradePlan) -> dict[str, Any]:
     When ``SKIP_ALL_THROTTLED`` and throttle < 1, keep full risk and set
     ``ab_skip=True`` so the order path skips the live fill.
     Returns fields for decision / forensic logging.
+
+    When the decision layer already applied A+B (parity path via
+    ``continuous_backtester``), leave risk unchanged to avoid double-throttle.
     """
     _ensure_live_sizing_health_rebuilt()
+    if bool(plan.ai.get("_ab_applied_in_decision")):
+        thr = plan.ai.get("_ab_throttle")
+        try:
+            thr_f = float(thr) if thr is not None else 1.0
+        except (TypeError, ValueError):
+            thr_f = 1.0
+        fields = {
+            "sizing_health_strategy_id": str(plan.strategy_id or "").strip().upper(),
+            "ab_throttle": thr_f,
+            "ab_skip": bool(plan.ai.get("_ab_skip")),
+            "ab_already_applied_in_decision": True,
+            "max_risk_dollars": round(float(plan.risk_usd or 0), 2),
+        }
+        plan.log_fields.update(fields)
+        return fields
     base_risk = float(plan.risk_usd or 0)
     sid = str(plan.strategy_id or "").strip().upper()
     conf = str(
@@ -1202,6 +1250,7 @@ def apply_cfg_guardrails(
     )
 
     # Base risk: compounding (funded) replaces post-AB dollars when enabled.
+    # ftmo keeps confidence-based post-AB risk (compound_risk_fraction is None).
     compound_risk = _compound_risk_from_cfg(CFG, eq)
     compound_applied = compound_risk is not None
     base_risk = float(compound_risk) if compound_applied else post_ab
@@ -1209,6 +1258,7 @@ def apply_cfg_guardrails(
     risk = float(base_risk)
     cap_applied = 1.0
     daily_stopped = False
+    account_stopped = False
     if live_guards:
         risk = base_risk * m["warmup_mult"] * m["cold_start_mult"] * m["dd_ladder_mult"]
         # Per-trade loss cap: reduce size only — never widen the stop.
@@ -1221,6 +1271,17 @@ def apply_cfg_guardrails(
             if max_risk >= 0 and risk > max_risk and risk > 0:
                 cap_applied = max_risk / risk
                 risk = max_risk
+        # Hard single-trade ceiling (ftmo replaces legacy 5.5% with 2.9%).
+        hard_pct = CFG.get("hard_risk_ceiling_pct")
+        if hard_pct is not None and eq > 0:
+            try:
+                hard_max = eq * float(hard_pct) / 100.0
+            except (TypeError, ValueError):
+                hard_max = None
+            if hard_max is not None and hard_max >= 0 and risk > hard_max and risk > 0:
+                if risk > 0:
+                    cap_applied = min(float(cap_applied), hard_max / risk) if risk else cap_applied
+                risk = hard_max
         stop_pct = CFG.get("daily_loss_stop_pct")
         if stop_pct is not None and anchor > 0:
             try:
@@ -1229,6 +1290,27 @@ def apply_cfg_guardrails(
                 thresh = None
             if thresh is not None and day_real <= thresh:
                 daily_stopped = True
+        # Absolute USD daily / static account loss limits (FTMO $10k: $500 / $1000).
+        daily_usd = CFG.get("daily_loss_limit_usd")
+        if daily_usd is not None:
+            try:
+                if day_real <= -abs(float(daily_usd)):
+                    daily_stopped = True
+            except (TypeError, ValueError):
+                pass
+        acct_usd = CFG.get("account_loss_limit_usd")
+        if acct_usd is not None and eq > 0:
+            try:
+                # Static DD from starting capital ($10k) — stop new risk when breached.
+                start_cap = float(
+                    st.get("ftmo_start_balance")
+                    or st.get("starting_balance")
+                    or 10_000.0
+                )
+                if eq <= start_cap - abs(float(acct_usd)):
+                    account_stopped = True
+            except (TypeError, ValueError):
+                pass
 
     plan.risk_usd = round(float(risk), 2)
     try:
@@ -1243,11 +1325,17 @@ def apply_cfg_guardrails(
     plan.ai["max_risk_dollars"] = round(float(risk), 2)
 
     mode = _resolve_guard_mode(
-        daily_stopped=daily_stopped,
+        daily_stopped=daily_stopped or account_stopped,
         ladder_level=int(m["dd_ladder_level"]) if live_guards else 0,
         warmup_mult=float(m["warmup_mult"]) if live_guards else 1.0,
     )
-    allow = not daily_stopped
+    allow = not daily_stopped and not account_stopped
+
+    hard_pct_out = CFG.get("hard_risk_ceiling_pct")
+    try:
+        hard_pct_out = float(hard_pct_out) if hard_pct_out is not None else None
+    except (TypeError, ValueError):
+        hard_pct_out = None
 
     fields: dict[str, Any] = {
         "guard_profile": PROFILE,
@@ -1265,6 +1353,11 @@ def apply_cfg_guardrails(
         "guard_day_realized_pnl": round(day_real, 2),
         "guard_day_anchor": round(anchor, 2),
         "guard_daily_stopped": bool(daily_stopped),
+        "guard_account_stopped": bool(account_stopped),
+        "guard_hard_risk_ceiling_pct": hard_pct_out,
+        "guard_daily_loss_stop_pct": CFG.get("daily_loss_stop_pct"),
+        "guard_account_loss_limit_usd": CFG.get("account_loss_limit_usd"),
+        "guard_daily_loss_limit_usd": CFG.get("daily_loss_limit_usd"),
         "guard_strat_closed_n": int(m["strat_closed_n"]),
         "guard_apply_live": bool(live_guards),
         "compounding_applied": bool(compound_applied),
@@ -2714,6 +2807,10 @@ def manage_trailing_v76(mt5: Any, st: dict[str, Any] | None = None) -> None:
 
 def run_full_scan_v76() -> None:
     _v76_logic.v72_load_strategy_status(at.BASE_DIR, log_fn=live_log)
+    try:
+        _v76_logic.bind_backtester_parity_state(force_reload_status=False)
+    except Exception:  # noqa: BLE001
+        pass
     st = load_v76_state()
     scan_d = datetime.now(timezone.utc).date()
     analysis_date = scan_d.isoformat()
@@ -2796,6 +2893,12 @@ def run_full_scan_v76() -> None:
     _v76_logic.CHRONO_JPY_PAIRS_SIGNALLED.clear()
     _v76_logic.CHRONO_JPY_STORM_SNAPSHOT.clear()
     _v76_logic.CHRONO_JPY_RISK_DAY = 0.0
+    try:
+        import continuous_backtester as _cb_parity
+
+        _cb_parity.CHRONO_JPY_RISK_DAY = 0.0
+    except Exception:  # noqa: BLE001
+        pass
 
     scan_cells: list[tuple[str, str]] = []
     checked = 0
