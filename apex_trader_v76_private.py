@@ -222,17 +222,15 @@ APEX_V76_MAGIC = int(os.environ.get("APEX_V76_PRIVATE_MAGIC", "760761"))
 ORDER_COMMENT_V76 = os.environ.get("APEX_V76_PRIVATE_ORDER_COMMENT", "APEX76P")
 DRY_RUN = os.environ.get("APEX_V76_PRIVATE_DRY_RUN", "true").strip().lower() in ("1", "true", "yes")
 
-# One engine, two profiles. Risk gates read through ``CFG`` only.
-# Keep PROFILE="private" for live capital. Funded multipliers are also computed
-# as write-only ``shadow_funded_*`` fields for forward evidence — do not point
-# real capital at PROFILE="funded" until that evidence is reviewed.
-#
-# Group E / PR13 — funded compounds at 0.20–0.30% risk fraction. The full
-# guardrail stack stays shadow-first (``apply_live_guardrails=False``) until
-# forward evidence lands; never go live with bare compounding (no guardrails).
-PROFILE = "private"  # "private" | "funded"
+# One engine, three profiles. Risk gates read through ``CFG`` only.
+# ``ftmo``: validated chrono RISK_BY_CONFIDENCE sizing + FTMO guardrails ON
+# (daily_loss_stop_pct=4.0, dd_ladder 6%/8%). Daily stop sets circuit_halt_until
+# for the rest of the trading day (new entries only — no auto-flatten).
+PROFILE = "ftmo"  # "private" | "funded" | "ftmo"
 FUNDED_COMPOUND_RISK_MIN = 0.002  # 0.20%
 FUNDED_COMPOUND_RISK_MAX = 0.003  # 0.30%
+FTMO_ACCOUNT_LOSS_LIMIT_USD = 1000.0
+FTMO_DAILY_LOSS_LIMIT_USD = 500.0
 PROFILES: dict[str, dict[str, Any]] = {
     "private": {
         "cold_start_min_trades": 0,  # disabled
@@ -246,6 +244,9 @@ PROFILES: dict[str, dict[str, Any]] = {
         "warmup_multiplier": 1.0,
         "compounding_enabled": False,
         "compound_risk_fraction": None,
+        "hard_risk_ceiling_pct": 5.5,
+        "account_loss_limit_usd": None,
+        "daily_loss_limit_usd": None,
         "apply_live_guardrails": True,  # no-op via None/0/empty levers above
     },
     "funded": {
@@ -258,12 +259,28 @@ PROFILES: dict[str, dict[str, Any]] = {
         "dry_run_after_losing_days": 3,
         "warmup_days": 40,
         "warmup_multiplier": 0.25,
-        # Compounding in the 0.20–0.30% band; bundle with full stack when live
-        # guardrails are eventually enabled. Bare 0.20% failed (~10.54% DD).
         "compounding_enabled": True,
         "compound_risk_fraction": 0.002,  # 0.20% of current equity per trade
-        # Change B — full stack does not drive live sizing until evidence reviewed.
+        "hard_risk_ceiling_pct": 5.5,
+        "account_loss_limit_usd": None,
+        "daily_loss_limit_usd": None,
         "apply_live_guardrails": False,
+    },
+    "ftmo": {
+        "cold_start_min_trades": 0,
+        "cold_start_multiplier": 1.0,
+        "per_trade_loss_cap_pct": 2.9,
+        "daily_loss_stop_pct": 4.0,
+        "dd_ladder": [(6.0, 0.5), (8.0, 0.25)],
+        "dry_run_after_losing_days": None,
+        "warmup_days": 0,
+        "warmup_multiplier": 1.0,
+        "compounding_enabled": False,
+        "compound_risk_fraction": None,
+        "hard_risk_ceiling_pct": 2.9,
+        "account_loss_limit_usd": FTMO_ACCOUNT_LOSS_LIMIT_USD,
+        "daily_loss_limit_usd": FTMO_DAILY_LOSS_LIMIT_USD,
+        "apply_live_guardrails": True,
     },
 }
 CFG: dict[str, Any] = PROFILES[PROFILE]
@@ -1022,6 +1039,71 @@ def _trading_days_inclusive(start: date, end: date) -> int:
     return n
 
 
+def _next_trading_day(d: date) -> date:
+    """Next Mon–Fri calendar day strictly after ``d``."""
+    n = d + timedelta(days=1)
+    while n.weekday() >= 5:
+        n += timedelta(days=1)
+    return n
+
+
+def daily_loss_halt_until(scan_d: date) -> datetime:
+    """
+    UTC midnight of the next trading day — new entries resume on that date.
+
+    Open swing trades are NOT flattened; only the entry scan respects the halt
+    via ``circuit_halt_until`` / ``_circuit_breaker_live``.
+    """
+    return datetime.combine(_next_trading_day(scan_d), datetime.min.time())
+
+
+def set_daily_loss_circuit_halt(
+    st: dict[str, Any],
+    scan_d: date,
+    *,
+    persist: bool = False,
+) -> datetime:
+    """
+    Persist ``circuit_halt_until`` through end of the trading day (next session).
+
+    If a longer halt is already set (e.g. 5d −8% → 48h), keep the later expiry.
+    """
+    until = daily_loss_halt_until(scan_d)
+    existing = _parse_halt_until(str(st.get("circuit_halt_until") or "").strip())
+    if existing is not None and existing >= until:
+        return existing
+    st["circuit_halt_until"] = until.isoformat()
+    if persist:
+        save_v76_state(st)
+    return until
+
+
+def _daily_loss_stop_tripped(
+    *,
+    day_pnl: float,
+    day_anchor: float,
+    stop_pct: float | None = None,
+) -> bool:
+    """True when intraday P&L ≤ −stop_pct% of day_anchor (CFG default)."""
+    if stop_pct is None:
+        raw = CFG.get("daily_loss_stop_pct")
+        if raw is None:
+            return False
+        try:
+            stop_pct = float(raw)
+        except (TypeError, ValueError):
+            return False
+    try:
+        anchor = float(day_anchor)
+        pnl = float(day_pnl)
+        pct = float(stop_pct)
+    except (TypeError, ValueError):
+        return False
+    if anchor <= 0 or pct <= 0:
+        return False
+    return pnl <= (-pct / 100.0) * anchor
+
+
 def _ensure_guard_activation_date(st: dict[str, Any], scan_d: date) -> date:
     _migrate_guard_profile_state(st)
     by_act = st["guard_activation_date_by_profile"]
@@ -1229,6 +1311,9 @@ def apply_cfg_guardrails(
                 thresh = None
             if thresh is not None and day_real <= thresh:
                 daily_stopped = True
+                # Block NEW entries for the rest of the trading day via the
+                # existing circuit-halt mechanism. Do not flatten open swings.
+                set_daily_loss_circuit_halt(st, scan_d, persist=True)
 
     plan.risk_usd = round(float(risk), 2)
     try:
@@ -1986,6 +2071,9 @@ def order_send_v76(
         day_real = float(st_use.get("day_realized_pnl") or 0)
     except (TypeError, ValueError):
         day_real = 0.0
+    # Intraday daily-loss uses the worse of closed-trade and mark-to-market day P&L.
+    if eq_use and anchor_use:
+        day_real = min(day_real, float(eq_use) - float(anchor_use))
     scan_use = scan_d or datetime.now(timezone.utc).date()
 
     # Sizing: existing multipliers → A+B throttle → CFG guardrails.
@@ -2767,9 +2855,29 @@ def run_full_scan_v76() -> None:
         st["day_anchor"] = equity
     day_anchor = float(st.get("day_anchor") or equity)
     day_pnl = equity - day_anchor
+    # Intraday loss uses the worse of mark-to-market and closed-trade day P&L.
+    day_realized = float(st.get("day_realized_pnl") or 0)
+    day_loss = min(float(day_pnl), day_realized)
     st["last_daily_pnl"] = round(day_pnl, 2)
     _update_peak_equity(st, equity)
     _ensure_guard_activation_date(st, scan_d)
+
+    # FTMO/CFG daily loss stop → circuit_halt_until (new entries only).
+    entries_halted = False
+    if bool(CFG.get("apply_live_guardrails", True)) and _daily_loss_stop_tripped(
+        day_pnl=day_loss,
+        day_anchor=day_anchor,
+    ):
+        until = set_daily_loss_circuit_halt(st, scan_d, persist=True)
+        entries_halted = True
+        live_log(
+            "warning",
+            "[DAILY LOSS STOP] circuit halt — no new entries until next trading day",
+            day_pnl=round(day_loss, 2),
+            day_anchor=round(day_anchor, 2),
+            stop_pct=CFG.get("daily_loss_stop_pct"),
+            circuit_halt_until=until.isoformat(),
+        )
 
     period_mode = _live_period_mode(st, balance, scan_d)
     st["last_period_mode"] = period_mode
@@ -2844,119 +2952,139 @@ def run_full_scan_v76() -> None:
 
     placed = 0
     skipped = 0
-    if mt5:
-        old_magic = at.APEX_MAGIC
-        try:
-            at.APEX_MAGIC = APEX_V76_MAGIC
-            at.resolve_apex_hedged_same_pair(mt5)
-            if len(at.open_apex_positions(mt5)) >= 15:
-                live_log("warning", "[SCAN CYCLE] max 15 open positions — abort entries")
-                publish_live_status(mt5, status="running", scan_aborted="max_positions")
-                save_v76_state(st)
-                return
-        finally:
-            at.APEX_MAGIC = old_magic
-
-    for sym, tf in scan_cells:
-        live_log("info", "[SCAN] evaluate entry", ticker=sym.upper(), timeframe=tf)
-        result = evaluate_cell_v76(
-            sym,
-            tf,
-            st=st,
-            balance=balance,
-            day_pnl=day_pnl,
-            period_mode=period_mode,
-            regime_ctx=regime_ctx,
-            scan_d=scan_d,
+    if entries_halted:
+        # Daily-loss circuit halt: skip NEW entries only. Trailing below still runs
+        # so open swings manage via their own SL / trail — no auto-flatten.
+        live_log(
+            "warning",
+            "[SCAN CYCLE] entries halted by daily loss stop",
+            circuit_halt_until=st.get("circuit_halt_until"),
+            cells_signalled=len(scan_cells),
         )
-        if result is None:
-            continue
-        if isinstance(result, ScanSkip):
-            skipped += 1
-            skip_fields = emit_skip_blocked_log(
-                sym=sym,
-                timeframe=tf,
-                reason=result.reason,
-                fields=result.fields,
-            )
-            append_decision_log(
-                {
-                    "date": analysis_date,
-                    "action": "SKIP",
-                    **skip_fields,
-                },
-            )
-            continue
-
-        plan: TradePlan = result
-        take_fields = {
-            "ticker": plan.sym,
-            "timeframe": plan.timeframe,
-            "strategy_id": plan.strategy_id,
-            "direction": plan.direction,
-            "macro_bias": plan.log_fields.get("macro_bias"),
-            "trend_strength": plan.log_fields.get("trend_strength"),
-            "regime": plan.log_fields.get("regime"),
-            "confidence": plan.log_fields.get("confidence"),
-            "confluence": plan.log_fields.get("strategy_confluence_count"),
-            "period_mode": plan.log_fields.get("period_mode"),
-            "trail_regime": plan.trail_regime,
-            "risk_usd": round(plan.risk_usd, 2),
-            "guard_profile": PROFILE,
-        }
-        take_fields.update(_sizing_fields_from_ai(plan.ai))
-        live_log("info", "[TAKE] trade plan approved", **take_fields)
-        bs = at.resolve_sym(mt5, sym) if mt5 else sym
-        if not bs and not DRY_RUN:
-            skipped += 1
-            live_log(
-                "warning",
-                "[SKIP] broker symbol resolve failed",
-                ticker=sym.upper(),
-                guard_mode="NORMAL",
-                guard_profile=PROFILE,
-            )
-            continue
-
+        append_decision_log(
+            {
+                "date": analysis_date,
+                "action": "HALT",
+                "skip_reason": "daily_loss_stop",
+                "halt_active": True,
+                "circuit_halt_until": st.get("circuit_halt_until"),
+            },
+        )
+        skipped = len(scan_cells)
+    else:
         if mt5:
-            ok_opp, rs_opp = at.account_symbol_direction_conflict(mt5, bs, plan.direction)
-            if ok_opp:
+            old_magic = at.APEX_MAGIC
+            try:
+                at.APEX_MAGIC = APEX_V76_MAGIC
+                at.resolve_apex_hedged_same_pair(mt5)
+                if len(at.open_apex_positions(mt5)) >= 15:
+                    live_log("warning", "[SCAN CYCLE] max 15 open positions — abort entries")
+                    publish_live_status(mt5, status="running", scan_aborted="max_positions")
+                    save_v76_state(st)
+                    return
+            finally:
+                at.APEX_MAGIC = old_magic
+
+        for sym, tf in scan_cells:
+            live_log("info", "[SCAN] evaluate entry", ticker=sym.upper(), timeframe=tf)
+            result = evaluate_cell_v76(
+                sym,
+                tf,
+                st=st,
+                balance=balance,
+                day_pnl=day_pnl,
+                period_mode=period_mode,
+                regime_ctx=regime_ctx,
+                scan_d=scan_d,
+            )
+            if result is None:
+                continue
+            if isinstance(result, ScanSkip):
                 skipped += 1
-                live_log(
-                    "info",
-                    "[SKIP] conflict",
-                    ticker=sym.upper(),
+                skip_fields = emit_skip_blocked_log(
+                    sym=sym,
                     timeframe=tf,
-                    skip_reason=rs_opp,
-                    guard_mode="NORMAL",
-                    guard_profile=PROFILE,
+                    reason=result.reason,
+                    fields=result.fields,
                 )
-                conflict_row = dict(plan.log_fields)
-                conflict_row.update(
+                append_decision_log(
                     {
                         "date": analysis_date,
                         "action": "SKIP",
-                        "skip_reason": rs_opp,
-                        "guard_mode": "NORMAL",
-                        "guard_profile": PROFILE,
-                    }
+                        **skip_fields,
+                    },
                 )
-                append_decision_log(conflict_row)
                 continue
 
-        out = order_send_v76(
-            mt5,
-            bs or sym,
-            plan,
-            st=st,
-            equity=equity,
-            day_anchor=day_anchor,
-            scan_d=scan_d,
-        )
-        if out.get("ok"):
-            placed += 1
-        else:
-            skipped += 1
+            plan: TradePlan = result
+            take_fields = {
+                "ticker": plan.sym,
+                "timeframe": plan.timeframe,
+                "strategy_id": plan.strategy_id,
+                "direction": plan.direction,
+                "macro_bias": plan.log_fields.get("macro_bias"),
+                "trend_strength": plan.log_fields.get("trend_strength"),
+                "regime": plan.log_fields.get("regime"),
+                "confidence": plan.log_fields.get("confidence"),
+                "confluence": plan.log_fields.get("strategy_confluence_count"),
+                "period_mode": plan.log_fields.get("period_mode"),
+                "trail_regime": plan.trail_regime,
+                "risk_usd": round(plan.risk_usd, 2),
+                "guard_profile": PROFILE,
+            }
+            take_fields.update(_sizing_fields_from_ai(plan.ai))
+            live_log("info", "[TAKE] trade plan approved", **take_fields)
+            bs = at.resolve_sym(mt5, sym) if mt5 else sym
+            if not bs and not DRY_RUN:
+                skipped += 1
+                live_log(
+                    "warning",
+                    "[SKIP] broker symbol resolve failed",
+                    ticker=sym.upper(),
+                    guard_mode="NORMAL",
+                    guard_profile=PROFILE,
+                )
+                continue
+
+            if mt5:
+                ok_opp, rs_opp = at.account_symbol_direction_conflict(mt5, bs, plan.direction)
+                if ok_opp:
+                    skipped += 1
+                    live_log(
+                        "info",
+                        "[SKIP] conflict",
+                        ticker=sym.upper(),
+                        timeframe=tf,
+                        skip_reason=rs_opp,
+                        guard_mode="NORMAL",
+                        guard_profile=PROFILE,
+                    )
+                    conflict_row = dict(plan.log_fields)
+                    conflict_row.update(
+                        {
+                            "date": analysis_date,
+                            "action": "SKIP",
+                            "skip_reason": rs_opp,
+                            "guard_mode": "NORMAL",
+                            "guard_profile": PROFILE,
+                        }
+                    )
+                    append_decision_log(conflict_row)
+                    continue
+
+            out = order_send_v76(
+                mt5,
+                bs or sym,
+                plan,
+                st=st,
+                equity=equity,
+                day_anchor=day_anchor,
+                scan_d=scan_d,
+            )
+            if out.get("ok"):
+                placed += 1
+            else:
+                skipped += 1
 
     if mt5:
         manage_trailing_v76(mt5, st=st)
