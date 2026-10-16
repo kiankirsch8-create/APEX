@@ -222,6 +222,12 @@ APEX_V76_MAGIC = int(os.environ.get("APEX_V76_PRIVATE_MAGIC", "760761"))
 ORDER_COMMENT_V76 = os.environ.get("APEX_V76_PRIVATE_ORDER_COMMENT", "APEX76P")
 DRY_RUN = os.environ.get("APEX_V76_PRIVATE_DRY_RUN", "true").strip().lower() in ("1", "true", "yes")
 
+# Entry-cycle margin guard (after max open-position cap). Tune here only.
+# Abort new entries for the cycle when breached; never closes existing positions.
+MARGIN_LEVEL_MIN_PCT = 400.0  # require margin_level >= 400% when margin is in use
+FREE_MARGIN_MIN_EQUITY_FRAC = 0.25  # require free_margin >= 25% of equity
+MAX_OPEN_POSITIONS = 15
+
 # One engine, three profiles. Risk gates read through ``CFG`` only.
 # ``ftmo`` mirrors the validated chrono private sizing curve
 # (RISK_BY_CONFIDENCE HIGH/MED/LOW = 2%/1%/0.5% of current balance + drawdown
@@ -310,6 +316,106 @@ def clamp_funded_compound_fraction(frac: float | None) -> float | None:
     if f <= 0:
         return None
     return max(FUNDED_COMPOUND_RISK_MIN, min(FUNDED_COMPOUND_RISK_MAX, f))
+
+
+def margin_guard_blocks_new_entries(
+    *,
+    margin_level: float | None,
+    free_margin: float | None,
+    equity: float | None,
+    margin: float | None = None,
+) -> tuple[bool, str]:
+    """
+    Entry-only margin gate (never closes positions).
+
+    Blocks when free margin is below ``FREE_MARGIN_MIN_EQUITY_FRAC`` of equity,
+    or when used margin is positive and ``margin_level`` is below
+    ``MARGIN_LEVEL_MIN_PCT``. When used margin is 0 (flat book), margin_level
+    is undefined in MT5 (often 0) and is not treated as a breach.
+    """
+    try:
+        eq = float(equity) if equity is not None else 0.0
+    except (TypeError, ValueError):
+        eq = 0.0
+    try:
+        free = float(free_margin) if free_margin is not None else 0.0
+    except (TypeError, ValueError):
+        free = 0.0
+    try:
+        used = float(margin) if margin is not None else 0.0
+    except (TypeError, ValueError):
+        used = 0.0
+
+    if eq > 0 and free < float(FREE_MARGIN_MIN_EQUITY_FRAC) * eq:
+        return (
+            True,
+            (
+                f"free_margin={free:.2f} < {float(FREE_MARGIN_MIN_EQUITY_FRAC):.0%} "
+                f"of equity={eq:.2f}"
+            ),
+        )
+
+    if used > 0:
+        try:
+            ml = float(margin_level) if margin_level is not None else 0.0
+        except (TypeError, ValueError):
+            ml = 0.0
+        if ml < float(MARGIN_LEVEL_MIN_PCT):
+            return (
+                True,
+                f"margin_level={ml:.1f}% < {float(MARGIN_LEVEL_MIN_PCT):.0f}%",
+            )
+
+    return False, ""
+
+
+def abort_new_entries_if_max_positions_or_margin(
+    mt5: Any,
+    st: dict[str, Any],
+) -> str | None:
+    """
+    After hedge resolve: abort the entry cycle on max open positions or margin
+    guard. Returns abort reason (``max_positions`` / ``margin_guard``) or None.
+    Never closes existing positions.
+    """
+    if mt5 is None:
+        return None
+    old_magic = at.APEX_MAGIC
+    try:
+        at.APEX_MAGIC = APEX_V76_MAGIC
+        at.resolve_apex_hedged_same_pair(mt5)
+        if len(at.open_apex_positions(mt5)) >= int(MAX_OPEN_POSITIONS):
+            live_log(
+                "warning",
+                f"[SCAN CYCLE] max {int(MAX_OPEN_POSITIONS)} open positions — abort entries",
+            )
+            publish_live_status(mt5, status="running", scan_aborted="max_positions")
+            save_v76_state(st)
+            return "max_positions"
+        ai_mg = mt5.account_info()
+        if ai_mg is not None:
+            blocked, mg_reason = margin_guard_blocks_new_entries(
+                margin_level=getattr(ai_mg, "margin_level", None),
+                free_margin=getattr(ai_mg, "margin_free", None),
+                equity=getattr(ai_mg, "equity", None),
+                margin=getattr(ai_mg, "margin", None),
+            )
+            if blocked:
+                live_log(
+                    "warning",
+                    f"[SCAN CYCLE] margin guard — abort entries ({mg_reason})",
+                    margin_level=getattr(ai_mg, "margin_level", None),
+                    free_margin=getattr(ai_mg, "margin_free", None),
+                    equity=getattr(ai_mg, "equity", None),
+                    margin=getattr(ai_mg, "margin", None),
+                )
+                publish_live_status(mt5, status="running", scan_aborted="margin_guard")
+                save_v76_state(st)
+                return "margin_guard"
+    finally:
+        at.APEX_MAGIC = old_magic
+    return None
+
 
 SCAN_HOURS = at.SCAN_HOURS
 TIMEFRAMES: tuple[str, ...] = ("1w", "1d", "4h")
@@ -2947,18 +3053,8 @@ def run_full_scan_v76() -> None:
 
     placed = 0
     skipped = 0
-    if mt5:
-        old_magic = at.APEX_MAGIC
-        try:
-            at.APEX_MAGIC = APEX_V76_MAGIC
-            at.resolve_apex_hedged_same_pair(mt5)
-            if len(at.open_apex_positions(mt5)) >= 15:
-                live_log("warning", "[SCAN CYCLE] max 15 open positions — abort entries")
-                publish_live_status(mt5, status="running", scan_aborted="max_positions")
-                save_v76_state(st)
-                return
-        finally:
-            at.APEX_MAGIC = old_magic
+    if mt5 and abort_new_entries_if_max_positions_or_margin(mt5, st):
+        return
 
     for sym, tf in scan_cells:
         live_log("info", "[SCAN] evaluate entry", ticker=sym.upper(), timeframe=tf)
