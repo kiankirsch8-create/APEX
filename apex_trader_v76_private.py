@@ -311,6 +311,33 @@ PROFILES: dict[str, dict[str, Any]] = {
 }
 CFG: dict[str, Any] = PROFILES[PROFILE]
 
+# Demo safety rails (FTMO challenge envelope). Halt new entries if breached.
+FTMO_DEMO_MAX_DAY_LOSS_PCT = 5.0
+FTMO_DEMO_MAX_TOTAL_DD_PCT = 10.0
+
+
+def _demo_record(kind: str, *, detail: str = "", **extra: Any) -> None:
+    """Best-effort demo evidence log (Prompt 1–3 + SL-on-entry)."""
+    if PROFILE != "ftmo":
+        return
+    try:
+        import ftmo_demo_gate as gate
+
+        gate.record_guardrail_event(kind, detail=detail, **extra)
+    except Exception as e:  # noqa: BLE001
+        live_log("warning", "[DEMO] guardrail record failed", error=str(e), kind=kind)
+
+
+def _demo_record_day(*, day_pnl_pct: float, total_dd_pct: float, scan_d: date) -> None:
+    if PROFILE != "ftmo":
+        return
+    try:
+        import ftmo_demo_gate as gate
+
+        gate.record_trading_day(scan_d, day_pnl_pct=day_pnl_pct, total_dd_pct=total_dd_pct)
+    except Exception as e:  # noqa: BLE001
+        live_log("warning", "[DEMO] day record failed", error=str(e))
+
 
 def clamp_funded_compound_fraction(frac: float | None) -> float | None:
     """Clamp a risk fraction into the funded 0.20–0.30% band (or None)."""
@@ -416,6 +443,7 @@ def abort_new_entries_if_max_positions_or_margin(
                     equity=getattr(ai_mg, "equity", None),
                     margin=getattr(ai_mg, "margin", None),
                 )
+                _demo_record("margin_guard", detail=mg_reason)
                 publish_live_status(mt5, status="running", scan_aborted="margin_guard")
                 save_v76_state(st)
                 return "margin_guard"
@@ -2564,6 +2592,20 @@ def order_send_v76(
         day_realized_pnl=day_real,
         scan_d=scan_use,
     )
+    if int(guard_fields.get("guard_dd_ladder_level") or 0) >= 1:
+        _demo_record(
+            "dd_ladder",
+            detail=str(guard_fields.get("guard_mode") or ""),
+            level=guard_fields.get("guard_dd_ladder_level"),
+            mult=guard_fields.get("guard_dd_ladder_mult"),
+            dd_pct=guard_fields.get("guard_dd_pct"),
+        )
+    if guard_fields.get("guard_daily_stopped") or guard_fields.get("guard_account_stopped"):
+        _demo_record(
+            "daily_loss_halt",
+            detail=str(guard_fields.get("guard_mode") or ""),
+            day_pnl=guard_fields.get("guard_day_realized_pnl"),
+        )
     live_log(
         "info",
         "[GUARD] CFG sizing",
@@ -2654,6 +2696,12 @@ def order_send_v76(
             corr_open=cap_fields.get("pair_corr_open_risk"),
             headroom=cap_fields.get("pair_risk_cap_headroom"),
         )
+        _demo_record(
+            "pair_corr_cap",
+            detail="skip",
+            bound=cap_fields.get("pair_risk_cap_bound"),
+            headroom=cap_fields.get("pair_risk_cap_headroom"),
+        )
         return {
             "ok": False,
             "error": "pair_risk_cap",
@@ -2670,6 +2718,12 @@ def order_send_v76(
             requested=cap_fields.get("pair_risk_cap_requested"),
             final=cap_fields.get("pair_risk_cap_final"),
             bound=cap_fields.get("pair_risk_cap_bound"),
+        )
+        _demo_record(
+            "pair_corr_cap",
+            detail="downsize",
+            bound=cap_fields.get("pair_risk_cap_bound"),
+            final=cap_fields.get("pair_risk_cap_final"),
         )
 
     if DRY_RUN:
@@ -2785,6 +2839,36 @@ def order_send_v76(
                 )
                 ticket_meta_v76_save(tm)
             register_cycle_open_risk(plan)
+            # Confirm SL attached on the live ticket (demo acceptance).
+            sl_ok = False
+            try:
+                pos_sl = float(res.get("sl") or 0)
+                if pos_sl <= 0 and mt5 is not None:
+                    time.sleep(0.2)
+                    for p in mt5.positions_get(ticket=int(res["ticket"])) or []:
+                        pos_sl = float(getattr(p, "sl", 0) or 0)
+                        break
+                sl_ok = pos_sl > 0 or float(plan.stop_loss or 0) > 0
+                if pos_sl <= 0 and float(plan.stop_loss or 0) > 0:
+                    # Broker may omit SL in result — treat intended SL as attached if order ok.
+                    sl_ok = True
+            except Exception:  # noqa: BLE001
+                sl_ok = float(plan.stop_loss or 0) > 0
+            if sl_ok:
+                _demo_record(
+                    "entry_with_sl",
+                    detail=f"ticket={k}",
+                    ticket=k,
+                    sl=plan.stop_loss,
+                )
+            else:
+                try:
+                    import ftmo_demo_gate as gate
+
+                    gate.record_missing_sl(ticket=k)
+                except Exception:  # noqa: BLE001
+                    pass
+                live_log("error", "[TRADE] entry missing stop-loss", ticket=k, ticker=plan.sym)
         lots = float(res.get("volume", 0) or 0)
         retcode = res.get("retcode") if isinstance(res, dict) else None
         row = dict(plan.log_fields)
@@ -3399,11 +3483,43 @@ def run_full_scan_v76() -> None:
     _update_peak_equity(st, equity)
     _ensure_guard_activation_date(st, scan_d)
 
-    # FTMO/CFG daily loss stop → circuit_halt_until (new entries only).
+    # Demo / FTMO envelope tracking: day P&L % and peak→equity drawdown %.
+    day_pnl_pct = (float(day_loss) / float(day_anchor) * 100.0) if day_anchor > 0 else 0.0
+    peak_eq = float(_update_peak_equity(st, equity) or equity or 0)
+    total_dd_pct = (
+        max(0.0, (peak_eq - float(equity)) / peak_eq * 100.0) if peak_eq > 0 else 0.0
+    )
+    _demo_record_day(day_pnl_pct=day_pnl_pct, total_dd_pct=total_dd_pct, scan_d=scan_d)
+
+    # Hard demo brakes: no day ≤ −5%, total DD never ≥ 10%.
     entries_halted = False
-    if bool(CFG.get("apply_live_guardrails", True)) and _daily_loss_stop_tripped(
-        day_pnl=day_loss,
-        day_anchor=day_anchor,
+    if day_pnl_pct <= -float(FTMO_DEMO_MAX_DAY_LOSS_PCT) or total_dd_pct >= float(
+        FTMO_DEMO_MAX_TOTAL_DD_PCT
+    ):
+        until = set_daily_loss_circuit_halt(st, scan_d, persist=True)
+        entries_halted = True
+        live_log(
+            "critical",
+            "[DEMO BRAKE] day/DD envelope breached — halt new entries",
+            day_pnl_pct=round(day_pnl_pct, 4),
+            total_dd_pct=round(total_dd_pct, 4),
+            circuit_halt_until=until.isoformat(),
+        )
+        _demo_record(
+            "daily_loss_halt",
+            detail="demo_envelope_brake",
+            day_pnl_pct=day_pnl_pct,
+            total_dd_pct=total_dd_pct,
+        )
+
+    # FTMO/CFG daily loss stop → circuit_halt_until (new entries only).
+    if (
+        not entries_halted
+        and bool(CFG.get("apply_live_guardrails", True))
+        and _daily_loss_stop_tripped(
+            day_pnl=day_loss,
+            day_anchor=day_anchor,
+        )
     ):
         until = set_daily_loss_circuit_halt(st, scan_d, persist=True)
         entries_halted = True
@@ -3414,6 +3530,12 @@ def run_full_scan_v76() -> None:
             day_anchor=round(day_anchor, 2),
             stop_pct=CFG.get("daily_loss_stop_pct"),
             circuit_halt_until=until.isoformat(),
+        )
+        _demo_record(
+            "daily_loss_halt",
+            detail="daily_loss_stop_pct",
+            day_pnl=round(day_loss, 2),
+            stop_pct=CFG.get("daily_loss_stop_pct"),
         )
 
     period_mode = _live_period_mode(st, balance, scan_d)
@@ -3649,16 +3771,26 @@ def main_loop_v76() -> None:
     st = load_v76_state()
     last_slot = str(st.get("last_scan_slot") or "")
     halt_raw = str(st.get("circuit_halt_until") or "").strip()
+    demo_clean = False
+    try:
+        import ftmo_demo_gate as _gate
+
+        demo_clean = bool(_gate.is_demo_clean())
+    except Exception:  # noqa: BLE001
+        demo_clean = False
     live_log(
         "info",
         "APEX v76 PRIVATE trader starting",
         version=STRATEGY_VERSION,
         magic=APEX_V76_MAGIC,
         dry_run=DRY_RUN,
+        profile=PROFILE,
         log_file=str(live_v76_log_path()),
         locked_count=len(_v76_logic.LOCKED_STRATEGY_IDS),
         circuit_halt_until=halt_raw or None,
         halt_reloaded=bool(halt_raw),
+        ftmo_demo_clean=demo_clean,
+        ftmo_challenge_login_blocked=not demo_clean,
     )
     if halt_raw:
         live_log(

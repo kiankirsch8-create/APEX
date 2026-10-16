@@ -873,17 +873,34 @@ def mt5_connect() -> Any | None:
     if not pw:
         log_msg("[MT5] Set APEX_MT5_PASSWORD", "error")
         return None
+    # FTMO gate: challenge login blocked until clean demo unlock exists.
+    login = int(MT5_LOGIN)
+    server = str(MT5_SERVER)
+    try:
+        import ftmo_demo_gate as _ftmo_gate
+
+        if os.environ.get("APEX_MT5_LOGIN") or os.environ.get("MT5_LOGIN"):
+            login, server = _ftmo_gate.resolve_mt5_login_server()
+        else:
+            _ftmo_gate.assert_login_allowed(login, server=server)
+    except PermissionError as e:
+        log_msg(f"[MT5] {e}", "error")
+        return None
+    except Exception as e:  # noqa: BLE001
+        log_msg(f"[MT5] FTMO demo gate error: {e}", "error")
+        return None
     path = os.environ.get("APEX_MT5_PATH") or os.environ.get("MT5_PATH")
-    kw: dict[str, Any] = {"login": MT5_LOGIN, "password": pw, "server": MT5_SERVER}
+    kw: dict[str, Any] = {"login": login, "password": pw, "server": server}
     if path:
         kw["path"] = path
-    if not mt5.initialize(**kw) or not mt5.login(MT5_LOGIN, password=pw, server=MT5_SERVER):
+    if not mt5.initialize(**kw) or not mt5.login(login, password=pw, server=server):
         log_msg(f"[MT5] connect fail {mt5.last_error()}", "error")
         try:
             mt5.shutdown()
         except Exception:  # noqa: BLE001
             pass
         return None
+    log_msg(f"[MT5] connected login={login} server={server}", "info")
     return mt5
 
 

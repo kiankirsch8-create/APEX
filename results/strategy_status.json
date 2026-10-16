@@ -1,5 +1,6 @@
 {
   "locked": [
+    "B01_RANGE_BREAKOUT",
     "M03_RSI_MOMENTUM_CONTINUATION",
     "M06_PRICE_ACCELERATION",
     "M07_VOLUME_SURGE_MOMENTUM",
@@ -13,7 +14,6 @@
     "T08_DONCHIAN_BREAKOUT"
   ],
   "testing": [
-    "B01_RANGE_BREAKOUT",
     "B06_TRIANGLE_BREAKOUT",
     "B08_KEY_LEVEL_RETEST",
     "B09_RSI_MOMENTUM_BREAK",
@@ -84,5 +84,5 @@
     "M03_RSI_MOMENTUM_CONTINUATION",
     "M02_MACD_ZERO_CROSS"
   ],
-  "last_updated": "2026-06-05"
+  "last_updated": "2026-05-28"
 }
