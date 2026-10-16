@@ -7,6 +7,12 @@ REM  --------------------------------------------------------------------------
 REM  Deploy to:  C:\Apex\install_service.bat
 REM  Run from an elevated (Administrator) Command Prompt.
 REM
+REM  Crash survival (acceptance):
+REM    AppExit Default Restart  — auto-restart on any exit / kill
+REM    AppThrottle 5000         — restart within ~5s (SLA: <60s)
+REM  On restart the engine reloads circuit_halt_until from state and
+REM  re-adopts open MT5 positions via _adopt_open_positions.
+REM
 REM  Prerequisites:
 REM    - Python 3 on PATH (python or pythonw)
 REM    - APEX_MT5_PASSWORD set in System Environment Variables (recommended)
@@ -20,6 +26,8 @@ set "NSSM_ROOT=C:\nssm"
 set "NSSM_EXE=%NSSM_ROOT%\nssm-2.24\win64\nssm.exe"
 set "NSSM_ZIP=%NSSM_ROOT%\nssm.zip"
 set "NSSM_URL=https://nssm.cc/release/nssm-2.24.zip"
+REM Restart delay after crash / kill (ms). Must stay well under 60s SLA.
+set "RESTART_THROTTLE_MS=5000"
 
 REM --- Admin check ------------------------------------------------------------
 net session >nul 2>&1
@@ -92,8 +100,9 @@ REM PYTHONPATH for local imports; APEX_MT5_PASSWORD should be in System env.
 "!NSSM_EXE!" set "%SERVICE_NAME%" AppStdout "%APEX_DIR%\apex_v76_live.log"
 "!NSSM_EXE!" set "%SERVICE_NAME%" AppStderr "%APEX_DIR%\apex_v76_errors.log"
 
+REM Equivalent to systemd Restart=always — restart on any exit including kill.
 "!NSSM_EXE!" set "%SERVICE_NAME%" AppExit Default Restart
-"!NSSM_EXE!" set "%SERVICE_NAME%" AppThrottle 5000
+"!NSSM_EXE!" set "%SERVICE_NAME%" AppThrottle %RESTART_THROTTLE_MS%
 "!NSSM_EXE!" set "%SERVICE_NAME%" Start SERVICE_AUTO_START
 
 REM --- Start now --------------------------------------------------------------
@@ -107,6 +116,8 @@ if errorlevel 1 (
 )
 
 echo.
-echo Done. Verify with:  sc query %SERVICE_NAME%
+echo Done. Crash-restart is ON ^(AppExit Default Restart, throttle %RESTART_THROTTLE_MS%ms^).
+echo Verify with:  sc query %SERVICE_NAME%
+echo Kill test:    taskkill /F /IM python.exe   then  sc query %SERVICE_NAME% within 60s
 endlocal
 exit /b 0

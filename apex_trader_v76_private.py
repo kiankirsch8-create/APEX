@@ -42,7 +42,8 @@ DEPLOY ON VPS:
    into C:\Apex
 2. Set env vars: APEX_MT5_PASSWORD (same as funded demo), APEX_V76_PRIVATE_DRY_RUN=false
    when ready to trade live, APEX_V76_PRIVATE_MAGIC=760761
-3. Install as a separate nssm service: ApexTraderPrivate (not ApexTraderV76)
+3. Install as a separate NSSM service via ``install_service_private.bat``
+   (service name APEX-LiveTraderPrivate; AppExit Default Restart — survives kills)
 4. Logs will land in C:\Apex\apex_v76_private.log and apex_v76_private_status.json
 
 Both services run independently, both read live MT5 balance from the connected account.
@@ -2660,19 +2661,26 @@ def _meta_from_adopted_position(pos: Any) -> dict[str, Any]:
     }
 
 
-def _adopt_open_positions(mt5: Any) -> None:
-    """Register open v76-magic MT5 tickets in ``apex_trader_v76_tickets.json`` on startup."""
+def _adopt_open_positions(mt5: Any) -> bool:
+    """
+    Register open v76-magic MT5 tickets in ticket meta on startup / restart.
+
+    Returns True when the terminal was reachable (adoption pass completed —
+    zero or more tickets). Returns False when MT5 is not ready so the caller
+    can retry without marking adoption done.
+    """
     if mt5 is None:
-        return
+        return False
     try:
         if not mt5.terminal_info():
-            return
+            return False
     except Exception:  # noqa: BLE001
-        return
+        return False
 
     raw = mt5.positions_get() or []
     meta = ticket_meta_v76_load()
     updated = False
+    adopted_n = 0
     for pos in raw:
         if int(getattr(pos, "magic", 0) or 0) != APEX_V76_MAGIC:
             continue
@@ -2682,10 +2690,20 @@ def _adopt_open_positions(mt5: Any) -> None:
             continue
         meta[key] = _meta_from_adopted_position(pos)
         updated = True
+        adopted_n += 1
         live_log("info", f"[ADOPT] Ticket {ticket} {pos.symbol} adopted from MT5 on startup")
 
     if updated:
         ticket_meta_v76_save(meta)
+    live_log(
+        "info",
+        "[ADOPT] startup pass complete",
+        adopted=adopted_n,
+        open_magic=sum(
+            1 for p in raw if int(getattr(p, "magic", 0) or 0) == APEX_V76_MAGIC
+        ),
+    )
+    return True
 
 
 def manage_trailing_v76(mt5: Any, st: dict[str, Any] | None = None) -> None:
@@ -2740,7 +2758,16 @@ def run_full_scan_v76() -> None:
         append_decision_log(
             {"date": analysis_date, "action": "HALT", "skip_reason": halt_reason, "halt_active": True},
         )
-        publish_live_status(None, status="halted", halt_reason=halt_reason)
+        # Halt blocks NEW entries only — still trail / manage open swings.
+        mt5_halt = None if DRY_RUN else at.ensure_mt5()
+        if mt5_halt:
+            try:
+                manage_trailing_v76(mt5_halt, st=st)
+            except Exception as te:  # noqa: BLE001
+                live_log("warning", "[SCAN CYCLE] halt trailing error", error=str(te))
+            publish_live_status(mt5_halt, status="halted", halt_reason=halt_reason)
+        else:
+            publish_live_status(None, status="halted", halt_reason=halt_reason)
         return
 
     mt5 = None if DRY_RUN else at.ensure_mt5()
@@ -2987,6 +3014,7 @@ def run_full_scan_v76() -> None:
 def main_loop_v76() -> None:
     st = load_v76_state()
     last_slot = str(st.get("last_scan_slot") or "")
+    halt_raw = str(st.get("circuit_halt_until") or "").strip()
     live_log(
         "info",
         "APEX v76 PRIVATE trader starting",
@@ -2995,8 +3023,16 @@ def main_loop_v76() -> None:
         dry_run=DRY_RUN,
         log_file=str(live_v76_log_path()),
         locked_count=len(_v76_logic.LOCKED_STRATEGY_IDS),
+        circuit_halt_until=halt_raw or None,
+        halt_reloaded=bool(halt_raw),
     )
-    publish_live_status(None, status="starting")
+    if halt_raw:
+        live_log(
+            "warning",
+            "[HALT] reloaded circuit_halt_until from state (crash-safe)",
+            circuit_halt_until=halt_raw,
+        )
+    publish_live_status(None, status="starting", circuit_halt_until=halt_raw or None)
     rebuild_live_sizing_health_from_forensic()
     if not DRY_RUN:
         at.emit_startup_diagnostics()
@@ -3010,9 +3046,12 @@ def main_loop_v76() -> None:
                 time.sleep(30)
                 continue
 
+            # Retry adopt until MT5 terminal is ready (survives slow reconnect after crash).
             if not DRY_RUN and mt5 and not adopted_positions:
-                _adopt_open_positions(mt5)
-                adopted_positions = True
+                if _adopt_open_positions(mt5):
+                    adopted_positions = True
+                else:
+                    live_log("warning", "[ADOPT] MT5 not ready — will retry")
 
             now = datetime.now(timezone.utc)
             ran = False
@@ -3040,8 +3079,12 @@ def main_loop_v76() -> None:
             break
         except Exception as e:  # noqa: BLE001
             log_v76(f"recover: {e}", "critical")
+            # Force re-adopt after unexpected recover — tickets may have changed.
+            adopted_positions = False
             time.sleep(60)
 
 
 if __name__ == "__main__":
-    main_loop_v76()
+    from apex_supervisor import run_supervised
+
+    run_supervised(main_loop_v76, log_fn=live_log)
