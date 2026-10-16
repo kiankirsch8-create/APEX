@@ -1,0 +1,23 @@
+[Unit]
+Description=APEX v7.6 Live Trader
+Documentation=https://github.com/kiankirsch8-create/APEX
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/apex
+ExecStart=/usr/bin/python3 /opt/apex/apex_trader_v76.py
+Restart=always
+RestartSec=5
+# Hard kill / crash must come back well under the 60s acceptance SLA.
+TimeoutStopSec=30
+Environment=PYTHONPATH=/opt/apex
+Environment=APEX_DRY_RUN=false
+# Set APEX_MT5_PASSWORD via EnvironmentFile or system environment — never commit it.
+# EnvironmentFile=-/etc/apex/apex.env
+StandardOutput=append:/var/log/apex/apex_v76_live.log
+StandardError=append:/var/log/apex/apex_v76_errors.log
+
+[Install]
+WantedBy=multi-user.target
