@@ -1,7 +1,12 @@
 """
-v7.6 live decision logic — copied from ``continuous_backtester.py`` without ``pandas_ta``.
+v7.6 live decision logic.
 
-Used only by ``apex_trader_v76.py``. No numba / llvmlite dependency chain.
+Layer-2 enter/skip + levels + risk are delegated to ``continuous_backtester``
+(``python_layer2_live_plan`` / ``_v7_python_prefilter_bundle``) so live decisions
+match the validated chrono path. Remaining helpers support regime/trail tagging
+and legacy call sites.
+
+Used by ``apex_trader_v76_private.py`` / ``apex_trader_v76.py``.
 """
 
 from __future__ import annotations
@@ -531,6 +536,10 @@ def v72_load_strategy_status(data_dir: Path, *, log_fn: LogFn | None = None) -> 
         raw["blocked"] = blk
         _save_json(status_file, raw)
     BLOCKED_STRATEGIES = frozenset(str(x).strip().upper() for x in blk if x)
+    try:
+        bind_backtester_parity_state()
+    except Exception:  # noqa: BLE001
+        pass
     if log_fn:
         log_fn(
             f"[v76] strategy_status locked={len(LOCKED_STRATEGY_IDS)} "
@@ -657,6 +666,37 @@ def _v7_filter_layer2_qualifiers(
     return out
 
 
+_PARITY_BOUND = False
+
+
+def bind_backtester_parity_state(*, force_reload_status: bool = False) -> None:
+    """
+    Point live CHRONO_* / LOCKED / BLOCKED globals at the backtester module objects
+    and reload strategy status so both paths share one source of truth.
+    """
+    import continuous_backtester as cb
+
+    global CHRONO_DAY_PREFILTER_SIDS, CHRONO_SYMDIR_TFS
+    global CHRONO_JPY_STORM_SNAPSHOT, CHRONO_JPY_PAIRS_SIGNALLED, CHRONO_JPY_RISK_DAY
+    global LOCKED_STRATEGY_IDS, UNTESTED_STRATEGIES_V72, BLOCKED_STRATEGIES, STRATEGY_STATUS
+    global _PARITY_BOUND
+
+    CHRONO_DAY_PREFILTER_SIDS = cb.CHRONO_DAY_PREFILTER_SIDS
+    CHRONO_SYMDIR_TFS = cb.CHRONO_SYMDIR_TFS
+    CHRONO_JPY_STORM_SNAPSHOT = cb.CHRONO_JPY_STORM_SNAPSHOT
+    CHRONO_JPY_PAIRS_SIGNALLED = cb.CHRONO_JPY_PAIRS_SIGNALLED
+    # Floats are not shared by reference — keep live module attribute in sync explicitly.
+    CHRONO_JPY_RISK_DAY = float(getattr(cb, "CHRONO_JPY_RISK_DAY", 0.0) or 0.0)
+    cb.CHRONO_JPY_RISK_DAY = float(CHRONO_JPY_RISK_DAY)
+    if force_reload_status or not _PARITY_BOUND or not cb.LOCKED_STRATEGY_IDS:
+        cb._v72_load_strategy_status(log_startup=False)
+    STRATEGY_STATUS = cb.STRATEGY_STATUS
+    LOCKED_STRATEGY_IDS = cb.LOCKED_STRATEGY_IDS
+    UNTESTED_STRATEGIES_V72 = cb.UNTESTED_STRATEGIES_V72
+    BLOCKED_STRATEGIES = cb.BLOCKED_STRATEGIES
+    _PARITY_BOUND = True
+
+
 def _v7_python_prefilter_bundle(
     sym: str,
     tf_key: str,
@@ -668,6 +708,25 @@ def _v7_python_prefilter_bundle(
     past: pd.DataFrame | None,
     log_fn: LogFn | None = None,
 ) -> tuple[bool, list[tuple[str, str, int, dict[str, Any] | None]], str]:
+    """Delegate to continuous_backtester so live prefilter matches chrono."""
+    _ = log_fn
+    try:
+        import continuous_backtester as cb
+
+        bind_backtester_parity_state()
+        return cb._v7_python_prefilter_bundle(
+            sym,
+            tf_key,
+            float(price),
+            ind,
+            float(zone_pct),
+            analysis_date=analysis_date,
+            past=past,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Fallback: local copy (parity harness will flag divergences).
+        if log_fn:
+            log_fn(f"[parity] prefilter fallback: {exc}", level="warning")
     raw_ok, raw_list, raw_reason = python_prefilter(
         sym,
         tf_key,
@@ -726,6 +785,13 @@ def _layer2_tuple_for_deterministic_pick(
     zone_pct: float,
     layer2_rows: list[tuple[str, str, int, dict[str, Any] | None]],
 ) -> tuple[str, str, int, dict[str, Any] | None] | None:
+    try:
+        import continuous_backtester as cb
+
+        bind_backtester_parity_state()
+        return cb._layer2_tuple_for_deterministic_pick(sym, tf_key, zone_pct, layer2_rows)
+    except Exception:  # noqa: BLE001
+        pass
     by_sid: dict[str, list[tuple[str, str, int, dict[str, Any] | None]]] = {}
     for row in layer2_rows:
         sid_u = str(row[0]).strip().upper()
@@ -1601,283 +1667,157 @@ def python_layer2_live_plan(
     past: pd.DataFrame | None = None,
     ind: dict[str, Any] | None = None,
     log_fn: LogFn | None = None,
+    future: pd.DataFrame | None = None,
+    calendar_risk: dict[str, Any] | None = None,
+    chrono_compounding_base: float | None = None,
+    chrono_peak_capital: float | None = None,
 ) -> dict[str, Any] | None:
     """
-    Layer-2 decision path for live (no forward simulation / no pandas_ta).
-    Returns trade plan dict or skip dict.
+    Layer-2 decision path for live — delegates to ``continuous_backtester`` so
+    enter/skip, levels, and risk_usd match the validated chrono decision path.
+
+    ``future`` is required for forward-sim inside the backtester helper; when
+    omitted, a one-bar synthetic forward window is built from ``past`` (live
+    callers ignore outcome fields and only use entry/stop/TP/risk).
     """
     if not layer2:
         return None
 
-    best = layer2[0] if len(layer2) == 1 else max(layer2, key=lambda x: int(x[2]))
-    strat_id = str(best[0]).strip().upper()
-    ok_frag, rs_frag = _fragile_bad_period_skip(strat_id, period_mode)
-    if ok_frag:
-        return _skip_row(
-            skip_reason=rs_frag,
-            ai={"strategy_id": strat_id, "period_mode": period_mode},
-            regime_ctx=regime_ctx,
-            cal={"action": "CLEAR", "reason": ""},
-        )
+    import continuous_backtester as cb
 
-    meta = best[3] if len(best) > 3 else None
-    direction = str(best[1]).strip().upper()
-    if direction == "BOTH":
-        direction = "LONG" if float(zone_pct) < 50 else "SHORT"
-    if direction not in ("LONG", "SHORT"):
+    bind_backtester_parity_state()
+    # Keep CHRONO_JPY_RISK_DAY in sync (float global on both modules).
+    global CHRONO_JPY_RISK_DAY
+    CHRONO_JPY_RISK_DAY = float(getattr(cb, "CHRONO_JPY_RISK_DAY", 0.0) or 0.0)
+
+    bal = float(chrono_balance or STARTING_CAPITAL)
+    base = float(chrono_compounding_base if chrono_compounding_base is not None else bal)
+    peak = float(chrono_peak_capital if chrono_peak_capital is not None else bal)
+
+    fut = future
+    if fut is None or getattr(fut, "empty", True):
+        if past is None or getattr(past, "empty", True):
+            return None
+        # One synthetic forward bar — enough for the backtester helper to return
+        # a decision row; live ignores simulated outcome fields.
+        fut = past.iloc[[-1]].copy()
+        try:
+            idx = fut.index[0]
+            if hasattr(idx, "to_pydatetime"):
+                fut.index = pd.DatetimeIndex([idx + pd.Timedelta(days=1)])
+        except Exception:  # noqa: BLE001
+            pass
+
+    cal = calendar_risk
+    if cal is None:
+        try:
+            from intelligence_fetch_cached import cached_calendar_historical
+
+            scan_d = date.fromisoformat(str(analysis_date).strip()[:10])
+            cal = cached_calendar_historical(sym, scan_d)
+        except Exception:  # noqa: BLE001
+            cal = check_calendar_risk(sym, datetime.now(timezone.utc))
+
+    row = cb._python_forced_layer2_trade(
+        sym=sym,
+        timeframe=timeframe,
+        analysis_date=analysis_date,
+        tf_key=tf_key,
+        price=float(price),
+        zone_pct=float(zone_pct),
+        zone_label=str(zone_label),
+        is_exotic=bool(is_exotic),
+        future=fut,
+        layer2=layer2,
+        rsi_live=float(rsi_live),
+        chrono_risk_mult=float(chrono_risk_mult),
+        chrono_tp_mult=float(chrono_tp_mult),
+        chrono_job=True,
+        calendar_risk=cal,
+        regime_ctx=regime_ctx,
+        chrono_balance=bal,
+        chrono_compounding_base=base,
+        chrono_peak_capital=peak,
+        chrono_day_pnl=float(chrono_day_pnl),
+        period_mode=str(period_mode or "NEUTRAL"),
+        past=past,
+        ind=ind or {},
+    )
+    if row is None:
         return None
 
-    if isinstance(meta, dict) and meta.get("v72_untested"):
-        direction = str(meta.get("direction", direction)).strip().upper()
-        entry = round(float(meta.get("entry", price)), 5)
-        stop = round(float(meta["stop_loss"]), 5)
-        tp1 = round(float(meta["tp1"]), 5)
-        tp2 = round(float(meta["tp2"]), 5)
-        tp3 = round(float(meta.get("tp3", tp2)), 5)
-    else:
-        mult = 1 if direction == "LONG" else -1
-        entry = round(float(price), 5)
-        if isinstance(meta, dict) and meta.get("b02_sl") is not None and float(meta.get("b02_atr14", 0) or 0) > 0:
-            stop = round(float(meta["b02_sl"]), 5)
-        else:
-            stop = round(entry * (1 - mult * 0.005), 5)
-        risk = abs(entry - stop)
-        if risk <= 0:
-            return None
-        tp1 = round(entry + mult * risk * 2, 5)
-        tp2 = round(entry + mult * risk * 3, 5)
-        tp3 = round(entry + mult * risk * 5, 5)
+    # Propagate JPY day risk usage back for subsequent live cells.
+    cb.CHRONO_JPY_RISK_DAY = float(getattr(cb, "CHRONO_JPY_RISK_DAY", 0.0) or 0.0)
+    CHRONO_JPY_RISK_DAY = float(cb.CHRONO_JPY_RISK_DAY)
 
-    ai: dict[str, Any] = {
-        "skip_trade": False,
-        "strategy_id": strat_id,
-        "strategy_name": str(STRATEGIES.get(strat_id, {}).get("name", strat_id)),
-        "strategy_met": True,
-        "direction": direction,
-        "confidence": "LOW",
-        "conviction_score": 3,
-        "entry": entry,
-        "stop_loss": stop,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
-        "zone_pct": zone_pct,
-        "confluences": [str(x[0]) for x in layer2],
-        "signals_used": [strat_id],
-        "reasoning": f"Python-forced {strat_id}",
-        "rr_ratio": "1:2.0",
-        "tp_target": "TP1",
-    }
-    if isinstance(meta, dict) and meta.get("v7_fallback"):
-        ai["reasoning"] = str(meta.get("reasoning") or ai["reasoning"])
-
-    scan_d_macro: date | None = None
-    try:
-        scan_d_macro = date.fromisoformat(analysis_date.strip()[:10])
-    except (TypeError, ValueError):
-        scan_d_macro = None
-
-    macro_bt = get_macro_bias(sym, direction, as_of_date=scan_d_macro)
-    macro_bt = align_macro_bias_with_price(
-        sym,
-        direction,
-        macro_bt,
-        as_of_date=scan_d_macro,
-        price_df=past if past is not None and not getattr(past, "empty", True) else None,
-        log_fn=log_fn,
-    )
-    ai.update(macro_result_fields(macro_bt))
-    ai["_balance_for_sizing"] = float(chrono_balance or STARTING_CAPITAL)
-
-    ai = enforce_rules(ai, tf_key, float(price), sym, rsi=float(rsi_live))
-    _v73_post_enforce_macro_confidence(ai, macro_bt, tf_key=tf_key, price=float(price), sym=sym, log_fn=log_fn)
-
-    now_utc = datetime.now(timezone.utc)
-    cal = check_calendar_risk(sym, now_utc)
-    if str(cal.get("action", "")).upper() == "BLOCK":
-        return _skip_row(
-            skip_reason=f"calendar BLOCK: {cal.get('reason', '')}",
-            ai=ai,
-            regime_ctx=regime_ctx,
-            cal=cal,
+    if bool(row.get("skipped") or row.get("skip_trade") or row.get("_ab_skip")):
+        out = dict(row)
+        out.setdefault("skipped", True)
+        out.setdefault("skip_trade", True)
+        out["entry_price"] = float(row.get("entry_price", row.get("entry", 0)) or 0)
+        out["max_risk_dollars"] = float(
+            row.get("max_risk_dollars", row.get("_max_risk_dollars", 0)) or 0
         )
-
-    if ai.get("skip_trade"):
-        return _skip_row(
-            skip_reason=str(ai.get("skip_reason") or "enforce_rules"),
-            ai=ai,
-            regime_ctx=regime_ctx,
-            cal=cal,
+        out["account_risk_pct"] = float(
+            row.get("account_risk_pct", row.get("_account_risk_pct", 0)) or 0
         )
+        out["_parity_source"] = "continuous_backtester"
+        out["_ab_applied_in_decision"] = bool(row.get("_ab_skip") or row.get("_ab_throttle") is not None)
+        return out
 
-    strat_id = str(ai.get("strategy_id", strat_id)).strip().upper()
-    direction = str(ai.get("direction", direction)).strip().upper()
-    entry_v75 = float(ai.get("entry", price) or price)
-    stop_v75 = float(ai.get("stop_loss", 0) or 0)
-    ok_v75, skip_v75, v75_meta = _v75_entry_guards(
-        sym=sym,
-        tf_key=tf_key,
-        direction=direction,
-        entry=entry_v75,
-        normal_stop=stop_v75,
-        past=past,
-        ind=ind or {},
-        log_fn=log_fn,
-    )
-    if not ok_v75:
-        ai2 = dict(ai)
-        ai2.update(v75_meta)
-        return _skip_row(skip_reason=skip_v75, ai=ai2, regime_ctx=regime_ctx, cal=cal)
-
-    normal_stop_v75 = float(v75_meta["normal_stop_price"])
-    ai["stop_loss"] = normal_stop_v75
-
-    sym_xu = sym.strip().upper()
-    if strat_id == "M03_RSI_MOMENTUM_CONTINUATION" and sym_xu not in M03_ALLOWED_TICKERS:
-        return _skip_row(
-            skip_reason=f"[M03 BLOCKED] {sym_xu} not in allowed ticker list",
-            ai=ai,
-            regime_ctx=regime_ctx,
-            cal=cal,
-        )
-
-    ok_mom, rs_mom = _momentum_neutral_ranging_skip(
-        sym=sym,
-        strat_id=strat_id,
-        macro_bias=str(ai.get("macro_bias", "")),
-        analysis_date=analysis_date,
-        past=past,
-        ind=ind or {},
-        direction=direction,
-        timeframe=timeframe,
-        log_fn=log_fn,
-    )
-    if ok_mom:
-        return _skip_row(skip_reason=rs_mom, ai=ai, regime_ctx=regime_ctx, cal=cal)
-
-    trend_result = apply_trend_filter(sym, direction, strat_id, as_of_date=analysis_date.strip()[:10])
-    if trend_result.get("action") == "BLOCK":
-        return _skip_row(
-            skip_reason=str(trend_result.get("reason") or "trend block"),
-            ai=ai,
-            regime_ctx=regime_ctx,
-            cal=cal,
-        )
-    trend_mult = float(trend_result.get("size_multiplier", 1.0) or 1.0)
-
-    sym_u = sym.upper()
-    dir_u = direction.strip().upper()
-    if sym_u in JPY_STORM_PAIRS:
-        tr_snap = trend_result.get("trend") or {}
-        if not isinstance(tr_snap, dict):
-            tr_snap = {}
-        CHRONO_JPY_STORM_SNAPSHOT[sym_u] = {
-            "macro_bias": str((macro_bt or {}).get("bias", "")),
-            "confidence": str(ai.get("confidence", "LOW")).strip().upper(),
-            "trend_strength": float(tr_snap.get("strength", 0) or 0),
-            "trend_bias": str(tr_snap.get("direction_bias", "NEUTRAL")).strip().upper(),
-            "rate_differential": float((macro_bt or {}).get("rate_differential", 0) or 0),
-        }
-
-    raw_sids = CHRONO_DAY_PREFILTER_SIDS.get((sym_u, dir_u), set())
-    scount = len({s for s in raw_sids if _locked_confluence_sid(s)})
-    triple = {"1w", "1d", "4h"}.issubset(CHRONO_SYMDIR_TFS.get((sym_u, dir_u), set()))
-    cf_mult = _strategy_confluence_multiplier(scount, triple_tf_agreement=triple)
-    if scount >= 3 and str(ai.get("tp_target") or "TP1").strip().upper() == "TP2":
-        ai["tp_target"] = "TP3"
-
-    ai["_v74_perfect_storm_m03_jpy"] = False
-    ai.pop("_jpy_risk_headroom", None)
-    bal = float(chrono_balance or STARTING_CAPITAL)
-    lim = max(5000.0, bal * 0.05)
-    ps_ok, _nj = detect_perfect_storm()
-    daily_ok = float(chrono_day_pnl) > -lim
-    if (
-        ps_ok
-        and daily_ok
-        and strat_id == "M03_RSI_MOMENTUM_CONTINUATION"
-        and sym_u in JPY_STORM_PAIRS
-        and str(ai.get("confidence", "")).strip().upper() == "HIGH"
-    ):
-        ai["_v74_perfect_storm_m03_jpy"] = True
-        if log_fn:
-            log_fn("[PERFECT STORM] M03 JPY sizing 2.8% base risk", level="info")
-    if sym_u.endswith("JPY"):
-        hr = bal * 0.20 - float(CHRONO_JPY_RISK_DAY)
-        ai["_jpy_risk_headroom"] = max(0.0, hr)
-
-    _v73_refresh_risk_fields_from_ai_confidence(ai, tf_key, float(price), sym)
-    _apply_chrono_risk_tp_multipliers(ai, price=float(price), chrono_risk_mult=chrono_risk_mult, chrono_tp_mult=chrono_tp_mult)
-    _v73_apply_calendar_regime_position_size(
-        ai,
-        confidence=str(ai.get("confidence", "LOW")),
-        calendar_risk=cal,
-        regime=regime_ctx,
-        macro=macro_bt,
-        trend_mult=trend_mult,
-        confluence_mult=cf_mult,
-        entry=float(ai.get("entry", price) or price),
-    )
-
-    tr_pre = trend_result.get("trend") or {}
-    if not isinstance(tr_pre, dict):
-        tr_pre = {}
-    ts_boost = float(tr_pre.get("strength", 0) or 0)
-    _v74_apply_recipe_and_monday_boosts(
-        ai,
-        sym=sym,
-        strat_id=strat_id,
-        locked_confluence=int(scount),
-        tf_key=tf_key,
-        analysis_date=analysis_date,
-        log_fn=log_fn,
-    )
-    _v75_apply_macro_event_and_combo_boosts(
-        ai,
-        sym=sym,
-        strat_id=strat_id,
-        locked_confluence=int(scount),
-        tf_key=tf_key,
-        trend_strength=ts_boost,
-        rate_diff=float(ai.get("macro_rate_diff", 0) or 0),
-        period_mode=period_mode,
-        log_fn=log_fn,
-    )
-
-    agreed_list = sorted(CHRONO_DAY_PREFILTER_SIDS.get((sym_u, direction), set()))
-    td = tr_pre
-    out: dict[str, Any] = {
+    out = {
         "skipped": False,
         "skip_trade": False,
-        "strategy_id": strat_id,
-        "direction": direction,
-        "entry_price": round(float(ai.get("entry", entry) or entry), 5),
-        "stop_loss": round(float(ai.get("stop_loss", stop) or stop), 5),
-        "tp1": float(ai.get("tp1", tp1)),
-        "tp2": float(ai.get("tp2", tp2)),
-        "tp3": float(ai.get("tp3", tp3)),
-        "max_risk_dollars": float(ai.get("_max_risk_dollars", 0) or 0),
-        "account_risk_pct": float(ai.get("_account_risk_pct", 0) or 0),
-        "confidence": str(ai.get("confidence", "LOW")),
-        "confidence_pre_upgrade": ai.get("confidence_pre_upgrade"),
-        "macro_bias": str(ai.get("macro_bias", "")),
-        "macro_bias_adjusted": ai.get("macro_bias_adjusted", ai.get("macro_bias")),
-        "macro_rate_diff": float(ai.get("macro_rate_diff", 0) or 0),
-        "trend_strength": ts_boost,
-        "trend_size_mult": trend_mult,
-        "strategy_confluence_count": int(scount),
-        "strategy_confluence_mult": float(cf_mult),
-        "strategies_agreed": agreed_list,
-        "period_mode": str(ai.get("period_mode") or period_mode),
-        "macro_event_boost_applied": bool(ai.get("macro_event_boost_applied")),
-        "combination_boost_applied": ai.get("combination_boost_applied", 1.0),
-        "calendar_action": str(cal.get("action", "CLEAR")),
-        "calendar_reason": str(cal.get("reason", "")),
+        "strategy_id": str(row.get("strategy_id") or "").strip().upper(),
+        "direction": str(row.get("direction") or "").strip().upper(),
+        "entry_price": round(float(row.get("entry_price", row.get("entry", price)) or price), 5),
+        "stop_loss": round(float(row.get("stop_loss", 0) or 0), 5),
+        "tp1": float(row.get("tp1", 0) or 0),
+        "tp2": float(row.get("tp2", 0) or 0),
+        "tp3": float(row.get("tp3", 0) or 0),
+        "max_risk_dollars": float(row.get("max_risk_dollars", row.get("_max_risk_dollars", 0)) or 0),
+        "account_risk_pct": float(row.get("account_risk_pct", row.get("_account_risk_pct", 0)) or 0),
+        "confidence": str(row.get("confidence", "LOW")),
+        "confidence_pre_upgrade": row.get("confidence_pre_upgrade"),
+        "macro_bias": str(row.get("macro_bias", "")),
+        "macro_bias_adjusted": row.get("macro_bias_adjusted", row.get("macro_bias")),
+        "macro_rate_diff": float(row.get("macro_rate_diff", 0) or 0),
+        "trend_strength": float(row.get("trend_strength", 0) or 0),
+        "trend_size_mult": float(row.get("trend_size_mult", 1.0) or 1.0),
+        "strategy_confluence_count": int(row.get("strategy_confluence_count", 0) or 0),
+        "strategy_confluence_mult": float(row.get("strategy_confluence_mult", 1.0) or 1.0),
+        "strategies_agreed": list(row.get("strategies_agreed") or []),
+        "period_mode": str(row.get("period_mode") or period_mode),
+        "macro_event_boost_applied": bool(row.get("macro_event_boost_applied")),
+        "combination_boost_applied": row.get("combination_boost_applied", 1.0),
+        "calendar_action": str(row.get("calendar_action", "CLEAR")),
+        "calendar_reason": str(row.get("calendar_reason", "")),
         "is_exotic": is_exotic,
         "zone_pct": zone_pct,
         "zone_label": zone_label,
-        **v75_meta,
-        **_v73_regime_row_fields(regime_ctx),
-        **merged_macro_result_fields(ai),
+        "regime": row.get("regime"),
+        "halt_active": row.get("halt_active"),
+        "_parity_source": "continuous_backtester",
+        "_ab_applied_in_decision": True,
+        "_ab_skip": bool(row.get("_ab_skip")),
+        "_ab_throttle": row.get("_ab_throttle"),
+        "_max_risk_dollars": float(row.get("max_risk_dollars", row.get("_max_risk_dollars", 0)) or 0),
+        "_account_risk_pct": float(row.get("account_risk_pct", row.get("_account_risk_pct", 0)) or 0),
+        "_position_size": row.get("position_size", row.get("_position_size")),
+        "_sizing_base": row.get("sizing_base", row.get("_sizing_base")),
+        "_drawdown_scale_applied": row.get("drawdown_scale_applied", row.get("_drawdown_scale_applied")),
+        "skip_reason": str(row.get("skip_reason") or ""),
     }
+    # Preserve v75 / regime extras when present.
+    for k, v in row.items():
+        if k not in out and k not in ("all_trades", "skipped", "future"):
+            if str(k).startswith("shadow_"):
+                continue
+            out[k] = v
+    if log_fn:
+        log_fn(
+            f"[parity] live plan via continuous_backtester {sym} {tf_key} "
+            f"{out.get('strategy_id')} {out.get('direction')} risk={out['max_risk_dollars']}",
+            level="info",
+        )
     return out

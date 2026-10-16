@@ -1,0 +1,21 @@
+[Unit]
+Description=APEX v7.6 Private Live Trader
+Documentation=https://github.com/kiankirsch8-create/APEX
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/apex
+ExecStart=/usr/bin/python3 /opt/apex/apex_trader_v76_private.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+Environment=PYTHONPATH=/opt/apex
+Environment=APEX_V76_PRIVATE_DRY_RUN=false
+# EnvironmentFile=-/etc/apex/apex.env
+StandardOutput=append:/var/log/apex/apex_v76_private.log
+StandardError=append:/var/log/apex/apex_v76_private_errors.log
+
+[Install]
+WantedBy=multi-user.target
