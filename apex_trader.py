@@ -1039,6 +1039,293 @@ def close_all_apex(mt5: Any) -> None:
             log_msg(f"[close_all] fail ticket={p.ticket} {r}", "error")
 
 
+# ---------------------------------------------------------------------------
+# Broker-space order construction
+# ---------------------------------------------------------------------------
+#
+# The decision/backtester produces (entry, stop_loss, tp1-3) in STRATEGY space
+# (yfinance quotes). FTMO's broker streams prices in its own space (e.g.
+# USDCHF ≈ 0.80 broker vs yfinance values like 24.33 produced inside the
+# strategy indicator stack). Sending the strategy-space absolute SL into
+# ``mt5.order_send`` as ``"sl": 24.33`` for USDCHF gets rejected with
+# "Invalid stops" and the strategy-space / broker-space distance mismatch
+# makes ``risk_usd / mpl`` floor to lot=0.0.
+#
+# ``build_broker_order_plan`` is the ONE place that translates strategy intent
+# into broker-space execution values. It:
+#   * takes direction-aware RATIOS from the strategy's own entry/SL/TPs,
+#   * anchors them to the broker's live tick,
+#   * rounds everything to ``symbol_info.digits``,
+#   * clamps SL/TP against ``symbol_info.trade_stops_level`` (minimum stop
+#     distance the broker will accept),
+#   * sizes volume from ``trade_tick_size`` / ``trade_tick_value`` so
+#     ``risk_usd`` maps to a real lot, floored to ``volume_step`` / ``volume_min``,
+#   * refuses to send if the floored minimum-lot would over-risk by >50%.
+#
+# The strategy's decision (direction / strategy_id / intended risk %) is
+# PRESERVED unchanged — only the broker-space execution values change, which
+# is what the backtester never has to compute because it works entirely in
+# strategy space. Live-vs-backtester parity (direction / strategy / intended R)
+# is therefore unaffected.
+
+
+class BrokerOrderPlanError(Exception):
+    """Raised by :func:`build_broker_order_plan` when the plan cannot be built.
+
+    The ``.reason`` attribute is a short machine-usable string
+    (``no_tick``, ``no_symbol_info``, ``bad_tick_value``,
+    ``bad_strategy_entry``, ``sl_wrong_side``, ``lot_min_overrisk``).
+    """
+
+    def __init__(self, reason: str, detail: str = "", diagnostics: dict[str, Any] | None = None):
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+        self.reason = reason
+        self.detail = detail
+        self.diagnostics = diagnostics or {}
+
+
+def _mt5_symbol_diagnostics(mt5: Any, sym: str) -> dict[str, Any]:
+    """Return a plain-dict snapshot of the broker's symbol state for logging."""
+    info = mt5.symbol_info(sym)
+    tick = mt5.symbol_info_tick(sym)
+    out: dict[str, Any] = {"symbol": sym}
+    if info is None:
+        out["symbol_info"] = None
+        return out
+    out.update(
+        {
+            "point": float(getattr(info, "point", 0) or 0),
+            "digits": int(getattr(info, "digits", 5) or 5),
+            "trade_stops_level": int(getattr(info, "trade_stops_level", 0) or 0),
+            "trade_freeze_level": int(getattr(info, "trade_freeze_level", 0) or 0),
+            "volume_min": float(getattr(info, "volume_min", 0.01) or 0.01),
+            "volume_step": float(getattr(info, "volume_step", 0.01) or 0.01),
+            "volume_max": float(getattr(info, "volume_max", 100.0) or 100.0),
+            "trade_tick_size": float(getattr(info, "trade_tick_size", 0) or 0)
+                or float(getattr(info, "point", 0) or 0),
+            "trade_tick_value": float(getattr(info, "trade_tick_value", 0) or 0),
+            "trade_contract_size": float(getattr(info, "trade_contract_size", 0) or 0),
+        }
+    )
+    if tick is not None:
+        out["bid"] = float(getattr(tick, "bid", 0) or 0)
+        out["ask"] = float(getattr(tick, "ask", 0) or 0)
+        spread_pt = (out["ask"] - out["bid"]) / out["point"] if out["point"] else 0
+        out["spread_points"] = round(spread_pt, 1)
+    return out
+
+
+def build_broker_order_plan(
+    mt5: Any,
+    sym: str,
+    direction: str,
+    *,
+    strategy_entry: float,
+    strategy_sl: float,
+    strategy_tp1: float = 0.0,
+    strategy_tp2: float = 0.0,
+    strategy_tp3: float = 0.0,
+    risk_usd: float,
+    lot_overrisk_tolerance: float = 1.5,
+) -> dict[str, Any]:
+    """Translate strategy-space (entry, SL, TPs) into broker-space execution values.
+
+    Returns a dict with::
+
+        {
+            "broker_entry": float,     # tick.ask (LONG) or tick.bid (SHORT), rounded to digits
+            "broker_sl":    float,     # anchored to broker_entry via strategy ratio, clamped
+            "broker_tp1":   float,
+            "broker_tp2":   float,
+            "broker_tp3":   float,
+            "volume":       float,     # sized from tick_value, floored to volume_step/volume_min
+            "sl_distance_price":    float,  # abs(broker_entry - broker_sl)
+            "sl_distance_ticks":    float,
+            "money_per_lot":        float,
+            "intended_risk_usd":    float,  # == risk_usd
+            "actual_risk_usd":      float,  # volume * money_per_lot
+            "stops_level_applied":  bool,   # True iff SL/TPs got clamped to broker min stop distance
+            "diagnostics":          dict,
+        }
+
+    Raises ``BrokerOrderPlanError`` with ``.reason`` on failure. The strategy's
+    direction/strategy_id/intended risk % are preserved — only the broker-space
+    execution prices and the final lot size are computed here.
+    """
+    d = (direction or "").strip().upper()
+    if d not in ("LONG", "SHORT"):
+        raise BrokerOrderPlanError("bad_direction", d)
+    if strategy_entry <= 0:
+        raise BrokerOrderPlanError("bad_strategy_entry", f"entry={strategy_entry}")
+
+    diag = _mt5_symbol_diagnostics(mt5, sym)
+    if "point" not in diag:
+        raise BrokerOrderPlanError("no_symbol_info", sym, diagnostics=diag)
+    if "bid" not in diag or diag["bid"] <= 0:
+        raise BrokerOrderPlanError("no_tick", sym, diagnostics=diag)
+
+    bid = diag["bid"]
+    ask = diag["ask"]
+    point = diag["point"] or 1e-5
+    digits = diag["digits"]
+    stops_level = diag["trade_stops_level"]
+    tick_size = diag["trade_tick_size"] or point
+    tick_value = diag["trade_tick_value"]
+    vol_min = diag["volume_min"]
+    vol_step = diag["volume_step"] or 0.01
+    vol_max = diag["volume_max"]
+
+    if tick_value <= 0 or tick_size <= 0:
+        raise BrokerOrderPlanError("bad_tick_value",
+                                   f"tick_size={tick_size} tick_value={tick_value}",
+                                   diagnostics=diag)
+
+    # Extract direction-aware RATIOS from strategy space. These are the stable,
+    # scale-independent intents the backtester expressed. For LONG, sl_pct<0
+    # and tp_pct>0; for SHORT the signs flip.
+    def _pct(x: float) -> float:
+        if x <= 0:
+            return 0.0
+        return (float(x) - float(strategy_entry)) / float(strategy_entry)
+
+    sl_pct = _pct(strategy_sl)
+    tp1_pct = _pct(strategy_tp1)
+    tp2_pct = _pct(strategy_tp2)
+    tp3_pct = _pct(strategy_tp3)
+
+    # Side-of-market anchor: BUY fills on ASK, SELL on BID.
+    broker_entry_raw = ask if d == "LONG" else bid
+
+    def _apply(pct: float) -> float:
+        return broker_entry_raw * (1.0 + pct) if pct else 0.0
+
+    broker_sl_raw = _apply(sl_pct)
+    broker_tp1_raw = _apply(tp1_pct)
+    broker_tp2_raw = _apply(tp2_pct)
+    broker_tp3_raw = _apply(tp3_pct)
+
+    # Direction sanity: SL must be on the correct side. If the strategy's ratio
+    # accidentally flipped (shouldn't happen for a sane plan), reject rather
+    # than send a broker-rejected request.
+    if broker_sl_raw <= 0:
+        raise BrokerOrderPlanError("missing_sl", f"strategy_sl={strategy_sl}", diagnostics=diag)
+    if d == "LONG" and broker_sl_raw >= broker_entry_raw:
+        raise BrokerOrderPlanError("sl_wrong_side",
+                                   f"LONG sl={broker_sl_raw} >= entry={broker_entry_raw}",
+                                   diagnostics=diag)
+    if d == "SHORT" and broker_sl_raw <= broker_entry_raw:
+        raise BrokerOrderPlanError("sl_wrong_side",
+                                   f"SHORT sl={broker_sl_raw} <= entry={broker_entry_raw}",
+                                   diagnostics=diag)
+
+    # Minimum stop distance enforced by the broker (+ 1 pt safety margin).
+    min_dist = max(stops_level, 1) * point
+    stops_level_applied = False
+
+    def _round(x: float) -> float:
+        return round(float(x), digits)
+
+    broker_entry = _round(broker_entry_raw)
+
+    if d == "LONG":
+        max_sl = broker_entry - min_dist
+        if broker_sl_raw > max_sl:
+            stops_level_applied = True
+            broker_sl = _round(max_sl)
+        else:
+            broker_sl = _round(broker_sl_raw)
+        broker_tp1 = _round(max(broker_tp1_raw, broker_entry + min_dist)) if broker_tp1_raw > 0 else 0.0
+        broker_tp2 = _round(max(broker_tp2_raw, broker_entry + min_dist)) if broker_tp2_raw > 0 else 0.0
+        broker_tp3 = _round(max(broker_tp3_raw, broker_entry + min_dist)) if broker_tp3_raw > 0 else 0.0
+    else:
+        min_sl = broker_entry + min_dist
+        if broker_sl_raw < min_sl:
+            stops_level_applied = True
+            broker_sl = _round(min_sl)
+        else:
+            broker_sl = _round(broker_sl_raw)
+        broker_tp1 = _round(min(broker_tp1_raw, broker_entry - min_dist)) if broker_tp1_raw > 0 else 0.0
+        broker_tp2 = _round(min(broker_tp2_raw, broker_entry - min_dist)) if broker_tp2_raw > 0 else 0.0
+        broker_tp3 = _round(min(broker_tp3_raw, broker_entry - min_dist)) if broker_tp3_raw > 0 else 0.0
+
+    sl_distance_price = abs(broker_entry - broker_sl)
+    sl_distance_ticks = sl_distance_price / tick_size
+    money_per_lot = sl_distance_ticks * tick_value
+    if money_per_lot <= 0:
+        raise BrokerOrderPlanError("zero_money_per_lot",
+                                   f"sl_dist={sl_distance_price} tv={tick_value}",
+                                   diagnostics=diag)
+
+    raw_lot = float(risk_usd) / money_per_lot
+    floored_lot = math.floor(raw_lot / vol_step + 1e-9) * vol_step
+
+    if floored_lot < vol_min:
+        candidate_lot = vol_min
+        actual_risk = candidate_lot * money_per_lot
+        if actual_risk > float(risk_usd) * lot_overrisk_tolerance:
+            raise BrokerOrderPlanError(
+                "lot_min_overrisk",
+                f"vol_min={vol_min} would risk ${actual_risk:.2f} "
+                f"vs intended ${risk_usd:.2f} (>{int((lot_overrisk_tolerance-1)*100)}% over)",
+                diagnostics={
+                    **diag,
+                    "intended_risk_usd": float(risk_usd),
+                    "money_per_lot": round(money_per_lot, 4),
+                    "sl_distance_ticks": round(sl_distance_ticks, 2),
+                    "would_risk_at_vol_min": round(actual_risk, 2),
+                    "raw_lot": round(raw_lot, 4),
+                },
+            )
+        volume = round(candidate_lot, 8)
+    else:
+        volume = round(min(floored_lot, vol_max), 8)
+    # Enforce step precision for display.
+    try:
+        step_digits = max(0, -math.floor(math.log10(vol_step))) if vol_step > 0 else 2
+        volume = round(volume, int(step_digits))
+    except (ValueError, OverflowError):
+        volume = round(volume, 2)
+
+    actual_risk_usd = volume * money_per_lot
+
+    diag_full = {
+        **diag,
+        "direction": d,
+        "strategy_entry": float(strategy_entry),
+        "strategy_sl": float(strategy_sl),
+        "strategy_tp1": float(strategy_tp1),
+        "strategy_tp2": float(strategy_tp2),
+        "strategy_tp3": float(strategy_tp3),
+        "sl_pct": round(sl_pct * 100, 4),
+        "tp1_pct": round(tp1_pct * 100, 4),
+        "tp2_pct": round(tp2_pct * 100, 4),
+        "tp3_pct": round(tp3_pct * 100, 4),
+        "min_dist_price": round(min_dist, max(digits, 5)),
+        "stops_level_applied": stops_level_applied,
+        "sl_distance_ticks": round(sl_distance_ticks, 2),
+        "sl_distance_price": round(sl_distance_price, max(digits, 5)),
+        "money_per_lot": round(money_per_lot, 4),
+        "raw_lot": round(raw_lot, 4),
+        "floored_lot": round(floored_lot, 4),
+    }
+
+    return {
+        "broker_entry": broker_entry,
+        "broker_sl": broker_sl,
+        "broker_tp1": broker_tp1,
+        "broker_tp2": broker_tp2,
+        "broker_tp3": broker_tp3,
+        "volume": volume,
+        "sl_distance_price": sl_distance_price,
+        "sl_distance_ticks": sl_distance_ticks,
+        "money_per_lot": money_per_lot,
+        "intended_risk_usd": float(risk_usd),
+        "actual_risk_usd": round(actual_risk_usd, 2),
+        "stops_level_applied": stops_level_applied,
+        "diagnostics": diag_full,
+    }
+
+
 def order_send_live(
     mt5: Any,
     sym: str,
@@ -1047,6 +1334,14 @@ def order_send_live(
     risk_usd: float,
     meta: dict[str, Any],
 ) -> dict[str, Any]:
+    """Submit a market order on ``sym`` in broker space.
+
+    ``sl`` is the STRATEGY-space absolute stop price (not usable as-is on the
+    broker). ``meta`` must carry the strategy-space ``entry`` as ``meta['entry']``
+    (and ``tp1``/``tp2``/``tp3`` if available) so we can derive the direction-
+    aware RATIOs that get re-anchored to the broker's live tick. ``meta['sl']``
+    is used if present, else the ``sl`` positional is used.
+    """
     tick = mt5.symbol_info_tick(sym)
     if tick is None:
         return {"ok": False, "error": "no_tick"}
@@ -1061,30 +1356,84 @@ def order_send_live(
     if ok_opp:
         log_msg(f"[ORDER] blocked — {rs_opp}", "warning")
         return {"ok": False, "error": f"symbol_conflict:{rs_opp}"}
-    entry = float(tick.ask if d == "LONG" else tick.bid)
-    mpl = mpl_sl(mt5, sym, entry, sl, d)
-    if mpl is None or mpl <= 0:
-        return {"ok": False, "error": "mpl"}
-    vol = norm_vol(mt5, sym, risk_usd / mpl)
+
+    strat_entry = float(meta.get("entry") or 0)
+    strat_sl = float(meta.get("sl", sl) or sl or 0)
+    strat_tp1 = float(meta.get("tp1", 0) or 0)
+    strat_tp2 = float(meta.get("tp2", 0) or 0)
+    strat_tp3 = float(meta.get("tp3", 0) or 0)
+
+    try:
+        bp = build_broker_order_plan(
+            mt5,
+            sym,
+            d,
+            strategy_entry=strat_entry,
+            strategy_sl=strat_sl,
+            strategy_tp1=strat_tp1,
+            strategy_tp2=strat_tp2,
+            strategy_tp3=strat_tp3,
+            risk_usd=float(risk_usd),
+        )
+    except BrokerOrderPlanError as exc:
+        log_msg(
+            f"[ORDER] build_broker_order_plan failed sym={sym} dir={d} "
+            f"reason={exc.reason} detail={exc.detail} diag={exc.diagnostics}",
+            "warning",
+        )
+        return {"ok": False, "error": exc.reason, "detail": exc.detail,
+                "diagnostics": exc.diagnostics}
+
+    entry = bp["broker_entry"]
+    vol = bp["volume"]
     typ = mt5.ORDER_TYPE_BUY if d == "LONG" else mt5.ORDER_TYPE_SELL
-    price = float(tick.ask if d == "LONG" else tick.bid)
     req = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": sym,
         "volume": vol,
         "type": typ,
-        "price": price,
-        "sl": float(sl),
-        "tp": 0.0,
+        "price": entry,
+        "sl": bp["broker_sl"],
+        "tp": bp["broker_tp1"] or 0.0,
         "deviation": 25,
         "magic": APEX_MAGIC,
         "comment": ORDER_COMMENT,
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": fill_mode(mt5, sym),
     }
+    log_msg(
+        f"[ORDER] submit {sym} dir={d} vol={vol} entry={entry} sl={req['sl']} tp={req['tp']} "
+        f"| sl_dist_ticks={bp['sl_distance_ticks']:.1f} intended_risk=${bp['intended_risk_usd']:.2f} "
+        f"actual_risk=${bp['actual_risk_usd']:.2f} stops_level_applied={bp['stops_level_applied']} "
+        f"| broker: bid={bp['diagnostics'].get('bid')} ask={bp['diagnostics'].get('ask')} "
+        f"point={bp['diagnostics'].get('point')} digits={bp['diagnostics'].get('digits')} "
+        f"stops_level={bp['diagnostics'].get('trade_stops_level')} "
+        f"vol_min={bp['diagnostics'].get('volume_min')} vol_step={bp['diagnostics'].get('volume_step')} "
+        f"tick_value={bp['diagnostics'].get('trade_tick_value')}",
+        "info",
+    )
+
     res = mt5.order_send(req)
+    rc = getattr(res, "retcode", None)
+    rc_comment = getattr(res, "comment", str(res))
+    try:
+        last_err = mt5.last_error()
+    except Exception:  # noqa: BLE001
+        last_err = None
+    log_msg(
+        f"[ORDER] mt5.order_send result sym={sym} retcode={rc} comment={rc_comment!r} "
+        f"last_error={last_err} request={req}",
+        "info" if rc == getattr(mt5, "TRADE_RETCODE_DONE", 10009) else "warning",
+    )
     if res is None or res.retcode != mt5.TRADE_RETCODE_DONE:
-        return {"ok": False, "error": getattr(res, "comment", str(res))}
+        return {
+            "ok": False,
+            "error": rc_comment,
+            "retcode": rc,
+            "last_error": last_err,
+            "request": req,
+            "broker_plan": {k: v for k, v in bp.items() if k != "diagnostics"},
+        }
     time.sleep(0.25)
     ticket = None
     candidates: list[Any] = []
@@ -1105,15 +1454,30 @@ def order_send_live(
     meta = dict(meta)
     meta["ticket"] = ticket
     meta["entry_fill"] = entry
-    meta["r"] = abs(entry - float(sl))
-    meta["tp1"] = float(meta.get("tp1", 0) or 0)
-    meta["tp2"] = float(meta.get("tp2", 0) or 0)
-    meta["tp3"] = float(meta.get("tp3", 0) or 0)
+    meta["sl"] = bp["broker_sl"]  # overwrite strategy-space SL with the broker-space value
+    meta["tp1"] = bp["broker_tp1"] or float(meta.get("tp1", 0) or 0)
+    meta["tp2"] = bp["broker_tp2"] or float(meta.get("tp2", 0) or 0)
+    meta["tp3"] = bp["broker_tp3"] or float(meta.get("tp3", 0) or 0)
+    meta["r"] = abs(entry - bp["broker_sl"])
+    meta["strategy_entry"] = strat_entry
+    meta["strategy_sl"] = strat_sl
+    meta["broker_entry"] = entry
+    meta["broker_sl"] = bp["broker_sl"]
     tm = ticket_meta_load()
     if ticket:
         tm[str(ticket)] = {k: (float(v) if isinstance(v, (float, int)) else v) for k, v in meta.items()}
         ticket_meta_save(tm)
-    return {"ok": True, "ticket": ticket, "volume": vol, "entry": entry}
+    return {
+        "ok": True,
+        "ticket": ticket,
+        "volume": vol,
+        "entry": entry,
+        "sl": bp["broker_sl"],
+        "tp": bp["broker_tp1"],
+        "retcode": rc,
+        "actual_risk_usd": bp["actual_risk_usd"],
+        "broker_plan": {k: v for k, v in bp.items() if k != "diagnostics"},
+    }
 
 
 # ---------------------------------------------------------------------------
