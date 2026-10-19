@@ -2518,10 +2518,27 @@ def evaluate_cell_v76(
 
 
 def lot_size_from_risk(mt5: Any, sym: str, entry: float, sl: float, risk_usd: float) -> float:
-    mpl = at.mpl_sl(mt5, sym, entry, sl, "LONG" if entry > sl else "SHORT")
-    if mpl is None or mpl <= 0:
+    """DRY_RUN preview sizing using the SAME broker-space builder as the live path.
+
+    ``entry`` and ``sl`` are the STRATEGY-space prices from the TradePlan — we
+    delegate to :func:`apex_trader.build_broker_order_plan` so DRY_RUN mirrors
+    exactly what live would send (and never silently returns 0.0 when the two
+    price spaces mismatch, which was the pre-fix behavior).
+    """
+    try:
+        bp = at.build_broker_order_plan(
+            mt5,
+            sym,
+            "LONG" if entry > sl else "SHORT",
+            strategy_entry=float(entry),
+            strategy_sl=float(sl),
+            risk_usd=float(risk_usd),
+        )
+    except at.BrokerOrderPlanError:
         return 0.0
-    return at.norm_vol(mt5, sym, risk_usd / mpl)
+    except Exception:  # noqa: BLE001
+        return 0.0
+    return float(bp.get("volume") or 0.0)
 
 
 def order_send_v76(
@@ -2823,6 +2840,9 @@ def order_send_v76(
             "tf": plan.timeframe,
             "strategy": plan.strategy_id,
             "direction": plan.direction,
+            # Strategy-space anchors — build_broker_order_plan uses these to
+            # derive direction-aware RATIOS and re-anchor them to the broker tick.
+            "entry": plan.entry,
             "sl": plan.stop_loss,
             "tp1": plan.tp1,
             "tp2": plan.tp2,
@@ -3128,22 +3148,38 @@ def _pyramid_send_add_order(
     sl: float,
     add_mrd: float,
 ) -> dict[str, Any]:
-    """Send pyramid add-in market order at computed risk dollars."""
+    """Send pyramid add-in market order at computed risk dollars.
+
+    ``sl`` here is expected to be a BROKER-space SL (the parent position's SL,
+    which the original ``order_send_live`` wrote as broker-space). We still
+    route through :func:`apex_trader.build_broker_order_plan` to pick up the
+    broker's live bid/ask, enforce ``trade_stops_level``, and size volume from
+    ``trade_tick_value`` — never let a floored vol<vol_min silently become 0.
+    """
     import MetaTrader5 as mt5m
 
+    d = direction.strip().upper()
     tick = mt5.symbol_info_tick(broker_sym)
     if tick is None:
         return {"ok": False, "error": "no_tick"}
-    d = direction.strip().upper()
-    entry = float(tick.ask if d == "LONG" else tick.bid)
-    mpl = at.mpl_sl(mt5, broker_sym, entry, sl, d)
-    if mpl is None or mpl <= 0:
-        return {"ok": False, "error": "mpl"}
-    vol = at.norm_vol(mt5, broker_sym, add_mrd / mpl)
+    strat_entry = float(tick.ask if d == "LONG" else tick.bid)
+    try:
+        bp = at.build_broker_order_plan(
+            mt5,
+            broker_sym,
+            d,
+            strategy_entry=strat_entry,
+            strategy_sl=float(sl),
+            risk_usd=float(add_mrd),
+        )
+    except at.BrokerOrderPlanError as exc:
+        return {"ok": False, "error": exc.reason, "detail": exc.detail}
+    entry = bp["broker_entry"]
+    vol = bp["volume"]
     if vol <= 0:
         return {"ok": False, "error": "zero_volume"}
     typ = mt5m.ORDER_TYPE_BUY if d == "LONG" else mt5m.ORDER_TYPE_SELL
-    price = float(tick.ask if d == "LONG" else tick.bid)
+    price = entry
     old_magic = at.APEX_MAGIC
     old_comment = at.ORDER_COMMENT
     try:
