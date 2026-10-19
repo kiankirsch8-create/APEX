@@ -2211,13 +2211,24 @@ def _locked_layer2_only(
     layer2: list[tuple[str, str, int] | tuple[str, str, int, dict[str, Any] | None]],
     *,
     tf_key: str,
+    past: Any,
+    ind: dict[str, Any],
 ) -> list[tuple[str, str, int] | tuple[str, str, int, dict[str, Any] | None]]:
-    """Live executes LOCKED strategies only (per design)."""
+    """Live executes LOCKED strategies only (per design).
+
+    ``past`` and ``ind`` are the same OHLC frame and indicator dict already
+    prepared for this (sym, tf) cell by ``evaluate_cell_v76`` — they are
+    forwarded verbatim to ``_v76_logic._v75_backtest_strategy_allowed`` so the
+    live gate uses the identical inputs the backtester does (see
+    ``continuous_backtester.py:1886``).
+    """
     tf_l = tf_key.strip().lower()
     out: list[tuple[str, str, int] | tuple[str, str, int, dict[str, Any] | None]] = []
     for row in layer2:
         sid = str(row[0]).strip().upper()
-        if sid not in _v76_logic.LOCKED_STRATEGY_IDS or not _v76_logic._v75_backtest_strategy_allowed(sid):
+        if sid not in _v76_logic.LOCKED_STRATEGY_IDS or not _v76_logic._v75_backtest_strategy_allowed(
+            sid, past=past, ind=ind
+        ):
             continue
         if tf_l == "4h" and sid == "M02_MACD_ZERO_CROSS":
             continue
@@ -2468,7 +2479,7 @@ def evaluate_cell_v76(
         )
 
     layer2 = [q for q in qualifying if str(q[0]).strip().upper() not in _v76_logic.LAYER1_STRATEGY_IDS]
-    layer2_locked = _locked_layer2_only(layer2, tf_key=tf_key)
+    layer2_locked = _locked_layer2_only(layer2, tf_key=tf_key, past=past, ind=ind)
     locked_ids = [str(r[0]).strip().upper() for r in layer2_locked]
     live_log(
         "info",
