@@ -1,0 +1,76 @@
+name: scan_once
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+concurrency:
+  group: scan_once-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan-once-dry-run:
+    name: run_full_scan_v76 (DRY_RUN) must complete clean
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      APEX_DRY_RUN: "1"
+      PROFILE: "ftmo"
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run v76 scan-path regression tests
+        run: |
+          python -m pytest \
+            test_decision_logic_log_fn_adapter.py \
+            test_locked_layer2_only_signature.py \
+            -v
+
+      - name: Run tools/scan_once.py (DRY_RUN end-to-end)
+        id: scan
+        run: |
+          set -o pipefail
+          python tools/scan_once.py 2>&1 | tee scan_once.log
+          echo "EXIT=$?"
+
+      - name: Assert zero exceptions in scan_once.log
+        run: |
+          if grep -E "Traceback \(most recent call last\)|^[A-Za-z_]*Error: " scan_once.log; then
+            echo "::error::scan_once.py produced a traceback — see job log above."
+            exit 1
+          fi
+          echo "scan_once.py completed with no tracebacks."
+
+      - name: Assert scan actually iterated cells (summary line present)
+        run: |
+          if ! grep -E "\[SCAN CYCLE\] complete|\[SCAN CYCLE\] prefilter pass complete|=== SCAN_ONCE summary ===" scan_once.log; then
+            echo "::error::scan_once.py did not reach its completion summary."
+            exit 1
+          fi
+
+      - name: Upload scan_once log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan_once-log
+          path: scan_once.log
+          retention-days: 14
