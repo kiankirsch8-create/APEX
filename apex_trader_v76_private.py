@@ -784,6 +784,19 @@ def live_log(level: str, msg: str, **fields: Any) -> None:
     at.log_msg(f"[v76-private] {msg}" + (f" | {extra}" if extra else ""), lvl)
 
 
+def _decision_log(msg: str, level: str = "info", **fields: Any) -> None:
+    """Message-first adapter for ``apex_v76_decision_logic`` log_fn injection.
+
+    ``apex_v76_decision_logic`` consistently calls its injected ``log_fn`` as
+    ``log_fn(msg, level="info")`` (positional message, optional ``level`` kwarg).
+    ``live_log`` is level-first, so passing it in directly causes a
+    ``TypeError: live_log() got multiple values for argument 'level'``.
+    This adapter is the ONE boundary that bridges the two conventions —
+    all other direct ``live_log("level", "msg")`` call sites stay unchanged.
+    """
+    live_log(level, msg, **fields)
+
+
 def publish_live_status(mt5: Any | None = None, **extra: Any) -> None:
     """Write ``LIVE_V76_STATUS`` to disk for ``GET /api/live/status`` (file or in-process)."""
     snap = collect_live_status(mt5)
@@ -2310,7 +2323,7 @@ def build_trade_plan_v76(
         period_mode=period_mode,
         past=past,
         ind=ind,
-        log_fn=live_log,
+        log_fn=_decision_log,
     )
     if res is None:
         return ScanSkip(reason="Layer 2 produced no result")
@@ -2332,7 +2345,7 @@ def build_trade_plan_v76(
     mb = str(res.get("macro_bias", "") or "")
     ts = float(res.get("trend_strength", 0) or 0)
     rd = float(res.get("macro_rate_diff", 0) or 0)
-    trail_reg = _v76_logic.resolve_trailing_regime(mb, ts, rd, timeframe=timeframe, log_fn=live_log)
+    trail_reg = _v76_logic.resolve_trailing_regime(mb, ts, rd, timeframe=timeframe, log_fn=_decision_log)
     tp1, tp2, tp3 = _regime_tp_levels(direction, entry, stop, trail_reg)
 
     risk_usd = float(res.get("max_risk_dollars", 0) or 0)
@@ -3408,7 +3421,7 @@ def manage_trailing_v76(mt5: Any, st: dict[str, Any] | None = None) -> None:
 
 
 def run_full_scan_v76() -> None:
-    _v76_logic.v72_load_strategy_status(at.BASE_DIR, log_fn=live_log)
+    _v76_logic.v72_load_strategy_status(at.BASE_DIR, log_fn=_decision_log)
     try:
         _v76_logic.bind_backtester_parity_state(force_reload_status=False)
     except Exception:  # noqa: BLE001
