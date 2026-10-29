@@ -180,10 +180,136 @@ STRATEGY_VERSION = "v7.6-live-mirror"
 APEX_V76_MAGIC = int(os.environ.get("APEX_V76_MAGIC", "760760"))
 ORDER_COMMENT_V76 = os.environ.get("APEX_V76_ORDER_COMMENT", "APEX76")
 DRY_RUN = os.environ.get("APEX_DRY_RUN", "true").strip().lower() in ("1", "true", "yes")
+MAX_OPEN_POSITIONS = 15
+
+# v7.0 portfolio construction (ticker-day dedupe + dual currency pools).
+import portfolio_construction as _pc  # noqa: E402
 
 SCAN_HOURS = at.SCAN_HOURS
 TIMEFRAMES: tuple[str, ...] = ("1w", "1d", "4h")
 TICKERS: list[str] = list(at.TICKERS)
+
+
+def open_v76_positions(mt5: Any) -> list[Any]:
+    """v76-aware enumerator: APEX_V76_MAGIC + ORDER_COMMENT_V76."""
+    if mt5 is None:
+        return []
+    return at.open_apex_positions(
+        mt5,
+        magic=APEX_V76_MAGIC,
+        comment=ORDER_COMMENT_V76,
+    )
+
+
+def _with_v76_identity():
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _ctx():
+        old_magic = at.APEX_MAGIC
+        old_comment = at.ORDER_COMMENT
+        try:
+            at.APEX_MAGIC = APEX_V76_MAGIC
+            at.ORDER_COMMENT = ORDER_COMMENT_V76
+            yield
+        finally:
+            at.APEX_MAGIC = old_magic
+            at.ORDER_COMMENT = old_comment
+
+    return _ctx()
+
+
+def _open_position_portfolio_rows(mt5: Any | None) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if mt5 is None:
+        return rows
+    meta = ticket_meta_v76_load()
+    try:
+        positions = open_v76_positions(mt5) or []
+    except Exception:  # noqa: BLE001
+        positions = []
+    for p in positions:
+        k = str(int(getattr(p, "ticket", 0) or 0))
+        m = meta.get(k) if isinstance(meta, dict) else None
+        if not isinstance(m, dict):
+            m = {}
+        ticker = str(m.get("ticker") or getattr(p, "symbol", "") or "").strip().upper()
+        if len(ticker) > 6 and ticker[:6].isalpha():
+            ticker = ticker[:6]
+        tf = str(m.get("tf") or m.get("timeframe") or "").strip().lower()
+        if ticker:
+            rows.append({"ticker": ticker, "timeframe": tf or "1d"})
+    return rows
+
+
+def load_portfolio_book(
+    st: dict[str, Any],
+    *,
+    mt5: Any | None = None,
+    utc_today: date | None = None,
+) -> _pc.PortfolioBookState:
+    return _pc.PortfolioBookState.from_state_dict(
+        st,
+        utc_today=utc_today,
+        open_rows=_open_position_portfolio_rows(mt5),
+    )
+
+
+def persist_portfolio_book(st: dict[str, Any], book: _pc.PortfolioBookState) -> None:
+    st.update(book.to_state_dict())
+
+
+def portfolio_construction_blocks(
+    ticker: str,
+    timeframe: str,
+    book: _pc.PortfolioBookState,
+) -> str | None:
+    if _pc.ticker_already_traded_today(ticker, book.traded_tickers_today):
+        return _pc.SKIP_TICKER_TRADED_TODAY
+    blocked, ccy = _pc.currency_cap_blocks(
+        ticker,
+        use_4h_pool=_pc.use_4h_currency_pool(timeframe),
+        open_currency_count=book.open_currency_count,
+        open_currency_count_4h=book.open_currency_count_4h,
+    )
+    if blocked:
+        return _pc.SKIP_CURRENCY_CAP_FMT.format(ccy=ccy)
+    return None
+
+
+def record_portfolio_entry(
+    book: _pc.PortfolioBookState,
+    ticker: str,
+    timeframe: str,
+) -> None:
+    tkr = (ticker or "").strip().upper()
+    if tkr:
+        book.traded_tickers_today.add(tkr)
+    _pc.increment_currency_counts(
+        ticker,
+        timeframe,
+        book.open_currency_count,
+        book.open_currency_count_4h,
+    )
+
+
+def _chrono_ticker_order() -> list[str]:
+    try:
+        from continuous_backtester import CHRONO_TICKERS
+
+        return [str(t).strip().upper() for t in CHRONO_TICKERS]
+    except Exception:  # noqa: BLE001
+        return [str(t).strip().upper() for t in TICKERS]
+
+
+def sort_scan_cells_chrono(
+    cells: list[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    order = _chrono_ticker_order()
+    return sorted(
+        cells,
+        key=lambda c: _pc.chrono_phase_sort_key(c[0], c[1], ticker_order=order),
+    )
 
 V76_STATE_FILE = at.BASE_DIR / "apex_v76_live_state.json"
 V76_TICKET_META = at.BASE_DIR / "apex_trader_v76_tickets.json"
@@ -314,42 +440,37 @@ def collect_live_status(mt5: Any | None = None) -> dict[str, Any]:
                 out["equity"] = float(ai.equity)
                 out["margin"] = float(getattr(ai, "margin", 0) or 0)
                 out["currency"] = str(getattr(ai, "currency", "") or "")
-            old_magic = at.APEX_MAGIC
-            try:
-                at.APEX_MAGIC = APEX_V76_MAGIC
-                for p in at.open_apex_positions(mt5):
-                    tick = mt5.symbol_info_tick(p.symbol)
-                    bid = float(tick.bid) if tick else 0.0
-                    ask = float(tick.ask) if tick else 0.0
-                    d = "LONG" if int(p.type) == 0 else "SHORT"
-                    px = bid if d == "LONG" else ask
-                    meta = ticket_meta_v76_load().get(str(int(p.ticket)), {})
-                    positions_out.append(
-                        {
-                            "ticket": int(p.ticket),
-                            "symbol": str(p.symbol),
-                            "ticker": str(meta.get("ticker", "")),
-                            "timeframe": str(meta.get("tf", "")),
-                            "strategy_id": str(meta.get("strategy", "")),
-                            "direction": d,
-                            "volume": float(p.volume),
-                            "entry": float(p.price_open),
-                            "current_price": px,
-                            "sl": float(p.sl or 0),
-                            "profit": float(p.profit),
-                            "swap": float(getattr(p, "swap", 0) or 0),
-                            "trail_regime": str(meta.get("trail_regime", "")),
-                            "tp1": float(meta.get("tp1", 0) or 0),
-                            "tp2": float(meta.get("tp2", 0) or 0),
-                            "tp3": float(meta.get("tp3", 0) or 0),
-                            "hit_tp1": bool(meta.get("hit_tp1")),
-                            "hit_tp2": bool(meta.get("hit_tp2")),
-                            "macro_bias": str(meta.get("macro_bias", "")),
-                            "confidence": str(meta.get("confidence", "")),
-                        }
-                    )
-            finally:
-                at.APEX_MAGIC = old_magic
+            for p in open_v76_positions(mt5):
+                tick = mt5.symbol_info_tick(p.symbol)
+                bid = float(tick.bid) if tick else 0.0
+                ask = float(tick.ask) if tick else 0.0
+                d = "LONG" if int(p.type) == 0 else "SHORT"
+                px = bid if d == "LONG" else ask
+                meta = ticket_meta_v76_load().get(str(int(p.ticket)), {})
+                positions_out.append(
+                    {
+                        "ticket": int(p.ticket),
+                        "symbol": str(p.symbol),
+                        "ticker": str(meta.get("ticker", "")),
+                        "timeframe": str(meta.get("tf", "")),
+                        "strategy_id": str(meta.get("strategy", "")),
+                        "direction": d,
+                        "volume": float(p.volume),
+                        "entry": float(p.price_open),
+                        "current_price": px,
+                        "sl": float(p.sl or 0),
+                        "profit": float(p.profit),
+                        "swap": float(getattr(p, "swap", 0) or 0),
+                        "trail_regime": str(meta.get("trail_regime", "")),
+                        "tp1": float(meta.get("tp1", 0) or 0),
+                        "tp2": float(meta.get("tp2", 0) or 0),
+                        "tp3": float(meta.get("tp3", 0) or 0),
+                        "hit_tp1": bool(meta.get("hit_tp1")),
+                        "hit_tp2": bool(meta.get("hit_tp2")),
+                        "macro_bias": str(meta.get("macro_bias", "")),
+                        "confidence": str(meta.get("confidence", "")),
+                    }
+                )
         except Exception as e:  # noqa: BLE001
             out["mt5_error"] = str(e)
     out["open_positions"] = positions_out
@@ -469,6 +590,8 @@ def load_v76_state() -> dict[str, Any]:
             "daily_pnl": [],
             "day_key": "",
             "day_anchor": None,
+            "portfolio_utc_date": "",
+            "traded_tickers_today": [],
         },
     )
     return d if isinstance(d, dict) else {}
@@ -1230,12 +1353,7 @@ def order_send_v76(
 def _log_positions_trailing_phase(mt5: Any, *, phase: str) -> None:
     """Log open v76 positions: price vs TP ladder and stop (before/after trail pass)."""
     meta = ticket_meta_v76_load()
-    old_magic = at.APEX_MAGIC
-    try:
-        at.APEX_MAGIC = APEX_V76_MAGIC
-        positions = at.open_apex_positions(mt5)
-    finally:
-        at.APEX_MAGIC = old_magic
+    positions = open_v76_positions(mt5)
     if not positions:
         live_log("info", f"[TRAIL] {phase} — no open v76 positions")
         return
@@ -1522,12 +1640,7 @@ def _process_pyramid_in_v76(mt5: Any) -> None:
     current_capital = float(ai.balance) if ai is not None else float(at.STARTING_BALANCE)
 
     meta = ticket_meta_v76_load()
-    old_magic = at.APEX_MAGIC
-    try:
-        at.APEX_MAGIC = APEX_V76_MAGIC
-        positions = at.open_apex_positions(mt5) or []
-    finally:
-        at.APEX_MAGIC = old_magic
+    positions = open_v76_positions(mt5) or []
 
     changed = False
     for pos in positions:
@@ -1682,13 +1795,11 @@ def _adopt_open_positions(mt5: Any) -> bool:
     except Exception:  # noqa: BLE001
         return False
 
-    raw = mt5.positions_get() or []
+    raw = open_v76_positions(mt5) or []
     meta = ticket_meta_v76_load()
     updated = False
     adopted_n = 0
     for pos in raw:
-        if int(getattr(pos, "magic", 0) or 0) != APEX_V76_MAGIC:
-            continue
         ticket = int(pos.ticket)
         key = str(ticket)
         if isinstance(meta.get(key), dict):
@@ -1704,9 +1815,7 @@ def _adopt_open_positions(mt5: Any) -> bool:
         "info",
         "[ADOPT] startup pass complete",
         adopted=adopted_n,
-        open_magic=sum(
-            1 for p in raw if int(getattr(p, "magic", 0) or 0) == APEX_V76_MAGIC
-        ),
+        open_magic=len(raw),
     )
     return True
 
@@ -1715,14 +1824,12 @@ def manage_trailing_v76(mt5: Any) -> None:
     """Trailing with deep logging (before/after each pass)."""
     _log_positions_trailing_phase(mt5, phase="BEFORE")
     pre_meta = ticket_meta_v76_load()
-    old_magic = at.APEX_MAGIC
     old_meta_path = at.TICKET_META_FILE
     try:
-        at.APEX_MAGIC = APEX_V76_MAGIC
         at.TICKET_META_FILE = V76_TICKET_META
-        at.manage_trailing_live(mt5)
+        with _with_v76_identity():
+            at.manage_trailing_live(mt5)
     finally:
-        at.APEX_MAGIC = old_magic
         at.TICKET_META_FILE = old_meta_path
     _process_pyramid_in_v76(mt5)
     _finalize_closed_positions_v76(mt5, prior_meta=pre_meta)
@@ -1863,18 +1970,32 @@ def run_full_scan_v76() -> None:
 
     placed = 0
     skipped = 0
+    portfolio_book = load_portfolio_book(st, mt5=mt5, utc_today=scan_d)
+    persist_portfolio_book(st, portfolio_book)
+    scan_cells = sort_scan_cells_chrono(scan_cells)
+    initial_open_n = len(open_v76_positions(mt5)) if mt5 else 0
+    live_log(
+        "info",
+        "[PORTFOLIO] construction state",
+        utc_date=portfolio_book.utc_date,
+        traded_tickers_today=sorted(portfolio_book.traded_tickers_today),
+        open_currency_count=dict(portfolio_book.open_currency_count),
+        open_currency_count_4h=dict(portfolio_book.open_currency_count_4h),
+        open_positions=initial_open_n,
+        cells_signalled=len(scan_cells),
+    )
+
     if mt5:
-        old_magic = at.APEX_MAGIC
-        try:
-            at.APEX_MAGIC = APEX_V76_MAGIC
+        with _with_v76_identity():
             at.resolve_apex_hedged_same_pair(mt5)
-            if len(at.open_apex_positions(mt5)) >= 15:
-                live_log("warning", "[SCAN CYCLE] max 15 open positions — abort entries")
+            if len(open_v76_positions(mt5)) >= int(MAX_OPEN_POSITIONS):
+                live_log(
+                    "warning",
+                    f"[SCAN CYCLE] max {int(MAX_OPEN_POSITIONS)} open positions — abort entries",
+                )
                 publish_live_status(mt5, status="running", scan_aborted="max_positions")
                 save_v76_state(st)
                 return
-        finally:
-            at.APEX_MAGIC = old_magic
 
     for sym, tf in scan_cells:
         live_log("info", "[SCAN] evaluate entry", ticker=sym.upper(), timeframe=tf)
@@ -1913,6 +2034,54 @@ def run_full_scan_v76() -> None:
             continue
 
         plan: TradePlan = result
+
+        if initial_open_n + placed >= int(MAX_OPEN_POSITIONS):
+            skipped += 1
+            live_log(
+                "warning",
+                "[SKIP] max_positions",
+                ticker=plan.sym,
+                timeframe=plan.timeframe,
+                open_positions=initial_open_n + placed,
+                cap=int(MAX_OPEN_POSITIONS),
+            )
+            append_decision_log(
+                {
+                    "date": analysis_date,
+                    "action": "SKIP",
+                    "ticker": plan.sym,
+                    "timeframe": plan.timeframe,
+                    "skip_reason": "max_positions",
+                    "portfolio_construction": True,
+                },
+            )
+            continue
+
+        pc_reason = portfolio_construction_blocks(
+            plan.sym, plan.timeframe, portfolio_book
+        )
+        if pc_reason:
+            skipped += 1
+            live_log(
+                "info",
+                "[SKIP] portfolio_construction",
+                ticker=plan.sym,
+                timeframe=plan.timeframe,
+                skip_reason=pc_reason,
+            )
+            append_decision_log(
+                {
+                    "date": analysis_date,
+                    "action": "SKIP",
+                    "ticker": plan.sym,
+                    "timeframe": plan.timeframe,
+                    "skip_reason": pc_reason,
+                    "portfolio_construction": True,
+                    **plan.log_fields,
+                },
+            )
+            continue
+
         live_log(
             "info",
             "[TAKE] trade plan approved",
@@ -1954,6 +2123,8 @@ def run_full_scan_v76() -> None:
         out = order_send_v76(mt5, bs or sym, plan)
         if out.get("ok"):
             placed += 1
+            record_portfolio_entry(portfolio_book, plan.sym, plan.timeframe)
+            persist_portfolio_book(st, portfolio_book)
         else:
             skipped += 1
 
