@@ -1001,12 +1001,26 @@ def clamp_sl_sell_live(mt5: Any, sym: str, ask: float, want_sl: float) -> float:
     return max(float(want_sl), min_sl)
 
 
-def open_apex_positions(mt5: Any) -> list[Any]:
+def open_apex_positions(
+    mt5: Any,
+    *,
+    magic: int | None = None,
+    comment: str | None = None,
+) -> list[Any]:
+    """
+    Enumerate open positions for this engine.
+
+    Optional ``magic`` / ``comment`` override module defaults so v76 callers can
+    select APEX_V76_MAGIC + ORDER_COMMENT_V76 without the fragile global swap
+    that previously left comment stuck on legacy ``\"APEX\"`` (caps saw 0).
+    """
+    mag = int(APEX_MAGIC if magic is None else magic)
+    com = str(ORDER_COMMENT if comment is None else comment).strip()
     out: list[Any] = []
     for p in mt5.positions_get() or []:
-        if int(getattr(p, "magic", 0) or 0) != APEX_MAGIC:
+        if int(getattr(p, "magic", 0) or 0) != mag:
             continue
-        if (p.comment or "").strip() != ORDER_COMMENT:
+        if str(getattr(p, "comment", "") or "").strip() != com:
             continue
         out.append(p)
     return out

@@ -84,9 +84,10 @@ def test_scan_aborts_on_margin_guard_then_resumes(monkeypatch) -> None:
 
     class _At:
         APEX_MAGIC = 1
+        ORDER_COMMENT = "APEX"
 
         @staticmethod
-        def open_apex_positions(_mt5):
+        def open_apex_positions(_mt5, *, magic=None, comment=None):
             return [object()] * open_n[0]
 
         @staticmethod
@@ -95,6 +96,7 @@ def test_scan_aborts_on_margin_guard_then_resumes(monkeypatch) -> None:
 
     monkeypatch.setattr(v76, "at", _At)
     monkeypatch.setattr(v76, "APEX_V76_MAGIC", 760761)
+    monkeypatch.setattr(v76, "ORDER_COMMENT_V76", "APEX76P")
 
     # Phase 1 — stressed margin (320%) → abort new entries
     mt5_stressed = MagicMock()
@@ -140,9 +142,10 @@ def test_max_positions_still_aborts_before_margin(monkeypatch) -> None:
 
     class _At:
         APEX_MAGIC = 1
+        ORDER_COMMENT = "APEX"
 
         @staticmethod
-        def open_apex_positions(_mt5):
+        def open_apex_positions(_mt5, *, magic=None, comment=None):
             return [object()] * 15
 
         @staticmethod

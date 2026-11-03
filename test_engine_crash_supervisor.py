@@ -63,6 +63,7 @@ def test_adopt_open_positions_on_restart(monkeypatch, tmp_path: Path) -> None:
     pos = SimpleNamespace(
         ticket=424242,
         magic=v76.APEX_V76_MAGIC,
+        comment=v76.ORDER_COMMENT_V76,
         symbol="EURUSD",
         type=0,  # LONG
         price_open=1.1000,
