@@ -72,6 +72,7 @@ from macro_manager import (
 from regime_engine import compute_pair_regime
 from utils import DATA_DIR, env, load_json, log, save_json, utcnow_iso
 
+import portfolio_construction as _pc
 import shadow_instruments as _si
 from entry_scores import (
     ENTRY_SCORE_KEYS,
@@ -213,7 +214,8 @@ OPEN_CURRENCY_COUNT: dict[str, int] = {}
 # v7.1 chrono: 4h + intraday share a separate per-day currency pool from 1w/1d.
 OPEN_CURRENCY_COUNT_4H: dict[str, int] = {}
 # USD side of these pairs is exempt from FIX 2 currency cap (FIX 15).
-EXOTIC_PAIRS: frozenset[str] = frozenset({"USDMXN", "USDZAR", "USDNOK", "USDSEK"})
+# Shared with live via portfolio_construction — do not diverge.
+EXOTIC_PAIRS: frozenset[str] = _pc.EXOTIC_PAIRS
 # Circuit breaker — chrono simulated halt end (walk-forward date, not wall clock).
 CHRONO_CIRCUIT_HALT_UNTIL: date | None = None
 CHRONO_DAILY_PNL_FOR_CB: list[dict[str, Any]] = []
@@ -1321,10 +1323,7 @@ from prefilter_v6 import python_prefilter
 
 def get_currencies(ticker: str) -> list[str]:
     """Forex spot symbols as 6-letter AAA/BBB; non-forex (e.g. QQQ) → no currencies (FIX 17)."""
-    t = (ticker or "").strip().upper()
-    if len(t) == 6 and t.isalpha():
-        return [t[:3], t[3:]]
-    return []
+    return _pc.get_currencies(ticker)
 
 
 # ── v7.2 strategy status — LOCKED_STRATEGY_IDS = confluence counting only (not execution skip) ──
@@ -7618,15 +7617,17 @@ def _apply_chrono_risk_tp_multipliers(
 
 
 def _chrono_currency_cap_blocks(ticker: str, *, use_4h_pool: bool) -> tuple[bool, str | None]:
-    """FIX 2 + FIX 9 + FIX 15 — return (blocked, ccy_or_None)."""
-    tkr_u = (ticker or "").strip().upper()
-    bucket = OPEN_CURRENCY_COUNT_4H if use_4h_pool else OPEN_CURRENCY_COUNT
-    for ccy in get_currencies(tkr_u):
-        if tkr_u in EXOTIC_PAIRS and ccy == "USD":
-            continue
-        if bucket.get(ccy, 0) >= 2:
-            return True, ccy
-    return False, None
+    """FIX 2 + FIX 9 + FIX 15 — return (blocked, ccy_or_None).
+
+    Delegates to shared ``portfolio_construction.currency_cap_blocks`` so live
+    and chrono cannot drift on grouping / cap / pool split.
+    """
+    return _pc.currency_cap_blocks(
+        ticker,
+        use_4h_pool=use_4h_pool,
+        open_currency_count=OPEN_CURRENCY_COUNT,
+        open_currency_count_4h=OPEN_CURRENCY_COUNT_4H,
+    )
 
 
 def _chrono_v71_phases(days_ago: int, *, scan_date: date) -> list[tuple[str, list[str], float, float, bool]]:
@@ -17632,15 +17633,12 @@ def run_chronological_backtest(
                 _tk = str(_row.get("ticker", "")).strip().upper()
                 if _tk:
                     TRADED_TICKERS_TODAY.add(_tk)
-                _tf_r = str(_row.get("timeframe", "")).strip().lower()
-                _use4 = _tf_r in ("4h", "15m", "30m")
-                for _ccy in get_currencies(_tk):
-                    if _tk in EXOTIC_PAIRS and _ccy == "USD":
-                        continue
-                    if _use4:
-                        OPEN_CURRENCY_COUNT_4H[_ccy] = OPEN_CURRENCY_COUNT_4H.get(_ccy, 0) + 1
-                    else:
-                        OPEN_CURRENCY_COUNT[_ccy] = OPEN_CURRENCY_COUNT.get(_ccy, 0) + 1
+                _pc.increment_currency_counts(
+                    _tk,
+                    str(_row.get("timeframe", "")),
+                    OPEN_CURRENCY_COUNT,
+                    OPEN_CURRENCY_COUNT_4H,
+                )
 
             CHRONO_LIVE_STATUS.update(
                 {
@@ -17824,14 +17822,16 @@ def run_chronological_backtest(
                                 continue
 
                             tkr_u = str(ticker).strip().upper()
-                            if (not DIAGNOSTIC_ALLOW_MULTI_TF_PER_DAY) and tkr_u in TRADED_TICKERS_TODAY:
+                            if (not DIAGNOSTIC_ALLOW_MULTI_TF_PER_DAY) and _pc.ticker_already_traded_today(
+                                tkr_u, TRADED_TICKERS_TODAY
+                            ):
                                 result = _chrono_gate_skip_row(
                                     date_str=date_str,
                                     ticker=ticker,
                                     timeframe=timeframe,
                                     session=session,
                                     job_id=job_id,
-                                    skip_reason="Ticker already traded today on another timeframe",
+                                    skip_reason=_pc.SKIP_TICKER_TRADED_TODAY,
                                 )
                                 append_result(result)
                                 day_skipped.append(_strip_chrono_dead_trade_fields(result) if isinstance(result, dict) else result)
@@ -17869,7 +17869,7 @@ def run_chronological_backtest(
                                     timeframe=timeframe,
                                     session=session,
                                     job_id=job_id,
-                                    skip_reason=f"Currency cap: {cap_ccy} already has 2 open trades",
+                                    skip_reason=_pc.SKIP_CURRENCY_CAP_FMT.format(ccy=cap_ccy),
                                 )
                                 append_result(result)
                                 day_skipped.append(_strip_chrono_dead_trade_fields(result) if isinstance(result, dict) else result)
@@ -18257,15 +18257,12 @@ def run_chronological_backtest(
                                 open_positions.pop(pos_key, None)
                                 record_trade(ticker, timeframe, date_str)
                                 TRADED_TICKERS_TODAY.add(tkr_u)
-                                tf_lc = str(timeframe).strip().lower()
-                                use_major = tf_lc not in ("4h", "15m", "30m")
-                                for _ccy in get_currencies(tkr_u):
-                                    if tkr_u in EXOTIC_PAIRS and _ccy == "USD":
-                                        continue
-                                    if use_major:
-                                        OPEN_CURRENCY_COUNT[_ccy] = OPEN_CURRENCY_COUNT.get(_ccy, 0) + 1
-                                    else:
-                                        OPEN_CURRENCY_COUNT_4H[_ccy] = OPEN_CURRENCY_COUNT_4H.get(_ccy, 0) + 1
+                                _pc.increment_currency_counts(
+                                    tkr_u,
+                                    str(timeframe),
+                                    OPEN_CURRENCY_COUNT,
+                                    OPEN_CURRENCY_COUNT_4H,
+                                )
                                 _rsid2 = str(row.get("strategy_id", "")).strip().upper()
                                 if _rsid2:
                                     STRATEGY_TRADE_COUNT[_rsid2] = STRATEGY_TRADE_COUNT.get(_rsid2, 0) + 1

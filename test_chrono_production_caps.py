@@ -11,8 +11,11 @@ def test_multi_tf_per_day_dedupe_is_enforced() -> None:
 
 
 def test_currency_cap_blocks_is_active() -> None:
+    import portfolio_construction as pc
+
     src = inspect.getsource(cb._chrono_currency_cap_blocks)
-    assert "return False, None" not in src.split("tkr_u", 1)[0]
+    assert "portfolio_construction" in src or "_pc.currency_cap_blocks" in src
+    assert "return False, None" not in src
     blocked, ccy = cb._chrono_currency_cap_blocks("CADJPY", use_4h_pool=False)
     # Empty pools → not blocked; function must reach real logic (not early-return).
     assert blocked is False and ccy is None
@@ -24,6 +27,13 @@ def test_currency_cap_blocks_is_active() -> None:
     # Separate 4h pool still empty
     blocked3, _ = cb._chrono_currency_cap_blocks("AUDJPY", use_4h_pool=True)
     assert blocked3 is False
+    # Shared helper agrees
+    assert pc.currency_cap_blocks(
+        "AUDJPY",
+        use_4h_pool=False,
+        open_currency_count=cb.OPEN_CURRENCY_COUNT,
+        open_currency_count_4h=cb.OPEN_CURRENCY_COUNT_4H,
+    ) == (True, "JPY")
     cb.OPEN_CURRENCY_COUNT.clear()
 
 

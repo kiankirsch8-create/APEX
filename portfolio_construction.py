@@ -1,8 +1,8 @@
 """
-Shared portfolio-construction rules (v7.0 baseline).
+Shared portfolio-construction rules (v7.0 baseline / caps-on production).
 
-These are the structural anti-clustering rules the validated chrono backtester
-enforced when scoring 95.4% — NOT the shadow-only CFG guardrails:
+Structural anti-clustering rules used by both continuous_backtester chrono and
+the live v76 engines (NOT the shadow-only CFG guardrails):
 
   1. At most one NEW entry per ticker per UTC calendar day
      (dedupe across timeframes / scan slots).
@@ -10,9 +10,9 @@ enforced when scoring 95.4% — NOT the shadow-only CFG guardrails:
      4h/intraday vs 1w/1d (1h checks the 4h pool but records into the major
      pool — matching continuous_backtester record vs check semantics).
 
-Live and backtester construction paths must call these helpers so the book
-shape matches given the same ordered decisions. Entry *decisions* are
-unchanged; only which decided trades actually open is filtered here.
+Entry *decisions* are unchanged; only which decided trades actually open is
+filtered here. Live marks ticker-day on ENTRY; chrono marks on same-day
+WIN/LOSS completion.
 """
 from __future__ import annotations
 

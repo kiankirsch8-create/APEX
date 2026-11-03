@@ -1020,7 +1020,7 @@ def open_apex_positions(
     for p in mt5.positions_get() or []:
         if int(getattr(p, "magic", 0) or 0) != mag:
             continue
-        if (p.comment or "").strip() != com:
+        if str(getattr(p, "comment", "") or "").strip() != com:
             continue
         out.append(p)
     return out
