@@ -1003,8 +1003,9 @@ COMPOUNDING_THRESHOLD_MULTIPLIERS = (2.0, 3.0, 5.0, 10.0, 20.0, 50.0)
 # Tunable knob: fraction of (capital - base) gap closed per eligible compounding update.
 # Increase for faster catch-up toward capital; decrease for slower/smoother glide.
 GLIDE_FRACTION = 0.10
-# DIAGNOSTIC — REMOVE BEFORE LIVE / BEFORE FINAL CONFIG: ceiling-measurement run.
-DIAGNOSTIC_ALLOW_MULTI_TF_PER_DAY = True  # DIAGNOSTIC — REMOVE BEFORE LIVE
+# Production (v7.0 baseline): one trade per ticker per calendar day.
+# PR #99 temporarily set this True for a ceiling-measurement run — restored False.
+DIAGNOSTIC_ALLOW_MULTI_TF_PER_DAY = False
 SINGLE_TRADE_MAX_PCT_OF_CURRENT = 0.08
 LEVERAGE = 50
 
@@ -7618,8 +7619,6 @@ def _apply_chrono_risk_tp_multipliers(
 
 def _chrono_currency_cap_blocks(ticker: str, *, use_4h_pool: bool) -> tuple[bool, str | None]:
     """FIX 2 + FIX 9 + FIX 15 — return (blocked, ccy_or_None)."""
-    # DIAGNOSTIC — currency cap disabled to measure ceiling. RESTORE BEFORE LIVE.
-    return False, None
     tkr_u = (ticker or "").strip().upper()
     bucket = OPEN_CURRENCY_COUNT_4H if use_4h_pool else OPEN_CURRENCY_COUNT
     for ccy in get_currencies(tkr_u):
@@ -10018,12 +10017,6 @@ def enforce_rules(
             return ai
 
     if strategy_id == "R01_EXTREME_ZONE_REVERSION":
-        # DIAGNOSTIC — REMOVE BEFORE LIVE / BEFORE FINAL CONFIG: slot-stealer test.
-        macro_bias = str(ai.get("macro_bias", "")).strip().upper()
-        if direction == "SHORT" and macro_bias == "STRONG_HEADWIND":
-            ai["skip_trade"] = True
-            ai["skip_reason"] = "DIAGNOSTIC R01 block: SHORT in STRONG_HEADWIND (slot-stealer test)"
-            return ai
         if tf in ("4h", "1h", "30m", "15m"):
             ai["skip_trade"] = True
             ai["skip_reason"] = f"R01 blocked on {tf}"
@@ -17211,6 +17204,14 @@ def run_chronological_backtest(
             "compounding_base_capital": STARTING_CAPITAL,
             "peak_capital": STARTING_CAPITAL,
             "account_type": ACCOUNT_TYPE,
+            # Auditable portfolio-construction flags (caps-on production vs ceiling).
+            "portfolio_construction": {
+                "currency_cap_enabled": True,
+                "currency_cap_max": 2,
+                "one_trade_per_ticker_per_day": not bool(DIAGNOSTIC_ALLOW_MULTI_TF_PER_DAY),
+                "diagnostic_allow_multi_tf_per_day": bool(DIAGNOSTIC_ALLOW_MULTI_TF_PER_DAY),
+                "r01_short_strong_headwind_diagnostic_block": False,
+            },
             "daily_pnl": [],
             "all_trades": [],
             "skipped": [],
@@ -17240,6 +17241,14 @@ def run_chronological_backtest(
             ("days_processed", 0),
         ):
             chrono_data.setdefault(_k, _v)
+        # Always stamp current portfolio-construction flags so resumed jobs are auditable.
+        chrono_data["portfolio_construction"] = {
+            "currency_cap_enabled": True,
+            "currency_cap_max": 2,
+            "one_trade_per_ticker_per_day": not bool(DIAGNOSTIC_ALLOW_MULTI_TF_PER_DAY),
+            "diagnostic_allow_multi_tf_per_day": bool(DIAGNOSTIC_ALLOW_MULTI_TF_PER_DAY),
+            "r01_short_strong_headwind_diagnostic_block": False,
+        }
         _strip_chrono_bulk_arrays(chrono_data)
 
         # Resolve resume/start cursor BEFORE seeding histories so load_all_results()
