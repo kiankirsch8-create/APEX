@@ -12,10 +12,16 @@ from scalping.strategies.base import (
 )
 from scalping.strategies.bollinger import BollingerReversion
 from scalping.strategies.donchian import DonchianBreakout
+from scalping.strategies.ema_zscore import EmaZscoreReversion
+from scalping.strategies.grid_reversion import GridReversion
+from scalping.strategies.mean_anchor import MeanAnchorReversion
 
 REGISTRY: dict[str, type[Strategy]] = {
     BollingerReversion.name: BollingerReversion,
     DonchianBreakout.name: DonchianBreakout,
+    EmaZscoreReversion.name: EmaZscoreReversion,
+    GridReversion.name: GridReversion,
+    MeanAnchorReversion.name: MeanAnchorReversion,
 }
 
 
@@ -38,6 +44,9 @@ __all__ = [
     "CancelIntent",
     "CloseIntent",
     "DonchianBreakout",
+    "EmaZscoreReversion",
+    "GridReversion",
+    "MeanAnchorReversion",
     "ModifyIntent",
     "OrderIntent",
     "Strategy",

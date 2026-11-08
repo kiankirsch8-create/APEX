@@ -73,7 +73,11 @@ class OrderView:
 
 
 class BarWindow:
-    """Closed bars ``[0, end)``. Index ``end`` and beyond are not exposed."""
+    """Closed bars ``[0, end)``. Index ``end`` and beyond are not exposed.
+
+    ``volume`` is the M1 bid+ask volume already stored on the bar. Strategies
+    can read it for a later VWAP or volume filter. It is not required.
+    """
 
     def __init__(self, market, end: int):
         self._market = market
@@ -102,6 +106,13 @@ class BarWindow:
     def spread_close(self) -> np.ndarray:
         return self._view(self._market.spread_close)
 
+    @property
+    def volume(self) -> np.ndarray:
+        values = getattr(self._market, "volume", None)
+        if values is None:
+            return np.ones(self._end, dtype=np.float64)
+        return self._view(values)
+
     def _view(self, values: np.ndarray) -> np.ndarray:
         view = values[: self._end]
         try:
@@ -127,6 +138,13 @@ class BarContext:
     positions: tuple[PositionView, ...]
     pending: tuple[OrderView, ...]
     equity: float
+
+    @property
+    def volume(self) -> float:
+        """Bid+ask volume of this closed bar. The window carries the history."""
+        if len(self.window) == 0:
+            return 0.0
+        return float(self.window.volume[-1])
 
 
 class Strategy(ABC):

@@ -24,6 +24,7 @@ class MarketData:
     close: np.ndarray
     spread_close: np.ndarray
     spread_mean: np.ndarray
+    volume: np.ndarray
     tick_start: np.ndarray
     tick_end: np.ndarray
 
@@ -58,6 +59,10 @@ def build_market(ticks: pd.DataFrame, bars: pd.DataFrame) -> MarketData:
     keep = end > start
     if not np.any(keep):
         raise ValueError("no bar contains a tick")
+    if "volume" in bars.columns:
+        volume = bars["volume"].to_numpy(dtype=np.float64)
+    else:
+        volume = np.ones(len(bars), dtype=np.float64)
     return MarketData(
         tick_time=np.ascontiguousarray(tick_time),
         bid=np.ascontiguousarray(ticks["bid"].to_numpy(dtype=np.float64)),
@@ -69,6 +74,7 @@ def build_market(ticks: pd.DataFrame, bars: pd.DataFrame) -> MarketData:
         close=np.ascontiguousarray(bars["close"].to_numpy(dtype=np.float64)[keep]),
         spread_close=np.ascontiguousarray(bars["spread_close"].to_numpy(dtype=np.float64)[keep]),
         spread_mean=np.ascontiguousarray(bars["spread_mean"].to_numpy(dtype=np.float64)[keep]),
+        volume=np.ascontiguousarray(volume[keep]),
         tick_start=np.ascontiguousarray(start[keep].astype(np.int64)),
         tick_end=np.ascontiguousarray(end[keep].astype(np.int64)),
     )
