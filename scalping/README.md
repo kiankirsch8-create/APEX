@@ -50,9 +50,17 @@ cannot silently skip a morning. Download on a machine that can reach
 Dukascopy. Do not run the download in CI. The unit tests under
 `scalping/tests` use synthetic ticks and a local `.bi5` fixture.
 
+Dukascopy throttles a busy client with 503s and read timeouts. The downloader
+waits 0.3s between hourly requests and, on those errors, retries the same hour
+with jittered backoff (1s, 2s, 4s, … capped at 60s). An hour that still fails
+is logged and skipped. It is not written to the cache, so the next run asks
+only for the gaps. The process exits non-zero only when it downloaded nothing
+and at least one hour was missed.
+
 ```bash
 python -m scalping.data.pipeline download
 python -m scalping.data.pipeline download --pair EURUSD --block 2018-19
+python -m scalping.data.pipeline download --delay 0.3 --max-retries 6 --max-backoff 60
 python -m scalping.data.pipeline status
 ```
 

@@ -15,7 +15,7 @@ import sys
 from datetime import datetime, timezone
 
 from scalping.config import load_config
-from scalping.data.download import sync_symbol
+from scalping.data.download import FetchPolicy, run_exit_code, sync_symbol
 from scalping.data.store import iter_days, missing_days
 
 
@@ -34,6 +34,24 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--start", default=None, help="UTC date YYYY-MM-DD, overrides blocks")
     parser.add_argument("--end", default=None, help="UTC date YYYY-MM-DD, exclusive")
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=None,
+        help="Seconds to wait between hourly Dukascopy requests (default 0.3)",
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=None,
+        help="Extra attempts after a 503 or read timeout (default 6)",
+    )
+    parser.add_argument(
+        "--max-backoff",
+        type=float,
+        default=None,
+        help="Cap on the exponential retry wait, in seconds (default 60)",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -50,19 +68,32 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "status":
         return _status(pairs, windows, data_dir)
+    policy = FetchPolicy(
+        request_delay=cfg.request_delay if args.delay is None else args.delay,
+        max_retries=cfg.max_retries if args.max_retries is None else args.max_retries,
+        max_backoff=cfg.max_backoff if args.max_backoff is None else args.max_backoff,
+    )
+    reports = []
     for pair in pairs:
         for block_id, start, end in windows:
             logging.info("sync %s %s %s -> %s backend=%s", pair, block_id, start.date(), end.date(), args.backend)
-            report = sync_symbol(pair, start, end, data_dir, backend=args.backend)
+            report = sync_symbol(pair, start, end, data_dir, backend=args.backend, policy=policy)
+            reports.append(report)
             print(
                 f"{pair} {block_id}: fetched={report.fetched_hours} "
                 f"cached={report.cached_hours} empty={report.empty_hours} "
+                f"missed={len(report.missed_hours)} "
                 f"tick_days={report.tick_days_written} bar_days={report.bar_days_written} "
                 f"backend={report.backend}"
             )
             for note in report.notes:
                 print(f"  {note}")
-    return 0
+            for hour in report.missed_hours:
+                print(f"  missed {hour}")
+    missed = [hour for report in reports for hour in report.missed_hours]
+    if missed:
+        print(f"missed {len(missed)} hour(s); re-run the same command to fill the gaps")
+    return run_exit_code(reports)
 
 
 def _status(pairs, windows, data_dir) -> int:

@@ -6,6 +6,9 @@
   "commission_currency": "USD",
   "slippage_points": 2.0,
   "data_dir": "scalping_data",
+  "request_delay": 0.3,
+  "max_retries": 6,
+  "max_backoff": 60.0,
   "blocks": [
     {"id": "2018-19", "start": "2018-01-01", "end": "2019-01-01"},
     {"id": "2019-20", "start": "2019-01-01", "end": "2020-01-01"},

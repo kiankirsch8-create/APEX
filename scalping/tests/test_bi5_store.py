@@ -62,17 +62,17 @@ def test_cache_never_redownloads_and_skips_saturday(tmp_path):
             return encode_bi5([(10, 1.10000, 1.10014, 1.0, 1.0)], get_instrument(symbol).price_scale)
         return b""
 
-    first = sync_symbol("EURUSD", start, end, tmp_path, fetcher=fetcher)
+    first = sync_symbol("EURUSD", start, end, tmp_path, fetcher=fetcher, request_delay=0)
     assert first.fetched_hours == 2
     assert len(calls) == 2
-    second = sync_symbol("EURUSD", start, end, tmp_path, fetcher=fetcher)
+    second = sync_symbol("EURUSD", start, end, tmp_path, fetcher=fetcher, request_delay=0)
     assert second.fetched_hours == 0
     assert second.cached_hours == 2
     assert len(calls) == 2
 
     saturday = datetime(2018, 1, 6, tzinfo=timezone.utc)
     before = len(calls)
-    sync_symbol("EURUSD", saturday, saturday + timedelta(days=1), tmp_path, fetcher=fetcher)
+    sync_symbol("EURUSD", saturday, saturday + timedelta(days=1), tmp_path, fetcher=fetcher, request_delay=0)
     assert len(calls) == before
 
 
@@ -88,7 +88,7 @@ def test_full_day_is_materialized_once(tmp_path):
             )
         return b""
 
-    report = sync_symbol("USDJPY", start, end, tmp_path, fetcher=fetcher)
+    report = sync_symbol("USDJPY", start, end, tmp_path, fetcher=fetcher, request_delay=0)
     assert report.fetched_hours == 24
     assert report.tick_days_written == 1
     assert report.bar_days_written == 1
@@ -101,7 +101,7 @@ def test_full_day_is_materialized_once(tmp_path):
     assert bars.loc[0, "spread_open"] == pytest.approx(0.004)
     assert bars.loc[0, "spread_mean"] == pytest.approx((0.004 + 0.006) / 2)
     # A second sync must not fetch and must not rewrite the day.
-    again = sync_symbol("USDJPY", start, end, tmp_path, fetcher=fetcher)
+    again = sync_symbol("USDJPY", start, end, tmp_path, fetcher=fetcher, request_delay=0)
     assert again.fetched_hours == 0
     assert again.tick_days_written == 0
 

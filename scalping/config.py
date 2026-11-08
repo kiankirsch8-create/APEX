@@ -29,6 +29,9 @@ class ScalpingConfig:
     initial_equity: float
     data_dir: Path
     source_path: Path
+    request_delay: float = 0.3
+    max_retries: int = 6
+    max_backoff: float = 60.0
 
     def block(self, block_id: str) -> Block:
         for block in self.blocks:
@@ -72,4 +75,7 @@ def load_config(path: str | Path | None = None) -> ScalpingConfig:
         initial_equity=float(raw.get("initial_equity", 100_000.0)),
         data_dir=data_dir,
         source_path=source,
+        request_delay=float(raw.get("request_delay", 0.3)),
+        max_retries=int(raw.get("max_retries", 6)),
+        max_backoff=float(raw.get("max_backoff", 60.0)),
     )
