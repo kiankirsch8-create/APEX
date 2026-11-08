@@ -17,3 +17,6 @@ results/*
 logs/*
 !logs/.gitkeep
 config/budget.json
+
+# Scalping historical cache. Downloaded on a workstation, never in CI or git.
+scalping_data/
