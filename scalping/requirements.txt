@@ -1,0 +1,11 @@
+# Workstation dependencies for the scalping backtest. Not installed by APEX CI.
+# The Dukascopy download runs on a machine with network access to Dukascopy,
+# never in GitHub Actions.
+pandas>=2.2.0,<3
+numpy>=1.26.4,<3
+# pyarrow 19+ requires NumPy 2. Stay on 18.x so this installs next to APEX's NumPy 1.26.
+pyarrow>=15.0.0,<19
+requests>=2.32.0
+numba>=0.60.0
+# HTTP session (retries) and the optional --backend library tick feed.
+dukascopy-python>=6.0.0

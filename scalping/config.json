@@ -1,0 +1,17 @@
+{
+  "pairs": ["EURUSD", "GBPUSD", "USDJPY"],
+  "account_currency": "EUR",
+  "initial_equity": 100000.0,
+  "commission_per_lot_side": 3.5,
+  "commission_currency": "USD",
+  "slippage_points": 2.0,
+  "data_dir": "scalping_data",
+  "blocks": [
+    {"id": "2018-19", "start": "2018-01-01", "end": "2019-01-01"},
+    {"id": "2019-20", "start": "2019-01-01", "end": "2020-01-01"},
+    {"id": "2020-21", "start": "2020-01-01", "end": "2021-01-01"},
+    {"id": "2021-22", "start": "2021-01-01", "end": "2022-01-01"},
+    {"id": "2022-23", "start": "2022-01-01", "end": "2023-01-01"},
+    {"id": "2023-24", "start": "2023-01-01", "end": "2024-01-01"}
+  ]
+}
