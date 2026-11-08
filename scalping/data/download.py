@@ -3,8 +3,13 @@
 Default backend ``bi5`` fetches the public hourly ``.bi5`` files (bid, ask,
 volume). A file that already exists is never requested again, including hours
 the feed returns empty. HTTP uses ``dukascopy_python.create_session`` when that
-library is installed, so retries match the library. The URL itself is the one
-``duka`` builds when ``duka`` is installed.
+library is installed. The URL itself is the one ``duka`` builds when ``duka``
+is installed.
+
+Dukascopy answers a busy client with 503s and read timeouts. Those are not
+fatal: each hour is retried with exponential backoff and jitter, and an hour
+that still fails is recorded and skipped. The next run requests only the hours
+that are not already in the cache, so the gaps fill in.
 
 Backend ``library`` calls ``dukascopy_python.fetch_ticks`` instead. That path
 is the JSON feed (shorter ranges). Its parquet days are cached the same way.
@@ -13,7 +18,9 @@ is the JSON feed (shorter ranges). Its parquet days are cached the same way.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+import random
+import time
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -31,6 +38,69 @@ _UA = (
     "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 )
 
+# Statuses Dukascopy uses when it is throttling or briefly unhealthy.
+# 404 is not in this set: an empty hour is a successful response.
+TRANSIENT_STATUS = frozenset({429, 500, 502, 503, 504})
+
+_RETRYABLE_NAMES = frozenset(
+    {
+        "MaxRetryError",
+        "ReadTimeout",
+        "ReadTimeoutError",
+        "ConnectTimeout",
+        "ConnectTimeoutError",
+        "Timeout",
+        "TimeoutError",
+        "RetryError",
+        "ConnectionError",
+        "ProtocolError",
+        "ChunkedEncodingError",
+        "TransientFetchError",
+    }
+)
+
+
+@dataclass(frozen=True)
+class FetchPolicy:
+    """How politely, and how patiently, to ask Dukascopy for each hour.
+
+    ``request_delay`` is the pause between hourly requests. ``max_retries`` is
+    how many extra attempts follow the first one after a 503 or a read
+    timeout. The wait before retry ``n`` (0-based) is ``min(max_backoff,
+    2**n)`` seconds, multiplied by a jitter factor in ``[0.5, 1]``.
+    """
+
+    request_delay: float = 0.3
+    max_retries: int = 6
+    max_backoff: float = 60.0
+    initial_backoff: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.request_delay < 0:
+            raise ValueError("request_delay must be >= 0")
+        if self.max_retries < 0:
+            raise ValueError("max_retries must be >= 0")
+        if self.max_backoff <= 0:
+            raise ValueError("max_backoff must be > 0")
+        if self.initial_backoff <= 0:
+            raise ValueError("initial_backoff must be > 0")
+
+
+class TransientFetchError(Exception):
+    """Dukascopy throttled this hour or the socket timed out. Safe to retry."""
+
+    def __init__(self, message: str, *, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+
+class HourFailed(Exception):
+    """The hour was given up after backoff. The run continues with the next hour."""
+
+    def __init__(self, error: BaseException):
+        super().__init__(str(error))
+        self.error = error
+
 
 @dataclass
 class DownloadReport:
@@ -42,6 +112,7 @@ class DownloadReport:
     bar_days_written: int = 0
     backend: str = "bi5"
     notes: list[str] = field(default_factory=list)
+    missed_hours: list[str] = field(default_factory=list)
 
 
 def iter_hours(start: datetime, end: datetime, *, skip_saturday: bool = True):
@@ -55,31 +126,109 @@ def iter_hours(start: datetime, end: datetime, *, skip_saturday: bool = True):
 
 
 def open_session():
-    """Retrying HTTP session. Prefers ``dukascopy-python`` when it imports."""
+    """HTTP session with no hidden retries.
+
+    Prefers ``dukascopy-python`` when it imports. Status retries stay off:
+    urllib3's own retry raises ``MaxRetryError`` and aborts the hour before
+    this module can back off. 503s and read timeouts are retried in
+    :func:`fetch_with_backoff`.
+    """
     try:
         import dukascopy_python as dk
 
-        return dk.create_session(retries=5), "dukascopy-python"
+        return dk.create_session(retries=0), "dukascopy-python"
     except Exception:
         import requests
-        from requests.adapters import HTTPAdapter
-        from urllib3.util.retry import Retry
 
-        session = requests.Session()
-        retry = Retry(
-            total=5,
-            connect=5,
-            read=5,
-            status=5,
-            backoff_factor=0.4,
-            status_forcelist=(429, 500, 502, 503, 504),
-            allowed_methods=frozenset({"GET"}),
-            respect_retry_after_header=True,
-        )
-        adapter = HTTPAdapter(max_retries=retry)
-        session.mount("https://", adapter)
-        session.mount("http://", adapter)
-        return session, "requests"
+        return requests.Session(), "requests"
+
+
+def is_retryable(exc: BaseException) -> bool:
+    """True for 503s, read timeouts, and the MaxRetryError those used to raise."""
+    if isinstance(exc, TransientFetchError):
+        return True
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(exc, "status", None)
+    if isinstance(status, int) and status in TRANSIENT_STATUS:
+        return True
+    if type(exc).__name__ in _RETRYABLE_NAMES:
+        return True
+    text = str(exc).lower()
+    if "read timed out" in text or "read timeout" in text or "max retries" in text:
+        return True
+    cause = exc.__cause__
+    if cause is not None and cause is not exc and is_retryable(cause):
+        return True
+    return False
+
+
+def backoff_seconds(
+    attempt: int,
+    *,
+    initial: float = 1.0,
+    max_backoff: float = 60.0,
+    uniform=None,
+) -> float:
+    """Wait before retry ``attempt`` (0 → ~1s, 1 → ~2s, 2 → ~4s, capped).
+
+    Jitter draws a factor in ``[0.5, 1]`` so the wait never exceeds the
+    schedule. Pass ``uniform`` (same signature as ``random.uniform``) to pin it.
+    """
+    raw = min(float(max_backoff), float(initial) * (2 ** int(attempt)))
+    if uniform is None:
+        factor = random.uniform(0.5, 1.0)
+    else:
+        factor = float(uniform(0.5, 1.0))
+    return raw * factor
+
+
+def fetch_with_backoff(call, policy: FetchPolicy, *, sleep=time.sleep, uniform=None):
+    """Call ``call`` until it returns or the retry budget is spent.
+
+    A non-retryable error, or a retryable error after ``max_retries``, raises
+    :class:`HourFailed` instead of escaping as a raw HTTP error.
+    """
+    last: BaseException | None = None
+    for attempt in range(policy.max_retries + 1):
+        try:
+            return call()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            last = exc
+            if not is_retryable(exc) or attempt >= policy.max_retries:
+                raise HourFailed(exc) from exc
+            wait = backoff_seconds(
+                attempt,
+                initial=policy.initial_backoff,
+                max_backoff=policy.max_backoff,
+                uniform=uniform,
+            )
+            log.warning(
+                "Dukascopy throttled this hour (%s); retry %s/%s in %.1fs",
+                exc,
+                attempt + 1,
+                policy.max_retries,
+                wait,
+            )
+            if wait > 0:
+                sleep(wait)
+    raise HourFailed(last or TransientFetchError("hour failed"))
+
+
+def run_exit_code(reports: list[DownloadReport]) -> int:
+    """Non-zero only when the run downloaded nothing and hours were missed.
+
+    A partial download (some hours saved, some missed) exits 0 so a caller can
+    keep the bytes and re-run for the gaps. A cache-only run with no misses
+    also exits 0.
+    """
+    fetched = sum(report.fetched_hours for report in reports)
+    missed = sum(len(report.missed_hours) for report in reports)
+    if missed and fetched == 0:
+        return 1
+    return 0
 
 
 def resolve_bi5_url(symbol: str, hour: datetime) -> str:
@@ -100,28 +249,41 @@ def resolve_bi5_url(symbol: str, hour: datetime) -> str:
 
 
 def fetch_bi5_http(symbol: str, hour: datetime, session) -> bytes:
-    """GET one hour. Empty body and 404 are valid (no ticks)."""
-    import requests
+    """GET one hour once across the known hosts.
 
+    Empty body and 404 are valid (no ticks) and return ``b""``. A 503 or a
+    read timeout raises :class:`TransientFetchError` so the caller can back
+    off and try the same hour again. Nothing is written here.
+    """
     headers = {"User-Agent": _UA}
     urls = [resolve_bi5_url(symbol, hour)]
     for host in BI5_HOSTS:
         alt = bi5_url(symbol, hour, host=host)
         if alt not in urls:
             urls.append(alt)
-    last_error: Exception | None = None
+    last_error: BaseException | None = None
     for url in urls:
         try:
             response = session.get(url, headers=headers, timeout=45)
-        except requests.RequestException as exc:
-            last_error = exc
-            continue
+        except Exception as exc:
+            if is_retryable(exc):
+                last_error = TransientFetchError(str(exc))
+                continue
+            raise
         if response.status_code == 404:
             return b""
-        if response.status_code != 200:
-            last_error = requests.HTTPError(f"{response.status_code} for {url}")
+        if response.status_code == 200:
+            return response.content or b""
+        if response.status_code in TRANSIENT_STATUS:
+            last_error = TransientFetchError(
+                f"{response.status_code} for {url}",
+                status=response.status_code,
+            )
             continue
-        return response.content or b""
+        last_error = TransientFetchError(
+            f"{response.status_code} for {url}",
+            status=response.status_code,
+        )
     if last_error is not None:
         raise last_error
     return b""
@@ -137,15 +299,24 @@ def sync_symbol(
     fetcher=None,
     skip_saturday: bool = True,
     session=None,
+    policy: FetchPolicy | None = None,
+    request_delay: float | None = None,
+    max_retries: int | None = None,
+    max_backoff: float | None = None,
+    sleep=time.sleep,
+    uniform=None,
 ) -> DownloadReport:
     """Cache every hour in the window, then write tick and M1 parquet days.
 
     ``fetcher(symbol, hour) -> bytes`` replaces HTTP. Tests use it. Production
-    leaves it ``None``.
+    leaves it ``None``. An hour that still fails after backoff is listed on
+    ``report.missed_hours`` and is not cached, so the next run tries it again.
+    Hours already on disk are not requested.
     """
     symbol = symbol.upper()
     get_instrument(symbol)  # fail fast on an unknown pair
     data_dir = Path(data_dir)
+    policy = _policy(policy, request_delay, max_retries, max_backoff)
     report = DownloadReport(symbol=symbol, backend=backend)
     if backend == "library":
         _sync_library(symbol, start, end, data_dir, report)
@@ -164,6 +335,7 @@ def sync_symbol(
             return fetch_bi5_http(sym, hour, session)
 
     hours = list(iter_hours(start, end, skip_saturday=skip_saturday))
+    requested = False
     for hour in hours:
         path = data_dir / cache_relpath(symbol, hour)
         if path.exists():
@@ -171,7 +343,21 @@ def sync_symbol(
             if path.stat().st_size == 0:
                 report.empty_hours += 1
             continue
-        payload = fetcher(symbol, hour)
+        if requested and policy.request_delay > 0:
+            sleep(policy.request_delay)
+        requested = True
+        try:
+            payload = fetch_with_backoff(
+                lambda hour=hour: fetcher(symbol, hour),
+                policy,
+                sleep=sleep,
+                uniform=uniform,
+            )
+        except HourFailed as exc:
+            key = _hour_key(hour)
+            report.missed_hours.append(key)
+            log.error("%s %s failed after backoff: %s", symbol, key, exc.error)
+            continue
         if payload is None:
             payload = b""
         _atomic_bytes(path, payload)
@@ -181,8 +367,28 @@ def sync_symbol(
         if report.fetched_hours and report.fetched_hours % 500 == 0:
             log.info("%s fetched %s hours", symbol, report.fetched_hours)
 
+    if report.missed_hours:
+        report.notes.append(f"missed {len(report.missed_hours)} hour(s)")
     _materialize_days(symbol, start, end, data_dir, report, skip_saturday=skip_saturday)
     return report
+
+
+def _policy(policy, request_delay, max_retries, max_backoff) -> FetchPolicy:
+    current = policy or FetchPolicy()
+    updates = {}
+    if request_delay is not None:
+        updates["request_delay"] = request_delay
+    if max_retries is not None:
+        updates["max_retries"] = max_retries
+    if max_backoff is not None:
+        updates["max_backoff"] = max_backoff
+    if not updates:
+        return current
+    return replace(current, **updates)
+
+
+def _hour_key(hour: datetime) -> str:
+    return _as_utc(hour).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _materialize_days(
