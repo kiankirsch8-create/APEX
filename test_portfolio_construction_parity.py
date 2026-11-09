@@ -207,29 +207,31 @@ def test_open_positions_seed_currency_pools() -> None:
 
 
 def test_open_v76_positions_uses_magic_and_comment(monkeypatch) -> None:
-    """Counting bug fix: enumerator matches APEX_V76_MAGIC + ORDER_COMMENT_V76."""
+    """Comment-primary match (MCP) with magic fallback (legacy IPC)."""
     positions = [
         SimpleNamespace(magic=760761, comment="APEX76P", ticket=1, symbol="AUDJPYm"),
-        SimpleNamespace(magic=760761, comment="APEX", ticket=2, symbol="USDCHFm"),  # wrong comment
-        SimpleNamespace(magic=107356887, comment="APEX76P", ticket=3, symbol="EURUSDm"),  # wrong magic
+        SimpleNamespace(magic=760761, comment="APEX", ticket=2, symbol="USDCHFm"),  # magic fallback
+        SimpleNamespace(magic=0, comment="APEX76P", ticket=3, symbol="EURUSDm"),  # MCP: comment only
         SimpleNamespace(magic=760761, comment="APEX76P", ticket=4, symbol="CADJPYm"),
+        SimpleNamespace(magic=0, comment="OTHER", ticket=5, symbol="NZDUSDm"),  # neither
     ]
     mt5 = MagicMock()
     mt5.positions_get.return_value = positions
 
-    # Direct apex_trader parametrized call
+    # Direct apex_trader parametrized call — comment OR magic
     found = at.open_apex_positions(mt5, magic=760761, comment="APEX76P")
-    assert {int(p.ticket) for p in found} == {1, 4}
+    assert {int(p.ticket) for p in found} == {1, 2, 3, 4}
 
     # Live helper
     monkeypatch.setattr(v76, "APEX_V76_MAGIC", 760761)
     monkeypatch.setattr(v76, "ORDER_COMMENT_V76", "APEX76P")
     found2 = v76.open_v76_positions(mt5)
-    assert {int(p.ticket) for p in found2} == {1, 4}
+    assert {int(p.ticket) for p in found2} == {1, 2, 3, 4}
 
-    # Legacy default still requires APEX magic+comment (no false positives)
+    # Legacy default: comment "APEX" OR magic APEX_MAGIC — only ticket 2 (comment APEX)
+    # matches via comment; none have APEX_MAGIC.
     legacy = at.open_apex_positions(mt5)
-    assert legacy == []
+    assert {int(p.ticket) for p in legacy} == {2}
 
 
 def test_bt_currency_cap_body_matches_shared_helper() -> None:

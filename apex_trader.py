@@ -719,9 +719,7 @@ def resolve_apex_hedged_same_pair(mt5: Any) -> None:
     """
     by_base: dict[str, dict[str, list[Any]]] = defaultdict(lambda: {"LONG": [], "SHORT": []})
     for p in mt5.positions_get() or []:
-        if int(getattr(p, "magic", 0) or 0) != APEX_MAGIC:
-            continue
-        if (p.comment or "").strip() != ORDER_COMMENT:
+        if not position_matches_apex(p):
             continue
         base = position_forex_base6(str(p.symbol))
         if not base:
@@ -808,7 +806,11 @@ def finalize_closed_positions(mt5: Any, st: dict[str, Any]) -> dict[str, Any]:
     try:
         import MetaTrader5 as mt5m
 
-        open_ids = {int(p.ticket) for p in (mt5.positions_get() or []) if int(getattr(p, "magic", 0) or 0) == APEX_MAGIC}
+        open_ids = {
+            int(p.ticket)
+            for p in (mt5.positions_get() or [])
+            if position_matches_apex(p)
+        }
         meta = ticket_meta_load()
         changed = False
         lc = dict(st.get("loss_consec") or {})
@@ -863,16 +865,12 @@ def update_closed_trades_and_losses(mt5: Any, st: dict[str, Any]) -> dict[str, A
 # ---------------------------------------------------------------------------
 
 
+def _use_mcp_mt5() -> bool:
+    """Single switch: APEX_USE_MCP → import apex_mcp as mt5 (legacy IPC times out on build 6272)."""
+    return os.environ.get("APEX_USE_MCP", "false").strip().lower() in ("1", "true", "yes", "on")
+
+
 def mt5_connect() -> Any | None:
-    try:
-        import MetaTrader5 as mt5
-    except ImportError:
-        log_msg("[MT5] pip install MetaTrader5 (Windows)", "error")
-        return None
-    pw = (os.environ.get("APEX_MT5_PASSWORD") or os.environ.get("MT5_PASSWORD") or "").strip()
-    if not pw:
-        log_msg("[MT5] Set APEX_MT5_PASSWORD", "error")
-        return None
     # FTMO gate: challenge login blocked until clean demo unlock exists.
     login = int(MT5_LOGIN)
     server = str(MT5_SERVER)
@@ -888,6 +886,33 @@ def mt5_connect() -> Any | None:
         return None
     except Exception as e:  # noqa: BLE001
         log_msg(f"[MT5] FTMO demo gate error: {e}", "error")
+        return None
+
+    if _use_mcp_mt5():
+        try:
+            import apex_mcp as mt5
+        except ImportError as e:
+            log_msg(f"[MT5] apex_mcp import failed: {e}", "error")
+            return None
+        # Terminal is already logged in; MCP handshake ignores login/pw/server.
+        if not mt5.initialize() or not mt5.login():
+            log_msg(f"[MT5] MCP connect fail {mt5.last_error()}", "error")
+            try:
+                mt5.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+            return None
+        log_msg(f"[MT5] MCP connected (login={login} server={server} via MCP_URL)", "info")
+        return mt5
+
+    try:
+        import MetaTrader5 as mt5
+    except ImportError:
+        log_msg("[MT5] pip install MetaTrader5 (Windows)", "error")
+        return None
+    pw = (os.environ.get("APEX_MT5_PASSWORD") or os.environ.get("MT5_PASSWORD") or "").strip()
+    if not pw:
+        log_msg("[MT5] Set APEX_MT5_PASSWORD", "error")
         return None
     path = os.environ.get("APEX_MT5_PATH") or os.environ.get("MT5_PATH")
     kw: dict[str, Any] = {"login": login, "password": pw, "server": server}
@@ -1001,6 +1026,29 @@ def clamp_sl_sell_live(mt5: Any, sym: str, ask: float, want_sl: float) -> float:
     return max(float(want_sl), min_sl)
 
 
+def position_matches_apex(
+    p: Any,
+    *,
+    magic: int | None = None,
+    comment: str | None = None,
+) -> bool:
+    """
+    Match an APEX position.
+
+    Primary: comment (MCP order tools cannot set magic — comment is ``APEX76P``).
+    Fallback: magic equality (legacy IPC tickets that still carry APEX_MAGIC).
+    """
+    mag = int(APEX_MAGIC if magic is None else magic)
+    com = str(ORDER_COMMENT if comment is None else comment).strip()
+    pc = str(getattr(p, "comment", "") or "").strip()
+    pm = int(getattr(p, "magic", 0) or 0)
+    if com and pc == com:
+        return True
+    if pm == mag:
+        return True
+    return False
+
+
 def open_apex_positions(
     mt5: Any,
     *,
@@ -1011,18 +1059,13 @@ def open_apex_positions(
     Enumerate open positions for this engine.
 
     Optional ``magic`` / ``comment`` override module defaults so v76 callers can
-    select APEX_V76_MAGIC + ORDER_COMMENT_V76 without the fragile global swap
-    that previously left comment stuck on legacy ``\"APEX\"`` (caps saw 0).
+    select APEX_V76_MAGIC + ORDER_COMMENT_V76. Matching is comment-first (MCP
+    cannot set magic) with magic as fallback for legacy IPC tickets.
     """
-    mag = int(APEX_MAGIC if magic is None else magic)
-    com = str(ORDER_COMMENT if comment is None else comment).strip()
     out: list[Any] = []
     for p in mt5.positions_get() or []:
-        if int(getattr(p, "magic", 0) or 0) != mag:
-            continue
-        if str(getattr(p, "comment", "") or "").strip() != com:
-            continue
-        out.append(p)
+        if position_matches_apex(p, magic=magic, comment=comment):
+            out.append(p)
     return out
 
 
@@ -1452,10 +1495,7 @@ def order_send_live(
     ticket = None
     candidates: list[Any] = []
     for p in mt5.positions_get(symbol=sym) or []:
-        if int(getattr(p, "magic", 0) or 0) != APEX_MAGIC:
-            continue
-        pc = (p.comment or "").strip()
-        if pc and pc != ORDER_COMMENT:
+        if not position_matches_apex(p):
             continue
         candidates.append(p)
     if candidates:
@@ -1536,7 +1576,7 @@ def manage_trailing_live(mt5: Any) -> None:
     raw = mt5.positions_get() or []
     managed: list[Any] = []
     for pos in raw:
-        if int(getattr(pos, "magic", 0) or 0) != APEX_MAGIC:
+        if not position_matches_apex(pos):
             continue
         k = str(int(pos.ticket))
         if not isinstance(meta.get(k), dict):
