@@ -204,8 +204,9 @@ def test_positions_get_parses_rows(monkeypatch) -> None:
     assert rows[0].ticket == 101
     assert rows[0].type == mcp.ORDER_TYPE_BUY
     assert rows[0].comment == "APEX76P"
-    assert rows[0].magic == 0
+    assert rows[0].magic == mcp.SYNTH_MAGIC_APEX76P  # magic 0 + APEX76P → synthesised
     assert rows[1].type == mcp.ORDER_TYPE_SELL
+    assert rows[1].magic == 0  # OTHER comment — not synthesised
     only = mcp.positions_get(symbol="EURUSD")
     assert only is not None and len(only) == 1 and only[0].ticket == 101
 
@@ -261,3 +262,106 @@ def test_constants_match_metatrader5_ints() -> None:
     assert mcp.ORDER_TIME_GTC == 0
     assert mcp.ORDER_FILLING_IOC == 1
     assert mcp.DEAL_ENTRY_OUT == 1
+
+
+def test_real_mcp_payload_shapes(monkeypatch) -> None:
+    """Real terminal MCP nests account, uses position_id/action, ISO chart times."""
+    from datetime import datetime, timezone
+
+    iso_bar = "2024-06-15T12:00:00Z"
+    expected_epoch = int(datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc).timestamp())
+
+    def fake_call_tool(name: str, args: dict[str, Any] | None = None) -> Any:
+        if name == "get_trading_account_info":
+            return {
+                "account": {
+                    "balance": 98542.17,
+                    "equity": 99100.5,
+                    "margin_free": 87000.0,
+                    "currency": "USD",
+                    "login": 1510123456,
+                    "leverage": 100,
+                    "margin": 1200.0,
+                    "profit": 558.33,
+                }
+            }
+        if name == "get_trading_open_positions":
+            return {
+                "positions": [
+                    {
+                        "position_id": 424242,
+                        "symbol": "EURUSDm",
+                        "action": "buy",
+                        "volume": 0.15,
+                        "price_open": 1.08421,
+                        "sl": 1.08000,
+                        "tp": 1.09200,
+                        "comment": "APEX76P",
+                        "magic": 0,
+                        "profit": 12.4,
+                        "create_time": "2024-06-15T10:30:00Z",
+                    }
+                ]
+            }
+        if name == "get_chart_history":
+            return {
+                "history": [
+                    {
+                        "time": iso_bar,
+                        "open": 1.0800,
+                        "high": 1.0850,
+                        "low": 1.0780,
+                        "close": 1.0830,
+                        "volume": 1200,
+                    }
+                ]
+            }
+        if name == "get_marketwatch_symbols":
+            return {
+                "symbols": [
+                    {
+                        "symbol": "EURUSDm",
+                        "digits": 5,
+                        "point": 0.00001,
+                        "trade_stops_level": 0,
+                        "volume_min": 0.01,
+                        "volume_max": 100.0,
+                        "volume_step": 0.01,
+                        "tick_value": 1.0,
+                        "contract_size": 100000,
+                        "trade_filling_mode": "IOC|FOK",
+                        "bid": 1.08420,
+                        "ask": 1.08425,
+                    }
+                ]
+            }
+        return {}
+
+    monkeypatch.setattr(mcp, "call_tool", fake_call_tool)
+
+    ai = mcp.account_info()
+    assert ai is not None
+    assert ai.balance == 98542.17
+    assert ai.equity == 99100.5
+    assert ai.login == 1510123456
+
+    positions = mcp.positions_get()
+    assert positions is not None and len(positions) == 1
+    pos = positions[0]
+    assert pos.ticket == 424242  # position_id
+    assert pos.type == mcp.ORDER_TYPE_BUY  # action=buy
+    assert pos.magic == 760761  # synthesised from APEX76P + magic 0
+    assert pos.comment == "APEX76P"
+    assert pos.time == int(datetime(2024, 6, 15, 10, 30, 0, tzinfo=timezone.utc).timestamp())
+
+    bars = mcp.copy_rates_from_pos("EURUSDm", mcp.TIMEFRAME_H4, 0, 1)
+    assert bars is not None and len(bars) == 1
+    assert bars[0]["time"] == expected_epoch
+    assert bars[0]["open"] == 1.0800
+    assert bars[0]["close"] == 1.0830
+
+    info = mcp.symbol_info("EURUSDm")
+    assert info is not None
+    assert info.trade_tick_value == 1.0
+    assert info.trade_contract_size == 100000.0
+    assert info.filling_mode == 3  # IOC|FOK → bits 1|2

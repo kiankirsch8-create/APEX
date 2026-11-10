@@ -16,6 +16,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
 
@@ -78,6 +79,8 @@ TIMEFRAME_MN1 = 49153
 
 # MCP cannot set magic — APEX identifies its book via comment.
 DEFAULT_ORDER_COMMENT = "APEX76P"
+# When MCP returns magic=0 + APEX76P comment, synthesise private v76 magic.
+SYNTH_MAGIC_APEX76P = 760761
 
 _PROTOCOL_VERSION = "2025-06-18"
 _lock = threading.RLock()
@@ -291,12 +294,80 @@ def _pick(d: MappingLike, *keys: str, default: Any = None) -> Any:
 MappingLike = Any
 
 
+def _to_epoch(value: Any) -> int:
+    """Coerce MCP time (epoch int/float/str or ISO-8601) to unix seconds."""
+    if value is None or value == "":
+        return 0
+    if isinstance(value, (int, float)):
+        # Heuristic: ms timestamps
+        v = float(value)
+        if v > 1e12:
+            v /= 1000.0
+        return int(v)
+    s = str(value).strip()
+    if not s:
+        return 0
+    try:
+        v = float(s)
+        if v > 1e12:
+            v /= 1000.0
+        return int(v)
+    except ValueError:
+        pass
+    s2 = s.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(s2)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except ValueError:
+        return 0
+
+
+def _unwrap_account_payload(raw: Any) -> dict[str, Any]:
+    """Real MCP nests fields under ``{\"account\": {...}}``."""
+    d = _as_dict(raw)
+    if not d and isinstance(raw, dict):
+        d = raw
+    nested = d.get("account") if isinstance(d, dict) else None
+    if isinstance(nested, dict):
+        return nested
+    return d if isinstance(d, dict) else {}
+
+
+def _coerce_filling_mode(raw: Any) -> int:
+    """Map MCP filling flags/strings to MetaTrader5 filling_mode bitmask."""
+    if raw is None:
+        return ORDER_FILLING_IOC  # bit 2 in MT5 symbol_info.filling_mode often IOC-capable
+    if isinstance(raw, bool):
+        return ORDER_FILLING_IOC
+    if isinstance(raw, (int, float)):
+        return int(raw)
+    s = str(raw).strip().upper()
+    if not s:
+        return 1
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    bits = 0
+    if "FOK" in s:
+        bits |= 1  # ORDER_FILLING_FOK flag in symbol_info.filling_mode
+    if "IOC" in s:
+        bits |= 2
+    if "RETURN" in s:
+        bits |= 4
+    return bits or 1
+
+
 def account_info() -> SimpleNamespace | None:
     try:
         raw = call_tool("get_trading_account_info", {})
-        d = _as_dict(raw)
-        if not d and isinstance(raw, dict):
-            d = raw
+        d = _unwrap_account_payload(raw)
+        login_raw = _pick(d, "login", "login_id", "account_id", default=0)
+        # Avoid treating nested account dict as login when unwrapping failed partially
+        if isinstance(login_raw, dict):
+            login_raw = _pick(login_raw, "login", default=0)
         return _ns(
             balance=float(_pick(d, "balance", default=0) or 0),
             equity=float(_pick(d, "equity", default=0) or 0),
@@ -304,7 +375,7 @@ def account_info() -> SimpleNamespace | None:
             margin_free=float(_pick(d, "margin_free", "free_margin", "marginFree", default=0) or 0),
             margin_level=float(_pick(d, "margin_level", "marginLevel", default=0) or 0),
             currency=str(_pick(d, "currency", default="") or ""),
-            login=int(_pick(d, "login", "account", default=0) or 0),
+            login=int(login_raw or 0),
             server=str(_pick(d, "server", default="") or ""),
             leverage=int(_pick(d, "leverage", default=0) or 0),
             profit=float(_pick(d, "profit", default=0) or 0),
@@ -384,12 +455,26 @@ def symbol_info(symbol: str) -> SimpleNamespace | None:
         d = _marketwatch_symbol(symbol)
         if not d:
             return None
+        # Real MCP may nest trading conditions under "symbol" / "info" / "trade"
+        for nest_key in ("symbol", "info", "trade", "properties"):
+            nested = d.get(nest_key) if isinstance(d, dict) else None
+            if isinstance(nested, dict) and (
+                "digits" in nested or "point" in nested or "volume_min" in nested or "tick_value" in nested
+            ):
+                # Keep top-level name/bid/ask; merge nested trade fields
+                merged = dict(d)
+                merged.update(nested)
+                d = merged
+                break
         point = float(_pick(d, "point", default=0) or 0)
         digits = int(_pick(d, "digits", default=5) or 5)
         if point <= 0:
             point = 10 ** (-digits)
+        name_raw = _pick(d, "symbol", "name", default=symbol)
+        if isinstance(name_raw, dict):
+            name_raw = _pick(name_raw, "name", "symbol", default=symbol)
         return _ns(
-            name=str(_pick(d, "symbol", "name", default=symbol) or symbol),
+            name=str(name_raw or symbol),
             digits=digits,
             point=point,
             trade_stops_level=int(_pick(d, "trade_stops_level", "stops_level", "stopsLevel", default=0) or 0),
@@ -406,8 +491,8 @@ def symbol_info(symbol: str) -> SimpleNamespace | None:
             trade_contract_size=float(
                 _pick(d, "trade_contract_size", "contract_size", "contractSize", default=100000) or 100000
             ),
-            filling_mode=int(
-                _pick(d, "filling_mode", "trade_filling_mode", "tradeFillingMode", default=1) or 1
+            filling_mode=_coerce_filling_mode(
+                _pick(d, "filling_mode", "trade_filling_mode", "tradeFillingMode", default=1)
             ),
             visible=True,
         )
@@ -427,26 +512,46 @@ def symbol_select(symbol: str, _enable: bool = True) -> bool:
 
 
 def _parse_position(row: dict[str, Any]) -> SimpleNamespace:
-    typ_raw = _pick(row, "type", "position_type", "order_type", default=0)
+    # Real MCP uses ``action`` (buy/sell) and ``position_id`` instead of type/ticket.
+    typ_raw = _pick(row, "action", "type", "position_type", "order_type", "side", default=0)
     if isinstance(typ_raw, str):
         t = typ_raw.strip().lower()
-        typ = ORDER_TYPE_BUY if t in ("buy", "long", "0") else ORDER_TYPE_SELL
+        typ = ORDER_TYPE_BUY if t in ("buy", "long", "0", "position_type_buy") else ORDER_TYPE_SELL
     else:
         typ = int(typ_raw or 0)
+    ticket = int(
+        _pick(row, "position_id", "ticket", "position", "position_ticket", "id", default=0) or 0
+    )
+    comment = str(_pick(row, "comment", default="") or "").strip()
+    magic = int(_pick(row, "magic", "magic_number", "magicNumber", default=0) or 0)
+    # MCP order tools cannot set magic — synthesise for APEX76P book.
+    if magic == 0 and comment == DEFAULT_ORDER_COMMENT:
+        magic = SYNTH_MAGIC_APEX76P
     return _ns(
-        ticket=int(_pick(row, "ticket", "position", "position_ticket", "id", default=0) or 0),
+        ticket=ticket,
         symbol=str(_pick(row, "symbol", default="") or ""),
         type=typ,
         volume=float(_pick(row, "volume", "lots", default=0) or 0),
-        price_open=float(_pick(row, "price_open", "open_price", "priceOpen", "openPrice", default=0) or 0),
+        price_open=float(
+            _pick(
+                row,
+                "price_open",
+                "open_price",
+                "priceOpen",
+                "openPrice",
+                "price",
+                default=0,
+            )
+            or 0
+        ),
         sl=float(_pick(row, "sl", "stop_loss", "stopLoss", default=0) or 0),
         tp=float(_pick(row, "tp", "take_profit", "takeProfit", default=0) or 0),
-        comment=str(_pick(row, "comment", default="") or ""),
-        magic=int(_pick(row, "magic", "magic_number", "magicNumber", default=0) or 0),
+        comment=comment,
+        magic=magic,
         profit=float(_pick(row, "profit", default=0) or 0),
         swap=float(_pick(row, "swap", default=0) or 0),
-        time=int(_pick(row, "time", "open_time", default=0) or 0),
-        identifier=int(_pick(row, "identifier", "ticket", default=0) or 0),
+        time=_to_epoch(_pick(row, "create_time", "time", "open_time", "time_create", default=0)),
+        identifier=int(_pick(row, "identifier", "position_id", "ticket", default=ticket) or ticket),
     )
 
 
@@ -465,7 +570,9 @@ def positions_get(symbol: str | None = None, ticket: int | None = None) -> tuple
                 if isinstance(v, list):
                     rows = [r for r in v if isinstance(r, dict)]
                     break
-            if not rows and ("ticket" in raw or "symbol" in raw):
+            if not rows and (
+                "ticket" in raw or "symbol" in raw or "position_id" in raw or "action" in raw
+            ):
                 rows = [raw]
         out = [_parse_position(r) for r in rows]
         if symbol:
@@ -565,7 +672,8 @@ def copy_rates_from_pos(symbol: str, timeframe: int, start_pos: int, count: int)
         if isinstance(raw, list):
             rows = raw
         elif isinstance(raw, dict):
-            for key in ("bars", "rates", "candles", "data", "history"):
+            # Prefer real MCP ``history`` key; also accept bars/rates/candles/data.
+            for key in ("history", "bars", "rates", "candles", "data"):
                 v = raw.get(key)
                 if isinstance(v, list):
                     rows = v
@@ -576,7 +684,7 @@ def copy_rates_from_pos(symbol: str, timeframe: int, start_pos: int, count: int)
                 continue
             out.append(
                 {
-                    "time": int(_pick(r, "time", "t", default=0) or 0),
+                    "time": _to_epoch(_pick(r, "time", "t", default=0)),
                     "open": float(_pick(r, "open", "o", default=0) or 0),
                     "high": float(_pick(r, "high", "h", default=0) or 0),
                     "low": float(_pick(r, "low", "l", default=0) or 0),
@@ -743,4 +851,5 @@ __all__ = [
     "TIMEFRAME_D1",
     "TIMEFRAME_W1",
     "DEFAULT_ORDER_COMMENT",
+    "SYNTH_MAGIC_APEX76P",
 ]
