@@ -16,7 +16,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
 
@@ -429,6 +429,30 @@ def _marketwatch_symbol(symbol: str) -> dict[str, Any]:
     return {}
 
 
+_TICK_VALUE_CACHE: dict[str, float] = {}
+
+
+def _calc_tick_value(symbol: str, price: float, tick_size: float) -> float:
+    """Real MCP returns trade_tick_value=0 — compute via profit of 1 lot over 1 tick."""
+    try:
+        if price <= 0 or tick_size <= 0:
+            return 0.0
+        r = call_tool(
+            "trade_order_calc_profit",
+            {
+                "type": "buy",
+                "symbol": symbol,
+                "volume": 1.0,
+                "price_open": float(price),
+                "price_close": float(price) + float(tick_size),
+            },
+        )
+        d = r if isinstance(r, dict) else _as_dict(r)
+        return abs(float(_pick(d, "profit", default=0) or 0))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 def symbol_info_tick(symbol: str) -> SimpleNamespace | None:
     try:
         d = _marketwatch_symbol(symbol)
@@ -473,6 +497,19 @@ def symbol_info(symbol: str) -> SimpleNamespace | None:
         name_raw = _pick(d, "symbol", "name", default=symbol)
         if isinstance(name_raw, dict):
             name_raw = _pick(name_raw, "name", "symbol", default=symbol)
+        tick_size = float(_pick(d, "trade_tick_size", "tick_size", "tickSize", default=0) or 0) or point
+        tick_value = float(_pick(d, "trade_tick_value", "tick_value", "tickValue", default=0) or 0)
+        # Live MCP feed returns trade_tick_value=0 → bad_tick_value kills all sizing.
+        if tick_value <= 0:
+            cached = _TICK_VALUE_CACHE.get(symbol, 0.0)
+            if cached > 0:
+                tick_value = cached
+            else:
+                px = float(_pick(d, "bid", default=0) or 0) or float(_pick(d, "ask", default=0) or 0)
+                tv = _calc_tick_value(symbol, px, tick_size)
+                if tv > 0:
+                    tick_value = tv
+                    _TICK_VALUE_CACHE[symbol] = tv
         return _ns(
             name=str(name_raw or symbol),
             digits=digits,
@@ -482,12 +519,8 @@ def symbol_info(symbol: str) -> SimpleNamespace | None:
             volume_min=float(_pick(d, "volume_min", "min_volume", "volumeMin", default=0.01) or 0.01),
             volume_max=float(_pick(d, "volume_max", "max_volume", "volumeMax", default=100.0) or 100.0),
             volume_step=float(_pick(d, "volume_step", "volumeStep", default=0.01) or 0.01),
-            trade_tick_value=float(
-                _pick(d, "trade_tick_value", "tick_value", "tickValue", default=0) or 0
-            ),
-            trade_tick_size=float(
-                _pick(d, "trade_tick_size", "tick_size", "tickSize", default=0) or point
-            ),
+            trade_tick_value=tick_value,
+            trade_tick_size=tick_size,
             trade_contract_size=float(
                 _pick(d, "trade_contract_size", "contract_size", "contractSize", default=100000) or 100000
             ),
@@ -653,19 +686,37 @@ _TF_TO_MCP: dict[int, str] = {
     TIMEFRAME_MN1: "MN1",
 }
 
+# Minutes per bar — used to build datetime_from/to for get_chart_history
+# (schema is additionalProperties:false; rejects timeframe/start_pos/count/bars).
+_TF_MINUTES: dict[int, int] = {
+    TIMEFRAME_M1: 1,
+    TIMEFRAME_M5: 5,
+    TIMEFRAME_M15: 15,
+    TIMEFRAME_M30: 30,
+    TIMEFRAME_H1: 60,
+    TIMEFRAME_H4: 240,
+    TIMEFRAME_D1: 1440,
+    TIMEFRAME_W1: 10080,
+    TIMEFRAME_MN1: 43200,
+}
+
 
 def copy_rates_from_pos(symbol: str, timeframe: int, start_pos: int, count: int) -> list[dict[str, Any]] | None:
     """Return list of bar dicts with keys time/open/high/low/close/tick_volume (dict-indexable)."""
     try:
-        tf_name = _TF_TO_MCP.get(int(timeframe), str(timeframe))
+        period = _TF_TO_MCP.get(int(timeframe), str(timeframe))
+        tf_min = _TF_MINUTES.get(int(timeframe), 60)
+        need = int(start_pos) + int(count)
+        span_min = need * tf_min * 3 + tf_min * 24 * 60
+        now = datetime.now(timezone.utc)
         raw = call_tool(
             "get_chart_history",
             {
                 "symbol": symbol,
-                "timeframe": tf_name,
-                "start_pos": int(start_pos),
-                "count": int(count),
-                "bars": int(count),
+                "period": period,
+                "datetime_from": (now - timedelta(minutes=span_min)).strftime("%Y-%m-%dT%H:%M:%S"),
+                "datetime_to": (now + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S"),
+                "limit": max(need + 50, 200),
             },
         )
         rows: list[Any] = []

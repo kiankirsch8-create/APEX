@@ -265,13 +265,21 @@ def test_constants_match_metatrader5_ints() -> None:
 
 
 def test_real_mcp_payload_shapes(monkeypatch) -> None:
-    """Real terminal MCP nests account, uses position_id/action, ISO chart times."""
+    """Real terminal MCP nests account, uses position_id/action, ISO chart times.
+
+    Also guards the two live regressions the first #182 tests missed:
+    - marketwatch tick_value=0 → must compute via trade_order_calc_profit
+    - get_chart_history must send period/datetime_from/datetime_to (not start_pos)
+    """
     from datetime import datetime, timezone
 
     iso_bar = "2024-06-15T12:00:00Z"
     expected_epoch = int(datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc).timestamp())
+    chart_calls: list[dict[str, Any]] = []
+    mcp._TICK_VALUE_CACHE.clear()
 
     def fake_call_tool(name: str, args: dict[str, Any] | None = None) -> Any:
+        a = dict(args or {})
         if name == "get_trading_account_info":
             return {
                 "account": {
@@ -304,6 +312,7 @@ def test_real_mcp_payload_shapes(monkeypatch) -> None:
                 ]
             }
         if name == "get_chart_history":
+            chart_calls.append(a)
             return {
                 "history": [
                     {
@@ -317,6 +326,7 @@ def test_real_mcp_payload_shapes(monkeypatch) -> None:
                 ]
             }
         if name == "get_marketwatch_symbols":
+            # Live feed: trade_tick_value is 0 (the sizing blocker).
             return {
                 "symbols": [
                     {
@@ -327,7 +337,8 @@ def test_real_mcp_payload_shapes(monkeypatch) -> None:
                         "volume_min": 0.01,
                         "volume_max": 100.0,
                         "volume_step": 0.01,
-                        "tick_value": 1.0,
+                        "tick_value": 0,
+                        "trade_tick_value": 0,
                         "contract_size": 100000,
                         "trade_filling_mode": "IOC|FOK",
                         "bid": 1.08420,
@@ -335,6 +346,12 @@ def test_real_mcp_payload_shapes(monkeypatch) -> None:
                     }
                 ]
             }
+        if name == "trade_order_calc_profit":
+            # 1 lot × 1 tick → ~$1 for EURUSD-class symbols
+            assert a.get("type") == "buy"
+            assert a.get("symbol") == "EURUSDm"
+            assert float(a.get("volume") or 0) == 1.0
+            return {"profit": 1.0}
         return {}
 
     monkeypatch.setattr(mcp, "call_tool", fake_call_tool)
@@ -359,9 +376,21 @@ def test_real_mcp_payload_shapes(monkeypatch) -> None:
     assert bars[0]["time"] == expected_epoch
     assert bars[0]["open"] == 1.0800
     assert bars[0]["close"] == 1.0830
+    assert len(chart_calls) == 1
+    chart_args = chart_calls[0]
+    assert chart_args.get("period") == "H4"
+    assert "datetime_from" in chart_args and "datetime_to" in chart_args
+    assert "limit" in chart_args
+    assert "start_pos" not in chart_args
+    assert "timeframe" not in chart_args
+    assert "count" not in chart_args
+    assert "bars" not in chart_args
 
     info = mcp.symbol_info("EURUSDm")
     assert info is not None
+    assert info.trade_tick_value > 0  # computed via trade_order_calc_profit
     assert info.trade_tick_value == 1.0
+    assert info.trade_tick_size == 0.00001
     assert info.trade_contract_size == 100000.0
     assert info.filling_mode == 3  # IOC|FOK → bits 1|2
+    assert mcp._TICK_VALUE_CACHE.get("EURUSDm") == 1.0
