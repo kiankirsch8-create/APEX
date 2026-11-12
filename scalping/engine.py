@@ -214,6 +214,7 @@ class _Engine:
         self.equity_bar = np.empty(len(market), dtype=np.float64)
         self.equity_trade: list[float] = []
         self.ticks_processed = 0
+        self.rejected_invalid_tp = 0
 
         self.pos_side = np.zeros(MAX_POS, dtype=np.int64)
         self.pos_lots = np.zeros(MAX_POS, dtype=np.float64)
@@ -254,6 +255,10 @@ class _Engine:
             self.pending = _as_list(emitted)
         if self.flatten_end:
             self._flatten()
+        if self.rejected_invalid_tp:
+            self.warnings.append(
+                f"rejected {self.rejected_invalid_tp} order(s): take-profit already through the fill price"
+            )
         final = float(self.equity_bar[-1]) if not self._open_positions() else self._mark(n_bars - 1)
         if self.flatten_end and not self._open_positions():
             final = self.cash
@@ -329,6 +334,9 @@ class _Engine:
         when = int(self.tick_ns[tick_i])
         if kind == 1.0:
             self._open_position(slot, ord_slot, side, lots, price, bid, ask, when)
+        elif kind == 5.0:
+            self.ord_meta[ord_slot] = None
+            self.rejected_invalid_tp += 1
         else:
             reason = {2.0: "sl", 3.0: "tp", 4.0: "market"}.get(kind, "exit")
             slip = 0.0 if reason == "tp" else self.slip

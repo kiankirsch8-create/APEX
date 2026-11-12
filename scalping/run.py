@@ -141,7 +141,7 @@ def format_table(report: dict) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="scalping.run")
-    parser.add_argument("--strategy", default="all", help="Strategy name, or 'all'")
+    parser.add_argument("--strategy", default="all", help="Strategy name, comma-separated names, or 'all'")
     parser.add_argument("--pair", action="append", dest="pairs")
     parser.add_argument("--block", action="append", dest="blocks")
     parser.add_argument("--config", default=None)
@@ -157,7 +157,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg = load_config(args.config)
     costs = _costs_from(cfg, args)
     equity = float(args.equity if args.equity is not None else cfg.initial_equity)
-    names = [cls.name for cls in all_strategies()] if args.strategy == "all" else [args.strategy]
+    names = [cls.name for cls in all_strategies()] if args.strategy == "all" else args.strategy.split(",")
     reports = []
     try:
         if args.demo:

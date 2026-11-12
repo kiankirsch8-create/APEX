@@ -17,6 +17,7 @@ KIND_ENTRY = 1.0
 KIND_SL = 2.0
 KIND_TP = 3.0
 KIND_MARKET = 4.0
+KIND_REJECT = 5.0  # order dropped: take-profit already on the wrong side of the fill
 
 OT_MARKET = 0
 OT_LIMIT = 1
@@ -152,6 +153,27 @@ def simulate_bar(
                     if b <= level:
                         filled = b - slip
             if filled < 0.0:
+                j += 1
+                continue
+
+            # A take-profit that is already through the fill price is an invalid
+            # stop. A broker rejects the order (MT5: TRADE_RETCODE_INVALID_STOPS);
+            # it does not open a position with no target.
+            tp_chk = ord_tp[j]
+            if tp_chk > 0.0 and ((side == 1 and tp_chk <= filled) or (side != 1 and tp_chk >= filled)):
+                ord_alive[j] = 0
+                events[n_ev, 0] = t
+                events[n_ev, 1] = KIND_REJECT
+                events[n_ev, 2] = -1.0
+                events[n_ev, 3] = j
+                events[n_ev, 4] = filled
+                events[n_ev, 5] = ord_lots[j]
+                events[n_ev, 6] = side
+                events[n_ev, 7] = b
+                events[n_ev, 8] = a
+                n_ev += 1
+                if n_ev >= max_ev:
+                    break
                 j += 1
                 continue
 

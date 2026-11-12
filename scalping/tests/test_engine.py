@@ -281,3 +281,23 @@ def test_numba_loop_matches_python_loop():
     assert numba_trade.exit_price == pytest.approx(python_trade.exit_price)
     assert numba_trade.exit_reason == python_trade.exit_reason
     assert numba_trade.net_pnl == pytest.approx(python_trade.net_pnl)
+
+
+def test_take_profit_already_through_the_fill_rejects_the_order():
+    # Signal on bar 0 with a TP set from bar-0 prices. The fill on bar 1 is
+    # already above that TP (ask + slippage), so a broker would refuse the
+    # stops. The order must be dropped, not opened without a target and held
+    # until the end of the data.
+    market = market_from_minutes(
+        [
+            [(1.10000, 1.10002)],
+            [(1.10010, 1.10012), (1.10011, 1.10013)],
+            [(1.10020, 1.10022)],
+        ]
+    )
+    strat = Scripted({0: [_buy(sl=1.09900, tp=1.10005)], 1: [_buy(sl=1.09900, tp=1.10100)]})
+    result = run_backtest(market, strat, EURUSD, _costs())
+    assert any("take-profit already through" in w for w in result.warnings)
+    # the first order is gone; the second (valid TP) fills and is flattened at the end
+    assert len(result.trades) == 1
+    assert result.trades[0].entry_price == pytest.approx(1.10022 + SLIP)

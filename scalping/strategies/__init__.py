@@ -15,6 +15,7 @@ from scalping.strategies.donchian import DonchianBreakout
 from scalping.strategies.ema_zscore import EmaZscoreReversion
 from scalping.strategies.grid_reversion import GridReversion
 from scalping.strategies.mean_anchor import MeanAnchorReversion
+from scalping.strategies.timeframe import Resampled, make_timeframe
 
 REGISTRY: dict[str, type[Strategy]] = {
     BollingerReversion.name: BollingerReversion,
@@ -25,11 +26,19 @@ REGISTRY: dict[str, type[Strategy]] = {
 }
 
 
+# Higher-timeframe variants, e.g. "bollinger_reversion@M15". Kept out of
+# REGISTRY so "--strategy all" still means the M1 reference set.
+TIMEFRAMES = (5, 15, 60)
+TIMEFRAME_REGISTRY: dict[str, type[Strategy]] = {
+    cls.name: cls for cls in (make_timeframe(base, m) for base in REGISTRY.values() for m in TIMEFRAMES)
+}
+
+
 def get_strategy(name: str) -> type[Strategy]:
     try:
-        return REGISTRY[name]
+        return REGISTRY[name] if name in REGISTRY else TIMEFRAME_REGISTRY[name]
     except KeyError as exc:
-        known = ", ".join(sorted(REGISTRY))
+        known = ", ".join(sorted(REGISTRY) + sorted(TIMEFRAME_REGISTRY))
         raise KeyError(f"Unknown strategy {name!r}. Known: {known}") from exc
 
 
@@ -39,6 +48,9 @@ def all_strategies() -> list[type[Strategy]]:
 
 __all__ = [
     "REGISTRY",
+    "TIMEFRAME_REGISTRY",
+    "Resampled",
+    "make_timeframe",
     "BarContext",
     "BollingerReversion",
     "CancelIntent",
