@@ -1,0 +1,5761 @@
+{
+  "bollinger_reversion@H1": {
+    "params": {
+      "timeframe_minutes": 60,
+      "period": 20,
+      "num_std": 2.0,
+      "atr_period": 14,
+      "sl_atr_mult": 1.5,
+      "lots": 0.1,
+      "max_spread_points": 30.0
+    },
+    "blocks": {
+      "2018Q1": {
+        "net_return": -0.00135968,
+        "trade_count": 102,
+        "win_rate": 0.38235294,
+        "profit_factor": 0.9026725,
+        "max_drawdown": 0.0026219,
+        "gross_pnl": -77.88533301,
+        "commission": 58.08229891,
+        "net_pnl": -135.96763192,
+        "spread_entry_mean": 3.373e-05,
+        "warnings": []
+      },
+      "2018Q2": {
+        "net_return": -0.00205642,
+        "trade_count": 109,
+        "win_rate": 0.37614679,
+        "profit_factor": 0.84659594,
+        "max_drawdown": 0.00273151,
+        "gross_pnl": -141.65791557,
+        "commission": 63.98395949,
+        "net_pnl": -205.64187507,
+        "spread_entry_mean": 4.367e-05,
+        "warnings": []
+      },
+      "2018Q3a": {
+        "net_return": -0.00012881,
+        "trade_count": 36,
+        "win_rate": 0.41666667,
+        "profit_factor": 0.96662164,
+        "max_drawdown": 0.00128557,
+        "gross_pnl": 8.67585311,
+        "commission": 21.55675033,
+        "net_pnl": -12.88089722,
+        "spread_entry_mean": 4.194e-05,
+        "warnings": []
+      },
+      "2018Q3b": {
+        "net_return": -0.00054379,
+        "trade_count": 32,
+        "win_rate": 0.40625,
+        "profit_factor": 0.84973429,
+        "max_drawdown": 0.001309,
+        "gross_pnl": -35.1808339,
+        "commission": 19.19773109,
+        "net_pnl": -54.37856499,
+        "spread_entry_mean": 3.75e-05,
+        "warnings": []
+      },
+      "2018Q4": {
+        "net_return": 4.36e-06,
+        "trade_count": 110,
+        "win_rate": 0.4,
+        "profit_factor": 1.00033914,
+        "max_drawdown": 0.00405914,
+        "gross_pnl": 67.93006146,
+        "commission": 67.49430844,
+        "net_pnl": 0.43575302,
+        "spread_entry_mean": 4.309e-05,
+        "warnings": []
+      },
+      "2019Q1": {
+        "net_return": 0.0016269,
+        "trade_count": 83,
+        "win_rate": 0.43373494,
+        "profit_factor": 1.2152208,
+        "max_drawdown": 0.00180157,
+        "gross_pnl": 213.90725209,
+        "commission": 51.21678524,
+        "net_pnl": 162.69046685,
+        "spread_entry_mean": 2.554e-05,
+        "warnings": []
+      },
+      "2019Q2": {
+        "net_return": -0.00418141,
+        "trade_count": 105,
+        "win_rate": 0.34285714,
+        "profit_factor": 0.57726385,
+        "max_drawdown": 0.00534871,
+        "gross_pnl": -352.67846618,
+        "commission": 65.46254571,
+        "net_pnl": -418.14101188,
+        "spread_entry_mean": 2.819e-05,
+        "warnings": []
+      },
+      "2019Q3": {
+        "net_return": 2.42e-06,
+        "trade_count": 113,
+        "win_rate": 0.36283186,
+        "profit_factor": 1.00024983,
+        "max_drawdown": 0.00228322,
+        "gross_pnl": 71.48282905,
+        "commission": 71.24086023,
+        "net_pnl": 0.24196881,
+        "spread_entry_mean": 2.903e-05,
+        "warnings": []
+      },
+      "2019Q4": {
+        "net_return": -0.00087551,
+        "trade_count": 103,
+        "win_rate": 0.41747573,
+        "profit_factor": 0.89167392,
+        "max_drawdown": 0.00268579,
+        "gross_pnl": -22.44639993,
+        "commission": 65.10492137,
+        "net_pnl": -87.55132129,
+        "spread_entry_mean": 2.301e-05,
+        "warnings": []
+      },
+      "2020Q1": {
+        "net_return": -0.00551028,
+        "trade_count": 110,
+        "win_rate": 0.29090909,
+        "profit_factor": 0.66130393,
+        "max_drawdown": 0.00859033,
+        "gross_pnl": -481.17537678,
+        "commission": 69.85274449,
+        "net_pnl": -551.02812126,
+        "spread_entry_mean": 3.045e-05,
+        "warnings": []
+      },
+      "2020Q2": {
+        "net_return": -0.00210652,
+        "trade_count": 97,
+        "win_rate": 0.3814433,
+        "profit_factor": 0.84430582,
+        "max_drawdown": 0.00367261,
+        "gross_pnl": -148.9433229,
+        "commission": 61.70899607,
+        "net_pnl": -210.65231896,
+        "spread_entry_mean": 2.804e-05,
+        "warnings": []
+      },
+      "2020Q3": {
+        "net_return": -0.00442984,
+        "trade_count": 110,
+        "win_rate": 0.32727273,
+        "profit_factor": 0.72250119,
+        "max_drawdown": 0.0057605,
+        "gross_pnl": -377.19785541,
+        "commission": 65.78604089,
+        "net_pnl": -442.9838963,
+        "spread_entry_mean": 3.4e-05,
+        "warnings": []
+      },
+      "2020Q4": {
+        "net_return": -0.00432054,
+        "trade_count": 96,
+        "win_rate": 0.29166667,
+        "profit_factor": 0.6486083,
+        "max_drawdown": 0.00533563,
+        "gross_pnl": -375.56143244,
+        "commission": 56.49277299,
+        "net_pnl": -432.05420543,
+        "spread_entry_mean": 3.021e-05,
+        "warnings": []
+      },
+      "2021Q1": {
+        "net_return": -0.0020583,
+        "trade_count": 98,
+        "win_rate": 0.34693878,
+        "profit_factor": 0.80890936,
+        "max_drawdown": 0.00400019,
+        "gross_pnl": -148.87019178,
+        "commission": 56.95973846,
+        "net_pnl": -205.82993024,
+        "spread_entry_mean": 2.918e-05,
+        "warnings": []
+      },
+      "2021Q2": {
+        "net_return": -0.00146984,
+        "trade_count": 106,
+        "win_rate": 0.3490566,
+        "profit_factor": 0.85893989,
+        "max_drawdown": 0.00247144,
+        "gross_pnl": -85.34969861,
+        "commission": 61.63449223,
+        "net_pnl": -146.98419084,
+        "spread_entry_mean": 2.906e-05,
+        "warnings": []
+      },
+      "2021Q3": {
+        "net_return": -0.00087202,
+        "trade_count": 104,
+        "win_rate": 0.43269231,
+        "profit_factor": 0.89205469,
+        "max_drawdown": 0.00170724,
+        "gross_pnl": -25.43915923,
+        "commission": 61.76270636,
+        "net_pnl": -87.20186559,
+        "spread_entry_mean": 2.721e-05,
+        "warnings": []
+      },
+      "2021Q4": {
+        "net_return": -0.00180047,
+        "trade_count": 96,
+        "win_rate": 0.375,
+        "profit_factor": 0.82563694,
+        "max_drawdown": 0.00399026,
+        "gross_pnl": -121.10441589,
+        "commission": 58.9424797,
+        "net_pnl": -180.04689558,
+        "spread_entry_mean": 2.937e-05,
+        "warnings": []
+      },
+      "2022Q1": {
+        "net_return": -0.00347795,
+        "trade_count": 113,
+        "win_rate": 0.37168142,
+        "profit_factor": 0.79623839,
+        "max_drawdown": 0.00515408,
+        "gross_pnl": -277.20842378,
+        "commission": 70.58640272,
+        "net_pnl": -347.79482651,
+        "spread_entry_mean": 3.257e-05,
+        "warnings": []
+      },
+      "2022Q2": {
+        "net_return": -0.00070109,
+        "trade_count": 92,
+        "win_rate": 0.39130435,
+        "profit_factor": 0.95303993,
+        "max_drawdown": 0.00423135,
+        "gross_pnl": -9.60843106,
+        "commission": 60.50036222,
+        "net_pnl": -70.10879329,
+        "spread_entry_mean": 3.283e-05,
+        "warnings": []
+      },
+      "2022Q3": {
+        "net_return": 0.00204565,
+        "trade_count": 95,
+        "win_rate": 0.4,
+        "profit_factor": 1.12210484,
+        "max_drawdown": 0.00370721,
+        "gross_pnl": 270.58869067,
+        "commission": 66.02356757,
+        "net_pnl": 204.5651231,
+        "spread_entry_mean": 4.253e-05,
+        "warnings": []
+      },
+      "2022Q4": {
+        "net_return": -0.00052906,
+        "trade_count": 97,
+        "win_rate": 0.43298969,
+        "profit_factor": 0.97082927,
+        "max_drawdown": 0.00511567,
+        "gross_pnl": 13.86196292,
+        "commission": 66.76755509,
+        "net_pnl": -52.90559217,
+        "spread_entry_mean": 5.031e-05,
+        "warnings": []
+      },
+      "2023Q1": {
+        "net_return": 0.00160309,
+        "trade_count": 78,
+        "win_rate": 0.37179487,
+        "profit_factor": 1.13101359,
+        "max_drawdown": 0.00255296,
+        "gross_pnl": 211.14847997,
+        "commission": 50.83917282,
+        "net_pnl": 160.30930714,
+        "spread_entry_mean": 5.244e-05,
+        "warnings": []
+      },
+      "2023Q2": {
+        "net_return": -4.44e-06,
+        "trade_count": 56,
+        "win_rate": 0.33928571,
+        "profit_factor": 0.99936694,
+        "max_drawdown": 0.00299168,
+        "gross_pnl": 35.53988605,
+        "commission": 35.98429082,
+        "net_pnl": -0.44440477,
+        "spread_entry_mean": 2.75e-05,
+        "warnings": []
+      },
+      "2023Q3": {
+        "net_return": -0.00340255,
+        "trade_count": 86,
+        "win_rate": 0.27906977,
+        "profit_factor": 0.71049997,
+        "max_drawdown": 0.00404099,
+        "gross_pnl": -284.85949952,
+        "commission": 55.39558526,
+        "net_pnl": -340.25508478,
+        "spread_entry_mean": 3.058e-05,
+        "warnings": []
+      },
+      "2023Q4": {
+        "net_return": -0.00206882,
+        "trade_count": 110,
+        "win_rate": 0.37272727,
+        "profit_factor": 0.8421273,
+        "max_drawdown": 0.00381986,
+        "gross_pnl": -135.40461965,
+        "commission": 71.47752417,
+        "net_pnl": -206.88214382,
+        "spread_entry_mean": 2.673e-05,
+        "warnings": []
+      },
+      "2024Q1": {
+        "net_return": 0.00328401,
+        "trade_count": 109,
+        "win_rate": 0.44954128,
+        "profit_factor": 1.37900413,
+        "max_drawdown": 0.00154484,
+        "gross_pnl": 398.66086632,
+        "commission": 70.26015847,
+        "net_pnl": 328.40070784,
+        "spread_entry_mean": 2.394e-05,
+        "warnings": []
+      },
+      "2024Q2": {
+        "net_return": -0.00137917,
+        "trade_count": 98,
+        "win_rate": 0.31632653,
+        "profit_factor": 0.85623094,
+        "max_drawdown": 0.00222946,
+        "gross_pnl": -74.1480506,
+        "commission": 63.76874665,
+        "net_pnl": -137.91679726,
+        "spread_entry_mean": 2.184e-05,
+        "warnings": []
+      },
+      "2024Q3": {
+        "net_return": 0.00115899,
+        "trade_count": 109,
+        "win_rate": 0.44954128,
+        "profit_factor": 1.12263821,
+        "max_drawdown": 0.00188333,
+        "gross_pnl": 185.32152397,
+        "commission": 69.42271189,
+        "net_pnl": 115.89881207,
+        "spread_entry_mean": 2.67e-05,
+        "warnings": []
+      },
+      "2024Q4": {
+        "net_return": -0.0021628,
+        "trade_count": 90,
+        "win_rate": 0.36666667,
+        "profit_factor": 0.80553118,
+        "max_drawdown": 0.00465076,
+        "gross_pnl": -157.40051922,
+        "commission": 58.87928895,
+        "net_pnl": -216.27980816,
+        "spread_entry_mean": 2.533e-05,
+        "warnings": []
+      }
+    },
+    "trades": 2743,
+    "positive_blocks": 7,
+    "gross_pnl_eur": -1855.00253985,
+    "commission_eur": 1716.38549863,
+    "net_pnl_eur": -3571.3880385,
+    "gross_per_trade_pips": -0.7514086522663749,
+    "commission_per_trade_pips": 0.695258840130433,
+    "net_per_trade_pips": -1.4466674924049094
+  },
+  "bollinger_reversion@M15": {
+    "params": {
+      "timeframe_minutes": 15,
+      "period": 20,
+      "num_std": 2.0,
+      "atr_period": 14,
+      "sl_atr_mult": 1.5,
+      "lots": 0.1,
+      "max_spread_points": 30.0
+    },
+    "blocks": {
+      "2018Q1": {
+        "net_return": -0.00398227,
+        "trade_count": 373,
+        "win_rate": 0.41286863,
+        "profit_factor": 0.85516474,
+        "max_drawdown": 0.00463037,
+        "gross_pnl": -185.82167968,
+        "commission": 212.40485782,
+        "net_pnl": -398.2265375,
+        "spread_entry_mean": 3.721e-05,
+        "warnings": []
+      },
+      "2018Q2": {
+        "net_return": -0.00735414,
+        "trade_count": 382,
+        "win_rate": 0.35602094,
+        "profit_factor": 0.72688002,
+        "max_drawdown": 0.00816167,
+        "gross_pnl": -510.80680094,
+        "commission": 224.60756406,
+        "net_pnl": -735.414365,
+        "spread_entry_mean": 4.471e-05,
+        "warnings": []
+      },
+      "2018Q3a": {
+        "net_return": -0.00272907,
+        "trade_count": 116,
+        "win_rate": 0.35344828,
+        "profit_factor": 0.66629181,
+        "max_drawdown": 0.00302919,
+        "gross_pnl": -203.43740311,
+        "commission": 69.46928954,
+        "net_pnl": -272.90669266,
+        "spread_entry_mean": 4.957e-05,
+        "warnings": []
+      },
+      "2018Q3b": {
+        "net_return": -0.00260566,
+        "trade_count": 125,
+        "win_rate": 0.36,
+        "profit_factor": 0.6964867,
+        "max_drawdown": 0.0030631,
+        "gross_pnl": -185.51942373,
+        "commission": 75.04653818,
+        "net_pnl": -260.56596191,
+        "spread_entry_mean": 4.016e-05,
+        "warnings": []
+      },
+      "2018Q4": {
+        "net_return": -0.0047061,
+        "trade_count": 343,
+        "win_rate": 0.40233236,
+        "profit_factor": 0.80103293,
+        "max_drawdown": 0.00616066,
+        "gross_pnl": -260.25461005,
+        "commission": 210.35585352,
+        "net_pnl": -470.61046358,
+        "spread_entry_mean": 4.557e-05,
+        "warnings": []
+      },
+      "2019Q1": {
+        "net_return": 0.00222158,
+        "trade_count": 308,
+        "win_rate": 0.45454545,
+        "profit_factor": 1.14406044,
+        "max_drawdown": 0.00135354,
+        "gross_pnl": 411.97463585,
+        "commission": 189.81615742,
+        "net_pnl": 222.15847842,
+        "spread_entry_mean": 3.107e-05,
+        "warnings": []
+      },
+      "2019Q2": {
+        "net_return": -0.00257322,
+        "trade_count": 349,
+        "win_rate": 0.44126074,
+        "profit_factor": 0.83432613,
+        "max_drawdown": 0.00406712,
+        "gross_pnl": -39.94682017,
+        "commission": 217.37556315,
+        "net_pnl": -257.32238331,
+        "spread_entry_mean": 2.98e-05,
+        "warnings": []
+      },
+      "2019Q3": {
+        "net_return": -0.00509005,
+        "trade_count": 346,
+        "win_rate": 0.3699422,
+        "profit_factor": 0.72049004,
+        "max_drawdown": 0.00576259,
+        "gross_pnl": -291.23795962,
+        "commission": 217.76713332,
+        "net_pnl": -509.00509294,
+        "spread_entry_mean": 3.127e-05,
+        "warnings": []
+      },
+      "2019Q4": {
+        "net_return": -0.00458013,
+        "trade_count": 340,
+        "win_rate": 0.38235294,
+        "profit_factor": 0.70196648,
+        "max_drawdown": 0.00516318,
+        "gross_pnl": -242.9475614,
+        "commission": 215.06554487,
+        "net_pnl": -458.01310626,
+        "spread_entry_mean": 2.791e-05,
+        "warnings": []
+      },
+      "2020Q1": {
+        "net_return": -0.00694287,
+        "trade_count": 361,
+        "win_rate": 0.38781163,
+        "profit_factor": 0.7605343,
+        "max_drawdown": 0.0074968,
+        "gross_pnl": -465.11334153,
+        "commission": 229.17399835,
+        "net_pnl": -694.28733988,
+        "spread_entry_mean": 3.587e-05,
+        "warnings": []
+      },
+      "2020Q2": {
+        "net_return": -0.00176262,
+        "trade_count": 373,
+        "win_rate": 0.4155496,
+        "profit_factor": 0.93592351,
+        "max_drawdown": 0.00380134,
+        "gross_pnl": 60.78126308,
+        "commission": 237.04290333,
+        "net_pnl": -176.26164025,
+        "spread_entry_mean": 3.182e-05,
+        "warnings": []
+      },
+      "2020Q3": {
+        "net_return": -0.00843745,
+        "trade_count": 376,
+        "win_rate": 0.34840426,
+        "profit_factor": 0.70140748,
+        "max_drawdown": 0.00942936,
+        "gross_pnl": -618.48316483,
+        "commission": 225.26163817,
+        "net_pnl": -843.74480301,
+        "spread_entry_mean": 3.574e-05,
+        "warnings": []
+      },
+      "2020Q4": {
+        "net_return": 0.00070582,
+        "trade_count": 367,
+        "win_rate": 0.40599455,
+        "profit_factor": 1.03560552,
+        "max_drawdown": 0.00382336,
+        "gross_pnl": 285.80778766,
+        "commission": 215.22545656,
+        "net_pnl": 70.5823311,
+        "spread_entry_mean": 3.27e-05,
+        "warnings": []
+      },
+      "2021Q1": {
+        "net_return": -0.00467474,
+        "trade_count": 346,
+        "win_rate": 0.3699422,
+        "profit_factor": 0.77062222,
+        "max_drawdown": 0.00612288,
+        "gross_pnl": -266.61290459,
+        "commission": 200.86101786,
+        "net_pnl": -467.47392244,
+        "spread_entry_mean": 3.066e-05,
+        "warnings": []
+      },
+      "2021Q2": {
+        "net_return": -0.0051609,
+        "trade_count": 384,
+        "win_rate": 0.38020833,
+        "profit_factor": 0.72656343,
+        "max_drawdown": 0.00596151,
+        "gross_pnl": -293.10964965,
+        "commission": 222.98036516,
+        "net_pnl": -516.09001481,
+        "spread_entry_mean": 2.867e-05,
+        "warnings": []
+      },
+      "2021Q3": {
+        "net_return": -0.0005603,
+        "trade_count": 356,
+        "win_rate": 0.45786517,
+        "profit_factor": 0.96188056,
+        "max_drawdown": 0.00137571,
+        "gross_pnl": 155.39079364,
+        "commission": 211.42110795,
+        "net_pnl": -56.03031431,
+        "spread_entry_mean": 2.823e-05,
+        "warnings": []
+      },
+      "2021Q4": {
+        "net_return": -0.00186503,
+        "trade_count": 376,
+        "win_rate": 0.39893617,
+        "profit_factor": 0.9064132,
+        "max_drawdown": 0.00343976,
+        "gross_pnl": 43.94850293,
+        "commission": 230.45153292,
+        "net_pnl": -186.50302999,
+        "spread_entry_mean": 2.912e-05,
+        "warnings": []
+      },
+      "2022Q1": {
+        "net_return": -0.00753557,
+        "trade_count": 360,
+        "win_rate": 0.35277778,
+        "profit_factor": 0.73093817,
+        "max_drawdown": 0.00835749,
+        "gross_pnl": -528.83335963,
+        "commission": 224.72384442,
+        "net_pnl": -753.55720404,
+        "spread_entry_mean": 3.358e-05,
+        "warnings": []
+      },
+      "2022Q2": {
+        "net_return": -0.00121428,
+        "trade_count": 343,
+        "win_rate": 0.39941691,
+        "profit_factor": 0.95811325,
+        "max_drawdown": 0.00360634,
+        "gross_pnl": 104.27001545,
+        "commission": 225.69816253,
+        "net_pnl": -121.42814708,
+        "spread_entry_mean": 3.796e-05,
+        "warnings": []
+      },
+      "2022Q3": {
+        "net_return": -0.00483436,
+        "trade_count": 373,
+        "win_rate": 0.36193029,
+        "profit_factor": 0.87424039,
+        "max_drawdown": 0.0057444,
+        "gross_pnl": -223.95737246,
+        "commission": 259.47822714,
+        "net_pnl": -483.4355996,
+        "spread_entry_mean": 4.724e-05,
+        "warnings": []
+      },
+      "2022Q4": {
+        "net_return": 0.00051187,
+        "trade_count": 370,
+        "win_rate": 0.43243243,
+        "profit_factor": 1.0144163,
+        "max_drawdown": 0.00592761,
+        "gross_pnl": 305.31360162,
+        "commission": 254.12625243,
+        "net_pnl": 51.18734918,
+        "spread_entry_mean": 5.438e-05,
+        "warnings": []
+      },
+      "2023Q1": {
+        "net_return": -0.00219805,
+        "trade_count": 304,
+        "win_rate": 0.40789474,
+        "profit_factor": 0.90975887,
+        "max_drawdown": 0.00423384,
+        "gross_pnl": -21.60858087,
+        "commission": 198.1962818,
+        "net_pnl": -219.80486267,
+        "spread_entry_mean": 4.615e-05,
+        "warnings": []
+      },
+      "2023Q2": {
+        "net_return": -0.00150796,
+        "trade_count": 237,
+        "win_rate": 0.38818565,
+        "profit_factor": 0.91205689,
+        "max_drawdown": 0.00343213,
+        "gross_pnl": 1.76821422,
+        "commission": 152.5643531,
+        "net_pnl": -150.79613888,
+        "spread_entry_mean": 2.743e-05,
+        "warnings": [
+          "rejected 1 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2023Q3": {
+        "net_return": -0.00618723,
+        "trade_count": 347,
+        "win_rate": 0.3832853,
+        "profit_factor": 0.72607601,
+        "max_drawdown": 0.00645456,
+        "gross_pnl": -395.08347506,
+        "commission": 223.63978872,
+        "net_pnl": -618.72326378,
+        "spread_entry_mean": 3.009e-05,
+        "warnings": []
+      },
+      "2023Q4": {
+        "net_return": -0.00023576,
+        "trade_count": 355,
+        "win_rate": 0.44225352,
+        "profit_factor": 0.98843677,
+        "max_drawdown": 0.00236683,
+        "gross_pnl": 207.67635649,
+        "commission": 231.25259187,
+        "net_pnl": -23.57623538,
+        "spread_entry_mean": 2.696e-05,
+        "warnings": []
+      },
+      "2024Q1": {
+        "net_return": -0.00173419,
+        "trade_count": 368,
+        "win_rate": 0.4048913,
+        "profit_factor": 0.90619163,
+        "max_drawdown": 0.00322454,
+        "gross_pnl": 63.74985125,
+        "commission": 237.16927835,
+        "net_pnl": -173.4194271,
+        "spread_entry_mean": 2.508e-05,
+        "warnings": []
+      },
+      "2024Q2": {
+        "net_return": -0.00435898,
+        "trade_count": 352,
+        "win_rate": 0.36079545,
+        "profit_factor": 0.75179979,
+        "max_drawdown": 0.00472952,
+        "gross_pnl": -207.10529012,
+        "commission": 228.7927303,
+        "net_pnl": -435.89802042,
+        "spread_entry_mean": 2.06e-05,
+        "warnings": []
+      },
+      "2024Q3": {
+        "net_return": 0.00041935,
+        "trade_count": 345,
+        "win_rate": 0.44927536,
+        "profit_factor": 1.02647326,
+        "max_drawdown": 0.00154612,
+        "gross_pnl": 261.77414176,
+        "commission": 219.83935048,
+        "net_pnl": 41.93479128,
+        "spread_entry_mean": 2.342e-05,
+        "warnings": []
+      },
+      "2024Q4": {
+        "net_return": -0.00060923,
+        "trade_count": 314,
+        "win_rate": 0.42038217,
+        "profit_factor": 0.96922051,
+        "max_drawdown": 0.00465735,
+        "gross_pnl": 144.41382056,
+        "commission": 205.3364735,
+        "net_pnl": -60.92265294,
+        "spread_entry_mean": 2.535e-05,
+        "warnings": []
+      }
+    },
+    "trades": 9689,
+    "positive_blocks": 4,
+    "gross_pnl_eur": -2893.0104129300003,
+    "commission_eur": 6065.14385682,
+    "net_pnl_eur": -8958.15426976,
+    "gross_per_trade_pips": -0.33176344456256235,
+    "commission_per_trade_pips": 0.6955360439467437,
+    "net_per_trade_pips": -1.027299488510453
+  },
+  "bollinger_reversion@M5": {
+    "params": {
+      "timeframe_minutes": 5,
+      "period": 20,
+      "num_std": 2.0,
+      "atr_period": 14,
+      "sl_atr_mult": 1.5,
+      "lots": 0.1,
+      "max_spread_points": 30.0
+    },
+    "blocks": {
+      "2018Q1": {
+        "net_return": -0.00517049,
+        "trade_count": 1011,
+        "win_rate": 0.41444115,
+        "profit_factor": 0.88098372,
+        "max_drawdown": 0.00586996,
+        "gross_pnl": 59.11078568,
+        "commission": 576.15965429,
+        "net_pnl": -517.04886861,
+        "spread_entry_mean": 4.011e-05,
+        "warnings": []
+      },
+      "2018Q2": {
+        "net_return": -0.01069261,
+        "trade_count": 983,
+        "win_rate": 0.37741607,
+        "profit_factor": 0.75592175,
+        "max_drawdown": 0.0116405,
+        "gross_pnl": -491.56002421,
+        "commission": 577.70099697,
+        "net_pnl": -1069.26102118,
+        "spread_entry_mean": 4.587e-05,
+        "warnings": []
+      },
+      "2018Q3a": {
+        "net_return": -0.00680834,
+        "trade_count": 346,
+        "win_rate": 0.35549133,
+        "profit_factor": 0.53591829,
+        "max_drawdown": 0.00691486,
+        "gross_pnl": -473.57064148,
+        "commission": 207.26289361,
+        "net_pnl": -680.83353509,
+        "spread_entry_mean": 4.766e-05,
+        "warnings": []
+      },
+      "2018Q3b": {
+        "net_return": -0.00382013,
+        "trade_count": 292,
+        "win_rate": 0.35616438,
+        "profit_factor": 0.69592802,
+        "max_drawdown": 0.004107,
+        "gross_pnl": -206.67536108,
+        "commission": 175.33810298,
+        "net_pnl": -382.01346406,
+        "spread_entry_mean": 4.329e-05,
+        "warnings": []
+      },
+      "2018Q4": {
+        "net_return": -0.01546846,
+        "trade_count": 1021,
+        "win_rate": 0.37218413,
+        "profit_factor": 0.65226062,
+        "max_drawdown": 0.01594397,
+        "gross_pnl": -920.6025834,
+        "commission": 626.24355922,
+        "net_pnl": -1546.84614262,
+        "spread_entry_mean": 4.589e-05,
+        "warnings": []
+      },
+      "2019Q1": {
+        "net_return": -0.00621632,
+        "trade_count": 935,
+        "win_rate": 0.42994652,
+        "profit_factor": 0.8013674,
+        "max_drawdown": 0.00690504,
+        "gross_pnl": -45.5042731,
+        "commission": 576.12785795,
+        "net_pnl": -621.63213105,
+        "spread_entry_mean": 3.33e-05,
+        "warnings": [
+          "rejected 1 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2019Q2": {
+        "net_return": -0.00873473,
+        "trade_count": 995,
+        "win_rate": 0.40904523,
+        "profit_factor": 0.6950628,
+        "max_drawdown": 0.00886072,
+        "gross_pnl": -253.73175281,
+        "commission": 619.7413034,
+        "net_pnl": -873.47305622,
+        "spread_entry_mean": 3.177e-05,
+        "warnings": []
+      },
+      "2019Q3": {
+        "net_return": -0.01169494,
+        "trade_count": 966,
+        "win_rate": 0.38923395,
+        "profit_factor": 0.6252242,
+        "max_drawdown": 0.01230772,
+        "gross_pnl": -561.708556,
+        "commission": 607.78586385,
+        "net_pnl": -1169.49441985,
+        "spread_entry_mean": 3.208e-05,
+        "warnings": [
+          "rejected 2 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2019Q4": {
+        "net_return": -0.00804741,
+        "trade_count": 987,
+        "win_rate": 0.41843972,
+        "profit_factor": 0.69110686,
+        "max_drawdown": 0.0081615,
+        "gross_pnl": -180.59556307,
+        "commission": 624.1457537,
+        "net_pnl": -804.74131677,
+        "spread_entry_mean": 2.831e-05,
+        "warnings": [
+          "rejected 4 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2020Q1": {
+        "net_return": -0.01331487,
+        "trade_count": 981,
+        "win_rate": 0.36799185,
+        "profit_factor": 0.71969279,
+        "max_drawdown": 0.01463242,
+        "gross_pnl": -708.42249473,
+        "commission": 623.06422537,
+        "net_pnl": -1331.4867201,
+        "spread_entry_mean": 3.622e-05,
+        "warnings": []
+      },
+      "2020Q2": {
+        "net_return": -0.00940068,
+        "trade_count": 1065,
+        "win_rate": 0.38591549,
+        "profit_factor": 0.80788259,
+        "max_drawdown": 0.0104509,
+        "gross_pnl": -263.41981253,
+        "commission": 676.64852988,
+        "net_pnl": -940.06834242,
+        "spread_entry_mean": 3.544e-05,
+        "warnings": []
+      },
+      "2020Q3": {
+        "net_return": -0.01013939,
+        "trade_count": 1064,
+        "win_rate": 0.39849624,
+        "profit_factor": 0.77481022,
+        "max_drawdown": 0.01031077,
+        "gross_pnl": -376.00519328,
+        "commission": 637.93427144,
+        "net_pnl": -1013.93946472,
+        "spread_entry_mean": 3.556e-05,
+        "warnings": []
+      },
+      "2020Q4": {
+        "net_return": -0.00906011,
+        "trade_count": 1030,
+        "win_rate": 0.38737864,
+        "profit_factor": 0.75874532,
+        "max_drawdown": 0.00924522,
+        "gross_pnl": -301.26658152,
+        "commission": 604.74421419,
+        "net_pnl": -906.01079571,
+        "spread_entry_mean": 3.456e-05,
+        "warnings": []
+      },
+      "2021Q1": {
+        "net_return": -0.00673862,
+        "trade_count": 1008,
+        "win_rate": 0.41071429,
+        "profit_factor": 0.80370445,
+        "max_drawdown": 0.00716792,
+        "gross_pnl": -88.42329325,
+        "commission": 585.43895896,
+        "net_pnl": -673.86225221,
+        "spread_entry_mean": 3.198e-05,
+        "warnings": []
+      },
+      "2021Q2": {
+        "net_return": -0.01029561,
+        "trade_count": 993,
+        "win_rate": 0.3836858,
+        "profit_factor": 0.67630955,
+        "max_drawdown": 0.01054904,
+        "gross_pnl": -452.68298747,
+        "commission": 576.87791426,
+        "net_pnl": -1029.56090174,
+        "spread_entry_mean": 2.905e-05,
+        "warnings": []
+      },
+      "2021Q3": {
+        "net_return": -0.00883139,
+        "trade_count": 1009,
+        "win_rate": 0.39841427,
+        "profit_factor": 0.68795706,
+        "max_drawdown": 0.00909134,
+        "gross_pnl": -284.07676222,
+        "commission": 599.06211894,
+        "net_pnl": -883.13888116,
+        "spread_entry_mean": 3.111e-05,
+        "warnings": [
+          "rejected 5 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2021Q4": {
+        "net_return": -0.00941797,
+        "trade_count": 1004,
+        "win_rate": 0.37749004,
+        "profit_factor": 0.71967633,
+        "max_drawdown": 0.00984002,
+        "gross_pnl": -327.17995736,
+        "commission": 614.61707584,
+        "net_pnl": -941.7970332,
+        "spread_entry_mean": 3.23e-05,
+        "warnings": [
+          "rejected 1 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2022Q1": {
+        "net_return": -0.01378343,
+        "trade_count": 1047,
+        "win_rate": 0.36294174,
+        "profit_factor": 0.71420281,
+        "max_drawdown": 0.01421507,
+        "gross_pnl": -724.72999233,
+        "commission": 653.61310216,
+        "net_pnl": -1378.3430945,
+        "spread_entry_mean": 3.591e-05,
+        "warnings": []
+      },
+      "2022Q2": {
+        "net_return": -0.00982027,
+        "trade_count": 966,
+        "win_rate": 0.4068323,
+        "profit_factor": 0.80530181,
+        "max_drawdown": 0.01066791,
+        "gross_pnl": -346.43848568,
+        "commission": 635.58832315,
+        "net_pnl": -982.02680882,
+        "spread_entry_mean": 3.844e-05,
+        "warnings": []
+      },
+      "2022Q3": {
+        "net_return": -0.00908996,
+        "trade_count": 1037,
+        "win_rate": 0.38379942,
+        "profit_factor": 0.85799591,
+        "max_drawdown": 0.01056253,
+        "gross_pnl": -187.86440079,
+        "commission": 721.13188402,
+        "net_pnl": -908.99628482,
+        "spread_entry_mean": 4.667e-05,
+        "warnings": []
+      },
+      "2022Q4": {
+        "net_return": -0.00800283,
+        "trade_count": 1038,
+        "win_rate": 0.39210019,
+        "profit_factor": 0.87360017,
+        "max_drawdown": 0.01059895,
+        "gross_pnl": -88.98097024,
+        "commission": 711.30165347,
+        "net_pnl": -800.28262371,
+        "spread_entry_mean": 5.322e-05,
+        "warnings": [
+          "rejected 1 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2023Q1": {
+        "net_return": -0.01142708,
+        "trade_count": 894,
+        "win_rate": 0.39932886,
+        "profit_factor": 0.74436691,
+        "max_drawdown": 0.0116955,
+        "gross_pnl": -559.84238021,
+        "commission": 582.8656018,
+        "net_pnl": -1142.70798202,
+        "spread_entry_mean": 4.697e-05,
+        "warnings": [
+          "rejected 3 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2023Q2": {
+        "net_return": -0.01100764,
+        "trade_count": 727,
+        "win_rate": 0.38376891,
+        "profit_factor": 0.64889819,
+        "max_drawdown": 0.01103972,
+        "gross_pnl": -633.15091889,
+        "commission": 467.61339813,
+        "net_pnl": -1100.76431702,
+        "spread_entry_mean": 2.838e-05,
+        "warnings": [
+          "rejected 1 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2023Q3": {
+        "net_return": -0.01162559,
+        "trade_count": 907,
+        "win_rate": 0.36052922,
+        "profit_factor": 0.67153332,
+        "max_drawdown": 0.01274125,
+        "gross_pnl": -578.52314179,
+        "commission": 584.0361115,
+        "net_pnl": -1162.55925329,
+        "spread_entry_mean": 2.998e-05,
+        "warnings": []
+      },
+      "2023Q4": {
+        "net_return": -0.01001604,
+        "trade_count": 1025,
+        "win_rate": 0.39414634,
+        "profit_factor": 0.73968832,
+        "max_drawdown": 0.01052996,
+        "gross_pnl": -334.4342524,
+        "commission": 667.16926764,
+        "net_pnl": -1001.60352005,
+        "spread_entry_mean": 2.805e-05,
+        "warnings": []
+      },
+      "2024Q1": {
+        "net_return": -0.00938516,
+        "trade_count": 1001,
+        "win_rate": 0.39260739,
+        "profit_factor": 0.69927011,
+        "max_drawdown": 0.0096666,
+        "gross_pnl": -293.2760717,
+        "commission": 645.24028007,
+        "net_pnl": -938.51635177,
+        "spread_entry_mean": 2.571e-05,
+        "warnings": []
+      },
+      "2024Q2": {
+        "net_return": -0.01569421,
+        "trade_count": 1011,
+        "win_rate": 0.34322453,
+        "profit_factor": 0.5297088,
+        "max_drawdown": 0.01578413,
+        "gross_pnl": -912.14180766,
+        "commission": 657.27882354,
+        "net_pnl": -1569.42063119,
+        "spread_entry_mean": 2.211e-05,
+        "warnings": []
+      },
+      "2024Q3": {
+        "net_return": -0.01135408,
+        "trade_count": 985,
+        "win_rate": 0.37969543,
+        "profit_factor": 0.63675404,
+        "max_drawdown": 0.01161445,
+        "gross_pnl": -508.02085544,
+        "commission": 627.38747146,
+        "net_pnl": -1135.4083269,
+        "spread_entry_mean": 2.333e-05,
+        "warnings": [
+          "rejected 2 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2024Q4": {
+        "net_return": -0.00928768,
+        "trade_count": 1012,
+        "win_rate": 0.3784585,
+        "profit_factor": 0.76537481,
+        "max_drawdown": 0.00944783,
+        "gross_pnl": -264.85851109,
+        "commission": 663.90956347,
+        "net_pnl": -928.76807456,
+        "spread_entry_mean": 2.435e-05,
+        "warnings": []
+      }
+    },
+    "trades": 27340,
+    "positive_blocks": 0,
+    "gross_pnl_eur": -11308.57684005,
+    "commission_eur": 17126.02877526,
+    "net_pnl_eur": -28434.60561536,
+    "gross_per_trade_pips": -0.45958615134723235,
+    "commission_per_trade_pips": 0.696010272911485,
+    "net_per_trade_pips": -1.1555964242607495
+  },
+  "donchian_breakout@H1": {
+    "params": {
+      "timeframe_minutes": 60,
+      "period": 20,
+      "sl_points": 387.3,
+      "tp_points": 619.68,
+      "lots": 0.1
+    },
+    "blocks": {
+      "2018Q1": {
+        "net_return": 0.00140988,
+        "trade_count": 68,
+        "win_rate": 0.42647059,
+        "profit_factor": 1.10974971,
+        "max_drawdown": 0.00288878,
+        "gross_pnl": 179.70008287,
+        "commission": 38.71237745,
+        "net_pnl": 140.98770542,
+        "spread_entry_mean": 5.147e-05,
+        "warnings": []
+      },
+      "2018Q2": {
+        "net_return": -0.00162472,
+        "trade_count": 56,
+        "win_rate": 0.375,
+        "profit_factor": 0.86450132,
+        "max_drawdown": 0.00410393,
+        "gross_pnl": -129.33162619,
+        "commission": 33.13989134,
+        "net_pnl": -162.47151753,
+        "spread_entry_mean": 5.554e-05,
+        "warnings": []
+      },
+      "2018Q3a": {
+        "net_return": -0.00045454,
+        "trade_count": 14,
+        "win_rate": 0.35714286,
+        "profit_factor": 0.84975549,
+        "max_drawdown": 0.00175973,
+        "gross_pnl": -37.07686255,
+        "commission": 8.37756919,
+        "net_pnl": -45.45443174,
+        "spread_entry_mean": 4.857e-05,
+        "warnings": []
+      },
+      "2018Q3b": {
+        "net_return": -0.00269884,
+        "trade_count": 21,
+        "win_rate": 0.23809524,
+        "profit_factor": 0.49123459,
+        "max_drawdown": 0.00424544,
+        "gross_pnl": -257.28507175,
+        "commission": 12.59917472,
+        "net_pnl": -269.88424647,
+        "spread_entry_mean": 5.048e-05,
+        "warnings": []
+      },
+      "2018Q4": {
+        "net_return": -0.00283383,
+        "trade_count": 53,
+        "win_rate": 0.33962264,
+        "profit_factor": 0.77210855,
+        "max_drawdown": 0.00481147,
+        "gross_pnl": -250.85977014,
+        "commission": 32.52321103,
+        "net_pnl": -283.38298117,
+        "spread_entry_mean": 5.189e-05,
+        "warnings": []
+      },
+      "2019Q1": {
+        "net_return": 0.00344265,
+        "trade_count": 34,
+        "win_rate": 0.5,
+        "profit_factor": 1.60719109,
+        "max_drawdown": 0.00156717,
+        "gross_pnl": 365.20898877,
+        "commission": 20.94381253,
+        "net_pnl": 344.26517623,
+        "spread_entry_mean": 2.971e-05,
+        "warnings": []
+      },
+      "2019Q2": {
+        "net_return": 0.00066775,
+        "trade_count": 24,
+        "win_rate": 0.41666667,
+        "profit_factor": 1.14050739,
+        "max_drawdown": 0.00205269,
+        "gross_pnl": 81.7242349,
+        "commission": 14.94876107,
+        "net_pnl": 66.77547383,
+        "spread_entry_mean": 3.458e-05,
+        "warnings": []
+      },
+      "2019Q3": {
+        "net_return": -9.604e-05,
+        "trade_count": 33,
+        "win_rate": 0.39393939,
+        "profit_factor": 0.98674603,
+        "max_drawdown": 0.00297043,
+        "gross_pnl": 11.17459982,
+        "commission": 20.77900177,
+        "net_pnl": -9.60440195,
+        "spread_entry_mean": 3.939e-05,
+        "warnings": []
+      },
+      "2019Q4": {
+        "net_return": 0.00050596,
+        "trade_count": 15,
+        "win_rate": 0.46666667,
+        "profit_factor": 1.17515081,
+        "max_drawdown": 0.00233985,
+        "gross_pnl": 60.06011883,
+        "commission": 9.46406886,
+        "net_pnl": 50.59604997,
+        "spread_entry_mean": 2.533e-05,
+        "warnings": []
+      },
+      "2020Q1": {
+        "net_return": 0.00161294,
+        "trade_count": 56,
+        "win_rate": 0.42857143,
+        "profit_factor": 1.1384005,
+        "max_drawdown": 0.00329991,
+        "gross_pnl": 196.91277653,
+        "commission": 35.61892804,
+        "net_pnl": 161.29384849,
+        "spread_entry_mean": 5.929e-05,
+        "warnings": []
+      },
+      "2020Q2": {
+        "net_return": -0.00149539,
+        "trade_count": 67,
+        "win_rate": 0.37313433,
+        "profit_factor": 0.90228218,
+        "max_drawdown": 0.00384302,
+        "gross_pnl": -106.9471874,
+        "commission": 42.59217825,
+        "net_pnl": -149.53936564,
+        "spread_entry_mean": 2.597e-05,
+        "warnings": []
+      },
+      "2020Q3": {
+        "net_return": -0.00585327,
+        "trade_count": 65,
+        "win_rate": 0.29230769,
+        "profit_factor": 0.62778575,
+        "max_drawdown": 0.00710969,
+        "gross_pnl": -546.44832282,
+        "commission": 38.87866826,
+        "net_pnl": -585.32699108,
+        "spread_entry_mean": 3.077e-05,
+        "warnings": []
+      },
+      "2020Q4": {
+        "net_return": -0.00226564,
+        "trade_count": 43,
+        "win_rate": 0.34883721,
+        "profit_factor": 0.75996273,
+        "max_drawdown": 0.00315189,
+        "gross_pnl": -201.32863484,
+        "commission": 25.23503737,
+        "net_pnl": -226.56367221,
+        "spread_entry_mean": 3.279e-05,
+        "warnings": []
+      },
+      "2021Q1": {
+        "net_return": 0.00163736,
+        "trade_count": 38,
+        "win_rate": 0.44736842,
+        "profit_factor": 1.23458098,
+        "max_drawdown": 0.00256141,
+        "gross_pnl": 185.80681635,
+        "commission": 22.07050025,
+        "net_pnl": 163.7363161,
+        "spread_entry_mean": 3.184e-05,
+        "warnings": []
+      },
+      "2021Q2": {
+        "net_return": -0.00036176,
+        "trade_count": 42,
+        "win_rate": 0.38095238,
+        "profit_factor": 0.95731593,
+        "max_drawdown": 0.00364187,
+        "gross_pnl": -11.77331258,
+        "commission": 24.40282942,
+        "net_pnl": -36.17614199,
+        "spread_entry_mean": 3.048e-05,
+        "warnings": []
+      },
+      "2021Q3": {
+        "net_return": -0.00195741,
+        "trade_count": 29,
+        "win_rate": 0.31034483,
+        "profit_factor": 0.7047198,
+        "max_drawdown": 0.0042909,
+        "gross_pnl": -178.51482268,
+        "commission": 17.22641078,
+        "net_pnl": -195.74123346,
+        "spread_entry_mean": 2.931e-05,
+        "warnings": []
+      },
+      "2021Q4": {
+        "net_return": -0.00089054,
+        "trade_count": 32,
+        "win_rate": 0.375,
+        "profit_factor": 0.87337642,
+        "max_drawdown": 0.00290749,
+        "gross_pnl": -69.43968457,
+        "commission": 19.61444415,
+        "net_pnl": -89.05412872,
+        "spread_entry_mean": 4.5e-05,
+        "warnings": []
+      },
+      "2022Q1": {
+        "net_return": -0.00052881,
+        "trade_count": 56,
+        "win_rate": 0.39285714,
+        "profit_factor": 0.95777674,
+        "max_drawdown": 0.00456103,
+        "gross_pnl": -17.76375684,
+        "commission": 35.11719759,
+        "net_pnl": -52.88095443,
+        "spread_entry_mean": 3.339e-05,
+        "warnings": []
+      },
+      "2022Q2": {
+        "net_return": -0.00119492,
+        "trade_count": 66,
+        "win_rate": 0.37878788,
+        "profit_factor": 0.92297968,
+        "max_drawdown": 0.00483155,
+        "gross_pnl": -75.98699655,
+        "commission": 43.50496099,
+        "net_pnl": -119.49195755,
+        "spread_entry_mean": 9.167e-05,
+        "warnings": []
+      },
+      "2022Q3": {
+        "net_return": -0.00065926,
+        "trade_count": 79,
+        "win_rate": 0.39240506,
+        "profit_factor": 0.9658739,
+        "max_drawdown": 0.00500996,
+        "gross_pnl": -10.8204142,
+        "commission": 55.10559346,
+        "net_pnl": -65.92600765,
+        "spread_entry_mean": 5.62e-05,
+        "warnings": []
+      },
+      "2022Q4": {
+        "net_return": -0.00891103,
+        "trade_count": 89,
+        "win_rate": 0.29213483,
+        "profit_factor": 0.63719999,
+        "max_drawdown": 0.01253063,
+        "gross_pnl": -829.9456635,
+        "commission": 61.15774408,
+        "net_pnl": -891.10340758,
+        "spread_entry_mean": 5.315e-05,
+        "warnings": []
+      },
+      "2023Q1": {
+        "net_return": -0.00541695,
+        "trade_count": 70,
+        "win_rate": 0.32857143,
+        "profit_factor": 0.69300102,
+        "max_drawdown": 0.00897673,
+        "gross_pnl": -496.06112621,
+        "commission": 45.63393403,
+        "net_pnl": -541.69506024,
+        "spread_entry_mean": 7.286e-05,
+        "warnings": []
+      },
+      "2023Q2": {
+        "net_return": -0.002927,
+        "trade_count": 40,
+        "win_rate": 0.35,
+        "profit_factor": 0.71328216,
+        "max_drawdown": 0.00433908,
+        "gross_pnl": -267.03257116,
+        "commission": 25.66763027,
+        "net_pnl": -292.70020143,
+        "spread_entry_mean": 3.45e-05,
+        "warnings": []
+      },
+      "2023Q3": {
+        "net_return": 0.00072794,
+        "trade_count": 39,
+        "win_rate": 0.43589744,
+        "profit_factor": 1.09014073,
+        "max_drawdown": 0.003419,
+        "gross_pnl": 97.80935382,
+        "commission": 25.01568113,
+        "net_pnl": 72.7936727,
+        "spread_entry_mean": 2.846e-05,
+        "warnings": []
+      },
+      "2023Q4": {
+        "net_return": 0.00471973,
+        "trade_count": 40,
+        "win_rate": 0.525,
+        "profit_factor": 1.66562996,
+        "max_drawdown": 0.00167659,
+        "gross_pnl": 498.0015294,
+        "commission": 26.02893333,
+        "net_pnl": 471.97259607,
+        "spread_entry_mean": 3.875e-05,
+        "warnings": []
+      },
+      "2024Q1": {
+        "net_return": -0.00200309,
+        "trade_count": 32,
+        "win_rate": 0.34375,
+        "profit_factor": 0.74360054,
+        "max_drawdown": 0.00472656,
+        "gross_pnl": -179.66256745,
+        "commission": 20.6462891,
+        "net_pnl": -200.30885654,
+        "spread_entry_mean": 4.406e-05,
+        "warnings": []
+      },
+      "2024Q2": {
+        "net_return": -0.0042488,
+        "trade_count": 32,
+        "win_rate": 0.25,
+        "profit_factor": 0.51595811,
+        "max_drawdown": 0.00480979,
+        "gross_pnl": -404.08617385,
+        "commission": 20.7934389,
+        "net_pnl": -424.87961275,
+        "spread_entry_mean": 2.031e-05,
+        "warnings": []
+      },
+      "2024Q3": {
+        "net_return": -7.923e-05,
+        "trade_count": 34,
+        "win_rate": 0.38235294,
+        "profit_factor": 0.98912303,
+        "max_drawdown": 0.00300807,
+        "gross_pnl": 13.65680064,
+        "commission": 21.57979249,
+        "net_pnl": -7.92299185,
+        "spread_entry_mean": 2.147e-05,
+        "warnings": []
+      },
+      "2024Q4": {
+        "net_return": -0.00138089,
+        "trade_count": 42,
+        "win_rate": 0.35714286,
+        "profit_factor": 0.86115305,
+        "max_drawdown": 0.00542801,
+        "gross_pnl": -110.37949055,
+        "commission": 27.70915188,
+        "net_pnl": -138.08864243,
+        "spread_entry_mean": 2.667e-05,
+        "warnings": []
+      }
+    },
+    "trades": 1309,
+    "positive_blocks": 8,
+    "gross_pnl_eur": -2490.6887539,
+    "commission_eur": 825.08721173,
+    "net_pnl_eur": -3315.7759656,
+    "gross_per_trade_pips": -2.114157332908921,
+    "commission_per_trade_pips": 0.7003541394873102,
+    "net_per_trade_pips": -2.814511472370766
+  },
+  "donchian_breakout@M15": {
+    "params": {
+      "timeframe_minutes": 15,
+      "period": 20,
+      "sl_points": 193.65,
+      "tp_points": 309.84,
+      "lots": 0.1
+    },
+    "blocks": {
+      "2018Q1": {
+        "net_return": -0.00097376,
+        "trade_count": 251,
+        "win_rate": 0.4063745,
+        "profit_factor": 0.96208474,
+        "max_drawdown": 0.00469663,
+        "gross_pnl": 45.33936622,
+        "commission": 142.7157739,
+        "net_pnl": -97.37640767,
+        "spread_entry_mean": 4.924e-05,
+        "warnings": []
+      },
+      "2018Q2": {
+        "net_return": -0.00199861,
+        "trade_count": 227,
+        "win_rate": 0.39647577,
+        "profit_factor": 0.91832575,
+        "max_drawdown": 0.00278583,
+        "gross_pnl": -65.99666892,
+        "commission": 133.86393622,
+        "net_pnl": -199.86060515,
+        "spread_entry_mean": 6.471e-05,
+        "warnings": []
+      },
+      "2018Q3a": {
+        "net_return": 0.00044794,
+        "trade_count": 60,
+        "win_rate": 0.43333333,
+        "profit_factor": 1.07333298,
+        "max_drawdown": 0.00221436,
+        "gross_pnl": 80.74963298,
+        "commission": 35.95551226,
+        "net_pnl": 44.79412072,
+        "spread_entry_mean": 7.383e-05,
+        "warnings": []
+      },
+      "2018Q3b": {
+        "net_return": -0.00035333,
+        "trade_count": 59,
+        "win_rate": 0.40677966,
+        "profit_factor": 0.94351112,
+        "max_drawdown": 0.00215181,
+        "gross_pnl": 0.10850065,
+        "commission": 35.44155467,
+        "net_pnl": -35.33305401,
+        "spread_entry_mean": 5.932e-05,
+        "warnings": []
+      },
+      "2018Q4": {
+        "net_return": -0.00697408,
+        "trade_count": 197,
+        "win_rate": 0.34010152,
+        "profit_factor": 0.71414683,
+        "max_drawdown": 0.00782524,
+        "gross_pnl": -576.56923677,
+        "commission": 120.83846393,
+        "net_pnl": -697.40770069,
+        "spread_entry_mean": 9.538e-05,
+        "warnings": []
+      },
+      "2019Q1": {
+        "net_return": -0.00320954,
+        "trade_count": 135,
+        "win_rate": 0.35555556,
+        "profit_factor": 0.79780823,
+        "max_drawdown": 0.00404843,
+        "gross_pnl": -237.79673738,
+        "commission": 83.15772751,
+        "net_pnl": -320.95446489,
+        "spread_entry_mean": 3.378e-05,
+        "warnings": []
+      },
+      "2019Q2": {
+        "net_return": 0.00052559,
+        "trade_count": 93,
+        "win_rate": 0.41935484,
+        "profit_factor": 1.05316704,
+        "max_drawdown": 0.00177547,
+        "gross_pnl": 110.44581358,
+        "commission": 57.88679294,
+        "net_pnl": 52.55902064,
+        "spread_entry_mean": 3.226e-05,
+        "warnings": []
+      },
+      "2019Q3": {
+        "net_return": 0.00089936,
+        "trade_count": 110,
+        "win_rate": 0.42727273,
+        "profit_factor": 1.07638052,
+        "max_drawdown": 0.00256818,
+        "gross_pnl": 159.21862739,
+        "commission": 69.28248413,
+        "net_pnl": 89.93614326,
+        "spread_entry_mean": 3.255e-05,
+        "warnings": []
+      },
+      "2019Q4": {
+        "net_return": -0.00053677,
+        "trade_count": 75,
+        "win_rate": 0.38666667,
+        "profit_factor": 0.93599427,
+        "max_drawdown": 0.00222969,
+        "gross_pnl": -6.28925178,
+        "commission": 47.38763909,
+        "net_pnl": -53.67689087,
+        "spread_entry_mean": 2.52e-05,
+        "warnings": []
+      },
+      "2020Q1": {
+        "net_return": 0.00197956,
+        "trade_count": 233,
+        "win_rate": 0.43347639,
+        "profit_factor": 1.07779541,
+        "max_drawdown": 0.00341737,
+        "gross_pnl": 346.04643989,
+        "commission": 148.09070733,
+        "net_pnl": 197.95573256,
+        "spread_entry_mean": 5.682e-05,
+        "warnings": []
+      },
+      "2020Q2": {
+        "net_return": -0.00447483,
+        "trade_count": 232,
+        "win_rate": 0.37068966,
+        "profit_factor": 0.83772042,
+        "max_drawdown": 0.00546205,
+        "gross_pnl": -300.1428656,
+        "commission": 147.34044528,
+        "net_pnl": -447.48331088,
+        "spread_entry_mean": 3.578e-05,
+        "warnings": []
+      },
+      "2020Q3": {
+        "net_return": -0.00372058,
+        "trade_count": 239,
+        "win_rate": 0.37656904,
+        "profit_factor": 0.85960827,
+        "max_drawdown": 0.00572174,
+        "gross_pnl": -229.30300207,
+        "commission": 142.75542729,
+        "net_pnl": -372.05842936,
+        "spread_entry_mean": 4.289e-05,
+        "warnings": []
+      },
+      "2020Q4": {
+        "net_return": -0.00453122,
+        "trade_count": 194,
+        "win_rate": 0.3556701,
+        "profit_factor": 0.7916462,
+        "max_drawdown": 0.00509627,
+        "gross_pnl": -339.24586349,
+        "commission": 113.87638916,
+        "net_pnl": -453.12225265,
+        "spread_entry_mean": 4.067e-05,
+        "warnings": []
+      },
+      "2021Q1": {
+        "net_return": -0.00164679,
+        "trade_count": 162,
+        "win_rate": 0.38271605,
+        "profit_factor": 0.90341845,
+        "max_drawdown": 0.00245376,
+        "gross_pnl": -70.66520922,
+        "commission": 94.0137472,
+        "net_pnl": -164.67895642,
+        "spread_entry_mean": 3.111e-05,
+        "warnings": []
+      },
+      "2021Q2": {
+        "net_return": -0.0029495,
+        "trade_count": 145,
+        "win_rate": 0.35862069,
+        "profit_factor": 0.81422385,
+        "max_drawdown": 0.00428209,
+        "gross_pnl": -210.7338906,
+        "commission": 84.21600303,
+        "net_pnl": -294.94989364,
+        "spread_entry_mean": 3.793e-05,
+        "warnings": []
+      },
+      "2021Q3": {
+        "net_return": -0.00188695,
+        "trade_count": 106,
+        "win_rate": 0.36792453,
+        "profit_factor": 0.84035955,
+        "max_drawdown": 0.00344252,
+        "gross_pnl": -125.74009219,
+        "commission": 62.95535238,
+        "net_pnl": -188.69544457,
+        "spread_entry_mean": 3.566e-05,
+        "warnings": []
+      },
+      "2021Q4": {
+        "net_return": -0.00354056,
+        "trade_count": 148,
+        "win_rate": 0.35810811,
+        "profit_factor": 0.79734128,
+        "max_drawdown": 0.00426777,
+        "gross_pnl": -263.23982787,
+        "commission": 90.81655288,
+        "net_pnl": -354.05638075,
+        "spread_entry_mean": 7.405e-05,
+        "warnings": []
+      },
+      "2022Q1": {
+        "net_return": -0.00325815,
+        "trade_count": 231,
+        "win_rate": 0.38961039,
+        "profit_factor": 0.88081095,
+        "max_drawdown": 0.0057164,
+        "gross_pnl": -180.9873513,
+        "commission": 144.82739326,
+        "net_pnl": -325.81474456,
+        "spread_entry_mean": 4.299e-05,
+        "warnings": []
+      },
+      "2022Q2": {
+        "net_return": -0.00450024,
+        "trade_count": 261,
+        "win_rate": 0.37547893,
+        "profit_factor": 0.85927092,
+        "max_drawdown": 0.00678565,
+        "gross_pnl": -278.07484697,
+        "commission": 171.94889307,
+        "net_pnl": -450.02374005,
+        "spread_entry_mean": 5.418e-05,
+        "warnings": []
+      },
+      "2022Q3": {
+        "net_return": 0.00179835,
+        "trade_count": 297,
+        "win_rate": 0.42424242,
+        "profit_factor": 1.05033144,
+        "max_drawdown": 0.00424603,
+        "gross_pnl": 386.94774676,
+        "commission": 207.11279393,
+        "net_pnl": 179.83495283,
+        "spread_entry_mean": 5.616e-05,
+        "warnings": []
+      },
+      "2022Q4": {
+        "net_return": -0.01104649,
+        "trade_count": 312,
+        "win_rate": 0.34294872,
+        "profit_factor": 0.7401221,
+        "max_drawdown": 0.01184313,
+        "gross_pnl": -889.41855042,
+        "commission": 215.2308541,
+        "net_pnl": -1104.64940451,
+        "spread_entry_mean": 5.484e-05,
+        "warnings": []
+      },
+      "2023Q1": {
+        "net_return": 0.00053008,
+        "trade_count": 202,
+        "win_rate": 0.42574257,
+        "profit_factor": 1.02307526,
+        "max_drawdown": 0.00386044,
+        "gross_pnl": 184.77778609,
+        "commission": 131.76964801,
+        "net_pnl": 53.00813808,
+        "spread_entry_mean": 6.064e-05,
+        "warnings": []
+      },
+      "2023Q2": {
+        "net_return": -0.00434759,
+        "trade_count": 143,
+        "win_rate": 0.39160839,
+        "profit_factor": 0.7652998,
+        "max_drawdown": 0.00766379,
+        "gross_pnl": -342.82892426,
+        "commission": 91.9299391,
+        "net_pnl": -434.75886335,
+        "spread_entry_mean": 3.559e-05,
+        "warnings": []
+      },
+      "2023Q3": {
+        "net_return": -0.00701034,
+        "trade_count": 175,
+        "win_rate": 0.33714286,
+        "profit_factor": 0.69293406,
+        "max_drawdown": 0.00789985,
+        "gross_pnl": -588.44370819,
+        "commission": 112.59024324,
+        "net_pnl": -701.03395143,
+        "spread_entry_mean": 4.24e-05,
+        "warnings": []
+      },
+      "2023Q4": {
+        "net_return": -0.00135261,
+        "trade_count": 158,
+        "win_rate": 0.39240506,
+        "profit_factor": 0.9266137,
+        "max_drawdown": 0.00298752,
+        "gross_pnl": -32.33902126,
+        "commission": 102.92151941,
+        "net_pnl": -135.26054067,
+        "spread_entry_mean": 6.114e-05,
+        "warnings": []
+      },
+      "2024Q1": {
+        "net_return": -0.00303283,
+        "trade_count": 121,
+        "win_rate": 0.3553719,
+        "profit_factor": 0.79571803,
+        "max_drawdown": 0.0036308,
+        "gross_pnl": -225.36590116,
+        "commission": 77.91742819,
+        "net_pnl": -303.28332935,
+        "spread_entry_mean": 5.124e-05,
+        "warnings": []
+      },
+      "2024Q2": {
+        "net_return": -0.00115683,
+        "trade_count": 108,
+        "win_rate": 0.38888889,
+        "profit_factor": 0.90944484,
+        "max_drawdown": 0.00410901,
+        "gross_pnl": -45.38813585,
+        "commission": 70.2952915,
+        "net_pnl": -115.68342735,
+        "spread_entry_mean": 3.407e-05,
+        "warnings": []
+      },
+      "2024Q3": {
+        "net_return": 0.00076106,
+        "trade_count": 110,
+        "win_rate": 0.42727273,
+        "profit_factor": 1.06328571,
+        "max_drawdown": 0.00180592,
+        "gross_pnl": 146.04494825,
+        "commission": 69.93937913,
+        "net_pnl": 76.10556912,
+        "spread_entry_mean": 3.127e-05,
+        "warnings": []
+      },
+      "2024Q4": {
+        "net_return": -0.00275813,
+        "trade_count": 163,
+        "win_rate": 0.37423313,
+        "profit_factor": 0.86148439,
+        "max_drawdown": 0.00406438,
+        "gross_pnl": -168.47775169,
+        "commission": 107.33521073,
+        "net_pnl": -275.81296243,
+        "spread_entry_mean": 3.73e-05,
+        "warnings": []
+      }
+    },
+    "trades": 4947,
+    "positive_blocks": 7,
+    "gross_pnl_eur": -3717.36797518,
+    "commission_eur": 3114.41310287,
+    "net_pnl_eur": -6831.7810780400005,
+    "gross_per_trade_pips": -0.834932052013566,
+    "commission_per_trade_pips": 0.6995065702827752,
+    "net_per_trade_pips": -1.5344386222940951
+  },
+  "donchian_breakout@M5": {
+    "params": {
+      "timeframe_minutes": 5,
+      "period": 20,
+      "sl_points": 111.8,
+      "tp_points": 178.89,
+      "lots": 0.1
+    },
+    "blocks": {
+      "2018Q1": {
+        "net_return": -0.01419848,
+        "trade_count": 762,
+        "win_rate": 0.35564304,
+        "profit_factor": 0.72200027,
+        "max_drawdown": 0.01488098,
+        "gross_pnl": -986.20955738,
+        "commission": 433.63868559,
+        "net_pnl": -1419.84824296,
+        "spread_entry_mean": 4.73e-05,
+        "warnings": []
+      },
+      "2018Q2": {
+        "net_return": -0.0159762,
+        "trade_count": 671,
+        "win_rate": 0.33532042,
+        "profit_factor": 0.66535158,
+        "max_drawdown": 0.01601061,
+        "gross_pnl": -1202.14731621,
+        "commission": 395.47277694,
+        "net_pnl": -1597.62009315,
+        "spread_entry_mean": 5.858e-05,
+        "warnings": []
+      },
+      "2018Q3a": {
+        "net_return": -0.00048219,
+        "trade_count": 174,
+        "win_rate": 0.41954023,
+        "profit_factor": 0.95613962,
+        "max_drawdown": 0.00194032,
+        "gross_pnl": 56.04968647,
+        "commission": 104.26914269,
+        "net_pnl": -48.21945622,
+        "spread_entry_mean": 5.983e-05,
+        "warnings": []
+      },
+      "2018Q3b": {
+        "net_return": -0.00091266,
+        "trade_count": 184,
+        "win_rate": 0.41304348,
+        "profit_factor": 0.92265369,
+        "max_drawdown": 0.00179955,
+        "gross_pnl": 19.17956055,
+        "commission": 110.4452805,
+        "net_pnl": -91.26571995,
+        "spread_entry_mean": 6.44e-05,
+        "warnings": []
+      },
+      "2018Q4": {
+        "net_return": -0.0137017,
+        "trade_count": 589,
+        "win_rate": 0.3582343,
+        "profit_factor": 0.69305042,
+        "max_drawdown": 0.01480996,
+        "gross_pnl": -1008.898587,
+        "commission": 361.27123233,
+        "net_pnl": -1370.16981933,
+        "spread_entry_mean": 0.00015012,
+        "warnings": []
+      },
+      "2019Q1": {
+        "net_return": -0.00393101,
+        "trade_count": 375,
+        "win_rate": 0.38933333,
+        "profit_factor": 0.84620211,
+        "max_drawdown": 0.00476426,
+        "gross_pnl": -162.10987013,
+        "commission": 230.99157165,
+        "net_pnl": -393.10144177,
+        "spread_entry_mean": 4.899e-05,
+        "warnings": []
+      },
+      "2019Q2": {
+        "net_return": -0.00467082,
+        "trade_count": 297,
+        "win_rate": 0.37037037,
+        "profit_factor": 0.77756919,
+        "max_drawdown": 0.00490432,
+        "gross_pnl": -282.1034299,
+        "commission": 184.9787947,
+        "net_pnl": -467.08222459,
+        "spread_entry_mean": 3.091e-05,
+        "warnings": []
+      },
+      "2019Q3": {
+        "net_return": 0.0007106,
+        "trade_count": 287,
+        "win_rate": 0.43554007,
+        "profit_factor": 1.03885643,
+        "max_drawdown": 0.00213691,
+        "gross_pnl": 251.83062285,
+        "commission": 180.77059827,
+        "net_pnl": 71.06002459,
+        "spread_entry_mean": 3.202e-05,
+        "warnings": []
+      },
+      "2019Q4": {
+        "net_return": -0.00603478,
+        "trade_count": 257,
+        "win_rate": 0.3385214,
+        "profit_factor": 0.68554117,
+        "max_drawdown": 0.00707957,
+        "gross_pnl": -441.04652806,
+        "commission": 162.43119132,
+        "net_pnl": -603.47771938,
+        "spread_entry_mean": 2.809e-05,
+        "warnings": []
+      },
+      "2020Q1": {
+        "net_return": -0.00741793,
+        "trade_count": 683,
+        "win_rate": 0.39385066,
+        "profit_factor": 0.8466648,
+        "max_drawdown": 0.00853474,
+        "gross_pnl": -308.5224477,
+        "commission": 433.27083446,
+        "net_pnl": -741.79328216,
+        "spread_entry_mean": 6.996e-05,
+        "warnings": []
+      },
+      "2020Q2": {
+        "net_return": -0.01074255,
+        "trade_count": 659,
+        "win_rate": 0.36570561,
+        "profit_factor": 0.77398505,
+        "max_drawdown": 0.01137893,
+        "gross_pnl": -655.36746255,
+        "commission": 418.88777005,
+        "net_pnl": -1074.2552326,
+        "spread_entry_mean": 3.859e-05,
+        "warnings": []
+      },
+      "2020Q3": {
+        "net_return": -0.01154281,
+        "trade_count": 681,
+        "win_rate": 0.35682819,
+        "profit_factor": 0.75237132,
+        "max_drawdown": 0.01164851,
+        "gross_pnl": -747.13747921,
+        "commission": 407.14338525,
+        "net_pnl": -1154.28086446,
+        "spread_entry_mean": 3.358e-05,
+        "warnings": []
+      },
+      "2020Q4": {
+        "net_return": -0.007902,
+        "trade_count": 523,
+        "win_rate": 0.36711281,
+        "profit_factor": 0.77429108,
+        "max_drawdown": 0.0083831,
+        "gross_pnl": -483.25218527,
+        "commission": 306.94762531,
+        "net_pnl": -790.19981057,
+        "spread_entry_mean": 3.549e-05,
+        "warnings": []
+      },
+      "2021Q1": {
+        "net_return": -0.00972038,
+        "trade_count": 495,
+        "win_rate": 0.34545455,
+        "profit_factor": 0.71101931,
+        "max_drawdown": 0.01065118,
+        "gross_pnl": -684.74563732,
+        "commission": 287.29262541,
+        "net_pnl": -972.03826273,
+        "spread_entry_mean": 3.313e-05,
+        "warnings": []
+      },
+      "2021Q2": {
+        "net_return": -0.00765379,
+        "trade_count": 391,
+        "win_rate": 0.34782609,
+        "profit_factor": 0.71298547,
+        "max_drawdown": 0.00794127,
+        "gross_pnl": -538.13719807,
+        "commission": 227.24198236,
+        "net_pnl": -765.37918043,
+        "spread_entry_mean": 4.184e-05,
+        "warnings": []
+      },
+      "2021Q3": {
+        "net_return": -0.00771773,
+        "trade_count": 328,
+        "win_rate": 0.33231707,
+        "profit_factor": 0.66910933,
+        "max_drawdown": 0.0079833,
+        "gross_pnl": -576.91258816,
+        "commission": 194.86085371,
+        "net_pnl": -771.77344187,
+        "spread_entry_mean": 4.226e-05,
+        "warnings": []
+      },
+      "2021Q4": {
+        "net_return": -0.0106805,
+        "trade_count": 435,
+        "win_rate": 0.33563218,
+        "profit_factor": 0.66946434,
+        "max_drawdown": 0.01085255,
+        "gross_pnl": -801.05560322,
+        "commission": 266.99470668,
+        "net_pnl": -1068.05030989,
+        "spread_entry_mean": 5.54e-05,
+        "warnings": []
+      },
+      "2022Q1": {
+        "net_return": -0.01503323,
+        "trade_count": 653,
+        "win_rate": 0.34762634,
+        "profit_factor": 0.69420191,
+        "max_drawdown": 0.0162263,
+        "gross_pnl": -1094.15844669,
+        "commission": 409.16430029,
+        "net_pnl": -1503.32274698,
+        "spread_entry_mean": 3.957e-05,
+        "warnings": []
+      },
+      "2022Q2": {
+        "net_return": -0.01278595,
+        "trade_count": 740,
+        "win_rate": 0.36756757,
+        "profit_factor": 0.77142497,
+        "max_drawdown": 0.01324086,
+        "gross_pnl": -790.93277356,
+        "commission": 487.66232996,
+        "net_pnl": -1278.59510353,
+        "spread_entry_mean": 5.758e-05,
+        "warnings": [
+          "rejected 1 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2022Q3": {
+        "net_return": -0.01408821,
+        "trade_count": 868,
+        "win_rate": 0.37557604,
+        "profit_factor": 0.79482775,
+        "max_drawdown": 0.0150377,
+        "gross_pnl": -804.27373926,
+        "commission": 604.54679777,
+        "net_pnl": -1408.82053703,
+        "spread_entry_mean": 5.289e-05,
+        "warnings": []
+      },
+      "2022Q4": {
+        "net_return": -0.01875083,
+        "trade_count": 889,
+        "win_rate": 0.35995501,
+        "profit_factor": 0.73812723,
+        "max_drawdown": 0.01887472,
+        "gross_pnl": -1263.67583958,
+        "commission": 611.40754621,
+        "net_pnl": -1875.08338579,
+        "spread_entry_mean": 6.979e-05,
+        "warnings": [
+          "rejected 1 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2023Q1": {
+        "net_return": -0.0119768,
+        "trade_count": 600,
+        "win_rate": 0.36666667,
+        "profit_factor": 0.74001483,
+        "max_drawdown": 0.01242004,
+        "gross_pnl": -806.59480766,
+        "commission": 391.08471347,
+        "net_pnl": -1197.67952113,
+        "spread_entry_mean": 6.403e-05,
+        "warnings": [
+          "rejected 2 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2023Q2": {
+        "net_return": -0.00460815,
+        "trade_count": 368,
+        "win_rate": 0.41847826,
+        "profit_factor": 0.83315076,
+        "max_drawdown": 0.00809655,
+        "gross_pnl": -224.24820113,
+        "commission": 236.56690106,
+        "net_pnl": -460.81510219,
+        "spread_entry_mean": 3.522e-05,
+        "warnings": [
+          "rejected 3 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2023Q3": {
+        "net_return": -0.00899791,
+        "trade_count": 451,
+        "win_rate": 0.36141907,
+        "profit_factor": 0.73591289,
+        "max_drawdown": 0.00919428,
+        "gross_pnl": -609.7170392,
+        "commission": 290.07433172,
+        "net_pnl": -899.79137092,
+        "spread_entry_mean": 3.144e-05,
+        "warnings": [
+          "rejected 1 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2023Q4": {
+        "net_return": -0.01386183,
+        "trade_count": 502,
+        "win_rate": 0.33466135,
+        "profit_factor": 0.65500762,
+        "max_drawdown": 0.01465084,
+        "gross_pnl": -1059.60872013,
+        "commission": 326.57468021,
+        "net_pnl": -1386.18340034,
+        "spread_entry_mean": 8.631e-05,
+        "warnings": []
+      },
+      "2024Q1": {
+        "net_return": -0.00651469,
+        "trade_count": 353,
+        "win_rate": 0.36260623,
+        "profit_factor": 0.75191878,
+        "max_drawdown": 0.00804513,
+        "gross_pnl": -424.00866557,
+        "commission": 227.45990872,
+        "net_pnl": -651.46857428,
+        "spread_entry_mean": 3.479e-05,
+        "warnings": []
+      },
+      "2024Q2": {
+        "net_return": -0.00467678,
+        "trade_count": 303,
+        "win_rate": 0.37293729,
+        "profit_factor": 0.79146929,
+        "max_drawdown": 0.00576766,
+        "gross_pnl": -270.30161597,
+        "commission": 197.37656481,
+        "net_pnl": -467.67818078,
+        "spread_entry_mean": 3.366e-05,
+        "warnings": []
+      },
+      "2024Q3": {
+        "net_return": -0.00405481,
+        "trade_count": 330,
+        "win_rate": 0.38484848,
+        "profit_factor": 0.82668284,
+        "max_drawdown": 0.00441187,
+        "gross_pnl": -195.86658836,
+        "commission": 209.61416545,
+        "net_pnl": -405.48075381,
+        "spread_entry_mean": 4.23e-05,
+        "warnings": []
+      },
+      "2024Q4": {
+        "net_return": -0.00831682,
+        "trade_count": 499,
+        "win_rate": 0.37274549,
+        "profit_factor": 0.7804409,
+        "max_drawdown": 0.0085105,
+        "gross_pnl": -502.84671526,
+        "commission": 328.83518588,
+        "net_pnl": -831.68190114,
+        "spread_entry_mean": 7.277e-05,
+        "warnings": []
+      }
+    },
+    "trades": 14347,
+    "positive_blocks": 1,
+    "gross_pnl_eur": -16596.81917268,
+    "commission_eur": 9027.27648277,
+    "net_pnl_eur": -25624.09565539,
+    "gross_per_trade_pips": -1.2853495638019563,
+    "commission_per_trade_pips": 0.6991222696785235,
+    "net_per_trade_pips": -1.984471833475833
+  },
+  "ema_zscore_reversion@H1": {
+    "params": {
+      "timeframe_minutes": 60,
+      "ema_period": 20,
+      "z_period": 20,
+      "z_enter": 2.0,
+      "sl_points": 193.65,
+      "lots": 0.1,
+      "max_spread_points": 30.0
+    },
+    "blocks": {
+      "2018Q1": {
+        "net_return": -0.00584736,
+        "trade_count": 99,
+        "win_rate": 0.31313131,
+        "profit_factor": 0.49225232,
+        "max_drawdown": 0.0066575,
+        "gross_pnl": -528.41213821,
+        "commission": 56.32392301,
+        "net_pnl": -584.73606123,
+        "spread_entry_mean": 3.313e-05,
+        "warnings": [
+          "rejected 5 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2018Q2": {
+        "net_return": -0.00306778,
+        "trade_count": 99,
+        "win_rate": 0.41414141,
+        "profit_factor": 0.70118188,
+        "max_drawdown": 0.00373715,
+        "gross_pnl": -248.53137668,
+        "commission": 58.24671698,
+        "net_pnl": -306.77809365,
+        "spread_entry_mean": 4.616e-05,
+        "warnings": [
+          "rejected 10 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2018Q3a": {
+        "net_return": -0.00097237,
+        "trade_count": 39,
+        "win_rate": 0.43589744,
+        "profit_factor": 0.73929041,
+        "max_drawdown": 0.00147843,
+        "gross_pnl": -73.88593395,
+        "commission": 23.35063696,
+        "net_pnl": -97.2365709,
+        "spread_entry_mean": 4.154e-05,
+        "warnings": [
+          "rejected 5 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2018Q3b": {
+        "net_return": -0.00204943,
+        "trade_count": 30,
+        "win_rate": 0.36666667,
+        "profit_factor": 0.40291907,
+        "max_drawdown": 0.00242953,
+        "gross_pnl": -186.96679699,
+        "commission": 17.97598101,
+        "net_pnl": -204.942778,
+        "spread_entry_mean": 3.933e-05,
+        "warnings": [
+          "rejected 2 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2018Q4": {
+        "net_return": -0.00228549,
+        "trade_count": 98,
+        "win_rate": 0.42857143,
+        "profit_factor": 0.77539955,
+        "max_drawdown": 0.00510988,
+        "gross_pnl": -168.43346053,
+        "commission": 60.11536587,
+        "net_pnl": -228.5488264,
+        "spread_entry_mean": 4.694e-05,
+        "warnings": [
+          "rejected 9 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2019Q1": {
+        "net_return": -0.00021864,
+        "trade_count": 79,
+        "win_rate": 0.50632911,
+        "profit_factor": 0.96899969,
+        "max_drawdown": 0.00202569,
+        "gross_pnl": 26.85685492,
+        "commission": 48.72130661,
+        "net_pnl": -21.86445169,
+        "spread_entry_mean": 2.759e-05,
+        "warnings": []
+      },
+      "2019Q2": {
+        "net_return": -0.00223393,
+        "trade_count": 82,
+        "win_rate": 0.52439024,
+        "profit_factor": 0.68184119,
+        "max_drawdown": 0.00299629,
+        "gross_pnl": -172.33047771,
+        "commission": 51.0621997,
+        "net_pnl": -223.39267741,
+        "spread_entry_mean": 2.817e-05,
+        "warnings": [
+          "rejected 2 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2019Q3": {
+        "net_return": -0.00119298,
+        "trade_count": 96,
+        "win_rate": 0.51041667,
+        "profit_factor": 0.86200059,
+        "max_drawdown": 0.00214955,
+        "gross_pnl": -58.74445852,
+        "commission": 60.55385343,
+        "net_pnl": -119.29831195,
+        "spread_entry_mean": 3.167e-05,
+        "warnings": [
+          "rejected 10 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2019Q4": {
+        "net_return": 0.00038108,
+        "trade_count": 75,
+        "win_rate": 0.6,
+        "profit_factor": 1.07009797,
+        "max_drawdown": 0.00126472,
+        "gross_pnl": 85.52956463,
+        "commission": 47.42109421,
+        "net_pnl": 38.10847042,
+        "spread_entry_mean": 2.267e-05,
+        "warnings": [
+          "rejected 3 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2020Q1": {
+        "net_return": 0.00054493,
+        "trade_count": 93,
+        "win_rate": 0.39784946,
+        "profit_factor": 1.05353365,
+        "max_drawdown": 0.0031568,
+        "gross_pnl": 113.57332666,
+        "commission": 59.08036124,
+        "net_pnl": 54.49296541,
+        "spread_entry_mean": 3.29e-05,
+        "warnings": [
+          "rejected 7 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2020Q2": {
+        "net_return": -0.00491671,
+        "trade_count": 105,
+        "win_rate": 0.38095238,
+        "profit_factor": 0.58746657,
+        "max_drawdown": 0.00647089,
+        "gross_pnl": -424.8861829,
+        "commission": 66.78483235,
+        "net_pnl": -491.67101525,
+        "spread_entry_mean": 3.2e-05,
+        "warnings": [
+          "rejected 11 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2020Q3": {
+        "net_return": -0.00587605,
+        "trade_count": 118,
+        "win_rate": 0.37288136,
+        "profit_factor": 0.53336622,
+        "max_drawdown": 0.00616561,
+        "gross_pnl": -517.08830018,
+        "commission": 70.51700322,
+        "net_pnl": -587.6053034,
+        "spread_entry_mean": 3.119e-05,
+        "warnings": [
+          "rejected 11 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2020Q4": {
+        "net_return": -0.0025864,
+        "trade_count": 98,
+        "win_rate": 0.43877551,
+        "profit_factor": 0.72068587,
+        "max_drawdown": 0.00391192,
+        "gross_pnl": -201.01332778,
+        "commission": 57.62644536,
+        "net_pnl": -258.63977315,
+        "spread_entry_mean": 2.888e-05,
+        "warnings": [
+          "rejected 10 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2021Q1": {
+        "net_return": -0.00184082,
+        "trade_count": 81,
+        "win_rate": 0.41975309,
+        "profit_factor": 0.76317291,
+        "max_drawdown": 0.00312966,
+        "gross_pnl": -137.06777334,
+        "commission": 47.01472326,
+        "net_pnl": -184.0824966,
+        "spread_entry_mean": 2.926e-05,
+        "warnings": [
+          "rejected 14 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2021Q2": {
+        "net_return": -0.00390837,
+        "trade_count": 95,
+        "win_rate": 0.42105263,
+        "profit_factor": 0.57993083,
+        "max_drawdown": 0.00441378,
+        "gross_pnl": -335.67158853,
+        "commission": 55.16501305,
+        "net_pnl": -390.83660157,
+        "spread_entry_mean": 2.895e-05,
+        "warnings": [
+          "rejected 12 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2021Q3": {
+        "net_return": -0.00190732,
+        "trade_count": 79,
+        "win_rate": 0.49367089,
+        "profit_factor": 0.71539699,
+        "max_drawdown": 0.00233563,
+        "gross_pnl": -143.84074452,
+        "commission": 46.8908431,
+        "net_pnl": -190.73158762,
+        "spread_entry_mean": 2.924e-05,
+        "warnings": [
+          "rejected 6 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2021Q4": {
+        "net_return": -0.00016916,
+        "trade_count": 95,
+        "win_rate": 0.51578947,
+        "profit_factor": 0.97896072,
+        "max_drawdown": 0.00353339,
+        "gross_pnl": 41.35020624,
+        "commission": 58.2662982,
+        "net_pnl": -16.91609195,
+        "spread_entry_mean": 2.895e-05,
+        "warnings": [
+          "rejected 4 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2022Q1": {
+        "net_return": -0.00364566,
+        "trade_count": 106,
+        "win_rate": 0.33962264,
+        "profit_factor": 0.71665142,
+        "max_drawdown": 0.00407767,
+        "gross_pnl": -298.31448888,
+        "commission": 66.25173027,
+        "net_pnl": -364.56621915,
+        "spread_entry_mean": 3.274e-05,
+        "warnings": [
+          "rejected 4 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2022Q2": {
+        "net_return": 0.00189566,
+        "trade_count": 103,
+        "win_rate": 0.4368932,
+        "profit_factor": 1.16897487,
+        "max_drawdown": 0.00250738,
+        "gross_pnl": 257.38452232,
+        "commission": 67.81824771,
+        "net_pnl": 189.56627461,
+        "spread_entry_mean": 3.495e-05,
+        "warnings": [
+          "rejected 8 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2022Q3": {
+        "net_return": -0.00061692,
+        "trade_count": 110,
+        "win_rate": 0.37272727,
+        "profit_factor": 0.9572485,
+        "max_drawdown": 0.00340759,
+        "gross_pnl": 15.03886292,
+        "commission": 76.73117892,
+        "net_pnl": -61.692316,
+        "spread_entry_mean": 4.255e-05,
+        "warnings": [
+          "rejected 11 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2022Q4": {
+        "net_return": -0.00217328,
+        "trade_count": 102,
+        "win_rate": 0.38235294,
+        "profit_factor": 0.83232904,
+        "max_drawdown": 0.00462792,
+        "gross_pnl": -147.20345648,
+        "commission": 70.12422061,
+        "net_pnl": -217.32767708,
+        "spread_entry_mean": 4.716e-05,
+        "warnings": [
+          "rejected 10 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2023Q1": {
+        "net_return": 0.00186287,
+        "trade_count": 82,
+        "win_rate": 0.46341463,
+        "profit_factor": 1.19811645,
+        "max_drawdown": 0.00213174,
+        "gross_pnl": 239.67949706,
+        "commission": 53.39233101,
+        "net_pnl": 186.28716605,
+        "spread_entry_mean": 5.866e-05,
+        "warnings": [
+          "rejected 8 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2023Q2": {
+        "net_return": 0.00208059,
+        "trade_count": 65,
+        "win_rate": 0.4,
+        "profit_factor": 1.36150439,
+        "max_drawdown": 0.00166451,
+        "gross_pnl": 249.79596915,
+        "commission": 41.73739937,
+        "net_pnl": 208.05856978,
+        "spread_entry_mean": 2.862e-05,
+        "warnings": [
+          "rejected 4 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2023Q3": {
+        "net_return": -0.00221681,
+        "trade_count": 93,
+        "win_rate": 0.41935484,
+        "profit_factor": 0.77336075,
+        "max_drawdown": 0.00291714,
+        "gross_pnl": -161.80980014,
+        "commission": 59.87162145,
+        "net_pnl": -221.68142159,
+        "spread_entry_mean": 3.753e-05,
+        "warnings": [
+          "rejected 6 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2023Q4": {
+        "net_return": -0.00110605,
+        "trade_count": 82,
+        "win_rate": 0.42682927,
+        "profit_factor": 0.87848578,
+        "max_drawdown": 0.00278438,
+        "gross_pnl": -57.1968634,
+        "commission": 53.40816772,
+        "net_pnl": -110.60503112,
+        "spread_entry_mean": 2.756e-05,
+        "warnings": [
+          "rejected 5 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2024Q1": {
+        "net_return": 0.00112038,
+        "trade_count": 88,
+        "win_rate": 0.54545455,
+        "profit_factor": 1.1453297,
+        "max_drawdown": 0.00168941,
+        "gross_pnl": 168.78580782,
+        "commission": 56.74777293,
+        "net_pnl": 112.03803489,
+        "spread_entry_mean": 2.5e-05,
+        "warnings": [
+          "rejected 7 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2024Q2": {
+        "net_return": -0.00159564,
+        "trade_count": 83,
+        "win_rate": 0.46987952,
+        "profit_factor": 0.81357959,
+        "max_drawdown": 0.00234076,
+        "gross_pnl": -105.59854989,
+        "commission": 53.96590944,
+        "net_pnl": -159.56445934,
+        "spread_entry_mean": 2.181e-05,
+        "warnings": [
+          "rejected 15 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2024Q3": {
+        "net_return": 0.00089237,
+        "trade_count": 79,
+        "win_rate": 0.58227848,
+        "profit_factor": 1.13995108,
+        "max_drawdown": 0.00123863,
+        "gross_pnl": 139.52423339,
+        "commission": 50.28704424,
+        "net_pnl": 89.23718915,
+        "spread_entry_mean": 2.696e-05,
+        "warnings": [
+          "rejected 9 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2024Q4": {
+        "net_return": -0.00021511,
+        "trade_count": 89,
+        "win_rate": 0.48314607,
+        "profit_factor": 0.97389539,
+        "max_drawdown": 0.00162077,
+        "gross_pnl": 37.02162767,
+        "commission": 58.53250394,
+        "net_pnl": -21.51087627,
+        "spread_entry_mean": 2.292e-05,
+        "warnings": []
+      }
+    },
+    "trades": 2543,
+    "positive_blocks": 7,
+    "gross_pnl_eur": -2592.45524585,
+    "commission_eur": 1593.98472517,
+    "net_pnl_eur": -4186.43997101,
+    "gross_per_trade_pips": -1.132719555140473,
+    "commission_per_trade_pips": 0.6964585682570892,
+    "net_per_trade_pips": -1.8291781233931923
+  },
+  "ema_zscore_reversion@M15": {
+    "params": {
+      "timeframe_minutes": 15,
+      "ema_period": 20,
+      "z_period": 20,
+      "z_enter": 2.0,
+      "sl_points": 96.82,
+      "lots": 0.1,
+      "max_spread_points": 30.0
+    },
+    "blocks": {
+      "2018Q1": {
+        "net_return": -0.00582319,
+        "trade_count": 390,
+        "win_rate": 0.40769231,
+        "profit_factor": 0.72090306,
+        "max_drawdown": 0.00602659,
+        "gross_pnl": -360.27639856,
+        "commission": 222.04269181,
+        "net_pnl": -582.31909038,
+        "spread_entry_mean": 3.672e-05,
+        "warnings": [
+          "rejected 46 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2018Q2": {
+        "net_return": -0.00425228,
+        "trade_count": 398,
+        "win_rate": 0.43969849,
+        "profit_factor": 0.79237421,
+        "max_drawdown": 0.00608279,
+        "gross_pnl": -191.229705,
+        "commission": 233.99798842,
+        "net_pnl": -425.22769342,
+        "spread_entry_mean": 4.432e-05,
+        "warnings": [
+          "rejected 27 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2018Q3a": {
+        "net_return": -0.0029972,
+        "trade_count": 123,
+        "win_rate": 0.41463415,
+        "profit_factor": 0.56150241,
+        "max_drawdown": 0.00313192,
+        "gross_pnl": -226.0261826,
+        "commission": 73.69393713,
+        "net_pnl": -299.72011973,
+        "spread_entry_mean": 4.504e-05,
+        "warnings": [
+          "rejected 14 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2018Q3b": {
+        "net_return": -0.00179913,
+        "trade_count": 121,
+        "win_rate": 0.43801653,
+        "profit_factor": 0.72759178,
+        "max_drawdown": 0.0022461,
+        "gross_pnl": -107.28374693,
+        "commission": 72.62959529,
+        "net_pnl": -179.91334222,
+        "spread_entry_mean": 3.909e-05,
+        "warnings": [
+          "rejected 8 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2018Q4": {
+        "net_return": -0.00563538,
+        "trade_count": 370,
+        "win_rate": 0.44594595,
+        "profit_factor": 0.71568513,
+        "max_drawdown": 0.00663271,
+        "gross_pnl": -336.56506986,
+        "commission": 226.97305699,
+        "net_pnl": -563.53812685,
+        "spread_entry_mean": 4.414e-05,
+        "warnings": [
+          "rejected 39 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2019Q1": {
+        "net_return": 0.00052018,
+        "trade_count": 315,
+        "win_rate": 0.54285714,
+        "profit_factor": 1.03903021,
+        "max_drawdown": 0.00266036,
+        "gross_pnl": 245.96914528,
+        "commission": 193.95121807,
+        "net_pnl": 52.01792721,
+        "spread_entry_mean": 3.092e-05,
+        "warnings": [
+          "rejected 28 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2019Q2": {
+        "net_return": -0.00148234,
+        "trade_count": 295,
+        "win_rate": 0.57966102,
+        "profit_factor": 0.87409894,
+        "max_drawdown": 0.00239108,
+        "gross_pnl": 35.5019332,
+        "commission": 183.73603175,
+        "net_pnl": -148.23409855,
+        "spread_entry_mean": 3.027e-05,
+        "warnings": [
+          "rejected 24 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2019Q3": {
+        "net_return": -0.00503126,
+        "trade_count": 314,
+        "win_rate": 0.47770701,
+        "profit_factor": 0.67787633,
+        "max_drawdown": 0.00532013,
+        "gross_pnl": -305.46536357,
+        "commission": 197.66071775,
+        "net_pnl": -503.12608132,
+        "spread_entry_mean": 3.236e-05,
+        "warnings": [
+          "rejected 36 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2019Q4": {
+        "net_return": -0.00245988,
+        "trade_count": 288,
+        "win_rate": 0.54513889,
+        "profit_factor": 0.79764064,
+        "max_drawdown": 0.00305411,
+        "gross_pnl": -63.91542052,
+        "commission": 182.07302379,
+        "net_pnl": -245.98844431,
+        "spread_entry_mean": 2.865e-05,
+        "warnings": [
+          "rejected 37 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2020Q1": {
+        "net_return": -0.00786369,
+        "trade_count": 350,
+        "win_rate": 0.42,
+        "profit_factor": 0.60963814,
+        "max_drawdown": 0.00868328,
+        "gross_pnl": -564.23954146,
+        "commission": 222.12976153,
+        "net_pnl": -786.36930298,
+        "spread_entry_mean": 3.871e-05,
+        "warnings": [
+          "rejected 28 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2020Q2": {
+        "net_return": -0.00743361,
+        "trade_count": 411,
+        "win_rate": 0.3892944,
+        "profit_factor": 0.7005872,
+        "max_drawdown": 0.00760423,
+        "gross_pnl": -482.14491823,
+        "commission": 261.21639674,
+        "net_pnl": -743.36131497,
+        "spread_entry_mean": 3.182e-05,
+        "warnings": [
+          "rejected 31 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2020Q3": {
+        "net_return": -0.00733622,
+        "trade_count": 395,
+        "win_rate": 0.38481013,
+        "profit_factor": 0.66679926,
+        "max_drawdown": 0.00764285,
+        "gross_pnl": -496.88254287,
+        "commission": 236.73918488,
+        "net_pnl": -733.62172774,
+        "spread_entry_mean": 3.554e-05,
+        "warnings": [
+          "rejected 44 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2020Q4": {
+        "net_return": -0.0020315,
+        "trade_count": 369,
+        "win_rate": 0.48238482,
+        "profit_factor": 0.88222701,
+        "max_drawdown": 0.00456222,
+        "gross_pnl": 13.42617521,
+        "commission": 216.57612245,
+        "net_pnl": -203.14994724,
+        "spread_entry_mean": 3.285e-05,
+        "warnings": [
+          "rejected 41 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2021Q1": {
+        "net_return": -0.00646957,
+        "trade_count": 337,
+        "win_rate": 0.41839763,
+        "profit_factor": 0.62541061,
+        "max_drawdown": 0.00705465,
+        "gross_pnl": -451.34347528,
+        "commission": 195.61375173,
+        "net_pnl": -646.95722701,
+        "spread_entry_mean": 2.988e-05,
+        "warnings": [
+          "rejected 44 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2021Q2": {
+        "net_return": -0.00318729,
+        "trade_count": 307,
+        "win_rate": 0.52117264,
+        "profit_factor": 0.76202957,
+        "max_drawdown": 0.00420755,
+        "gross_pnl": -140.47708939,
+        "commission": 178.25227526,
+        "net_pnl": -318.72936464,
+        "spread_entry_mean": 2.84e-05,
+        "warnings": [
+          "rejected 45 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2021Q3": {
+        "net_return": -0.00232769,
+        "trade_count": 324,
+        "win_rate": 0.55864198,
+        "profit_factor": 0.81111658,
+        "max_drawdown": 0.00259923,
+        "gross_pnl": -40.33106705,
+        "commission": 192.43771949,
+        "net_pnl": -232.76878654,
+        "spread_entry_mean": 3.009e-05,
+        "warnings": [
+          "rejected 28 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2021Q4": {
+        "net_return": -0.00293809,
+        "trade_count": 344,
+        "win_rate": 0.49709302,
+        "profit_factor": 0.81643519,
+        "max_drawdown": 0.00360255,
+        "gross_pnl": -83.14661845,
+        "commission": 210.66223173,
+        "net_pnl": -293.80885018,
+        "spread_entry_mean": 2.977e-05,
+        "warnings": [
+          "rejected 32 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2022Q1": {
+        "net_return": -0.00543812,
+        "trade_count": 377,
+        "win_rate": 0.40318302,
+        "profit_factor": 0.75099161,
+        "max_drawdown": 0.00555216,
+        "gross_pnl": -308.19686134,
+        "commission": 235.61470539,
+        "net_pnl": -543.81156673,
+        "spread_entry_mean": 3.35e-05,
+        "warnings": [
+          "rejected 54 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2022Q2": {
+        "net_return": -0.00557109,
+        "trade_count": 392,
+        "win_rate": 0.39285714,
+        "profit_factor": 0.77182647,
+        "max_drawdown": 0.00582581,
+        "gross_pnl": -299.05100383,
+        "commission": 258.05826271,
+        "net_pnl": -557.10926654,
+        "spread_entry_mean": 3.735e-05,
+        "warnings": [
+          "rejected 27 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2022Q3": {
+        "net_return": -0.00418944,
+        "trade_count": 409,
+        "win_rate": 0.36674817,
+        "profit_factor": 0.85387327,
+        "max_drawdown": 0.00514847,
+        "gross_pnl": -134.64016621,
+        "commission": 284.30388497,
+        "net_pnl": -418.94405118,
+        "spread_entry_mean": 4.572e-05,
+        "warnings": [
+          "rejected 42 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2022Q4": {
+        "net_return": -0.00129482,
+        "trade_count": 434,
+        "win_rate": 0.42165899,
+        "profit_factor": 0.95263532,
+        "max_drawdown": 0.00520665,
+        "gross_pnl": 168.69318321,
+        "commission": 298.17471816,
+        "net_pnl": -129.48153496,
+        "spread_entry_mean": 5.27e-05,
+        "warnings": [
+          "rejected 38 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2023Q1": {
+        "net_return": -0.00358407,
+        "trade_count": 375,
+        "win_rate": 0.45333333,
+        "profit_factor": 0.8317708,
+        "max_drawdown": 0.00470058,
+        "gross_pnl": -113.8855772,
+        "commission": 244.5211061,
+        "net_pnl": -358.4066833,
+        "spread_entry_mean": 4.419e-05,
+        "warnings": [
+          "rejected 43 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2023Q2": {
+        "net_return": -0.00334979,
+        "trade_count": 269,
+        "win_rate": 0.40892193,
+        "profit_factor": 0.79057247,
+        "max_drawdown": 0.00354633,
+        "gross_pnl": -161.96395888,
+        "commission": 173.01516803,
+        "net_pnl": -334.97912691,
+        "spread_entry_mean": 2.684e-05,
+        "warnings": [
+          "rejected 46 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2023Q3": {
+        "net_return": -0.00476799,
+        "trade_count": 330,
+        "win_rate": 0.47878788,
+        "profit_factor": 0.72509607,
+        "max_drawdown": 0.00528157,
+        "gross_pnl": -264.41387446,
+        "commission": 212.384705,
+        "net_pnl": -476.79857946,
+        "spread_entry_mean": 2.988e-05,
+        "warnings": [
+          "rejected 44 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2023Q4": {
+        "net_return": -0.001374,
+        "trade_count": 352,
+        "win_rate": 0.50852273,
+        "profit_factor": 0.91926629,
+        "max_drawdown": 0.00336217,
+        "gross_pnl": 91.95026934,
+        "commission": 229.3505762,
+        "net_pnl": -137.40030686,
+        "spread_entry_mean": 2.739e-05,
+        "warnings": [
+          "rejected 25 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2024Q1": {
+        "net_return": -0.00219686,
+        "trade_count": 314,
+        "win_rate": 0.51592357,
+        "profit_factor": 0.85210142,
+        "max_drawdown": 0.00334672,
+        "gross_pnl": -17.28671074,
+        "commission": 202.39900927,
+        "net_pnl": -219.68572002,
+        "spread_entry_mean": 2.519e-05,
+        "warnings": [
+          "rejected 30 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2024Q2": {
+        "net_return": -0.00409771,
+        "trade_count": 280,
+        "win_rate": 0.49285714,
+        "profit_factor": 0.71212417,
+        "max_drawdown": 0.00431386,
+        "gross_pnl": -227.71695684,
+        "commission": 182.05452712,
+        "net_pnl": -409.77148396,
+        "spread_entry_mean": 2.189e-05,
+        "warnings": [
+          "rejected 46 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2024Q3": {
+        "net_return": 0.00014042,
+        "trade_count": 293,
+        "win_rate": 0.55290102,
+        "profit_factor": 1.01118577,
+        "max_drawdown": 0.00120434,
+        "gross_pnl": 200.57868171,
+        "commission": 186.53695372,
+        "net_pnl": 14.04172799,
+        "spread_entry_mean": 2.379e-05,
+        "warnings": [
+          "rejected 30 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2024Q4": {
+        "net_return": 0.00089897,
+        "trade_count": 351,
+        "win_rate": 0.52136752,
+        "profit_factor": 1.05407463,
+        "max_drawdown": 0.00228584,
+        "gross_pnl": 320.6615944,
+        "commission": 230.76457265,
+        "net_pnl": 89.89702175,
+        "spread_entry_mean": 2.681e-05,
+        "warnings": [
+          "rejected 40 order(s): take-profit already through the fill price"
+        ]
+      }
+    },
+    "trades": 9627,
+    "positive_blocks": 3,
+    "gross_pnl_eur": -4299.70126692,
+    "commission_eur": 6037.56389413,
+    "net_pnl_eur": -10337.26516105,
+    "gross_per_trade_pips": -0.4962548927114713,
+    "commission_per_trade_pips": 0.6968322765982249,
+    "net_per_trade_pips": -1.193087169309696
+  },
+  "ema_zscore_reversion@M5": {
+    "params": {
+      "timeframe_minutes": 5,
+      "ema_period": 20,
+      "z_period": 20,
+      "z_enter": 2.0,
+      "sl_points": 55.9,
+      "lots": 0.1,
+      "max_spread_points": 30.0
+    },
+    "blocks": {
+      "2018Q1": {
+        "net_return": -0.01114023,
+        "trade_count": 1065,
+        "win_rate": 0.39906103,
+        "profit_factor": 0.68842302,
+        "max_drawdown": 0.01124094,
+        "gross_pnl": -507.82841598,
+        "commission": 606.19440778,
+        "net_pnl": -1114.02282376,
+        "spread_entry_mean": 3.864e-05,
+        "warnings": [
+          "rejected 122 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2018Q2": {
+        "net_return": -0.01201458,
+        "trade_count": 1053,
+        "win_rate": 0.41975309,
+        "profit_factor": 0.65538258,
+        "max_drawdown": 0.01209575,
+        "gross_pnl": -582.20028774,
+        "commission": 619.25780782,
+        "net_pnl": -1201.45809555,
+        "spread_entry_mean": 4.471e-05,
+        "warnings": [
+          "rejected 89 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2018Q3a": {
+        "net_return": -0.00535923,
+        "trade_count": 312,
+        "win_rate": 0.40705128,
+        "profit_factor": 0.48794101,
+        "max_drawdown": 0.00542022,
+        "gross_pnl": -349.04335866,
+        "commission": 186.87941755,
+        "net_pnl": -535.92277621,
+        "spread_entry_mean": 4.776e-05,
+        "warnings": [
+          "rejected 33 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2018Q3b": {
+        "net_return": -0.0039421,
+        "trade_count": 299,
+        "win_rate": 0.40802676,
+        "profit_factor": 0.62053564,
+        "max_drawdown": 0.00408015,
+        "gross_pnl": -214.68011026,
+        "commission": 179.53029961,
+        "net_pnl": -394.21040987,
+        "spread_entry_mean": 4.294e-05,
+        "warnings": [
+          "rejected 31 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2018Q4": {
+        "net_return": -0.01158599,
+        "trade_count": 989,
+        "win_rate": 0.43073812,
+        "profit_factor": 0.64921159,
+        "max_drawdown": 0.01208296,
+        "gross_pnl": -552.03866901,
+        "commission": 606.56025035,
+        "net_pnl": -1158.59891935,
+        "spread_entry_mean": 4.605e-05,
+        "warnings": [
+          "rejected 132 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2019Q1": {
+        "net_return": -0.00962279,
+        "trade_count": 881,
+        "win_rate": 0.46424518,
+        "profit_factor": 0.64327173,
+        "max_drawdown": 0.00976651,
+        "gross_pnl": -419.52480311,
+        "commission": 542.75459528,
+        "net_pnl": -962.27939839,
+        "spread_entry_mean": 3.377e-05,
+        "warnings": [
+          "rejected 78 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2019Q2": {
+        "net_return": -0.00643249,
+        "trade_count": 852,
+        "win_rate": 0.52934272,
+        "profit_factor": 0.70664251,
+        "max_drawdown": 0.00690797,
+        "gross_pnl": -112.49686785,
+        "commission": 530.75219186,
+        "net_pnl": -643.2490597,
+        "spread_entry_mean": 3.196e-05,
+        "warnings": [
+          "rejected 86 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2019Q3": {
+        "net_return": -0.0082418,
+        "trade_count": 839,
+        "win_rate": 0.50059595,
+        "profit_factor": 0.65084947,
+        "max_drawdown": 0.00859947,
+        "gross_pnl": -296.14002739,
+        "commission": 528.03968533,
+        "net_pnl": -824.17971272,
+        "spread_entry_mean": 3.297e-05,
+        "warnings": [
+          "rejected 130 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2019Q4": {
+        "net_return": -0.00647403,
+        "trade_count": 760,
+        "win_rate": 0.51447368,
+        "profit_factor": 0.66662338,
+        "max_drawdown": 0.00688411,
+        "gross_pnl": -167.02931109,
+        "commission": 480.37405407,
+        "net_pnl": -647.40336516,
+        "spread_entry_mean": 2.738e-05,
+        "warnings": [
+          "rejected 108 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2020Q1": {
+        "net_return": -0.01337062,
+        "trade_count": 953,
+        "win_rate": 0.41238195,
+        "profit_factor": 0.61170722,
+        "max_drawdown": 0.01340446,
+        "gross_pnl": -732.23390014,
+        "commission": 604.828347,
+        "net_pnl": -1337.06224714,
+        "spread_entry_mean": 4.014e-05,
+        "warnings": [
+          "rejected 94 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2020Q2": {
+        "net_return": -0.01148874,
+        "trade_count": 1076,
+        "win_rate": 0.40892193,
+        "profit_factor": 0.70109177,
+        "max_drawdown": 0.01218944,
+        "gross_pnl": -464.91389728,
+        "commission": 683.95970794,
+        "net_pnl": -1148.87360521,
+        "spread_entry_mean": 3.48e-05,
+        "warnings": [
+          "rejected 97 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2020Q3": {
+        "net_return": -0.00966148,
+        "trade_count": 1079,
+        "win_rate": 0.43188137,
+        "profit_factor": 0.72153452,
+        "max_drawdown": 0.01020126,
+        "gross_pnl": -319.77820918,
+        "commission": 646.37018794,
+        "net_pnl": -966.14839712,
+        "spread_entry_mean": 3.584e-05,
+        "warnings": [
+          "rejected 140 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2020Q4": {
+        "net_return": -0.00934444,
+        "trade_count": 936,
+        "win_rate": 0.43696581,
+        "profit_factor": 0.67829128,
+        "max_drawdown": 0.00972958,
+        "gross_pnl": -384.94418212,
+        "commission": 549.50012604,
+        "net_pnl": -934.44430816,
+        "spread_entry_mean": 3.257e-05,
+        "warnings": [
+          "rejected 95 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2021Q1": {
+        "net_return": -0.0103029,
+        "trade_count": 933,
+        "win_rate": 0.45123258,
+        "profit_factor": 0.62766982,
+        "max_drawdown": 0.01060294,
+        "gross_pnl": -488.35426119,
+        "commission": 541.93557985,
+        "net_pnl": -1030.28984104,
+        "spread_entry_mean": 3.266e-05,
+        "warnings": [
+          "rejected 140 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2021Q2": {
+        "net_return": -0.00826253,
+        "trade_count": 860,
+        "win_rate": 0.46976744,
+        "profit_factor": 0.65804822,
+        "max_drawdown": 0.00879185,
+        "gross_pnl": -326.46639855,
+        "commission": 499.7865425,
+        "net_pnl": -826.25294105,
+        "spread_entry_mean": 2.969e-05,
+        "warnings": [
+          "rejected 137 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2021Q3": {
+        "net_return": -0.00752772,
+        "trade_count": 904,
+        "win_rate": 0.50442478,
+        "profit_factor": 0.65905056,
+        "max_drawdown": 0.00805385,
+        "gross_pnl": -215.86901985,
+        "commission": 536.90325762,
+        "net_pnl": -752.77227747,
+        "spread_entry_mean": 3.185e-05,
+        "warnings": [
+          "rejected 125 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2021Q4": {
+        "net_return": -0.01058993,
+        "trade_count": 920,
+        "win_rate": 0.44021739,
+        "profit_factor": 0.62635993,
+        "max_drawdown": 0.01088491,
+        "gross_pnl": -495.34655211,
+        "commission": 563.64640342,
+        "net_pnl": -1058.99295553,
+        "spread_entry_mean": 3.145e-05,
+        "warnings": [
+          "rejected 161 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2022Q1": {
+        "net_return": -0.00966018,
+        "trade_count": 1024,
+        "win_rate": 0.42089844,
+        "profit_factor": 0.72824688,
+        "max_drawdown": 0.01022419,
+        "gross_pnl": -326.24812156,
+        "commission": 639.77006779,
+        "net_pnl": -966.01818935,
+        "spread_entry_mean": 3.506e-05,
+        "warnings": [
+          "rejected 124 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2022Q2": {
+        "net_return": -0.01269193,
+        "trade_count": 1090,
+        "win_rate": 0.40550459,
+        "profit_factor": 0.68870016,
+        "max_drawdown": 0.01326684,
+        "gross_pnl": -551.943654,
+        "commission": 717.24976179,
+        "net_pnl": -1269.19341579,
+        "spread_entry_mean": 3.932e-05,
+        "warnings": [
+          "rejected 119 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2022Q3": {
+        "net_return": -0.01550775,
+        "trade_count": 1193,
+        "win_rate": 0.37133277,
+        "profit_factor": 0.69596887,
+        "max_drawdown": 0.01591853,
+        "gross_pnl": -720.44212673,
+        "commission": 830.33278041,
+        "net_pnl": -1550.77490714,
+        "spread_entry_mean": 4.622e-05,
+        "warnings": [
+          "rejected 118 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2022Q4": {
+        "net_return": -0.00867325,
+        "trade_count": 1164,
+        "win_rate": 0.39948454,
+        "profit_factor": 0.81628786,
+        "max_drawdown": 0.01014996,
+        "gross_pnl": -68.12055487,
+        "commission": 799.20449168,
+        "net_pnl": -867.32504655,
+        "spread_entry_mean": 5.253e-05,
+        "warnings": [
+          "rejected 94 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2023Q1": {
+        "net_return": -0.01147285,
+        "trade_count": 897,
+        "win_rate": 0.41025641,
+        "profit_factor": 0.65133408,
+        "max_drawdown": 0.01181538,
+        "gross_pnl": -562.51657698,
+        "commission": 584.76832426,
+        "net_pnl": -1147.28490124,
+        "spread_entry_mean": 4.727e-05,
+        "warnings": [
+          "rejected 106 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2023Q2": {
+        "net_return": -0.01003083,
+        "trade_count": 692,
+        "win_rate": 0.42774566,
+        "profit_factor": 0.58812816,
+        "max_drawdown": 0.01016759,
+        "gross_pnl": -558.21373438,
+        "commission": 444.86917181,
+        "net_pnl": -1003.08290619,
+        "spread_entry_mean": 2.772e-05,
+        "warnings": [
+          "rejected 115 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2023Q3": {
+        "net_return": -0.00945629,
+        "trade_count": 859,
+        "win_rate": 0.44586729,
+        "profit_factor": 0.66741708,
+        "max_drawdown": 0.00995406,
+        "gross_pnl": -392.05699925,
+        "commission": 553.57187068,
+        "net_pnl": -945.62886993,
+        "spread_entry_mean": 2.823e-05,
+        "warnings": [
+          "rejected 121 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2023Q4": {
+        "net_return": -0.01224435,
+        "trade_count": 903,
+        "win_rate": 0.43189369,
+        "profit_factor": 0.59906126,
+        "max_drawdown": 0.01248301,
+        "gross_pnl": -636.69044164,
+        "commission": 587.74441454,
+        "net_pnl": -1224.43485618,
+        "spread_entry_mean": 2.755e-05,
+        "warnings": [
+          "rejected 125 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2024Q1": {
+        "net_return": -0.00907917,
+        "trade_count": 815,
+        "win_rate": 0.48343558,
+        "profit_factor": 0.61317666,
+        "max_drawdown": 0.00910678,
+        "gross_pnl": -382.73506797,
+        "commission": 525.18175614,
+        "net_pnl": -907.91682411,
+        "spread_entry_mean": 2.707e-05,
+        "warnings": [
+          "rejected 127 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2024Q2": {
+        "net_return": -0.01138162,
+        "trade_count": 756,
+        "win_rate": 0.44973545,
+        "profit_factor": 0.51674687,
+        "max_drawdown": 0.01149657,
+        "gross_pnl": -646.48338825,
+        "commission": 491.67857505,
+        "net_pnl": -1138.1619633,
+        "spread_entry_mean": 2.204e-05,
+        "warnings": [
+          "rejected 155 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2024Q3": {
+        "net_return": -0.00885236,
+        "trade_count": 874,
+        "win_rate": 0.49656751,
+        "profit_factor": 0.63457691,
+        "max_drawdown": 0.00909959,
+        "gross_pnl": -328.4677651,
+        "commission": 556.76832244,
+        "net_pnl": -885.23608753,
+        "spread_entry_mean": 2.327e-05,
+        "warnings": [
+          "rejected 140 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2024Q4": {
+        "net_return": -0.0086076,
+        "trade_count": 925,
+        "win_rate": 0.45621622,
+        "profit_factor": 0.71463539,
+        "max_drawdown": 0.00879904,
+        "gross_pnl": -253.29086475,
+        "commission": 607.46921316,
+        "net_pnl": -860.76007791,
+        "spread_entry_mean": 2.519e-05,
+        "warnings": [
+          "rejected 115 order(s): take-profit already through the fill price"
+        ]
+      }
+    },
+    "trades": 25903,
+    "positive_blocks": 0,
+    "gross_pnl_eur": -12056.09756699,
+    "commission_eur": 16245.88161171,
+    "net_pnl_eur": -28301.97917865,
+    "gross_per_trade_pips": -0.51714720161071,
+    "commission_per_trade_pips": 0.696868299755498,
+    "net_per_trade_pips": -1.2140155013640632
+  },
+  "grid_reversion@H1": {
+    "params": {
+      "timeframe_minutes": 60,
+      "step_points": 154.92,
+      "levels": 3,
+      "tp_points": 154.92,
+      "basket_sl_points": 929.52,
+      "band_period": 20,
+      "band_std": 2.0,
+      "lots": 0.1,
+      "max_spread_points": 30.0
+    },
+    "blocks": {
+      "2018Q1": {
+        "net_return": 0.00157435,
+        "trade_count": 162,
+        "win_rate": 0.80246914,
+        "profit_factor": 1.1119974,
+        "max_drawdown": 0.00467257,
+        "gross_pnl": 249.6527135,
+        "commission": 92.21763197,
+        "net_pnl": 157.43508152,
+        "spread_entry_mean": 3.883e-05,
+        "warnings": []
+      },
+      "2018Q2": {
+        "net_return": 0.00212075,
+        "trade_count": 146,
+        "win_rate": 0.81506849,
+        "profit_factor": 1.16674711,
+        "max_drawdown": 0.00487846,
+        "gross_pnl": 298.21858158,
+        "commission": 86.14367135,
+        "net_pnl": 212.07491023,
+        "spread_entry_mean": 4.712e-05,
+        "warnings": []
+      },
+      "2018Q3a": {
+        "net_return": -0.00393946,
+        "trade_count": 34,
+        "win_rate": 0.61764706,
+        "profit_factor": 0.4030537,
+        "max_drawdown": 0.00433086,
+        "gross_pnl": -373.56415989,
+        "commission": 20.38160926,
+        "net_pnl": -393.94576915,
+        "spread_entry_mean": 4.794e-05,
+        "warnings": []
+      },
+      "2018Q3b": {
+        "net_return": -0.00378885,
+        "trade_count": 35,
+        "win_rate": 0.6,
+        "profit_factor": 0.40957187,
+        "max_drawdown": 0.0043491,
+        "gross_pnl": -357.81524351,
+        "commission": 21.0693193,
+        "net_pnl": -378.88456281,
+        "spread_entry_mean": 5.657e-05,
+        "warnings": []
+      },
+      "2018Q4": {
+        "net_return": 0.00118495,
+        "trade_count": 98,
+        "win_rate": 0.81632653,
+        "profit_factor": 1.12880218,
+        "max_drawdown": 0.0023338,
+        "gross_pnl": 178.67763614,
+        "commission": 60.18217046,
+        "net_pnl": 118.49546568,
+        "spread_entry_mean": 5.265e-05,
+        "warnings": []
+      },
+      "2019Q1": {
+        "net_return": -0.00622223,
+        "trade_count": 79,
+        "win_rate": 0.67088608,
+        "profit_factor": 0.52523287,
+        "max_drawdown": 0.00812227,
+        "gross_pnl": -573.63163235,
+        "commission": 48.59185118,
+        "net_pnl": -622.22348353,
+        "spread_entry_mean": 3.051e-05,
+        "warnings": []
+      },
+      "2019Q2": {
+        "net_return": 0.00283436,
+        "trade_count": 37,
+        "win_rate": 0.94594595,
+        "profit_factor": 2.59944182,
+        "max_drawdown": 0.0012317,
+        "gross_pnl": 306.47906325,
+        "commission": 23.04294408,
+        "net_pnl": 283.43611917,
+        "spread_entry_mean": 2.541e-05,
+        "warnings": []
+      },
+      "2019Q3": {
+        "net_return": -0.00370204,
+        "trade_count": 49,
+        "win_rate": 0.71428571,
+        "profit_factor": 0.55653302,
+        "max_drawdown": 0.00632727,
+        "gross_pnl": -339.36242178,
+        "commission": 30.84113429,
+        "net_pnl": -370.20355607,
+        "spread_entry_mean": 2.571e-05,
+        "warnings": []
+      },
+      "2019Q4": {
+        "net_return": 0.0006957,
+        "trade_count": 43,
+        "win_rate": 0.8372093,
+        "profit_factor": 1.16947556,
+        "max_drawdown": 0.00158102,
+        "gross_pnl": 96.70348353,
+        "commission": 27.13362641,
+        "net_pnl": 69.56985711,
+        "spread_entry_mean": 2.372e-05,
+        "warnings": []
+      },
+      "2020Q1": {
+        "net_return": -0.00277375,
+        "trade_count": 69,
+        "win_rate": 0.73913043,
+        "profit_factor": 0.71081043,
+        "max_drawdown": 0.00470272,
+        "gross_pnl": -233.64125697,
+        "commission": 43.73415293,
+        "net_pnl": -277.37540991,
+        "spread_entry_mean": 2.565e-05,
+        "warnings": []
+      },
+      "2020Q2": {
+        "net_return": -0.00032151,
+        "trade_count": 133,
+        "win_rate": 0.80451128,
+        "profit_factor": 0.97798487,
+        "max_drawdown": 0.00426861,
+        "gross_pnl": 52.43946879,
+        "commission": 84.59019481,
+        "net_pnl": -32.15072602,
+        "spread_entry_mean": 2.008e-05,
+        "warnings": []
+      },
+      "2020Q3": {
+        "net_return": 0.00083421,
+        "trade_count": 140,
+        "win_rate": 0.82142857,
+        "profit_factor": 1.06094156,
+        "max_drawdown": 0.00232036,
+        "gross_pnl": 167.07450604,
+        "commission": 83.65319251,
+        "net_pnl": 83.42131354,
+        "spread_entry_mean": 2.029e-05,
+        "warnings": []
+      },
+      "2020Q4": {
+        "net_return": -0.00122658,
+        "trade_count": 82,
+        "win_rate": 0.80487805,
+        "profit_factor": 0.86964214,
+        "max_drawdown": 0.00582727,
+        "gross_pnl": -74.52447017,
+        "commission": 48.13339857,
+        "net_pnl": -122.65786874,
+        "spread_entry_mean": 2.378e-05,
+        "warnings": []
+      },
+      "2021Q1": {
+        "net_return": -0.00147495,
+        "trade_count": 88,
+        "win_rate": 0.77272727,
+        "profit_factor": 0.8495952,
+        "max_drawdown": 0.00477787,
+        "gross_pnl": -96.45144604,
+        "commission": 51.04367265,
+        "net_pnl": -147.49511869,
+        "spread_entry_mean": 2.273e-05,
+        "warnings": []
+      },
+      "2021Q2": {
+        "net_return": -0.0027455,
+        "trade_count": 68,
+        "win_rate": 0.76470588,
+        "profit_factor": 0.69838418,
+        "max_drawdown": 0.00385226,
+        "gross_pnl": -235.17377929,
+        "commission": 39.37648567,
+        "net_pnl": -274.55026496,
+        "spread_entry_mean": 2.485e-05,
+        "warnings": []
+      },
+      "2021Q3": {
+        "net_return": 0.00305981,
+        "trade_count": 54,
+        "win_rate": 0.92592593,
+        "profit_factor": 1.95250001,
+        "max_drawdown": 0.00142152,
+        "gross_pnl": 338.05327506,
+        "commission": 32.07188946,
+        "net_pnl": 305.9813856,
+        "spread_entry_mean": 2.759e-05,
+        "warnings": []
+      },
+      "2021Q4": {
+        "net_return": -0.00303839,
+        "trade_count": 76,
+        "win_rate": 0.73684211,
+        "profit_factor": 0.70560499,
+        "max_drawdown": 0.00570893,
+        "gross_pnl": -257.11844673,
+        "commission": 46.72068938,
+        "net_pnl": -303.83913611,
+        "spread_entry_mean": 2.447e-05,
+        "warnings": []
+      },
+      "2022Q1": {
+        "net_return": 0.00105571,
+        "trade_count": 153,
+        "win_rate": 0.80392157,
+        "profit_factor": 1.06924731,
+        "max_drawdown": 0.00563585,
+        "gross_pnl": 201.47161109,
+        "commission": 95.90045752,
+        "net_pnl": 105.57115357,
+        "spread_entry_mean": 4.294e-05,
+        "warnings": []
+      },
+      "2022Q2": {
+        "net_return": -0.00371531,
+        "trade_count": 165,
+        "win_rate": 0.75151515,
+        "profit_factor": 0.82194099,
+        "max_drawdown": 0.00783285,
+        "gross_pnl": -262.89869883,
+        "commission": 108.63204592,
+        "net_pnl": -371.53074475,
+        "spread_entry_mean": 3.521e-05,
+        "warnings": []
+      },
+      "2022Q3": {
+        "net_return": -0.00269284,
+        "trade_count": 191,
+        "win_rate": 0.80104712,
+        "profit_factor": 0.89320745,
+        "max_drawdown": 0.00734588,
+        "gross_pnl": -136.22137081,
+        "commission": 133.06303291,
+        "net_pnl": -269.28440373,
+        "spread_entry_mean": 3.037e-05,
+        "warnings": []
+      },
+      "2022Q4": {
+        "net_return": 0.00333386,
+        "trade_count": 154,
+        "win_rate": 0.85064935,
+        "profit_factor": 1.21140956,
+        "max_drawdown": 0.00438323,
+        "gross_pnl": 439.75574493,
+        "commission": 106.37018432,
+        "net_pnl": 333.38556062,
+        "spread_entry_mean": 3.474e-05,
+        "warnings": []
+      },
+      "2023Q1": {
+        "net_return": -0.01092113,
+        "trade_count": 127,
+        "win_rate": 0.68503937,
+        "profit_factor": 0.52315622,
+        "max_drawdown": 0.01161802,
+        "gross_pnl": -1009.33217912,
+        "commission": 82.78091012,
+        "net_pnl": -1092.11308923,
+        "spread_entry_mean": 3.134e-05,
+        "warnings": []
+      },
+      "2023Q2": {
+        "net_return": -0.00451586,
+        "trade_count": 105,
+        "win_rate": 0.6952381,
+        "profit_factor": 0.68722504,
+        "max_drawdown": 0.0060098,
+        "gross_pnl": -384.1452865,
+        "commission": 67.4405471,
+        "net_pnl": -451.5858336,
+        "spread_entry_mean": 3.21e-05,
+        "warnings": []
+      },
+      "2023Q3": {
+        "net_return": -0.00212921,
+        "trade_count": 101,
+        "win_rate": 0.75247525,
+        "profit_factor": 0.82950357,
+        "max_drawdown": 0.00585199,
+        "gross_pnl": -147.85165445,
+        "commission": 65.06962901,
+        "net_pnl": -212.92128346,
+        "spread_entry_mean": 2e-05,
+        "warnings": []
+      },
+      "2023Q4": {
+        "net_return": 0.00062183,
+        "trade_count": 85,
+        "win_rate": 0.82352941,
+        "profit_factor": 1.06892771,
+        "max_drawdown": 0.00232266,
+        "gross_pnl": 117.59642983,
+        "commission": 55.41376094,
+        "net_pnl": 62.18266889,
+        "spread_entry_mean": 2.153e-05,
+        "warnings": []
+      },
+      "2024Q1": {
+        "net_return": 0.001094,
+        "trade_count": 74,
+        "win_rate": 0.81081081,
+        "profit_factor": 1.15470085,
+        "max_drawdown": 0.0024583,
+        "gross_pnl": 157.04750382,
+        "commission": 47.64755581,
+        "net_pnl": 109.39994801,
+        "spread_entry_mean": 1.959e-05,
+        "warnings": []
+      },
+      "2024Q2": {
+        "net_return": -0.00385312,
+        "trade_count": 55,
+        "win_rate": 0.70909091,
+        "profit_factor": 0.58246633,
+        "max_drawdown": 0.00505864,
+        "gross_pnl": -349.45895758,
+        "commission": 35.85321191,
+        "net_pnl": -385.31216949,
+        "spread_entry_mean": 2.145e-05,
+        "warnings": []
+      },
+      "2024Q3": {
+        "net_return": 0.00466662,
+        "trade_count": 67,
+        "win_rate": 0.92537313,
+        "profit_factor": 2.28251976,
+        "max_drawdown": 0.00160565,
+        "gross_pnl": 509.22429181,
+        "commission": 42.56224165,
+        "net_pnl": 466.66205016,
+        "spread_entry_mean": 2.493e-05,
+        "warnings": []
+      },
+      "2024Q4": {
+        "net_return": 0.00131802,
+        "trade_count": 92,
+        "win_rate": 0.82608696,
+        "profit_factor": 1.14199565,
+        "max_drawdown": 0.00259622,
+        "gross_pnl": 192.55084837,
+        "commission": 60.74901081,
+        "net_pnl": 131.80183756,
+        "spread_entry_mean": 1.598e-05,
+        "warnings": []
+      }
+    },
+    "trades": 2762,
+    "positive_blocks": 13,
+    "gross_pnl_eur": -1526.24584628,
+    "commission_eur": 1740.4102223,
+    "net_pnl_eur": -3266.65606859,
+    "gross_per_trade_pips": -0.6139857777295036,
+    "commission_per_trade_pips": 0.7001408891704883,
+    "net_per_trade_pips": -1.3141266669040148
+  },
+  "grid_reversion@M15": {
+    "params": {
+      "timeframe_minutes": 15,
+      "step_points": 77.46,
+      "levels": 3,
+      "tp_points": 77.46,
+      "basket_sl_points": 464.76,
+      "band_period": 20,
+      "band_std": 2.0,
+      "lots": 0.1,
+      "max_spread_points": 30.0
+    },
+    "blocks": {
+      "2018Q1": {
+        "net_return": -0.00255887,
+        "trade_count": 531,
+        "win_rate": 0.80037665,
+        "profit_factor": 0.90475372,
+        "max_drawdown": 0.00507549,
+        "gross_pnl": 45.89227213,
+        "commission": 301.77956627,
+        "net_pnl": -255.88729414,
+        "spread_entry_mean": 4.021e-05,
+        "warnings": []
+      },
+      "2018Q2": {
+        "net_return": -0.00295237,
+        "trade_count": 463,
+        "win_rate": 0.79049676,
+        "profit_factor": 0.88045249,
+        "max_drawdown": 0.00783573,
+        "gross_pnl": -21.89177284,
+        "commission": 273.34553667,
+        "net_pnl": -295.2373095,
+        "spread_entry_mean": 4.62e-05,
+        "warnings": []
+      },
+      "2018Q3a": {
+        "net_return": -0.00097647,
+        "trade_count": 116,
+        "win_rate": 0.82758621,
+        "profit_factor": 0.8556253,
+        "max_drawdown": 0.0016801,
+        "gross_pnl": -28.17135334,
+        "commission": 69.47577183,
+        "net_pnl": -97.64712517,
+        "spread_entry_mean": 5.034e-05,
+        "warnings": []
+      },
+      "2018Q3b": {
+        "net_return": -0.00031692,
+        "trade_count": 122,
+        "win_rate": 0.81147541,
+        "profit_factor": 0.94919505,
+        "max_drawdown": 0.00233037,
+        "gross_pnl": 41.56854705,
+        "commission": 73.2607343,
+        "net_pnl": -31.69218724,
+        "spread_entry_mean": 4.697e-05,
+        "warnings": []
+      },
+      "2018Q4": {
+        "net_return": -0.00536492,
+        "trade_count": 422,
+        "win_rate": 0.78199052,
+        "profit_factor": 0.791,
+        "max_drawdown": 0.0063974,
+        "gross_pnl": -277.84096574,
+        "commission": 258.65138542,
+        "net_pnl": -536.49235115,
+        "spread_entry_mean": 4.69e-05,
+        "warnings": []
+      },
+      "2019Q1": {
+        "net_return": -0.00156543,
+        "trade_count": 285,
+        "win_rate": 0.81052632,
+        "profit_factor": 0.90131895,
+        "max_drawdown": 0.00401643,
+        "gross_pnl": 19.03727674,
+        "commission": 175.58073923,
+        "net_pnl": -156.5434625,
+        "spread_entry_mean": 2.6e-05,
+        "warnings": []
+      },
+      "2019Q2": {
+        "net_return": 0.0007761,
+        "trade_count": 194,
+        "win_rate": 0.83505155,
+        "profit_factor": 1.0828133,
+        "max_drawdown": 0.00282617,
+        "gross_pnl": 198.36472786,
+        "commission": 120.75505197,
+        "net_pnl": 77.60967588,
+        "spread_entry_mean": 2.716e-05,
+        "warnings": []
+      },
+      "2019Q3": {
+        "net_return": -0.00080903,
+        "trade_count": 236,
+        "win_rate": 0.80084746,
+        "profit_factor": 0.936715,
+        "max_drawdown": 0.00208259,
+        "gross_pnl": 67.61460845,
+        "commission": 148.51741056,
+        "net_pnl": -80.9028021,
+        "spread_entry_mean": 2.581e-05,
+        "warnings": []
+      },
+      "2019Q4": {
+        "net_return": 2.252e-05,
+        "trade_count": 168,
+        "win_rate": 0.83333333,
+        "profit_factor": 1.0025347,
+        "max_drawdown": 0.00246508,
+        "gross_pnl": 108.42821986,
+        "commission": 106.17596332,
+        "net_pnl": 2.25225654,
+        "spread_entry_mean": 2.006e-05,
+        "warnings": []
+      },
+      "2020Q1": {
+        "net_return": -0.00664182,
+        "trade_count": 272,
+        "win_rate": 0.74632353,
+        "profit_factor": 0.66133819,
+        "max_drawdown": 0.00728274,
+        "gross_pnl": -491.54407262,
+        "commission": 172.6375121,
+        "net_pnl": -664.18158472,
+        "spread_entry_mean": 2.846e-05,
+        "warnings": []
+      },
+      "2020Q2": {
+        "net_return": -0.00442725,
+        "trade_count": 526,
+        "win_rate": 0.78897338,
+        "profit_factor": 0.85701313,
+        "max_drawdown": 0.00644334,
+        "gross_pnl": -108.27311086,
+        "commission": 334.45191902,
+        "net_pnl": -442.72502988,
+        "spread_entry_mean": 2.354e-05,
+        "warnings": []
+      },
+      "2020Q3": {
+        "net_return": -0.0017319,
+        "trade_count": 505,
+        "win_rate": 0.7960396,
+        "profit_factor": 0.93322199,
+        "max_drawdown": 0.00394485,
+        "gross_pnl": 128.97145447,
+        "commission": 302.16166441,
+        "net_pnl": -173.19020994,
+        "spread_entry_mean": 2.244e-05,
+        "warnings": []
+      },
+      "2020Q4": {
+        "net_return": -0.00355356,
+        "trade_count": 399,
+        "win_rate": 0.78696742,
+        "profit_factor": 0.83898681,
+        "max_drawdown": 0.00637904,
+        "gross_pnl": -121.6356145,
+        "commission": 233.72050149,
+        "net_pnl": -355.35611599,
+        "spread_entry_mean": 2.396e-05,
+        "warnings": []
+      },
+      "2021Q1": {
+        "net_return": -0.00250319,
+        "trade_count": 332,
+        "win_rate": 0.78614458,
+        "profit_factor": 0.85895583,
+        "max_drawdown": 0.00444449,
+        "gross_pnl": -57.61608751,
+        "commission": 192.70320619,
+        "net_pnl": -250.31929369,
+        "spread_entry_mean": 2.666e-05,
+        "warnings": []
+      },
+      "2021Q2": {
+        "net_return": -0.00467273,
+        "trade_count": 314,
+        "win_rate": 0.75477707,
+        "profit_factor": 0.74765561,
+        "max_drawdown": 0.00569485,
+        "gross_pnl": -285.04061937,
+        "commission": 182.23240211,
+        "net_pnl": -467.27302148,
+        "spread_entry_mean": 2.567e-05,
+        "warnings": []
+      },
+      "2021Q3": {
+        "net_return": -0.00221371,
+        "trade_count": 232,
+        "win_rate": 0.78017241,
+        "profit_factor": 0.83006438,
+        "max_drawdown": 0.00425161,
+        "gross_pnl": -83.70056934,
+        "commission": 137.66997469,
+        "net_pnl": -221.37054404,
+        "spread_entry_mean": 2.474e-05,
+        "warnings": []
+      },
+      "2021Q4": {
+        "net_return": -0.00123971,
+        "trade_count": 304,
+        "win_rate": 0.8125,
+        "profit_factor": 0.92478649,
+        "max_drawdown": 0.00353736,
+        "gross_pnl": 62.4543031,
+        "commission": 186.4251344,
+        "net_pnl": -123.9708313,
+        "spread_entry_mean": 2.668e-05,
+        "warnings": []
+      },
+      "2022Q1": {
+        "net_return": -0.01098885,
+        "trade_count": 395,
+        "win_rate": 0.75189873,
+        "profit_factor": 0.63002721,
+        "max_drawdown": 0.0124389,
+        "gross_pnl": -851.40715172,
+        "commission": 247.47834709,
+        "net_pnl": -1098.8854988,
+        "spread_entry_mean": 3.491e-05,
+        "warnings": []
+      },
+      "2022Q2": {
+        "net_return": -0.00711819,
+        "trade_count": 519,
+        "win_rate": 0.78034682,
+        "profit_factor": 0.79039765,
+        "max_drawdown": 0.00871139,
+        "gross_pnl": -370.22339543,
+        "commission": 341.59566719,
+        "net_pnl": -711.81906262,
+        "spread_entry_mean": 3.372e-05,
+        "warnings": []
+      },
+      "2022Q3": {
+        "net_return": -0.0162935,
+        "trade_count": 511,
+        "win_rate": 0.7592955,
+        "profit_factor": 0.62490609,
+        "max_drawdown": 0.01835974,
+        "gross_pnl": -1274.0601552,
+        "commission": 355.28953094,
+        "net_pnl": -1629.34968615,
+        "spread_entry_mean": 3.614e-05,
+        "warnings": []
+      },
+      "2022Q4": {
+        "net_return": -0.00868429,
+        "trade_count": 509,
+        "win_rate": 0.79174853,
+        "profit_factor": 0.76244593,
+        "max_drawdown": 0.01087007,
+        "gross_pnl": -518.29397439,
+        "commission": 350.13521687,
+        "net_pnl": -868.42919126,
+        "spread_entry_mean": 4.43e-05,
+        "warnings": []
+      },
+      "2023Q1": {
+        "net_return": -0.00539921,
+        "trade_count": 415,
+        "win_rate": 0.80722892,
+        "profit_factor": 0.80274253,
+        "max_drawdown": 0.00892887,
+        "gross_pnl": -269.59553396,
+        "commission": 270.32593091,
+        "net_pnl": -539.92146488,
+        "spread_entry_mean": 3.463e-05,
+        "warnings": []
+      },
+      "2023Q2": {
+        "net_return": -0.0108078,
+        "trade_count": 264,
+        "win_rate": 0.6780303,
+        "profit_factor": 0.51734973,
+        "max_drawdown": 0.01143851,
+        "gross_pnl": -910.9395395,
+        "commission": 169.84021112,
+        "net_pnl": -1080.77975062,
+        "spread_entry_mean": 2.72e-05,
+        "warnings": []
+      },
+      "2023Q3": {
+        "net_return": -0.00627274,
+        "trade_count": 337,
+        "win_rate": 0.75667656,
+        "profit_factor": 0.72437652,
+        "max_drawdown": 0.00666582,
+        "gross_pnl": -410.61925892,
+        "commission": 216.65482712,
+        "net_pnl": -627.27408604,
+        "spread_entry_mean": 2.077e-05,
+        "warnings": []
+      },
+      "2023Q4": {
+        "net_return": -0.00143243,
+        "trade_count": 370,
+        "win_rate": 0.81621622,
+        "profit_factor": 0.93254808,
+        "max_drawdown": 0.00421761,
+        "gross_pnl": 97.70761689,
+        "commission": 240.95029001,
+        "net_pnl": -143.24267312,
+        "spread_entry_mean": 2.268e-05,
+        "warnings": []
+      },
+      "2024Q1": {
+        "net_return": -0.00274368,
+        "trade_count": 219,
+        "win_rate": 0.80365297,
+        "profit_factor": 0.80608427,
+        "max_drawdown": 0.00680057,
+        "gross_pnl": -133.28900231,
+        "commission": 141.07908137,
+        "net_pnl": -274.36808368,
+        "spread_entry_mean": 2.626e-05,
+        "warnings": []
+      },
+      "2024Q2": {
+        "net_return": -0.00485028,
+        "trade_count": 191,
+        "win_rate": 0.73298429,
+        "profit_factor": 0.65440013,
+        "max_drawdown": 0.005109,
+        "gross_pnl": -360.5945493,
+        "commission": 124.43301318,
+        "net_pnl": -485.02756248,
+        "spread_entry_mean": 1.942e-05,
+        "warnings": []
+      },
+      "2024Q3": {
+        "net_return": -0.00739413,
+        "trade_count": 237,
+        "win_rate": 0.73417722,
+        "profit_factor": 0.60134485,
+        "max_drawdown": 0.00909113,
+        "gross_pnl": -588.72360848,
+        "commission": 150.6895917,
+        "net_pnl": -739.41320019,
+        "spread_entry_mean": 2.034e-05,
+        "warnings": []
+      },
+      "2024Q4": {
+        "net_return": -0.01001956,
+        "trade_count": 353,
+        "win_rate": 0.76770538,
+        "profit_factor": 0.64118997,
+        "max_drawdown": 0.01083821,
+        "gross_pnl": -769.69420973,
+        "commission": 232.26195292,
+        "net_pnl": -1001.95616265,
+        "spread_entry_mean": 2.193e-05,
+        "warnings": []
+      }
+    },
+    "trades": 9741,
+    "positive_blocks": 2,
+    "gross_pnl_eur": -7163.115518510001,
+    "commission_eur": 6110.2781344,
+    "net_pnl_eur": -13273.39365291,
+    "gross_per_trade_pips": -0.8170636734204794,
+    "commission_per_trade_pips": 0.696971350694088,
+    "net_per_trade_pips": -1.514035024114567
+  },
+  "grid_reversion@M5": {
+    "params": {
+      "timeframe_minutes": 5,
+      "step_points": 44.72,
+      "levels": 3,
+      "tp_points": 44.72,
+      "basket_sl_points": 268.33,
+      "band_period": 20,
+      "band_std": 2.0,
+      "lots": 0.1,
+      "max_spread_points": 30.0
+    },
+    "blocks": {
+      "2018Q1": {
+        "net_return": -0.01460525,
+        "trade_count": 1435,
+        "win_rate": 0.76376307,
+        "profit_factor": 0.69705723,
+        "max_drawdown": 0.01540571,
+        "gross_pnl": -644.06640661,
+        "commission": 816.4583246,
+        "net_pnl": -1460.5247312,
+        "spread_entry_mean": 3.78e-05,
+        "warnings": []
+      },
+      "2018Q2": {
+        "net_return": -0.01435907,
+        "trade_count": 1214,
+        "win_rate": 0.76112026,
+        "profit_factor": 0.67110883,
+        "max_drawdown": 0.01467893,
+        "gross_pnl": -720.82941196,
+        "commission": 715.07738491,
+        "net_pnl": -1435.90679687,
+        "spread_entry_mean": 4.713e-05,
+        "warnings": []
+      },
+      "2018Q3a": {
+        "net_return": -0.00165813,
+        "trade_count": 347,
+        "win_rate": 0.82708934,
+        "profit_factor": 0.84821052,
+        "max_drawdown": 0.0026872,
+        "gross_pnl": 42.10974741,
+        "commission": 207.9225016,
+        "net_pnl": -165.81275419,
+        "spread_entry_mean": 4.464e-05,
+        "warnings": []
+      },
+      "2018Q3b": {
+        "net_return": -0.00861092,
+        "trade_count": 368,
+        "win_rate": 0.68206522,
+        "profit_factor": 0.48530362,
+        "max_drawdown": 0.00902994,
+        "gross_pnl": -640.15136959,
+        "commission": 220.94066156,
+        "net_pnl": -861.09203115,
+        "spread_entry_mean": 4.842e-05,
+        "warnings": []
+      },
+      "2018Q4": {
+        "net_return": -0.01195611,
+        "trade_count": 1162,
+        "win_rate": 0.7788296,
+        "profit_factor": 0.71430037,
+        "max_drawdown": 0.01277789,
+        "gross_pnl": -483.24268305,
+        "commission": 712.36817623,
+        "net_pnl": -1195.61085928,
+        "spread_entry_mean": 4.418e-05,
+        "warnings": []
+      },
+      "2019Q1": {
+        "net_return": -0.00469997,
+        "trade_count": 804,
+        "win_rate": 0.81343284,
+        "profit_factor": 0.82206798,
+        "max_drawdown": 0.00599104,
+        "gross_pnl": 25.40602472,
+        "commission": 495.4026566,
+        "net_pnl": -469.99663188,
+        "spread_entry_mean": 2.259e-05,
+        "warnings": []
+      },
+      "2019Q2": {
+        "net_return": -0.00409206,
+        "trade_count": 612,
+        "win_rate": 0.80882353,
+        "profit_factor": 0.80231055,
+        "max_drawdown": 0.00566241,
+        "gross_pnl": -28.13966508,
+        "commission": 381.06650793,
+        "net_pnl": -409.20617301,
+        "spread_entry_mean": 2.252e-05,
+        "warnings": []
+      },
+      "2019Q3": {
+        "net_return": -0.0072477,
+        "trade_count": 594,
+        "win_rate": 0.77441077,
+        "profit_factor": 0.68283909,
+        "max_drawdown": 0.00742883,
+        "gross_pnl": -350.67575738,
+        "commission": 374.09423654,
+        "net_pnl": -724.76999393,
+        "spread_entry_mean": 2.598e-05,
+        "warnings": []
+      },
+      "2019Q4": {
+        "net_return": -0.00034285,
+        "trade_count": 440,
+        "win_rate": 0.83409091,
+        "profit_factor": 0.9733006,
+        "max_drawdown": 0.00227507,
+        "gross_pnl": 243.89162601,
+        "commission": 278.17692477,
+        "net_pnl": -34.28529876,
+        "spread_entry_mean": 2.1e-05,
+        "warnings": []
+      },
+      "2020Q1": {
+        "net_return": -0.01270019,
+        "trade_count": 741,
+        "win_rate": 0.7611336,
+        "profit_factor": 0.60303916,
+        "max_drawdown": 0.01350309,
+        "gross_pnl": -799.76882347,
+        "commission": 470.24991205,
+        "net_pnl": -1270.01873552,
+        "spread_entry_mean": 3e-05,
+        "warnings": []
+      },
+      "2020Q2": {
+        "net_return": -0.0099124,
+        "trade_count": 1285,
+        "win_rate": 0.78910506,
+        "profit_factor": 0.77760215,
+        "max_drawdown": 0.0129664,
+        "gross_pnl": -175.44045033,
+        "commission": 815.79918375,
+        "net_pnl": -991.23963408,
+        "spread_entry_mean": 2.258e-05,
+        "warnings": []
+      },
+      "2020Q3": {
+        "net_return": -0.02157539,
+        "trade_count": 1258,
+        "win_rate": 0.72098569,
+        "profit_factor": 0.57555128,
+        "max_drawdown": 0.02289963,
+        "gross_pnl": -1404.49085249,
+        "commission": 753.04841081,
+        "net_pnl": -2157.5392633,
+        "spread_entry_mean": 2.296e-05,
+        "warnings": []
+      },
+      "2020Q4": {
+        "net_return": -0.01489679,
+        "trade_count": 966,
+        "win_rate": 0.7484472,
+        "profit_factor": 0.60524498,
+        "max_drawdown": 0.01534745,
+        "gross_pnl": -923.65515093,
+        "commission": 566.0237128,
+        "net_pnl": -1489.67886372,
+        "spread_entry_mean": 2.797e-05,
+        "warnings": []
+      },
+      "2021Q1": {
+        "net_return": -0.00955924,
+        "trade_count": 958,
+        "win_rate": 0.78496868,
+        "profit_factor": 0.71101511,
+        "max_drawdown": 0.01171652,
+        "gross_pnl": -399.97657534,
+        "commission": 555.94766767,
+        "net_pnl": -955.92424301,
+        "spread_entry_mean": 2.441e-05,
+        "warnings": []
+      },
+      "2021Q2": {
+        "net_return": -0.01187543,
+        "trade_count": 859,
+        "win_rate": 0.73690338,
+        "profit_factor": 0.62546962,
+        "max_drawdown": 0.01300245,
+        "gross_pnl": -688.13963214,
+        "commission": 499.40323577,
+        "net_pnl": -1187.54286791,
+        "spread_entry_mean": 2.371e-05,
+        "warnings": []
+      },
+      "2021Q3": {
+        "net_return": -0.00378308,
+        "trade_count": 596,
+        "win_rate": 0.80201342,
+        "profit_factor": 0.80170432,
+        "max_drawdown": 0.00467338,
+        "gross_pnl": -24.38321707,
+        "commission": 353.9248993,
+        "net_pnl": -378.30811636,
+        "spread_entry_mean": 2.943e-05,
+        "warnings": []
+      },
+      "2021Q4": {
+        "net_return": -0.0073234,
+        "trade_count": 827,
+        "win_rate": 0.77509069,
+        "profit_factor": 0.74296439,
+        "max_drawdown": 0.00875248,
+        "gross_pnl": -225.39894861,
+        "commission": 506.94114462,
+        "net_pnl": -732.34009323,
+        "spread_entry_mean": 3.058e-05,
+        "warnings": []
+      },
+      "2022Q1": {
+        "net_return": -0.01118336,
+        "trade_count": 1143,
+        "win_rate": 0.78215223,
+        "profit_factor": 0.7292033,
+        "max_drawdown": 0.01263864,
+        "gross_pnl": -403.2793727,
+        "commission": 715.05663831,
+        "net_pnl": -1118.33601101,
+        "spread_entry_mean": 3.021e-05,
+        "warnings": []
+      },
+      "2022Q2": {
+        "net_return": -0.0234074,
+        "trade_count": 1288,
+        "win_rate": 0.73524845,
+        "profit_factor": 0.5889995,
+        "max_drawdown": 0.02452764,
+        "gross_pnl": -1493.40830881,
+        "commission": 847.33177158,
+        "net_pnl": -2340.74008039,
+        "spread_entry_mean": 3.244e-05,
+        "warnings": []
+      },
+      "2022Q3": {
+        "net_return": -0.02539674,
+        "trade_count": 1306,
+        "win_rate": 0.75574273,
+        "profit_factor": 0.59271106,
+        "max_drawdown": 0.02587852,
+        "gross_pnl": -1632.11193759,
+        "commission": 907.56246646,
+        "net_pnl": -2539.67440405,
+        "spread_entry_mean": 3.382e-05,
+        "warnings": []
+      },
+      "2022Q4": {
+        "net_return": -0.01235581,
+        "trade_count": 1422,
+        "win_rate": 0.79254571,
+        "profit_factor": 0.77136581,
+        "max_drawdown": 0.01423735,
+        "gross_pnl": -259.28204544,
+        "commission": 976.29932974,
+        "net_pnl": -1235.58137518,
+        "spread_entry_mean": 3.95e-05,
+        "warnings": []
+      },
+      "2023Q1": {
+        "net_return": -0.02213281,
+        "trade_count": 1020,
+        "win_rate": 0.74117647,
+        "profit_factor": 0.5451977,
+        "max_drawdown": 0.02286119,
+        "gross_pnl": -1549.01458135,
+        "commission": 664.26685697,
+        "net_pnl": -2213.28143832,
+        "spread_entry_mean": 3.56e-05,
+        "warnings": []
+      },
+      "2023Q2": {
+        "net_return": -0.01717285,
+        "trade_count": 678,
+        "win_rate": 0.72123894,
+        "profit_factor": 0.49649817,
+        "max_drawdown": 0.01749778,
+        "gross_pnl": -1281.46504905,
+        "commission": 435.81980039,
+        "net_pnl": -1717.28484943,
+        "spread_entry_mean": 2.558e-05,
+        "warnings": []
+      },
+      "2023Q3": {
+        "net_return": -0.01283842,
+        "trade_count": 792,
+        "win_rate": 0.74494949,
+        "profit_factor": 0.61462909,
+        "max_drawdown": 0.01377889,
+        "gross_pnl": -774.31653429,
+        "commission": 509.5250842,
+        "net_pnl": -1283.84161849,
+        "spread_entry_mean": 1.999e-05,
+        "warnings": []
+      },
+      "2023Q4": {
+        "net_return": -0.0133843,
+        "trade_count": 927,
+        "win_rate": 0.76375405,
+        "profit_factor": 0.64979429,
+        "max_drawdown": 0.01348222,
+        "gross_pnl": -735.01618749,
+        "commission": 603.413745,
+        "net_pnl": -1338.42993249,
+        "spread_entry_mean": 2.161e-05,
+        "warnings": []
+      },
+      "2024Q1": {
+        "net_return": -0.00727502,
+        "trade_count": 664,
+        "win_rate": 0.76957831,
+        "profit_factor": 0.70916745,
+        "max_drawdown": 0.00781394,
+        "gross_pnl": -299.79565502,
+        "commission": 427.70677185,
+        "net_pnl": -727.50242687,
+        "spread_entry_mean": 2.056e-05,
+        "warnings": []
+      },
+      "2024Q2": {
+        "net_return": -0.01091927,
+        "trade_count": 609,
+        "win_rate": 0.75041051,
+        "profit_factor": 0.5949052,
+        "max_drawdown": 0.01146185,
+        "gross_pnl": -695.45085026,
+        "commission": 396.47605476,
+        "net_pnl": -1091.92690503,
+        "spread_entry_mean": 1.888e-05,
+        "warnings": []
+      },
+      "2024Q3": {
+        "net_return": -0.00783842,
+        "trade_count": 652,
+        "win_rate": 0.76687117,
+        "profit_factor": 0.68629395,
+        "max_drawdown": 0.00845116,
+        "gross_pnl": -368.92470121,
+        "commission": 414.91776185,
+        "net_pnl": -783.84246306,
+        "spread_entry_mean": 1.983e-05,
+        "warnings": []
+      },
+      "2024Q4": {
+        "net_return": -0.01525307,
+        "trade_count": 930,
+        "win_rate": 0.75376344,
+        "profit_factor": 0.62006605,
+        "max_drawdown": 0.01682348,
+        "gross_pnl": -912.31257044,
+        "commission": 612.99492833,
+        "net_pnl": -1525.30749876,
+        "spread_entry_mean": 2.082e-05,
+        "warnings": []
+      }
+    },
+    "trades": 25897,
+    "positive_blocks": 0,
+    "gross_pnl_eur": -17601.32933956,
+    "commission_eur": 16234.21675095,
+    "net_pnl_eur": -33835.54609048,
+    "gross_per_trade_pips": -0.7551852569606947,
+    "commission_per_trade_pips": 0.6965292741308516,
+    "net_per_trade_pips": -1.451714531090259
+  },
+  "mean_anchor_reversion@H1": {
+    "params": {
+      "timeframe_minutes": 60,
+      "anchor_period": 20,
+      "entry_points": 116.19,
+      "sl_points": 154.92,
+      "trend_slope_max": 15.49,
+      "lots": 0.1,
+      "max_spread_points": 30.0
+    },
+    "blocks": {
+      "2018Q1": {
+        "net_return": 0.0006243,
+        "trade_count": 118,
+        "win_rate": 0.55932203,
+        "profit_factor": 1.06585209,
+        "max_drawdown": 0.00151673,
+        "gross_pnl": 129.61083482,
+        "commission": 67.18116947,
+        "net_pnl": 62.42966535,
+        "spread_entry_mean": 3.475e-05,
+        "warnings": []
+      },
+      "2018Q2": {
+        "net_return": -0.00268817,
+        "trade_count": 127,
+        "win_rate": 0.52755906,
+        "profit_factor": 0.79189473,
+        "max_drawdown": 0.0042125,
+        "gross_pnl": -194.05720686,
+        "commission": 74.7595324,
+        "net_pnl": -268.81673926,
+        "spread_entry_mean": 4.299e-05,
+        "warnings": []
+      },
+      "2018Q3a": {
+        "net_return": 0.00037951,
+        "trade_count": 46,
+        "win_rate": 0.58695652,
+        "profit_factor": 1.10663598,
+        "max_drawdown": 0.00102269,
+        "gross_pnl": 65.5079426,
+        "commission": 27.55645331,
+        "net_pnl": 37.95148929,
+        "spread_entry_mean": 4.13e-05,
+        "warnings": []
+      },
+      "2018Q3b": {
+        "net_return": 0.00069523,
+        "trade_count": 33,
+        "win_rate": 0.60606061,
+        "profit_factor": 1.29552004,
+        "max_drawdown": 0.00076698,
+        "gross_pnl": 89.31959265,
+        "commission": 19.79626001,
+        "net_pnl": 69.52333264,
+        "spread_entry_mean": 4.394e-05,
+        "warnings": []
+      },
+      "2018Q4": {
+        "net_return": -0.00476204,
+        "trade_count": 115,
+        "win_rate": 0.43478261,
+        "profit_factor": 0.63861868,
+        "max_drawdown": 0.00569849,
+        "gross_pnl": -405.72668948,
+        "commission": 70.47756936,
+        "net_pnl": -476.20425884,
+        "spread_entry_mean": 4.487e-05,
+        "warnings": []
+      },
+      "2019Q1": {
+        "net_return": -0.00304757,
+        "trade_count": 96,
+        "win_rate": 0.5,
+        "profit_factor": 0.68093634,
+        "max_drawdown": 0.00396164,
+        "gross_pnl": -245.58506201,
+        "commission": 59.17182747,
+        "net_pnl": -304.75688948,
+        "spread_entry_mean": 2.948e-05,
+        "warnings": []
+      },
+      "2019Q2": {
+        "net_return": -0.00272229,
+        "trade_count": 82,
+        "win_rate": 0.5,
+        "profit_factor": 0.67463181,
+        "max_drawdown": 0.00429863,
+        "gross_pnl": -221.14961413,
+        "commission": 51.07979078,
+        "net_pnl": -272.22940491,
+        "spread_entry_mean": 3.268e-05,
+        "warnings": []
+      },
+      "2019Q3": {
+        "net_return": -0.00194439,
+        "trade_count": 88,
+        "win_rate": 0.53409091,
+        "profit_factor": 0.76861461,
+        "max_drawdown": 0.00263814,
+        "gross_pnl": -139.0139293,
+        "commission": 55.42459111,
+        "net_pnl": -194.4385204,
+        "spread_entry_mean": 3.023e-05,
+        "warnings": []
+      },
+      "2019Q4": {
+        "net_return": 0.00212003,
+        "trade_count": 75,
+        "win_rate": 0.64,
+        "profit_factor": 1.42672401,
+        "max_drawdown": 0.00096342,
+        "gross_pnl": 259.42698183,
+        "commission": 47.42421121,
+        "net_pnl": 212.00277062,
+        "spread_entry_mean": 2.373e-05,
+        "warnings": []
+      },
+      "2020Q1": {
+        "net_return": -0.00203494,
+        "trade_count": 86,
+        "win_rate": 0.44186047,
+        "profit_factor": 0.80898897,
+        "max_drawdown": 0.00530007,
+        "gross_pnl": -148.78576919,
+        "commission": 54.70794451,
+        "net_pnl": -203.4937137,
+        "spread_entry_mean": 3.663e-05,
+        "warnings": []
+      },
+      "2020Q2": {
+        "net_return": 0.00173446,
+        "trade_count": 133,
+        "win_rate": 0.60150376,
+        "profit_factor": 1.15599792,
+        "max_drawdown": 0.00167518,
+        "gross_pnl": 258.06176133,
+        "commission": 84.61567863,
+        "net_pnl": 173.44608269,
+        "spread_entry_mean": 3.474e-05,
+        "warnings": []
+      },
+      "2020Q3": {
+        "net_return": -0.00420645,
+        "trade_count": 134,
+        "win_rate": 0.46268657,
+        "profit_factor": 0.7007777,
+        "max_drawdown": 0.00471745,
+        "gross_pnl": -340.53327118,
+        "commission": 80.11163527,
+        "net_pnl": -420.64490644,
+        "spread_entry_mean": 3.53e-05,
+        "warnings": []
+      },
+      "2020Q4": {
+        "net_return": -0.00463026,
+        "trade_count": 112,
+        "win_rate": 0.42857143,
+        "profit_factor": 0.59579152,
+        "max_drawdown": 0.00491423,
+        "gross_pnl": -397.33523025,
+        "commission": 65.69115002,
+        "net_pnl": -463.02638028,
+        "spread_entry_mean": 3.277e-05,
+        "warnings": []
+      },
+      "2021Q1": {
+        "net_return": -0.00447102,
+        "trade_count": 102,
+        "win_rate": 0.43137255,
+        "profit_factor": 0.5828184,
+        "max_drawdown": 0.0053252,
+        "gross_pnl": -387.81453943,
+        "commission": 59.28740472,
+        "net_pnl": -447.10194414,
+        "spread_entry_mean": 3.147e-05,
+        "warnings": []
+      },
+      "2021Q2": {
+        "net_return": -0.00189227,
+        "trade_count": 100,
+        "win_rate": 0.51,
+        "profit_factor": 0.7875787,
+        "max_drawdown": 0.00297572,
+        "gross_pnl": -131.15086014,
+        "commission": 58.0761781,
+        "net_pnl": -189.22703824,
+        "spread_entry_mean": 2.85e-05,
+        "warnings": []
+      },
+      "2021Q3": {
+        "net_return": -0.00116508,
+        "trade_count": 98,
+        "win_rate": 0.53061224,
+        "profit_factor": 0.85237445,
+        "max_drawdown": 0.00161862,
+        "gross_pnl": -58.3579271,
+        "commission": 58.14990279,
+        "net_pnl": -116.50782989,
+        "spread_entry_mean": 3.082e-05,
+        "warnings": []
+      },
+      "2021Q4": {
+        "net_return": 0.00030393,
+        "trade_count": 96,
+        "win_rate": 0.55208333,
+        "profit_factor": 1.03881757,
+        "max_drawdown": 0.0024343,
+        "gross_pnl": 89.19370766,
+        "commission": 58.80023976,
+        "net_pnl": 30.39346791,
+        "spread_entry_mean": 3e-05,
+        "warnings": []
+      },
+      "2022Q1": {
+        "net_return": 0.00187121,
+        "trade_count": 116,
+        "win_rate": 0.62068966,
+        "profit_factor": 1.19547627,
+        "max_drawdown": 0.00155793,
+        "gross_pnl": 259.47959793,
+        "commission": 72.35898656,
+        "net_pnl": 187.12061138,
+        "spread_entry_mean": 3.095e-05,
+        "warnings": []
+      },
+      "2022Q2": {
+        "net_return": -0.00364458,
+        "trade_count": 131,
+        "win_rate": 0.47328244,
+        "profit_factor": 0.75406633,
+        "max_drawdown": 0.00432804,
+        "gross_pnl": -278.18912229,
+        "commission": 86.2687348,
+        "net_pnl": -364.45785709,
+        "spread_entry_mean": 3.389e-05,
+        "warnings": []
+      },
+      "2022Q3": {
+        "net_return": 0.00072608,
+        "trade_count": 130,
+        "win_rate": 0.53846154,
+        "profit_factor": 1.05113491,
+        "max_drawdown": 0.00293109,
+        "gross_pnl": 163.12956606,
+        "commission": 90.52155744,
+        "net_pnl": 72.60800862,
+        "spread_entry_mean": 4.254e-05,
+        "warnings": []
+      },
+      "2022Q4": {
+        "net_return": 0.00327063,
+        "trade_count": 129,
+        "win_rate": 0.59689922,
+        "profit_factor": 1.27769688,
+        "max_drawdown": 0.00152615,
+        "gross_pnl": 415.33023169,
+        "commission": 88.26721983,
+        "net_pnl": 327.06301186,
+        "spread_entry_mean": 5.341e-05,
+        "warnings": []
+      },
+      "2023Q1": {
+        "net_return": -0.00280718,
+        "trade_count": 96,
+        "win_rate": 0.51041667,
+        "profit_factor": 0.73886248,
+        "max_drawdown": 0.00484282,
+        "gross_pnl": -218.21595257,
+        "commission": 62.50250049,
+        "net_pnl": -280.71845306,
+        "spread_entry_mean": 6.031e-05,
+        "warnings": []
+      },
+      "2023Q2": {
+        "net_return": -0.00293913,
+        "trade_count": 78,
+        "win_rate": 0.44871795,
+        "profit_factor": 0.66026585,
+        "max_drawdown": 0.00322271,
+        "gross_pnl": -243.71454526,
+        "commission": 50.19833665,
+        "net_pnl": -293.91288192,
+        "spread_entry_mean": 2.897e-05,
+        "warnings": [
+          "rejected 1 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2023Q3": {
+        "net_return": -0.00079397,
+        "trade_count": 89,
+        "win_rate": 0.52808989,
+        "profit_factor": 0.90003574,
+        "max_drawdown": 0.00144045,
+        "gross_pnl": -22.06486972,
+        "commission": 57.33236187,
+        "net_pnl": -79.39723159,
+        "spread_entry_mean": 4.202e-05,
+        "warnings": []
+      },
+      "2023Q4": {
+        "net_return": -0.00193688,
+        "trade_count": 111,
+        "win_rate": 0.52252252,
+        "profit_factor": 0.81838327,
+        "max_drawdown": 0.00282017,
+        "gross_pnl": -121.35828389,
+        "commission": 72.32959804,
+        "net_pnl": -193.68788193,
+        "spread_entry_mean": 3.297e-05,
+        "warnings": []
+      },
+      "2024Q1": {
+        "net_return": 0.00201583,
+        "trade_count": 102,
+        "win_rate": 0.60784314,
+        "profit_factor": 1.2756841,
+        "max_drawdown": 0.0009231,
+        "gross_pnl": 267.32223171,
+        "commission": 65.73912355,
+        "net_pnl": 201.58310816,
+        "spread_entry_mean": 2.755e-05,
+        "warnings": []
+      },
+      "2024Q2": {
+        "net_return": -0.0012732,
+        "trade_count": 80,
+        "win_rate": 0.5375,
+        "profit_factor": 0.83111594,
+        "max_drawdown": 0.0014055,
+        "gross_pnl": -75.23632146,
+        "commission": 52.08374409,
+        "net_pnl": -127.32006555,
+        "spread_entry_mean": 1.85e-05,
+        "warnings": []
+      },
+      "2024Q3": {
+        "net_return": 0.00050868,
+        "trade_count": 93,
+        "win_rate": 0.58064516,
+        "profit_factor": 1.06766548,
+        "max_drawdown": 0.00139815,
+        "gross_pnl": 110.04187419,
+        "commission": 59.17395839,
+        "net_pnl": 50.86791579,
+        "spread_entry_mean": 2.505e-05,
+        "warnings": []
+      },
+      "2024Q4": {
+        "net_return": -0.00168362,
+        "trade_count": 115,
+        "win_rate": 0.53043478,
+        "profit_factor": 0.85885269,
+        "max_drawdown": 0.0031699,
+        "gross_pnl": -92.69238377,
+        "commission": 75.67000878,
+        "net_pnl": -168.36239255,
+        "spread_entry_mean": 2.704e-05,
+        "warnings": []
+      }
+    },
+    "trades": 2911,
+    "positive_blocks": 11,
+    "gross_pnl_eur": -1614.55725556,
+    "commission_eur": 1824.75766941,
+    "net_pnl_eur": -3439.31492496,
+    "gross_per_trade_pips": -0.6162667489446162,
+    "commission_per_trade_pips": 0.6964989768349937,
+    "net_per_trade_pips": -1.312765725775793
+  },
+  "mean_anchor_reversion@M15": {
+    "params": {
+      "timeframe_minutes": 15,
+      "anchor_period": 20,
+      "entry_points": 58.09,
+      "sl_points": 77.46,
+      "trend_slope_max": 7.75,
+      "lots": 0.1,
+      "max_spread_points": 30.0
+    },
+    "blocks": {
+      "2018Q1": {
+        "net_return": -0.00381869,
+        "trade_count": 515,
+        "win_rate": 0.55145631,
+        "profit_factor": 0.83665792,
+        "max_drawdown": 0.00447085,
+        "gross_pnl": -88.80953437,
+        "commission": 293.05914723,
+        "net_pnl": -381.8686816,
+        "spread_entry_mean": 3.909e-05,
+        "warnings": []
+      },
+      "2018Q2": {
+        "net_return": -0.00340963,
+        "trade_count": 479,
+        "win_rate": 0.54488518,
+        "profit_factor": 0.84488424,
+        "max_drawdown": 0.00369806,
+        "gross_pnl": -59.29459619,
+        "commission": 281.66793674,
+        "net_pnl": -340.96253293,
+        "spread_entry_mean": 4.695e-05,
+        "warnings": []
+      },
+      "2018Q3a": {
+        "net_return": -0.00394085,
+        "trade_count": 144,
+        "win_rate": 0.45138889,
+        "profit_factor": 0.51746891,
+        "max_drawdown": 0.00395627,
+        "gross_pnl": -307.84726924,
+        "commission": 86.23802143,
+        "net_pnl": -394.08529067,
+        "spread_entry_mean": 4.819e-05,
+        "warnings": []
+      },
+      "2018Q3b": {
+        "net_return": -0.00309375,
+        "trade_count": 120,
+        "win_rate": 0.45833333,
+        "profit_factor": 0.53631541,
+        "max_drawdown": 0.00340596,
+        "gross_pnl": -237.33143244,
+        "commission": 72.04385928,
+        "net_pnl": -309.37529172,
+        "spread_entry_mean": 4.175e-05,
+        "warnings": []
+      },
+      "2018Q4": {
+        "net_return": -0.00713247,
+        "trade_count": 456,
+        "win_rate": 0.50219298,
+        "profit_factor": 0.70792457,
+        "max_drawdown": 0.00758861,
+        "gross_pnl": -433.52283756,
+        "commission": 279.7240096,
+        "net_pnl": -713.24684716,
+        "spread_entry_mean": 4.43e-05,
+        "warnings": []
+      },
+      "2019Q1": {
+        "net_return": -0.00208381,
+        "trade_count": 395,
+        "win_rate": 0.55696203,
+        "profit_factor": 0.87833013,
+        "max_drawdown": 0.00394547,
+        "gross_pnl": 34.89636346,
+        "commission": 243.27778313,
+        "net_pnl": -208.38141967,
+        "spread_entry_mean": 3.084e-05,
+        "warnings": []
+      },
+      "2019Q2": {
+        "net_return": -0.00128971,
+        "trade_count": 310,
+        "win_rate": 0.58064516,
+        "profit_factor": 0.9002722,
+        "max_drawdown": 0.00225381,
+        "gross_pnl": 64.1748408,
+        "commission": 193.14631386,
+        "net_pnl": -128.97147307,
+        "spread_entry_mean": 3.161e-05,
+        "warnings": []
+      },
+      "2019Q3": {
+        "net_return": -0.00421508,
+        "trade_count": 312,
+        "win_rate": 0.53525641,
+        "profit_factor": 0.72619315,
+        "max_drawdown": 0.00453384,
+        "gross_pnl": -224.99691003,
+        "commission": 196.51087824,
+        "net_pnl": -421.50778827,
+        "spread_entry_mean": 3.256e-05,
+        "warnings": []
+      },
+      "2019Q4": {
+        "net_return": -0.00220155,
+        "trade_count": 278,
+        "win_rate": 0.56834532,
+        "profit_factor": 0.81848562,
+        "max_drawdown": 0.00295051,
+        "gross_pnl": -44.4261197,
+        "commission": 175.72873369,
+        "net_pnl": -220.15485339,
+        "spread_entry_mean": 2.518e-05,
+        "warnings": []
+      },
+      "2020Q1": {
+        "net_return": -0.0055194,
+        "trade_count": 368,
+        "win_rate": 0.51630435,
+        "profit_factor": 0.73711912,
+        "max_drawdown": 0.00563489,
+        "gross_pnl": -318.50232329,
+        "commission": 233.43788833,
+        "net_pnl": -551.94021162,
+        "spread_entry_mean": 3.924e-05,
+        "warnings": [
+          "rejected 1 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2020Q2": {
+        "net_return": -0.00516173,
+        "trade_count": 509,
+        "win_rate": 0.5324165,
+        "profit_factor": 0.80211314,
+        "max_drawdown": 0.00756589,
+        "gross_pnl": -192.74817907,
+        "commission": 323.42458292,
+        "net_pnl": -516.17276199,
+        "spread_entry_mean": 3.385e-05,
+        "warnings": [
+          "rejected 1 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2020Q3": {
+        "net_return": -0.00706498,
+        "trade_count": 504,
+        "win_rate": 0.50793651,
+        "profit_factor": 0.71960637,
+        "max_drawdown": 0.00748437,
+        "gross_pnl": -404.8427132,
+        "commission": 301.65545993,
+        "net_pnl": -706.49817314,
+        "spread_entry_mean": 3.637e-05,
+        "warnings": []
+      },
+      "2020Q4": {
+        "net_return": -0.00391488,
+        "trade_count": 462,
+        "win_rate": 0.52597403,
+        "profit_factor": 0.81540571,
+        "max_drawdown": 0.00482827,
+        "gross_pnl": -120.6047266,
+        "commission": 270.88363286,
+        "net_pnl": -391.48835945,
+        "spread_entry_mean": 3.242e-05,
+        "warnings": []
+      },
+      "2021Q1": {
+        "net_return": -0.00327797,
+        "trade_count": 460,
+        "win_rate": 0.55869565,
+        "profit_factor": 0.83400285,
+        "max_drawdown": 0.0037789,
+        "gross_pnl": -60.7371329,
+        "commission": 267.05957631,
+        "net_pnl": -327.79670921,
+        "spread_entry_mean": 3.104e-05,
+        "warnings": []
+      },
+      "2021Q2": {
+        "net_return": -0.00448179,
+        "trade_count": 405,
+        "win_rate": 0.5308642,
+        "profit_factor": 0.74659599,
+        "max_drawdown": 0.00474792,
+        "gross_pnl": -212.91119746,
+        "commission": 235.26756441,
+        "net_pnl": -448.17876187,
+        "spread_entry_mean": 2.951e-05,
+        "warnings": []
+      },
+      "2021Q3": {
+        "net_return": -0.00197785,
+        "trade_count": 356,
+        "win_rate": 0.55898876,
+        "profit_factor": 0.86475153,
+        "max_drawdown": 0.00279772,
+        "gross_pnl": 13.63658398,
+        "commission": 211.42112555,
+        "net_pnl": -197.78454156,
+        "spread_entry_mean": 2.955e-05,
+        "warnings": []
+      },
+      "2021Q4": {
+        "net_return": -0.0013302,
+        "trade_count": 411,
+        "win_rate": 0.5620438,
+        "profit_factor": 0.92491397,
+        "max_drawdown": 0.00237405,
+        "gross_pnl": 118.63892829,
+        "commission": 251.65907562,
+        "net_pnl": -133.02014733,
+        "spread_entry_mean": 3.131e-05,
+        "warnings": []
+      },
+      "2022Q1": {
+        "net_return": -0.00369934,
+        "trade_count": 487,
+        "win_rate": 0.54209446,
+        "profit_factor": 0.84546487,
+        "max_drawdown": 0.00494654,
+        "gross_pnl": -65.61552717,
+        "commission": 304.31874376,
+        "net_pnl": -369.93427092,
+        "spread_entry_mean": 3.283e-05,
+        "warnings": []
+      },
+      "2022Q2": {
+        "net_return": -0.00876088,
+        "trade_count": 527,
+        "win_rate": 0.51802657,
+        "profit_factor": 0.71684755,
+        "max_drawdown": 0.00968341,
+        "gross_pnl": -529.48807826,
+        "commission": 346.6002553,
+        "net_pnl": -876.08833356,
+        "spread_entry_mean": 3.774e-05,
+        "warnings": []
+      },
+      "2022Q3": {
+        "net_return": -0.00638815,
+        "trade_count": 546,
+        "win_rate": 0.52747253,
+        "profit_factor": 0.80511452,
+        "max_drawdown": 0.00703664,
+        "gross_pnl": -258.94698621,
+        "commission": 379.8681369,
+        "net_pnl": -638.81512311,
+        "spread_entry_mean": 4.665e-05,
+        "warnings": []
+      },
+      "2022Q4": {
+        "net_return": -0.00682723,
+        "trade_count": 578,
+        "win_rate": 0.52768166,
+        "profit_factor": 0.803473,
+        "max_drawdown": 0.00863677,
+        "gross_pnl": -285.90562044,
+        "commission": 396.81694997,
+        "net_pnl": -682.72257041,
+        "spread_entry_mean": 5.356e-05,
+        "warnings": []
+      },
+      "2023Q1": {
+        "net_return": -0.00671429,
+        "trade_count": 419,
+        "win_rate": 0.51551313,
+        "profit_factor": 0.71027054,
+        "max_drawdown": 0.00795585,
+        "gross_pnl": -398.16665013,
+        "commission": 273.26232939,
+        "net_pnl": -671.42897952,
+        "spread_entry_mean": 4.575e-05,
+        "warnings": []
+      },
+      "2023Q2": {
+        "net_return": -0.00469095,
+        "trade_count": 285,
+        "win_rate": 0.49122807,
+        "profit_factor": 0.70453215,
+        "max_drawdown": 0.00518217,
+        "gross_pnl": -285.77524434,
+        "commission": 183.32019815,
+        "net_pnl": -469.09544249,
+        "spread_entry_mean": 2.863e-05,
+        "warnings": [
+          "rejected 6 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2023Q3": {
+        "net_return": -0.00518907,
+        "trade_count": 396,
+        "win_rate": 0.53030303,
+        "profit_factor": 0.73510541,
+        "max_drawdown": 0.00560229,
+        "gross_pnl": -264.16759719,
+        "commission": 254.73918706,
+        "net_pnl": -518.90678425,
+        "spread_entry_mean": 2.785e-05,
+        "warnings": [
+          "rejected 1 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2023Q4": {
+        "net_return": -0.00383692,
+        "trade_count": 427,
+        "win_rate": 0.53629977,
+        "profit_factor": 0.81525166,
+        "max_drawdown": 0.00554187,
+        "gross_pnl": -105.68463412,
+        "commission": 278.00782101,
+        "net_pnl": -383.69245513,
+        "spread_entry_mean": 2.735e-05,
+        "warnings": []
+      },
+      "2024Q1": {
+        "net_return": -0.00322906,
+        "trade_count": 354,
+        "win_rate": 0.54237288,
+        "profit_factor": 0.80146236,
+        "max_drawdown": 0.00367863,
+        "gross_pnl": -94.75751989,
+        "commission": 228.14830832,
+        "net_pnl": -322.90582821,
+        "spread_entry_mean": 2.655e-05,
+        "warnings": []
+      },
+      "2024Q2": {
+        "net_return": -0.00575997,
+        "trade_count": 306,
+        "win_rate": 0.49019608,
+        "profit_factor": 0.64335307,
+        "max_drawdown": 0.00600185,
+        "gross_pnl": -376.90400256,
+        "commission": 199.09303924,
+        "net_pnl": -575.9970418,
+        "spread_entry_mean": 2.059e-05,
+        "warnings": [
+          "rejected 1 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2024Q3": {
+        "net_return": -0.0028535,
+        "trade_count": 334,
+        "win_rate": 0.55688623,
+        "profit_factor": 0.80743267,
+        "max_drawdown": 0.0029763,
+        "gross_pnl": -72.68078804,
+        "commission": 212.66874611,
+        "net_pnl": -285.34953415,
+        "spread_entry_mean": 2.401e-05,
+        "warnings": []
+      },
+      "2024Q4": {
+        "net_return": -0.00804211,
+        "trade_count": 422,
+        "win_rate": 0.49052133,
+        "profit_factor": 0.66098047,
+        "max_drawdown": 0.00958581,
+        "gross_pnl": -526.82912657,
+        "commission": 277.382275,
+        "net_pnl": -804.21140157,
+        "spread_entry_mean": 2.564e-05,
+        "warnings": [
+          "rejected 2 order(s): take-profit already through the fill price"
+        ]
+      }
+    },
+    "trades": 11565,
+    "positive_blocks": 0,
+    "gross_pnl_eur": -5740.15003044,
+    "commission_eur": 7250.43157934,
+    "net_pnl_eur": -12990.58160977,
+    "gross_per_trade_pips": -0.5514867685487822,
+    "commission_per_trade_pips": 0.6965875562607484,
+    "net_per_trade_pips": -1.24807432480857
+  },
+  "mean_anchor_reversion@M5": {
+    "params": {
+      "timeframe_minutes": 5,
+      "anchor_period": 20,
+      "entry_points": 33.54,
+      "sl_points": 44.72,
+      "trend_slope_max": 4.47,
+      "lots": 0.1,
+      "max_spread_points": 30.0
+    },
+    "blocks": {
+      "2018Q1": {
+        "net_return": -0.01678216,
+        "trade_count": 1569,
+        "win_rate": 0.5098789,
+        "profit_factor": 0.64536303,
+        "max_drawdown": 0.01688728,
+        "gross_pnl": -785.1726844,
+        "commission": 893.04298006,
+        "net_pnl": -1678.21566446,
+        "spread_entry_mean": 3.766e-05,
+        "warnings": []
+      },
+      "2018Q2": {
+        "net_return": -0.01608203,
+        "trade_count": 1339,
+        "win_rate": 0.50933532,
+        "profit_factor": 0.60809445,
+        "max_drawdown": 0.01610238,
+        "gross_pnl": -821.11382867,
+        "commission": 787.08897917,
+        "net_pnl": -1608.20280784,
+        "spread_entry_mean": 4.348e-05,
+        "warnings": []
+      },
+      "2018Q3a": {
+        "net_return": -0.0052048,
+        "trade_count": 465,
+        "win_rate": 0.54193548,
+        "profit_factor": 0.61539569,
+        "max_drawdown": 0.00522021,
+        "gross_pnl": -241.89679463,
+        "commission": 278.58276217,
+        "net_pnl": -520.47955681,
+        "spread_entry_mean": 4.667e-05,
+        "warnings": []
+      },
+      "2018Q3b": {
+        "net_return": -0.00473539,
+        "trade_count": 368,
+        "win_rate": 0.51630435,
+        "profit_factor": 0.60040415,
+        "max_drawdown": 0.00491,
+        "gross_pnl": -252.55828128,
+        "commission": 220.98116209,
+        "net_pnl": -473.53944337,
+        "spread_entry_mean": 4.185e-05,
+        "warnings": []
+      },
+      "2018Q4": {
+        "net_return": -0.01765621,
+        "trade_count": 1333,
+        "win_rate": 0.51612903,
+        "profit_factor": 0.59195536,
+        "max_drawdown": 0.01765621,
+        "gross_pnl": -947.98874839,
+        "commission": 817.63268558,
+        "net_pnl": -1765.62143398,
+        "spread_entry_mean": 4.397e-05,
+        "warnings": [
+          "rejected 1 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2019Q1": {
+        "net_return": -0.01291144,
+        "trade_count": 1137,
+        "win_rate": 0.52858399,
+        "profit_factor": 0.62016472,
+        "max_drawdown": 0.01326196,
+        "gross_pnl": -590.74224444,
+        "commission": 700.40208935,
+        "net_pnl": -1291.14433379,
+        "spread_entry_mean": 3.233e-05,
+        "warnings": []
+      },
+      "2019Q2": {
+        "net_return": -0.00634829,
+        "trade_count": 954,
+        "win_rate": 0.58280922,
+        "profit_factor": 0.74621618,
+        "max_drawdown": 0.00647284,
+        "gross_pnl": -40.78754928,
+        "commission": 594.04186498,
+        "net_pnl": -634.82941426,
+        "spread_entry_mean": 3.055e-05,
+        "warnings": []
+      },
+      "2019Q3": {
+        "net_return": -0.00784507,
+        "trade_count": 1019,
+        "win_rate": 0.56722277,
+        "profit_factor": 0.72236252,
+        "max_drawdown": 0.00801174,
+        "gross_pnl": -142.89254519,
+        "commission": 641.61447305,
+        "net_pnl": -784.50701824,
+        "spread_entry_mean": 3.293e-05,
+        "warnings": []
+      },
+      "2019Q4": {
+        "net_return": -0.00936152,
+        "trade_count": 841,
+        "win_rate": 0.53388823,
+        "profit_factor": 0.61396545,
+        "max_drawdown": 0.00938235,
+        "gross_pnl": -404.49175725,
+        "commission": 531.65977686,
+        "net_pnl": -936.1515341,
+        "spread_entry_mean": 2.621e-05,
+        "warnings": []
+      },
+      "2020Q1": {
+        "net_return": -0.0129015,
+        "trade_count": 1122,
+        "win_rate": 0.52406417,
+        "profit_factor": 0.66975883,
+        "max_drawdown": 0.01294087,
+        "gross_pnl": -577.69118823,
+        "commission": 712.45855018,
+        "net_pnl": -1290.14973841,
+        "spread_entry_mean": 4.221e-05,
+        "warnings": []
+      },
+      "2020Q2": {
+        "net_return": -0.01480976,
+        "trade_count": 1466,
+        "win_rate": 0.5218281,
+        "profit_factor": 0.68306322,
+        "max_drawdown": 0.01488885,
+        "gross_pnl": -548.94242206,
+        "commission": 932.03386836,
+        "net_pnl": -1480.97629042,
+        "spread_entry_mean": 3.289e-05,
+        "warnings": []
+      },
+      "2020Q3": {
+        "net_return": -0.01403066,
+        "trade_count": 1537,
+        "win_rate": 0.52700065,
+        "profit_factor": 0.68788018,
+        "max_drawdown": 0.01465798,
+        "gross_pnl": -483.85455479,
+        "commission": 919.2117424,
+        "net_pnl": -1403.06629719,
+        "spread_entry_mean": 3.465e-05,
+        "warnings": []
+      },
+      "2020Q4": {
+        "net_return": -0.01168497,
+        "trade_count": 1345,
+        "win_rate": 0.54795539,
+        "profit_factor": 0.68594228,
+        "max_drawdown": 0.0121532,
+        "gross_pnl": -379.24576905,
+        "commission": 789.25079007,
+        "net_pnl": -1168.49655912,
+        "spread_entry_mean": 3.288e-05,
+        "warnings": []
+      },
+      "2021Q1": {
+        "net_return": -0.01371402,
+        "trade_count": 1293,
+        "win_rate": 0.51430781,
+        "profit_factor": 0.62997234,
+        "max_drawdown": 0.01406581,
+        "gross_pnl": -620.57087384,
+        "commission": 750.83106814,
+        "net_pnl": -1371.40194198,
+        "spread_entry_mean": 3.144e-05,
+        "warnings": []
+      },
+      "2021Q2": {
+        "net_return": -0.01164592,
+        "trade_count": 1131,
+        "win_rate": 0.51724138,
+        "profit_factor": 0.63478523,
+        "max_drawdown": 0.01198739,
+        "gross_pnl": -507.24836947,
+        "commission": 657.34360964,
+        "net_pnl": -1164.59197911,
+        "spread_entry_mean": 2.851e-05,
+        "warnings": [
+          "rejected 1 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2021Q3": {
+        "net_return": -0.00916299,
+        "trade_count": 1050,
+        "win_rate": 0.54761905,
+        "profit_factor": 0.67129472,
+        "max_drawdown": 0.00976001,
+        "gross_pnl": -292.68004911,
+        "commission": 623.61859064,
+        "net_pnl": -916.29863975,
+        "spread_entry_mean": 2.897e-05,
+        "warnings": []
+      },
+      "2021Q4": {
+        "net_return": -0.01404037,
+        "trade_count": 1180,
+        "win_rate": 0.50847458,
+        "profit_factor": 0.59983909,
+        "max_drawdown": 0.01412926,
+        "gross_pnl": -681.08006829,
+        "commission": 722.95646544,
+        "net_pnl": -1404.03653373,
+        "spread_entry_mean": 3.142e-05,
+        "warnings": []
+      },
+      "2022Q1": {
+        "net_return": -0.01797969,
+        "trade_count": 1430,
+        "win_rate": 0.50909091,
+        "profit_factor": 0.61377749,
+        "max_drawdown": 0.01818668,
+        "gross_pnl": -904.73555902,
+        "commission": 893.23304636,
+        "net_pnl": -1797.96860538,
+        "spread_entry_mean": 3.48e-05,
+        "warnings": []
+      },
+      "2022Q2": {
+        "net_return": -0.01671693,
+        "trade_count": 1525,
+        "win_rate": 0.52655738,
+        "profit_factor": 0.67209356,
+        "max_drawdown": 0.01716335,
+        "gross_pnl": -668.17730666,
+        "commission": 1003.51521278,
+        "net_pnl": -1671.69251945,
+        "spread_entry_mean": 3.861e-05,
+        "warnings": []
+      },
+      "2022Q3": {
+        "net_return": -0.02624325,
+        "trade_count": 1609,
+        "win_rate": 0.48912368,
+        "profit_factor": 0.58850432,
+        "max_drawdown": 0.02725773,
+        "gross_pnl": -1505.27361074,
+        "commission": 1119.0509164,
+        "net_pnl": -2624.32452714,
+        "spread_entry_mean": 4.627e-05,
+        "warnings": []
+      },
+      "2022Q4": {
+        "net_return": -0.02519554,
+        "trade_count": 1616,
+        "win_rate": 0.49009901,
+        "profit_factor": 0.60251687,
+        "max_drawdown": 0.02560933,
+        "gross_pnl": -1410.07055699,
+        "commission": 1109.48323633,
+        "net_pnl": -2519.55379332,
+        "spread_entry_mean": 5.184e-05,
+        "warnings": []
+      },
+      "2023Q1": {
+        "net_return": -0.01544413,
+        "trade_count": 1277,
+        "win_rate": 0.52310102,
+        "profit_factor": 0.6400813,
+        "max_drawdown": 0.01565705,
+        "gross_pnl": -712.13214633,
+        "commission": 832.28055696,
+        "net_pnl": -1544.41270329,
+        "spread_entry_mean": 4.622e-05,
+        "warnings": [
+          "rejected 3 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2023Q2": {
+        "net_return": -0.01000707,
+        "trade_count": 841,
+        "win_rate": 0.53269917,
+        "profit_factor": 0.63419879,
+        "max_drawdown": 0.01007207,
+        "gross_pnl": -460.05599798,
+        "commission": 540.65149369,
+        "net_pnl": -1000.70749167,
+        "spread_entry_mean": 2.867e-05,
+        "warnings": [
+          "rejected 8 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2023Q3": {
+        "net_return": -0.01388354,
+        "trade_count": 1132,
+        "win_rate": 0.50971731,
+        "profit_factor": 0.61870168,
+        "max_drawdown": 0.01419856,
+        "gross_pnl": -659.31342973,
+        "commission": 729.04034345,
+        "net_pnl": -1388.35377318,
+        "spread_entry_mean": 2.729e-05,
+        "warnings": [
+          "rejected 2 order(s): take-profit already through the fill price"
+        ]
+      },
+      "2023Q4": {
+        "net_return": -0.01546003,
+        "trade_count": 1221,
+        "win_rate": 0.5045045,
+        "profit_factor": 0.61248137,
+        "max_drawdown": 0.01562158,
+        "gross_pnl": -751.43930471,
+        "commission": 794.56383932,
+        "net_pnl": -1546.00314403,
+        "spread_entry_mean": 2.584e-05,
+        "warnings": []
+      },
+      "2024Q1": {
+        "net_return": -0.01180055,
+        "trade_count": 1016,
+        "win_rate": 0.5226378,
+        "profit_factor": 0.62000608,
+        "max_drawdown": 0.01200761,
+        "gross_pnl": -525.13647085,
+        "commission": 654.91810505,
+        "net_pnl": -1180.05457591,
+        "spread_entry_mean": 2.446e-05,
+        "warnings": []
+      },
+      "2024Q2": {
+        "net_return": -0.01388819,
+        "trade_count": 925,
+        "win_rate": 0.48648649,
+        "profit_factor": 0.53789409,
+        "max_drawdown": 0.01412271,
+        "gross_pnl": -786.7621064,
+        "commission": 602.05719837,
+        "net_pnl": -1388.81930476,
+        "spread_entry_mean": 2.027e-05,
+        "warnings": []
+      },
+      "2024Q3": {
+        "net_return": -0.01231122,
+        "trade_count": 979,
+        "win_rate": 0.50970378,
+        "profit_factor": 0.58627175,
+        "max_drawdown": 0.01232863,
+        "gross_pnl": -607.6999289,
+        "commission": 623.42254272,
+        "net_pnl": -1231.12247162,
+        "spread_entry_mean": 2.247e-05,
+        "warnings": []
+      },
+      "2024Q4": {
+        "net_return": -0.01504851,
+        "trade_count": 1224,
+        "win_rate": 0.51715686,
+        "profit_factor": 0.61752421,
+        "max_drawdown": 0.01512967,
+        "gross_pnl": -699.89776395,
+        "commission": 804.95349586,
+        "net_pnl": -1504.85125982,
+        "spread_entry_mean": 2.521e-05,
+        "warnings": []
+      }
+    },
+    "trades": 33944,
+    "positive_blocks": 0,
+    "gross_pnl_eur": -18009.65191063,
+    "commission_eur": 21279.92144547,
+    "net_pnl_eur": -39289.57335613,
+    "gross_per_trade_pips": -0.5895216929396785,
+    "commission_per_trade_pips": 0.6965695605006285,
+    "net_per_trade_pips": -1.286091253441289
+  }
+}

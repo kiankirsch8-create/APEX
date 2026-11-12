@@ -1,0 +1,3612 @@
+{
+ "meta": {
+  "pair": "EURUSD",
+  "trades": 816535,
+  "blocks": 29,
+  "period": "2018-01-01 to 2024-12-31",
+  "pip": 0.0001,
+  "notes": "edge = mid-to-mid move in trade direction, before all costs; net = edge - spread - slippage - commission (EUR->pips at the trade exit rate)"
+ },
+ "strategies": {
+  "bollinger_reversion": {
+   "trades": 149656,
+   "edge_pips": 0.077,
+   "edge_t": 7.38,
+   "net_pips": -1.321,
+   "win_rate": 0.318,
+   "costs_pips": {
+    "spread": 0.366,
+    "slippage": 0.332,
+    "commission": 0.7,
+    "total": 1.398
+   },
+   "avg_win_pips": 3.41,
+   "avg_loss_pips": 3.53,
+   "breakeven_win_rate": 0.509,
+   "edge_abs_move_pips": 2.91,
+   "cost_share_of_move": 0.481,
+   "hold_minutes_median": 4.5,
+   "trades_per_quarter": 5160.6,
+   "by_exit_reason": {
+    "eod": {
+     "trades": 9,
+     "edge_pips": 2.117,
+     "edge_t": 1.96,
+     "net_pips": 0.411,
+     "win_rate": 0.333,
+     "share": 0.0
+    },
+    "sl": {
+     "trades": 99007,
+     "edge_pips": -2.136,
+     "edge_t": -375.86,
+     "net_pips": -3.629,
+     "win_rate": 0.0,
+     "share": 0.662
+    },
+    "tp": {
+     "trades": 50640,
+     "edge_pips": 4.403,
+     "edge_t": 269.89,
+     "net_pips": 3.19,
+     "win_rate": 0.941,
+     "share": 0.338
+    }
+   },
+   "by_side": {
+    "long": {
+     "trades": 75704,
+     "edge_pips": 0.061,
+     "edge_t": 4.15,
+     "net_pips": -1.332,
+     "win_rate": 0.317
+    },
+    "short": {
+     "trades": 73952,
+     "edge_pips": 0.094,
+     "edge_t": 6.31,
+     "net_pips": -1.31,
+     "win_rate": 0.319
+    }
+   },
+   "by_session": {
+    "asia 22-07": {
+     "trades": 58291,
+     "edge_pips": 0.092,
+     "edge_t": 9.04,
+     "net_pips": -1.382,
+     "win_rate": 0.272
+    },
+    "london 07-12": {
+     "trades": 32552,
+     "edge_pips": 0.085,
+     "edge_t": 3.39,
+     "net_pips": -1.241,
+     "win_rate": 0.358
+    },
+    "ny 16-22": {
+     "trades": 32902,
+     "edge_pips": 0.055,
+     "edge_t": 2.52,
+     "net_pips": -1.338,
+     "win_rate": 0.325
+    },
+    "overlap 12-16": {
+     "trades": 25911,
+     "edge_pips": 0.061,
+     "edge_t": 1.67,
+     "net_pips": -1.263,
+     "win_rate": 0.365
+    }
+   },
+   "by_year": {
+    "2018": {
+     "trades": 20405,
+     "edge_pips": 0.104,
+     "edge_t": 3.43,
+     "net_pips": -1.44,
+     "win_rate": 0.322
+    },
+    "2019": {
+     "trades": 21970,
+     "edge_pips": 0.118,
+     "edge_t": 6.05,
+     "net_pips": -1.234,
+     "win_rate": 0.307
+    },
+    "2020": {
+     "trades": 22146,
+     "edge_pips": 0.073,
+     "edge_t": 2.4,
+     "net_pips": -1.309,
+     "win_rate": 0.323
+    },
+    "2021": {
+     "trades": 22073,
+     "edge_pips": 0.09,
+     "edge_t": 4.15,
+     "net_pips": -1.271,
+     "win_rate": 0.317
+    },
+    "2022": {
+     "trades": 22067,
+     "edge_pips": 0.11,
+     "edge_t": 3.0,
+     "net_pips": -1.374,
+     "win_rate": 0.336
+    },
+    "2023": {
+     "trades": 18586,
+     "edge_pips": -0.0,
+     "edge_t": -0.0,
+     "net_pips": -1.378,
+     "win_rate": 0.319
+    },
+    "2024": {
+     "trades": 22409,
+     "edge_pips": 0.035,
+     "edge_t": 1.67,
+     "net_pips": -1.261,
+     "win_rate": 0.304
+    }
+   },
+   "by_hold": {
+    "<5m": {
+     "trades": 78001,
+     "edge_pips": -0.784,
+     "edge_t": -76.22,
+     "net_pips": -2.207,
+     "win_rate": 0.204
+    },
+    "5-30m": {
+     "trades": 62288,
+     "edge_pips": 0.845,
+     "edge_t": 48.83,
+     "net_pips": -0.493,
+     "win_rate": 0.442
+    },
+    "30m-2h": {
+     "trades": 7642,
+     "edge_pips": 2.32,
+     "edge_t": 28.9,
+     "net_pips": 0.957,
+     "win_rate": 0.509
+    },
+    "2-8h": {
+     "trades": 416,
+     "edge_pips": 4.435,
+     "edge_t": 7.58,
+     "net_pips": 3.013,
+     "win_rate": 0.512
+    },
+    ">8h": {
+     "trades": 125,
+     "edge_pips": 3.451,
+     "edge_t": 1.93,
+     "net_pips": 0.814,
+     "win_rate": 0.456
+    }
+   }
+  },
+  "bollinger_reversion@H1": {
+   "trades": 2743,
+   "edge_pips": -0.133,
+   "edge_t": -0.24,
+   "net_pips": -1.49,
+   "win_rate": 0.374,
+   "costs_pips": {
+    "spread": 0.331,
+    "slippage": 0.326,
+    "commission": 0.7,
+    "total": 1.357
+   },
+   "avg_win_pips": 31.95,
+   "avg_loss_pips": 21.47,
+   "breakeven_win_rate": 0.402,
+   "edge_abs_move_pips": 24.95,
+   "cost_share_of_move": 0.054,
+   "hold_minutes_median": 229.8,
+   "trades_per_quarter": 94.6,
+   "by_exit_reason": {
+    "eod": {
+     "trades": 12,
+     "edge_pips": 5.292,
+     "edge_t": 1.73,
+     "net_pips": 2.358,
+     "win_rate": 0.417,
+     "share": 0.004
+    },
+    "sl": {
+     "trades": 1710,
+     "edge_pips": -20.106,
+     "edge_t": -98.35,
+     "net_pips": -21.545,
+     "win_rate": 0.0,
+     "share": 0.623
+    },
+    "tp": {
+     "trades": 1021,
+     "edge_pips": 33.254,
+     "edge_t": 52.77,
+     "net_pips": 32.054,
+     "win_rate": 1.0,
+     "share": 0.372
+    }
+   },
+   "by_side": {
+    "long": {
+     "trades": 1421,
+     "edge_pips": -0.544,
+     "edge_t": -0.7,
+     "net_pips": -1.891,
+     "win_rate": 0.364
+    },
+    "short": {
+     "trades": 1322,
+     "edge_pips": 0.309,
+     "edge_t": 0.38,
+     "net_pips": -1.058,
+     "win_rate": 0.385
+    }
+   },
+   "by_session": {
+    "asia 22-07": {
+     "trades": 174,
+     "edge_pips": 5.455,
+     "edge_t": 2.11,
+     "net_pips": 4.007,
+     "win_rate": 0.454
+    },
+    "london 07-12": {
+     "trades": 803,
+     "edge_pips": 0.318,
+     "edge_t": 0.36,
+     "net_pips": -1.035,
+     "win_rate": 0.361
+    },
+    "ny 16-22": {
+     "trades": 770,
+     "edge_pips": -0.634,
+     "edge_t": -0.52,
+     "net_pips": -1.985,
+     "win_rate": 0.374
+    },
+    "overlap 12-16": {
+     "trades": 996,
+     "edge_pips": -1.086,
+     "edge_t": -1.24,
+     "net_pips": -2.434,
+     "win_rate": 0.37
+    }
+   },
+   "by_year": {
+    "2018": {
+     "trades": 389,
+     "edge_pips": 0.241,
+     "edge_t": 0.16,
+     "net_pips": -1.249,
+     "win_rate": 0.391
+    },
+    "2019": {
+     "trades": 404,
+     "edge_pips": 0.38,
+     "edge_t": 0.35,
+     "net_pips": -0.938,
+     "win_rate": 0.386
+    },
+    "2020": {
+     "trades": 413,
+     "edge_pips": -3.225,
+     "edge_t": -2.06,
+     "net_pips": -4.549,
+     "win_rate": 0.322
+    },
+    "2021": {
+     "trades": 404,
+     "edge_pips": -0.479,
+     "edge_t": -0.41,
+     "net_pips": -1.799,
+     "win_rate": 0.376
+    },
+    "2022": {
+     "trades": 397,
+     "edge_pips": 0.648,
+     "edge_t": 0.33,
+     "net_pips": -0.756,
+     "win_rate": 0.398
+    },
+    "2023": {
+     "trades": 330,
+     "edge_pips": 0.109,
+     "edge_t": 0.06,
+     "net_pips": -1.268,
+     "win_rate": 0.342
+    },
+    "2024": {
+     "trades": 406,
+     "edge_pips": 1.527,
+     "edge_t": 1.29,
+     "net_pips": 0.252,
+     "win_rate": 0.399
+    }
+   },
+   "by_hold": {
+    "<5m": {
+     "trades": 16,
+     "edge_pips": -3.633,
+     "edge_t": -0.92,
+     "net_pips": -5.011,
+     "win_rate": 0.312
+    },
+    "5-30m": {
+     "trades": 192,
+     "edge_pips": -9.281,
+     "edge_t": -7.84,
+     "net_pips": -10.651,
+     "win_rate": 0.193
+    },
+    "30m-2h": {
+     "trades": 696,
+     "edge_pips": -6.361,
+     "edge_t": -8.21,
+     "net_pips": -7.719,
+     "win_rate": 0.283
+    },
+    "2-8h": {
+     "trades": 863,
+     "edge_pips": 1.517,
+     "edge_t": 1.64,
+     "net_pips": 0.164,
+     "win_rate": 0.425
+    },
+    ">8h": {
+     "trades": 973,
+     "edge_pips": 4.721,
+     "edge_t": 4.01,
+     "net_pips": 3.365,
+     "win_rate": 0.432
+    }
+   }
+  },
+  "bollinger_reversion@M15": {
+   "trades": 9689,
+   "edge_pips": 0.317,
+   "edge_t": 1.94,
+   "net_pips": -1.042,
+   "win_rate": 0.398,
+   "costs_pips": {
+    "spread": 0.339,
+    "slippage": 0.321,
+    "commission": 0.7,
+    "total": 1.359
+   },
+   "avg_win_pips": 15.45,
+   "avg_loss_pips": 11.94,
+   "breakeven_win_rate": 0.436,
+   "edge_abs_move_pips": 12.94,
+   "cost_share_of_move": 0.105,
+   "hold_minutes_median": 61.4,
+   "trades_per_quarter": 334.1,
+   "by_exit_reason": {
+    "eod": {
+     "trades": 18,
+     "edge_pips": 5.275,
+     "edge_t": 3.07,
+     "net_pips": 3.122,
+     "win_rate": 0.611,
+     "share": 0.002
+    },
+    "sl": {
+     "trades": 5826,
+     "edge_pips": -10.495,
+     "edge_t": -138.74,
+     "net_pips": -11.95,
+     "win_rate": 0.0,
+     "share": 0.601
+    },
+    "tp": {
+     "trades": 3845,
+     "edge_pips": 16.677,
+     "edge_t": 82.97,
+     "net_pips": 15.466,
+     "win_rate": 1.0,
+     "share": 0.397
+    }
+   },
+   "by_side": {
+    "long": {
+     "trades": 4961,
+     "edge_pips": 0.125,
+     "edge_t": 0.54,
+     "net_pips": -1.234,
+     "win_rate": 0.388
+    },
+    "short": {
+     "trades": 4728,
+     "edge_pips": 0.519,
+     "edge_t": 2.25,
+     "net_pips": -0.842,
+     "win_rate": 0.408
+    }
+   },
+   "by_session": {
+    "asia 22-07": {
+     "trades": 2644,
+     "edge_pips": 0.387,
+     "edge_t": 1.97,
+     "net_pips": -0.999,
+     "win_rate": 0.403
+    },
+    "london 07-12": {
+     "trades": 3585,
+     "edge_pips": 0.018,
+     "edge_t": 0.07,
+     "net_pips": -1.318,
+     "win_rate": 0.394
+    },
+    "ny 16-22": {
+     "trades": 1130,
+     "edge_pips": 1.573,
+     "edge_t": 2.43,
+     "net_pips": 0.169,
+     "win_rate": 0.427
+    },
+    "overlap 12-16": {
+     "trades": 2330,
+     "edge_pips": 0.089,
+     "edge_t": 0.21,
+     "net_pips": -1.255,
+     "win_rate": 0.385
+    }
+   },
+   "by_year": {
+    "2018": {
+     "trades": 1339,
+     "edge_pips": -0.381,
+     "edge_t": -0.84,
+     "net_pips": -1.877,
+     "win_rate": 0.384
+    },
+    "2019": {
+     "trades": 1343,
+     "edge_pips": 0.482,
+     "edge_t": 1.48,
+     "net_pips": -0.824,
+     "win_rate": 0.411
+    },
+    "2020": {
+     "trades": 1477,
+     "edge_pips": 0.099,
+     "edge_t": 0.21,
+     "net_pips": -1.255,
+     "win_rate": 0.389
+    },
+    "2021": {
+     "trades": 1462,
+     "edge_pips": 0.317,
+     "edge_t": 0.96,
+     "net_pips": -0.996,
+     "win_rate": 0.402
+    },
+    "2022": {
+     "trades": 1446,
+     "edge_pips": 0.47,
+     "edge_t": 0.84,
+     "net_pips": -0.966,
+     "win_rate": 0.387
+    },
+    "2023": {
+     "trades": 1243,
+     "edge_pips": 0.473,
+     "edge_t": 1.0,
+     "net_pips": -0.878,
+     "win_rate": 0.407
+    },
+    "2024": {
+     "trades": 1379,
+     "edge_pips": 0.769,
+     "edge_t": 2.13,
+     "net_pips": -0.494,
+     "win_rate": 0.408
+    }
+   },
+   "by_hold": {
+    "<5m": {
+     "trades": 388,
+     "edge_pips": -5.967,
+     "edge_t": -13.69,
+     "net_pips": -7.471,
+     "win_rate": 0.165
+    },
+    "5-30m": {
+     "trades": 2464,
+     "edge_pips": -3.577,
+     "edge_t": -16.23,
+     "net_pips": -4.944,
+     "win_rate": 0.293
+    },
+    "30m-2h": {
+     "trades": 3831,
+     "edge_pips": 0.103,
+     "edge_t": 0.45,
+     "net_pips": -1.24,
+     "win_rate": 0.418
+    },
+    "2-8h": {
+     "trades": 2217,
+     "edge_pips": 3.599,
+     "edge_t": 9.43,
+     "net_pips": 2.259,
+     "win_rate": 0.484
+    },
+    ">8h": {
+     "trades": 783,
+     "edge_pips": 7.445,
+     "edge_t": 7.75,
+     "net_pips": 6.051,
+     "win_rate": 0.506
+    }
+   }
+  },
+  "bollinger_reversion@M5": {
+   "trades": 27340,
+   "edge_pips": 0.211,
+   "edge_t": 3.69,
+   "net_pips": -1.161,
+   "win_rate": 0.388,
+   "costs_pips": {
+    "spread": 0.35,
+    "slippage": 0.322,
+    "commission": 0.7,
+    "total": 1.373
+   },
+   "avg_win_pips": 8.5,
+   "avg_loss_pips": 7.29,
+   "breakeven_win_rate": 0.462,
+   "edge_abs_move_pips": 7.33,
+   "cost_share_of_move": 0.187,
+   "hold_minutes_median": 24.0,
+   "trades_per_quarter": 942.8,
+   "by_exit_reason": {
+    "eod": {
+     "trades": 18,
+     "edge_pips": 7.214,
+     "edge_t": 3.92,
+     "net_pips": 5.217,
+     "win_rate": 0.611,
+     "share": 0.001
+    },
+    "sl": {
+     "trades": 16688,
+     "edge_pips": -5.834,
+     "edge_t": -198.04,
+     "net_pips": -7.304,
+     "win_rate": 0.0,
+     "share": 0.61
+    },
+    "tp": {
+     "trades": 10634,
+     "edge_pips": 9.686,
+     "edge_t": 128.78,
+     "net_pips": 8.468,
+     "win_rate": 0.997,
+     "share": 0.389
+    }
+   },
+   "by_side": {
+    "long": {
+     "trades": 13839,
+     "edge_pips": 0.207,
+     "edge_t": 2.58,
+     "net_pips": -1.161,
+     "win_rate": 0.385
+    },
+    "short": {
+     "trades": 13501,
+     "edge_pips": 0.216,
+     "edge_t": 2.65,
+     "net_pips": -1.161,
+     "win_rate": 0.391
+    }
+   },
+   "by_session": {
+    "asia 22-07": {
+     "trades": 9653,
+     "edge_pips": 0.222,
+     "edge_t": 3.77,
+     "net_pips": -1.192,
+     "win_rate": 0.377
+    },
+    "london 07-12": {
+     "trades": 7452,
+     "edge_pips": 0.204,
+     "edge_t": 1.81,
+     "net_pips": -1.117,
+     "win_rate": 0.397
+    },
+    "ny 16-22": {
+     "trades": 4303,
+     "edge_pips": 0.335,
+     "edge_t": 2.1,
+     "net_pips": -1.097,
+     "win_rate": 0.393
+    },
+    "overlap 12-16": {
+     "trades": 5932,
+     "edge_pips": 0.114,
+     "edge_t": 0.69,
+     "net_pips": -1.213,
+     "win_rate": 0.39
+    }
+   },
+   "by_year": {
+    "2018": {
+     "trades": 3653,
+     "edge_pips": 0.17,
+     "edge_t": 1.0,
+     "net_pips": -1.341,
+     "win_rate": 0.382
+    },
+    "2019": {
+     "trades": 3883,
+     "edge_pips": 0.321,
+     "edge_t": 2.95,
+     "net_pips": -0.998,
+     "win_rate": 0.412
+    },
+    "2020": {
+     "trades": 4140,
+     "edge_pips": 0.21,
+     "edge_t": 1.28,
+     "net_pips": -1.15,
+     "win_rate": 0.385
+    },
+    "2021": {
+     "trades": 4014,
+     "edge_pips": 0.305,
+     "edge_t": 2.55,
+     "net_pips": -1.04,
+     "win_rate": 0.393
+    },
+    "2022": {
+     "trades": 4088,
+     "edge_pips": 0.39,
+     "edge_t": 1.95,
+     "net_pips": -1.057,
+     "win_rate": 0.386
+    },
+    "2023": {
+     "trades": 3553,
+     "edge_pips": 0.017,
+     "edge_t": 0.11,
+     "net_pips": -1.34,
+     "win_rate": 0.385
+    },
+    "2024": {
+     "trades": 4009,
+     "edge_pips": 0.042,
+     "edge_t": 0.35,
+     "net_pips": -1.235,
+     "win_rate": 0.373
+    }
+   },
+   "by_hold": {
+    "<5m": {
+     "trades": 3299,
+     "edge_pips": -3.438,
+     "edge_t": -35.92,
+     "net_pips": -4.907,
+     "win_rate": 0.162
+    },
+    "5-30m": {
+     "trades": 12238,
+     "edge_pips": -0.888,
+     "edge_t": -13.07,
+     "net_pips": -2.251,
+     "win_rate": 0.356
+    },
+    "30m-2h": {
+     "trades": 9164,
+     "edge_pips": 1.777,
+     "edge_t": 16.95,
+     "net_pips": 0.436,
+     "win_rate": 0.478
+    },
+    "2-8h": {
+     "trades": 2148,
+     "edge_pips": 3.985,
+     "edge_t": 13.39,
+     "net_pips": 2.634,
+     "win_rate": 0.503
+    },
+    ">8h": {
+     "trades": 481,
+     "edge_pips": 6.542,
+     "edge_t": 7.14,
+     "net_pips": 4.935,
+     "win_rate": 0.524
+    }
+   }
+  },
+  "donchian_breakout": {
+   "trades": 74194,
+   "edge_pips": -0.225,
+   "edge_t": -9.91,
+   "net_pips": -2.027,
+   "win_rate": 0.339,
+   "costs_pips": {
+    "spread": 0.77,
+    "slippage": 0.332,
+    "commission": 0.7,
+    "total": 1.802
+   },
+   "avg_win_pips": 6.97,
+   "avg_loss_pips": 6.64,
+   "breakeven_win_rate": 0.488,
+   "edge_abs_move_pips": 5.79,
+   "cost_share_of_move": 0.311,
+   "hold_minutes_median": 11.5,
+   "trades_per_quarter": 2558.4,
+   "by_exit_reason": {
+    "eod": {
+     "trades": 26,
+     "edge_pips": 2.44,
+     "edge_t": 4.97,
+     "net_pips": -0.319,
+     "win_rate": 0.385,
+     "share": 0.0
+    },
+    "sl": {
+     "trades": 49009,
+     "edge_pips": -4.552,
+     "edge_t": -617.53,
+     "net_pips": -6.645,
+     "win_rate": 0.0,
+     "share": 0.661
+    },
+    "tp": {
+     "trades": 25159,
+     "edge_pips": 8.202,
+     "edge_t": 3948.3,
+     "net_pips": 6.966,
+     "win_rate": 1.0,
+     "share": 0.339
+    }
+   },
+   "by_side": {
+    "long": {
+     "trades": 37030,
+     "edge_pips": -0.238,
+     "edge_t": -7.38,
+     "net_pips": -2.053,
+     "win_rate": 0.338
+    },
+    "short": {
+     "trades": 37164,
+     "edge_pips": -0.212,
+     "edge_t": -6.63,
+     "net_pips": -2.001,
+     "win_rate": 0.341
+    }
+   },
+   "by_session": {
+    "asia 22-07": {
+     "trades": 15913,
+     "edge_pips": -0.425,
+     "edge_t": -9.54,
+     "net_pips": -3.252,
+     "win_rate": 0.277
+    },
+    "london 07-12": {
+     "trades": 20506,
+     "edge_pips": -0.064,
+     "edge_t": -1.46,
+     "net_pips": -1.528,
+     "win_rate": 0.365
+    },
+    "ny 16-22": {
+     "trades": 16516,
+     "edge_pips": -0.377,
+     "edge_t": -7.72,
+     "net_pips": -2.176,
+     "win_rate": 0.33
+    },
+    "overlap 12-16": {
+     "trades": 21259,
+     "edge_pips": -0.112,
+     "edge_t": -2.56,
+     "net_pips": -1.476,
+     "win_rate": 0.368
+    }
+   },
+   "by_year": {
+    "2018": {
+     "trades": 12557,
+     "edge_pips": -0.311,
+     "edge_t": -5.75,
+     "net_pips": -2.398,
+     "win_rate": 0.323
+    },
+    "2019": {
+     "trades": 6453,
+     "edge_pips": -0.47,
+     "edge_t": -6.17,
+     "net_pips": -1.948,
+     "win_rate": 0.332
+    },
+    "2020": {
+     "trades": 13177,
+     "edge_pips": -0.152,
+     "edge_t": -2.83,
+     "net_pips": -1.852,
+     "win_rate": 0.346
+    },
+    "2021": {
+     "trades": 8488,
+     "edge_pips": -0.234,
+     "edge_t": -3.54,
+     "net_pips": -1.931,
+     "win_rate": 0.339
+    },
+    "2022": {
+     "trades": 16476,
+     "edge_pips": -0.154,
+     "edge_t": -3.17,
+     "net_pips": -1.868,
+     "win_rate": 0.344
+    },
+    "2023": {
+     "trades": 9646,
+     "edge_pips": -0.229,
+     "edge_t": -3.56,
+     "net_pips": -2.365,
+     "win_rate": 0.336
+    },
+    "2024": {
+     "trades": 7397,
+     "edge_pips": -0.135,
+     "edge_t": -1.87,
+     "net_pips": -1.802,
+     "win_rate": 0.354
+    }
+   },
+   "by_hold": {
+    "<5m": {
+     "trades": 20219,
+     "edge_pips": -1.193,
+     "edge_t": -29.61,
+     "net_pips": -2.903,
+     "win_rate": 0.267
+    },
+    "5-30m": {
+     "trades": 32804,
+     "edge_pips": -0.156,
+     "edge_t": -4.52,
+     "net_pips": -1.584,
+     "win_rate": 0.357
+    },
+    "30m-2h": {
+     "trades": 15098,
+     "edge_pips": 0.623,
+     "edge_t": 11.66,
+     "net_pips": -0.814,
+     "win_rate": 0.42
+    },
+    "2-8h": {
+     "trades": 3459,
+     "edge_pips": 1.09,
+     "edge_t": 9.76,
+     "net_pips": -0.428,
+     "win_rate": 0.452
+    },
+    ">8h": {
+     "trades": 430,
+     "edge_pips": -1.476,
+     "edge_t": -2.63,
+     "net_pips": -4.042,
+     "win_rate": 0.349
+    }
+   }
+  },
+  "donchian_breakout@H1": {
+   "trades": 1309,
+   "edge_pips": -1.316,
+   "edge_t": -0.98,
+   "net_pips": -2.777,
+   "win_rate": 0.373,
+   "costs_pips": {
+    "spread": 0.435,
+    "slippage": 0.326,
+    "commission": 0.7,
+    "total": 1.461
+   },
+   "avg_win_pips": 59.91,
+   "avg_loss_pips": 40.04,
+   "breakeven_win_rate": 0.401,
+   "edge_abs_move_pips": 46.95,
+   "cost_share_of_move": 0.031,
+   "hold_minutes_median": 1144.6,
+   "trades_per_quarter": 45.1,
+   "by_exit_reason": {
+    "eod": {
+     "trades": 21,
+     "edge_pips": -2.048,
+     "edge_t": -0.57,
+     "net_pips": -4.852,
+     "win_rate": 0.286,
+     "share": 0.016
+    },
+    "sl": {
+     "trades": 806,
+     "edge_pips": -39.0,
+     "edge_t": -386.55,
+     "net_pips": -40.544,
+     "win_rate": 0.0,
+     "share": 0.616
+    },
+    "tp": {
+     "trades": 482,
+     "edge_pips": 61.73,
+     "edge_t": 434.12,
+     "net_pips": 60.467,
+     "win_rate": 1.0,
+     "share": 0.368
+    }
+   },
+   "by_side": {
+    "long": {
+     "trades": 653,
+     "edge_pips": -2.051,
+     "edge_t": -1.08,
+     "net_pips": -3.568,
+     "win_rate": 0.368
+    },
+    "short": {
+     "trades": 656,
+     "edge_pips": -0.584,
+     "edge_t": -0.31,
+     "net_pips": -1.99,
+     "win_rate": 0.378
+    }
+   },
+   "by_session": {
+    "asia 22-07": {
+     "trades": 194,
+     "edge_pips": -6.211,
+     "edge_t": -1.83,
+     "net_pips": -7.869,
+     "win_rate": 0.325
+    },
+    "london 07-12": {
+     "trades": 322,
+     "edge_pips": -1.197,
+     "edge_t": -0.44,
+     "net_pips": -2.588,
+     "win_rate": 0.373
+    },
+    "ny 16-22": {
+     "trades": 323,
+     "edge_pips": -6.687,
+     "edge_t": -2.59,
+     "net_pips": -8.138,
+     "win_rate": 0.316
+    },
+    "overlap 12-16": {
+     "trades": 470,
+     "edge_pips": 4.314,
+     "edge_t": 1.88,
+     "net_pips": 2.879,
+     "win_rate": 0.432
+    }
+   },
+   "by_year": {
+    "2018": {
+     "trades": 212,
+     "edge_pips": -1.72,
+     "edge_t": -0.52,
+     "net_pips": -3.309,
+     "win_rate": 0.368
+    },
+    "2019": {
+     "trades": 106,
+     "edge_pips": 6.145,
+     "edge_t": 1.27,
+     "net_pips": 4.794,
+     "win_rate": 0.443
+    },
+    "2020": {
+     "trades": 231,
+     "edge_pips": -2.658,
+     "edge_t": -0.84,
+     "net_pips": -4.032,
+     "win_rate": 0.359
+    },
+    "2021": {
+     "trades": 141,
+     "edge_pips": -0.011,
+     "edge_t": -0.0,
+     "net_pips": -1.384,
+     "win_rate": 0.383
+    },
+    "2022": {
+     "trades": 290,
+     "edge_pips": -2.487,
+     "edge_t": -0.87,
+     "net_pips": -4.058,
+     "win_rate": 0.359
+    },
+    "2023": {
+     "trades": 189,
+     "edge_pips": -0.185,
+     "edge_t": -0.05,
+     "net_pips": -1.671,
+     "win_rate": 0.397
+    },
+    "2024": {
+     "trades": 140,
+     "edge_pips": -4.553,
+     "edge_t": -1.14,
+     "net_pips": -5.876,
+     "win_rate": 0.336
+    }
+   },
+   "by_hold": {
+    "<5m": {
+     "trades": 2,
+     "edge_pips": -37.325,
+     "edge_t": -42.66,
+     "net_pips": -40.65,
+     "win_rate": 0.0
+    },
+    "5-30m": {
+     "trades": 15,
+     "edge_pips": -18.693,
+     "edge_t": -1.75,
+     "net_pips": -21.016,
+     "win_rate": 0.2
+    },
+    "30m-2h": {
+     "trades": 107,
+     "edge_pips": -11.575,
+     "edge_t": -2.69,
+     "net_pips": -13.134,
+     "win_rate": 0.271
+    },
+    "2-8h": {
+     "trades": 263,
+     "edge_pips": -9.549,
+     "edge_t": -3.45,
+     "net_pips": -11.034,
+     "win_rate": 0.285
+    },
+    ">8h": {
+     "trades": 922,
+     "edge_pips": 2.584,
+     "edge_t": 1.58,
+     "net_pips": 1.159,
+     "win_rate": 0.413
+    }
+   }
+  },
+  "donchian_breakout@M15": {
+   "trades": 4947,
+   "edge_pips": -0.04,
+   "edge_t": -0.11,
+   "net_pips": -1.538,
+   "win_rate": 0.384,
+   "costs_pips": {
+    "spread": 0.474,
+    "slippage": 0.324,
+    "commission": 0.7,
+    "total": 1.497
+   },
+   "avg_win_pips": 29.7,
+   "avg_loss_pips": 21.03,
+   "breakeven_win_rate": 0.415,
+   "edge_abs_move_pips": 23.85,
+   "cost_share_of_move": 0.063,
+   "hold_minutes_median": 223.4,
+   "trades_per_quarter": 170.6,
+   "by_exit_reason": {
+    "eod": {
+     "trades": 23,
+     "edge_pips": 4.254,
+     "edge_t": 2.32,
+     "net_pips": 1.522,
+     "win_rate": 0.391,
+     "share": 0.005
+    },
+    "sl": {
+     "trades": 3032,
+     "edge_pips": -19.48,
+     "edge_t": -336.82,
+     "net_pips": -21.114,
+     "win_rate": 0.0,
+     "share": 0.613
+    },
+    "tp": {
+     "trades": 1892,
+     "edge_pips": 31.06,
+     "edge_t": 994.0,
+     "net_pips": 29.796,
+     "win_rate": 1.0,
+     "share": 0.382
+    }
+   },
+   "by_side": {
+    "long": {
+     "trades": 2427,
+     "edge_pips": -0.419,
+     "edge_t": -0.84,
+     "net_pips": -1.928,
+     "win_rate": 0.378
+    },
+    "short": {
+     "trades": 2520,
+     "edge_pips": 0.325,
+     "edge_t": 0.66,
+     "net_pips": -1.162,
+     "win_rate": 0.39
+    }
+   },
+   "by_session": {
+    "asia 22-07": {
+     "trades": 990,
+     "edge_pips": -0.959,
+     "edge_t": -1.25,
+     "net_pips": -2.641,
+     "win_rate": 0.362
+    },
+    "london 07-12": {
+     "trades": 1318,
+     "edge_pips": 0.681,
+     "edge_t": 1.0,
+     "net_pips": -0.694,
+     "win_rate": 0.398
+    },
+    "ny 16-22": {
+     "trades": 1091,
+     "edge_pips": 0.085,
+     "edge_t": 0.11,
+     "net_pips": -1.532,
+     "win_rate": 0.386
+    },
+    "overlap 12-16": {
+     "trades": 1548,
+     "edge_pips": -0.155,
+     "edge_t": -0.25,
+     "net_pips": -1.555,
+     "win_rate": 0.386
+    }
+   },
+   "by_year": {
+    "2018": {
+     "trades": 794,
+     "edge_pips": 0.251,
+     "edge_t": 0.29,
+     "net_pips": -1.438,
+     "win_rate": 0.389
+    },
+    "2019": {
+     "trades": 413,
+     "edge_pips": 0.707,
+     "edge_t": 0.58,
+     "net_pips": -0.644,
+     "win_rate": 0.395
+    },
+    "2020": {
+     "trades": 898,
+     "edge_pips": 0.045,
+     "edge_t": 0.05,
+     "net_pips": -1.396,
+     "win_rate": 0.385
+    },
+    "2021": {
+     "trades": 561,
+     "edge_pips": -0.625,
+     "edge_t": -0.61,
+     "net_pips": -2.104,
+     "win_rate": 0.367
+    },
+    "2022": {
+     "trades": 1101,
+     "edge_pips": -0.083,
+     "edge_t": -0.11,
+     "net_pips": -1.614,
+     "win_rate": 0.382
+    },
+    "2023": {
+     "trades": 678,
+     "edge_pips": -0.464,
+     "edge_t": -0.49,
+     "net_pips": -1.955,
+     "win_rate": 0.388
+    },
+    "2024": {
+     "trades": 502,
+     "edge_pips": 0.051,
+     "edge_t": 0.05,
+     "net_pips": -1.32,
+     "win_rate": 0.384
+    }
+   },
+   "by_hold": {
+    "<5m": {
+     "trades": 90,
+     "edge_pips": -1.869,
+     "edge_t": -0.74,
+     "net_pips": -4.055,
+     "win_rate": 0.344
+    },
+    "5-30m": {
+     "trades": 454,
+     "edge_pips": -4.738,
+     "edge_t": -4.43,
+     "net_pips": -6.266,
+     "win_rate": 0.291
+    },
+    "30m-2h": {
+     "trades": 1178,
+     "edge_pips": -3.739,
+     "edge_t": -5.48,
+     "net_pips": -5.185,
+     "win_rate": 0.311
+    },
+    "2-8h": {
+     "trades": 1701,
+     "edge_pips": 0.525,
+     "edge_t": 0.88,
+     "net_pips": -0.941,
+     "win_rate": 0.393
+    },
+    ">8h": {
+     "trades": 1522,
+     "edge_pips": 3.7,
+     "edge_t": 5.63,
+     "net_pips": 2.215,
+     "win_rate": 0.462
+    }
+   }
+  },
+  "donchian_breakout@M5": {
+   "trades": 14347,
+   "edge_pips": -0.419,
+   "edge_t": -3.55,
+   "net_pips": -1.997,
+   "win_rate": 0.365,
+   "costs_pips": {
+    "spread": 0.55,
+    "slippage": 0.327,
+    "commission": 0.7,
+    "total": 1.577
+   },
+   "avg_win_pips": 16.79,
+   "avg_loss_pips": 12.79,
+   "breakeven_win_rate": 0.432,
+   "edge_abs_move_pips": 13.58,
+   "cost_share_of_move": 0.116,
+   "hold_minutes_median": 66.5,
+   "trades_per_quarter": 494.7,
+   "by_exit_reason": {
+    "eod": {
+     "trades": 25,
+     "edge_pips": 1.442,
+     "edge_t": 1.11,
+     "net_pips": -1.568,
+     "win_rate": 0.4,
+     "share": 0.002
+    },
+    "sl": {
+     "trades": 9093,
+     "edge_pips": -11.039,
+     "edge_t": -418.01,
+     "net_pips": -12.805,
+     "win_rate": 0.0,
+     "share": 0.634
+    },
+    "tp": {
+     "trades": 5229,
+     "edge_pips": 18.038,
+     "edge_t": 1583.0,
+     "net_pips": 16.797,
+     "win_rate": 0.999,
+     "share": 0.364
+    }
+   },
+   "by_side": {
+    "long": {
+     "trades": 7125,
+     "edge_pips": -0.487,
+     "edge_t": -2.9,
+     "net_pips": -2.061,
+     "win_rate": 0.363
+    },
+    "short": {
+     "trades": 7222,
+     "edge_pips": -0.352,
+     "edge_t": -2.12,
+     "net_pips": -1.933,
+     "win_rate": 0.367
+    }
+   },
+   "by_session": {
+    "asia 22-07": {
+     "trades": 2605,
+     "edge_pips": -0.876,
+     "edge_t": -3.28,
+     "net_pips": -2.931,
+     "win_rate": 0.335
+    },
+    "london 07-12": {
+     "trades": 4092,
+     "edge_pips": 0.024,
+     "edge_t": 0.11,
+     "net_pips": -1.386,
+     "win_rate": 0.382
+    },
+    "ny 16-22": {
+     "trades": 3320,
+     "edge_pips": -1.081,
+     "edge_t": -4.4,
+     "net_pips": -2.749,
+     "win_rate": 0.345
+    },
+    "overlap 12-16": {
+     "trades": 4330,
+     "edge_pips": -0.057,
+     "edge_t": -0.26,
+     "net_pips": -1.434,
+     "win_rate": 0.382
+    }
+   },
+   "by_year": {
+    "2018": {
+     "trades": 2380,
+     "edge_pips": -0.431,
+     "edge_t": -1.5,
+     "net_pips": -2.261,
+     "win_rate": 0.36
+    },
+    "2019": {
+     "trades": 1216,
+     "edge_pips": 0.105,
+     "edge_t": 0.26,
+     "net_pips": -1.283,
+     "win_rate": 0.385
+    },
+    "2020": {
+     "trades": 2546,
+     "edge_pips": -0.222,
+     "edge_t": -0.8,
+     "net_pips": -1.688,
+     "win_rate": 0.371
+    },
+    "2021": {
+     "trades": 1649,
+     "edge_pips": -1.088,
+     "edge_t": -3.2,
+     "net_pips": -2.557,
+     "win_rate": 0.341
+    },
+    "2022": {
+     "trades": 3150,
+     "edge_pips": -0.427,
+     "edge_t": -1.68,
+     "net_pips": -2.026,
+     "win_rate": 0.363
+    },
+    "2023": {
+     "trades": 1921,
+     "edge_pips": -0.623,
+     "edge_t": -1.89,
+     "net_pips": -2.222,
+     "win_rate": 0.367
+    },
+    "2024": {
+     "trades": 1485,
+     "edge_pips": -0.148,
+     "edge_t": -0.41,
+     "net_pips": -1.709,
+     "win_rate": 0.373
+    }
+   },
+   "by_hold": {
+    "<5m": {
+     "trades": 783,
+     "edge_pips": -0.586,
+     "edge_t": -1.19,
+     "net_pips": -2.584,
+     "win_rate": 0.352
+    },
+    "5-30m": {
+     "trades": 3571,
+     "edge_pips": -2.709,
+     "edge_t": -12.32,
+     "net_pips": -4.209,
+     "win_rate": 0.285
+    },
+    "30m-2h": {
+     "trades": 5073,
+     "edge_pips": -0.372,
+     "edge_t": -1.87,
+     "net_pips": -1.805,
+     "win_rate": 0.368
+    },
+    "2-8h": {
+     "trades": 3558,
+     "edge_pips": 1.237,
+     "edge_t": 5.08,
+     "net_pips": -0.2,
+     "win_rate": 0.424
+    },
+    ">8h": {
+     "trades": 1297,
+     "edge_pips": 1.235,
+     "edge_t": 2.87,
+     "net_pips": -0.352,
+     "win_rate": 0.435
+    }
+   }
+  },
+  "ema_zscore_reversion": {
+   "trades": 118679,
+   "edge_pips": 0.069,
+   "edge_t": 7.01,
+   "net_pips": -1.296,
+   "win_rate": 0.351,
+   "costs_pips": {
+    "spread": 0.356,
+    "slippage": 0.308,
+    "commission": 0.7,
+    "total": 1.364
+   },
+   "avg_win_pips": 2.47,
+   "avg_loss_pips": 3.33,
+   "breakeven_win_rate": 0.574,
+   "edge_abs_move_pips": 2.71,
+   "cost_share_of_move": 0.503,
+   "hold_minutes_median": 4.0,
+   "trades_per_quarter": 4092.4,
+   "by_exit_reason": {
+    "eod": {
+     "trades": 7,
+     "edge_pips": 0.764,
+     "edge_t": 1.02,
+     "net_pips": -1.043,
+     "win_rate": 0.286,
+     "share": 0.0
+    },
+    "sl": {
+     "trades": 64137,
+     "edge_pips": -2.446,
+     "edge_t": -760.44,
+     "net_pips": -3.933,
+     "win_rate": 0.0,
+     "share": 0.54
+    },
+    "tp": {
+     "trades": 54535,
+     "edge_pips": 3.026,
+     "edge_t": 253.43,
+     "net_pips": 1.806,
+     "win_rate": 0.764,
+     "share": 0.46
+    }
+   },
+   "by_side": {
+    "long": {
+     "trades": 60390,
+     "edge_pips": 0.064,
+     "edge_t": 4.66,
+     "net_pips": -1.297,
+     "win_rate": 0.35
+    },
+    "short": {
+     "trades": 58289,
+     "edge_pips": 0.074,
+     "edge_t": 5.26,
+     "net_pips": -1.294,
+     "win_rate": 0.352
+    }
+   },
+   "by_session": {
+    "asia 22-07": {
+     "trades": 36387,
+     "edge_pips": 0.094,
+     "edge_t": 6.64,
+     "net_pips": -1.328,
+     "win_rate": 0.361
+    },
+    "london 07-12": {
+     "trades": 29705,
+     "edge_pips": 0.051,
+     "edge_t": 2.5,
+     "net_pips": -1.269,
+     "win_rate": 0.353
+    },
+    "ny 16-22": {
+     "trades": 26519,
+     "edge_pips": 0.035,
+     "edge_t": 1.67,
+     "net_pips": -1.339,
+     "win_rate": 0.353
+    },
+    "overlap 12-16": {
+     "trades": 26068,
+     "edge_pips": 0.088,
+     "edge_t": 3.56,
+     "net_pips": -1.237,
+     "win_rate": 0.332
+    }
+   },
+   "by_year": {
+    "2018": {
+     "trades": 17245,
+     "edge_pips": 0.082,
+     "edge_t": 3.06,
+     "net_pips": -1.423,
+     "win_rate": 0.338
+    },
+    "2019": {
+     "trades": 15139,
+     "edge_pips": 0.146,
+     "edge_t": 6.19,
+     "net_pips": -1.153,
+     "win_rate": 0.372
+    },
+    "2020": {
+     "trades": 18818,
+     "edge_pips": 0.065,
+     "edge_t": 2.53,
+     "net_pips": -1.291,
+     "win_rate": 0.342
+    },
+    "2021": {
+     "trades": 16283,
+     "edge_pips": 0.118,
+     "edge_t": 4.97,
+     "net_pips": -1.197,
+     "win_rate": 0.375
+    },
+    "2022": {
+     "trades": 20548,
+     "edge_pips": 0.072,
+     "edge_t": 2.66,
+     "net_pips": -1.375,
+     "win_rate": 0.328
+    },
+    "2023": {
+     "trades": 15032,
+     "edge_pips": 0.016,
+     "edge_t": 0.55,
+     "net_pips": -1.324,
+     "win_rate": 0.354
+    },
+    "2024": {
+     "trades": 15614,
+     "edge_pips": -0.021,
+     "edge_t": -0.89,
+     "net_pips": -1.269,
+     "win_rate": 0.359
+    }
+   },
+   "by_hold": {
+    "<5m": {
+     "trades": 67074,
+     "edge_pips": -0.465,
+     "edge_t": -44.68,
+     "net_pips": -1.838,
+     "win_rate": 0.278
+    },
+    "5-30m": {
+     "trades": 44427,
+     "edge_pips": 0.703,
+     "edge_t": 39.7,
+     "net_pips": -0.637,
+     "win_rate": 0.444
+    },
+    "30m-2h": {
+     "trades": 6694,
+     "edge_pips": 1.089,
+     "edge_t": 19.03,
+     "net_pips": -0.297,
+     "win_rate": 0.463
+    },
+    "2-8h": {
+     "trades": 342,
+     "edge_pips": 2.299,
+     "edge_t": 5.76,
+     "net_pips": 0.855,
+     "win_rate": 0.5
+    },
+    ">8h": {
+     "trades": 101,
+     "edge_pips": -0.026,
+     "edge_t": -0.01,
+     "net_pips": -3.219,
+     "win_rate": 0.386
+    }
+   }
+  },
+  "ema_zscore_reversion@H1": {
+   "trades": 2543,
+   "edge_pips": -0.553,
+   "edge_t": -1.14,
+   "net_pips": -1.9,
+   "win_rate": 0.44,
+   "costs_pips": {
+    "spread": 0.337,
+    "slippage": 0.31,
+    "commission": 0.7,
+    "total": 1.347
+   },
+   "avg_win_pips": 21.55,
+   "avg_loss_pips": 20.35,
+   "breakeven_win_rate": 0.486,
+   "edge_abs_move_pips": 20.62,
+   "cost_share_of_move": 0.065,
+   "hold_minutes_median": 160.0,
+   "trades_per_quarter": 87.7,
+   "by_exit_reason": {
+    "eod": {
+     "trades": 11,
+     "edge_pips": -1.791,
+     "edge_t": -0.76,
+     "net_pips": -4.855,
+     "win_rate": 0.091,
+     "share": 0.004
+    },
+    "sl": {
+     "trades": 1386,
+     "edge_pips": -19.396,
+     "edge_t": -225.77,
+     "net_pips": -20.845,
+     "win_rate": 0.0,
+     "share": 0.545
+    },
+    "tp": {
+     "trades": 1146,
+     "edge_pips": 22.249,
+     "edge_t": 39.38,
+     "net_pips": 21.041,
+     "win_rate": 0.976,
+     "share": 0.451
+    }
+   },
+   "by_side": {
+    "long": {
+     "trades": 1295,
+     "edge_pips": -0.514,
+     "edge_t": -0.76,
+     "net_pips": -1.852,
+     "win_rate": 0.439
+    },
+    "short": {
+     "trades": 1248,
+     "edge_pips": -0.592,
+     "edge_t": -0.86,
+     "net_pips": -1.95,
+     "win_rate": 0.442
+    }
+   },
+   "by_session": {
+    "asia 22-07": {
+     "trades": 179,
+     "edge_pips": 1.341,
+     "edge_t": 0.81,
+     "net_pips": -0.123,
+     "win_rate": 0.547
+    },
+    "london 07-12": {
+     "trades": 718,
+     "edge_pips": 0.018,
+     "edge_t": 0.02,
+     "net_pips": -1.298,
+     "win_rate": 0.503
+    },
+    "ny 16-22": {
+     "trades": 763,
+     "edge_pips": 0.127,
+     "edge_t": 0.12,
+     "net_pips": -1.231,
+     "win_rate": 0.387
+    },
+    "overlap 12-16": {
+     "trades": 883,
+     "edge_pips": -1.987,
+     "edge_t": -2.57,
+     "net_pips": -3.327,
+     "win_rate": 0.414
+    }
+   },
+   "by_year": {
+    "2018": {
+     "trades": 365,
+     "edge_pips": -3.166,
+     "edge_t": -2.69,
+     "net_pips": -4.643,
+     "win_rate": 0.389
+    },
+    "2019": {
+     "trades": 332,
+     "edge_pips": 0.186,
+     "edge_t": 0.16,
+     "net_pips": -1.095,
+     "win_rate": 0.533
+    },
+    "2020": {
+     "trades": 414,
+     "edge_pips": -2.26,
+     "edge_t": -1.83,
+     "net_pips": -3.566,
+     "win_rate": 0.396
+    },
+    "2021": {
+     "trades": 350,
+     "edge_pips": -1.381,
+     "edge_t": -1.22,
+     "net_pips": -2.676,
+     "win_rate": 0.463
+    },
+    "2022": {
+     "trades": 421,
+     "edge_pips": 0.315,
+     "edge_t": 0.23,
+     "net_pips": -1.09,
+     "win_rate": 0.382
+    },
+    "2023": {
+     "trades": 322,
+     "edge_pips": 1.618,
+     "edge_t": 1.03,
+     "net_pips": 0.22,
+     "win_rate": 0.429
+    },
+    "2024": {
+     "trades": 339,
+     "edge_pips": 1.34,
+     "edge_t": 1.1,
+     "net_pips": 0.084,
+     "win_rate": 0.519
+    }
+   },
+   "by_hold": {
+    "<5m": {
+     "trades": 103,
+     "edge_pips": 0.07,
+     "edge_t": 0.08,
+     "net_pips": -1.196,
+     "win_rate": 0.65
+    },
+    "5-30m": {
+     "trades": 296,
+     "edge_pips": -4.139,
+     "edge_t": -4.25,
+     "net_pips": -5.456,
+     "win_rate": 0.486
+    },
+    "30m-2h": {
+     "trades": 680,
+     "edge_pips": -4.808,
+     "edge_t": -6.55,
+     "net_pips": -6.145,
+     "win_rate": 0.409
+    },
+    "2-8h": {
+     "trades": 766,
+     "edge_pips": -0.464,
+     "edge_t": -0.53,
+     "net_pips": -1.826,
+     "win_rate": 0.426
+    },
+    ">8h": {
+     "trades": 690,
+     "edge_pips": 4.982,
+     "edge_t": 4.14,
+     "net_pips": 3.617,
+     "win_rate": 0.442
+    }
+   }
+  },
+  "ema_zscore_reversion@M15": {
+   "trades": 9627,
+   "edge_pips": 0.135,
+   "edge_t": 1.06,
+   "net_pips": -1.209,
+   "win_rate": 0.462,
+   "costs_pips": {
+    "spread": 0.339,
+    "slippage": 0.304,
+    "commission": 0.7,
+    "total": 1.343
+   },
+   "avg_win_pips": 10.0,
+   "avg_loss_pips": 10.81,
+   "breakeven_win_rate": 0.52,
+   "edge_abs_move_pips": 10.24,
+   "cost_share_of_move": 0.131,
+   "hold_minutes_median": 43.0,
+   "trades_per_quarter": 332.0,
+   "by_exit_reason": {
+    "eod": {
+     "trades": 7,
+     "edge_pips": 7.679,
+     "edge_t": 3.25,
+     "net_pips": 6.0,
+     "win_rate": 0.714,
+     "share": 0.001
+    },
+    "sl": {
+     "trades": 5012,
+     "edge_pips": -9.709,
+     "edge_t": -640.24,
+     "net_pips": -11.172,
+     "win_rate": 0.0,
+     "share": 0.521
+    },
+    "tp": {
+     "trades": 4608,
+     "edge_pips": 10.829,
+     "edge_t": 73.48,
+     "net_pips": 9.617,
+     "win_rate": 0.963,
+     "share": 0.479
+    }
+   },
+   "by_side": {
+    "long": {
+     "trades": 4984,
+     "edge_pips": 0.053,
+     "edge_t": 0.3,
+     "net_pips": -1.284,
+     "win_rate": 0.459
+    },
+    "short": {
+     "trades": 4643,
+     "edge_pips": 0.223,
+     "edge_t": 1.23,
+     "net_pips": -1.127,
+     "win_rate": 0.465
+    }
+   },
+   "by_session": {
+    "asia 22-07": {
+     "trades": 2383,
+     "edge_pips": 0.623,
+     "edge_t": 3.05,
+     "net_pips": -0.725,
+     "win_rate": 0.582
+    },
+    "london 07-12": {
+     "trades": 3655,
+     "edge_pips": 0.004,
+     "edge_t": 0.02,
+     "net_pips": -1.318,
+     "win_rate": 0.454
+    },
+    "ny 16-22": {
+     "trades": 1151,
+     "edge_pips": 0.533,
+     "edge_t": 1.32,
+     "net_pips": -0.866,
+     "win_rate": 0.423
+    },
+    "overlap 12-16": {
+     "trades": 2438,
+     "edge_pips": -0.335,
+     "edge_t": -1.16,
+     "net_pips": -1.679,
+     "win_rate": 0.374
+    }
+   },
+   "by_year": {
+    "2018": {
+     "trades": 1402,
+     "edge_pips": -0.259,
+     "edge_t": -0.8,
+     "net_pips": -1.722,
+     "win_rate": 0.43
+    },
+    "2019": {
+     "trades": 1212,
+     "edge_pips": 0.496,
+     "edge_t": 1.62,
+     "net_pips": -0.774,
+     "win_rate": 0.535
+    },
+    "2020": {
+     "trades": 1525,
+     "edge_pips": -0.476,
+     "edge_t": -1.47,
+     "net_pips": -1.819,
+     "win_rate": 0.418
+    },
+    "2021": {
+     "trades": 1312,
+     "edge_pips": -0.068,
+     "edge_t": -0.23,
+     "net_pips": -1.358,
+     "win_rate": 0.498
+    },
+    "2022": {
+     "trades": 1612,
+     "edge_pips": 0.342,
+     "edge_t": 0.93,
+     "net_pips": -1.084,
+     "win_rate": 0.396
+    },
+    "2023": {
+     "trades": 1326,
+     "edge_pips": 0.259,
+     "edge_t": 0.73,
+     "net_pips": -1.064,
+     "win_rate": 0.465
+    },
+    "2024": {
+     "trades": 1238,
+     "edge_pips": 0.789,
+     "edge_t": 2.32,
+     "net_pips": -0.46,
+     "win_rate": 0.521
+    }
+   },
+   "by_hold": {
+    "<5m": {
+     "trades": 1049,
+     "edge_pips": -3.281,
+     "edge_t": -15.36,
+     "net_pips": -4.66,
+     "win_rate": 0.377
+    },
+    "5-30m": {
+     "trades": 2854,
+     "edge_pips": -1.968,
+     "edge_t": -11.08,
+     "net_pips": -3.306,
+     "win_rate": 0.438
+    },
+    "30m-2h": {
+     "trades": 3499,
+     "edge_pips": 0.561,
+     "edge_t": 2.68,
+     "net_pips": -0.767,
+     "win_rate": 0.472
+    },
+    "2-8h": {
+     "trades": 1837,
+     "edge_pips": 2.878,
+     "edge_t": 8.43,
+     "net_pips": 1.545,
+     "win_rate": 0.514
+    },
+    ">8h": {
+     "trades": 380,
+     "edge_pips": 8.174,
+     "edge_t": 7.26,
+     "net_pips": 6.717,
+     "win_rate": 0.529
+    }
+   }
+  },
+  "ema_zscore_reversion@M5": {
+   "trades": 25903,
+   "edge_pips": 0.133,
+   "edge_t": 2.97,
+   "net_pips": -1.22,
+   "win_rate": 0.441,
+   "costs_pips": {
+    "spread": 0.351,
+    "slippage": 0.303,
+    "commission": 0.7,
+    "total": 1.354
+   },
+   "avg_win_pips": 5.51,
+   "avg_loss_pips": 6.52,
+   "breakeven_win_rate": 0.542,
+   "edge_abs_move_pips": 5.88,
+   "cost_share_of_move": 0.23,
+   "hold_minutes_median": 16.5,
+   "trades_per_quarter": 893.2,
+   "by_exit_reason": {
+    "eod": {
+     "trades": 10,
+     "edge_pips": 5.27,
+     "edge_t": 2.07,
+     "net_pips": 3.59,
+     "win_rate": 0.6,
+     "share": 0.0
+    },
+    "sl": {
+     "trades": 13338,
+     "edge_pips": -5.577,
+     "edge_t": -830.14,
+     "net_pips": -7.052,
+     "win_rate": 0.0,
+     "share": 0.515
+    },
+    "tp": {
+     "trades": 12555,
+     "edge_pips": 6.196,
+     "edge_t": 117.53,
+     "net_pips": 4.97,
+     "win_rate": 0.909,
+     "share": 0.485
+    }
+   },
+   "by_side": {
+    "long": {
+     "trades": 13272,
+     "edge_pips": 0.129,
+     "edge_t": 2.05,
+     "net_pips": -1.221,
+     "win_rate": 0.438
+    },
+    "short": {
+     "trades": 12631,
+     "edge_pips": 0.137,
+     "edge_t": 2.16,
+     "net_pips": -1.22,
+     "win_rate": 0.443
+    }
+   },
+   "by_session": {
+    "asia 22-07": {
+     "trades": 7979,
+     "edge_pips": 0.323,
+     "edge_t": 4.94,
+     "net_pips": -1.057,
+     "win_rate": 0.52
+    },
+    "london 07-12": {
+     "trades": 7266,
+     "edge_pips": 0.121,
+     "edge_t": 1.37,
+     "net_pips": -1.195,
+     "win_rate": 0.422
+    },
+    "ny 16-22": {
+     "trades": 4290,
+     "edge_pips": 0.115,
+     "edge_t": 1.05,
+     "net_pips": -1.288,
+     "win_rate": 0.433
+    },
+    "overlap 12-16": {
+     "trades": 6368,
+     "edge_pips": -0.079,
+     "edge_t": -0.76,
+     "net_pips": -1.409,
+     "win_rate": 0.368
+    }
+   },
+   "by_year": {
+    "2018": {
+     "trades": 3718,
+     "edge_pips": 0.08,
+     "edge_t": 0.65,
+     "net_pips": -1.399,
+     "win_rate": 0.415
+    },
+    "2019": {
+     "trades": 3332,
+     "edge_pips": 0.254,
+     "edge_t": 2.43,
+     "net_pips": -1.035,
+     "win_rate": 0.501
+    },
+    "2020": {
+     "trades": 4044,
+     "edge_pips": 0.114,
+     "edge_t": 0.97,
+     "net_pips": -1.232,
+     "win_rate": 0.422
+    },
+    "2021": {
+     "trades": 3617,
+     "edge_pips": 0.114,
+     "edge_t": 1.06,
+     "net_pips": -1.199,
+     "win_rate": 0.466
+    },
+    "2022": {
+     "trades": 4471,
+     "edge_pips": 0.349,
+     "edge_t": 2.74,
+     "net_pips": -1.091,
+     "win_rate": 0.398
+    },
+    "2023": {
+     "trades": 3351,
+     "edge_pips": -0.065,
+     "edge_t": -0.53,
+     "net_pips": -1.393,
+     "win_rate": 0.429
+    },
+    "2024": {
+     "trades": 3370,
+     "edge_pips": 0.026,
+     "edge_t": 0.23,
+     "net_pips": -1.217,
+     "win_rate": 0.472
+    }
+   },
+   "by_hold": {
+    "<5m": {
+     "trades": 5915,
+     "edge_pips": -1.847,
+     "edge_t": -31.04,
+     "net_pips": -3.217,
+     "win_rate": 0.323
+    },
+    "5-30m": {
+     "trades": 11207,
+     "edge_pips": -0.042,
+     "edge_t": -0.67,
+     "net_pips": -1.382,
+     "win_rate": 0.457
+    },
+    "30m-2h": {
+     "trades": 7046,
+     "edge_pips": 1.406,
+     "edge_t": 14.26,
+     "net_pips": 0.064,
+     "win_rate": 0.495
+    },
+    "2-8h": {
+     "trades": 1480,
+     "edge_pips": 2.705,
+     "edge_t": 9.86,
+     "net_pips": 1.358,
+     "win_rate": 0.511
+    },
+    ">8h": {
+     "trades": 244,
+     "edge_pips": 3.819,
+     "edge_t": 4.63,
+     "net_pips": 1.932,
+     "win_rate": 0.545
+    }
+   }
+  },
+  "grid_reversion": {
+   "trades": 118867,
+   "edge_pips": -0.338,
+   "edge_t": -24.09,
+   "net_pips": -1.387,
+   "win_rate": 0.729,
+   "costs_pips": {
+    "spread": 0.295,
+    "slippage": 0.054,
+    "commission": 0.7,
+    "total": 1.049
+   },
+   "avg_win_pips": 1.3,
+   "avg_loss_pips": 8.6,
+   "breakeven_win_rate": 0.869,
+   "edge_abs_move_pips": 3.67,
+   "cost_share_of_move": 0.286,
+   "hold_minutes_median": 5.0,
+   "trades_per_quarter": 4098.9,
+   "by_exit_reason": {
+    "eod": {
+     "trades": 23,
+     "edge_pips": -3.133,
+     "edge_t": -4.82,
+     "net_pips": -5.491,
+     "win_rate": 0.0,
+     "share": 0.0
+    },
+    "market": {
+     "trades": 32235,
+     "edge_pips": -7.377,
+     "edge_t": -310.26,
+     "net_pips": -8.604,
+     "win_rate": 0.0,
+     "share": 0.271
+    },
+    "tp": {
+     "trades": 86609,
+     "edge_pips": 2.282,
+     "edge_t": 2986.12,
+     "net_pips": 1.3,
+     "win_rate": 1.0,
+     "share": 0.729
+    }
+   },
+   "by_side": {
+    "long": {
+     "trades": 59295,
+     "edge_pips": -0.347,
+     "edge_t": -17.52,
+     "net_pips": -1.395,
+     "win_rate": 0.727
+    },
+    "short": {
+     "trades": 59572,
+     "edge_pips": -0.329,
+     "edge_t": -16.55,
+     "net_pips": -1.379,
+     "win_rate": 0.73
+    }
+   },
+   "by_session": {
+    "asia 22-07": {
+     "trades": 20322,
+     "edge_pips": -0.21,
+     "edge_t": -6.2,
+     "net_pips": -1.352,
+     "win_rate": 0.744
+    },
+    "london 07-12": {
+     "trades": 37841,
+     "edge_pips": -0.364,
+     "edge_t": -15.35,
+     "net_pips": -1.387,
+     "win_rate": 0.719
+    },
+    "ny 16-22": {
+     "trades": 27090,
+     "edge_pips": -0.23,
+     "edge_t": -7.91,
+     "net_pips": -1.284,
+     "win_rate": 0.738
+    },
+    "overlap 12-16": {
+     "trades": 33614,
+     "edge_pips": -0.474,
+     "edge_t": -16.94,
+     "net_pips": -1.491,
+     "win_rate": 0.723
+    }
+   },
+   "by_year": {
+    "2018": {
+     "trades": 20224,
+     "edge_pips": -0.258,
+     "edge_t": -7.78,
+     "net_pips": -1.44,
+     "win_rate": 0.719
+    },
+    "2019": {
+     "trades": 11391,
+     "edge_pips": -0.12,
+     "edge_t": -2.75,
+     "net_pips": -1.097,
+     "win_rate": 0.765
+    },
+    "2020": {
+     "trades": 19903,
+     "edge_pips": -0.322,
+     "edge_t": -9.84,
+     "net_pips": -1.335,
+     "win_rate": 0.729
+    },
+    "2021": {
+     "trades": 14757,
+     "edge_pips": -0.219,
+     "edge_t": -5.72,
+     "net_pips": -1.229,
+     "win_rate": 0.743
+    },
+    "2022": {
+     "trades": 24114,
+     "edge_pips": -0.36,
+     "edge_t": -11.5,
+     "net_pips": -1.459,
+     "win_rate": 0.717
+    },
+    "2023": {
+     "trades": 15841,
+     "edge_pips": -0.647,
+     "edge_t": -15.06,
+     "net_pips": -1.665,
+     "win_rate": 0.711
+    },
+    "2024": {
+     "trades": 12637,
+     "edge_pips": -0.4,
+     "edge_t": -9.05,
+     "net_pips": -1.345,
+     "win_rate": 0.74
+    }
+   },
+   "by_hold": {
+    "<5m": {
+     "trades": 59560,
+     "edge_pips": 0.628,
+     "edge_t": 40.35,
+     "net_pips": -0.409,
+     "win_rate": 0.796
+    },
+    "5-30m": {
+     "trades": 44851,
+     "edge_pips": -0.828,
+     "edge_t": -35.69,
+     "net_pips": -1.88,
+     "win_rate": 0.675
+    },
+    "30m-2h": {
+     "trades": 11448,
+     "edge_pips": -2.515,
+     "edge_t": -40.25,
+     "net_pips": -3.582,
+     "win_rate": 0.632
+    },
+    "2-8h": {
+     "trades": 2581,
+     "edge_pips": -4.056,
+     "edge_t": -27.72,
+     "net_pips": -5.159,
+     "win_rate": 0.56
+    },
+    ">8h": {
+     "trades": 427,
+     "edge_pips": -2.783,
+     "edge_t": -6.68,
+     "net_pips": -4.407,
+     "win_rate": 0.653
+    }
+   }
+  },
+  "grid_reversion@H1": {
+   "trades": 2762,
+   "edge_pips": -0.228,
+   "edge_t": -0.36,
+   "net_pips": -1.298,
+   "win_rate": 0.785,
+   "costs_pips": {
+    "spread": 0.327,
+    "slippage": 0.043,
+    "commission": 0.7,
+    "total": 1.07
+   },
+   "avg_win_pips": 14.78,
+   "avg_loss_pips": 60.1,
+   "breakeven_win_rate": 0.803,
+   "edge_abs_move_pips": 25.03,
+   "cost_share_of_move": 0.043,
+   "hold_minutes_median": 199.6,
+   "trades_per_quarter": 95.2,
+   "by_exit_reason": {
+    "eod": {
+     "trades": 21,
+     "edge_pips": -29.29,
+     "edge_t": -4.28,
+     "net_pips": -31.615,
+     "win_rate": 0.19,
+     "share": 0.008
+    },
+    "market": {
+     "trades": 576,
+     "edge_pips": -59.425,
+     "edge_t": -52.49,
+     "net_pips": -60.67,
+     "win_rate": 0.0,
+     "share": 0.209
+    },
+    "tp": {
+     "trades": 2165,
+     "edge_pips": 15.803,
+     "edge_t": 2096.47,
+     "net_pips": 14.792,
+     "win_rate": 1.0,
+     "share": 0.784
+    }
+   },
+   "by_side": {
+    "long": {
+     "trades": 1397,
+     "edge_pips": -1.514,
+     "edge_t": -1.67,
+     "net_pips": -2.582,
+     "win_rate": 0.766
+    },
+    "short": {
+     "trades": 1365,
+     "edge_pips": 1.088,
+     "edge_t": 1.24,
+     "net_pips": 0.016,
+     "win_rate": 0.805
+    }
+   },
+   "by_session": {
+    "asia 22-07": {
+     "trades": 458,
+     "edge_pips": -1.821,
+     "edge_t": -1.11,
+     "net_pips": -2.966,
+     "win_rate": 0.775
+    },
+    "london 07-12": {
+     "trades": 820,
+     "edge_pips": -0.872,
+     "edge_t": -0.74,
+     "net_pips": -1.899,
+     "win_rate": 0.778
+    },
+    "ny 16-22": {
+     "trades": 536,
+     "edge_pips": 0.902,
+     "edge_t": 0.67,
+     "net_pips": -0.204,
+     "win_rate": 0.793
+    },
+    "overlap 12-16": {
+     "trades": 948,
+     "edge_pips": 0.46,
+     "edge_t": 0.44,
+     "net_pips": -0.591,
+     "win_rate": 0.792
+    }
+   },
+   "by_year": {
+    "2018": {
+     "trades": 475,
+     "edge_pips": 0.55,
+     "edge_t": 0.38,
+     "net_pips": -0.669,
+     "win_rate": 0.781
+    },
+    "2019": {
+     "trades": 208,
+     "edge_pips": -2.375,
+     "edge_t": -0.97,
+     "net_pips": -3.436,
+     "win_rate": 0.764
+    },
+    "2020": {
+     "trades": 424,
+     "edge_pips": 0.072,
+     "edge_t": 0.04,
+     "net_pips": -0.907,
+     "win_rate": 0.8
+    },
+    "2021": {
+     "trades": 286,
+     "edge_pips": -0.718,
+     "edge_t": -0.36,
+     "net_pips": -1.713,
+     "win_rate": 0.79
+    },
+    "2022": {
+     "trades": 663,
+     "edge_pips": 0.817,
+     "edge_t": 0.65,
+     "net_pips": -0.303,
+     "win_rate": 0.801
+    },
+    "2023": {
+     "trades": 418,
+     "edge_pips": -3.335,
+     "edge_t": -1.92,
+     "net_pips": -4.399,
+     "win_rate": 0.732
+    },
+    "2024": {
+     "trades": 288,
+     "edge_pips": 2.187,
+     "edge_t": 1.17,
+     "net_pips": 1.255,
+     "win_rate": 0.823
+    }
+   },
+   "by_hold": {
+    "<5m": {
+     "trades": 70,
+     "edge_pips": 14.578,
+     "edge_t": 11.26,
+     "net_pips": 13.493,
+     "win_rate": 0.986
+    },
+    "5-30m": {
+     "trades": 309,
+     "edge_pips": 12.632,
+     "edge_t": 15.57,
+     "net_pips": 11.603,
+     "win_rate": 0.948
+    },
+    "30m-2h": {
+     "trades": 708,
+     "edge_pips": 8.151,
+     "edge_t": 10.15,
+     "net_pips": 7.092,
+     "win_rate": 0.876
+    },
+    "2-8h": {
+     "trades": 750,
+     "edge_pips": 0.235,
+     "edge_t": 0.22,
+     "net_pips": -0.814,
+     "win_rate": 0.76
+    },
+    ">8h": {
+     "trades": 925,
+     "edge_pips": -12.432,
+     "edge_t": -8.75,
+     "net_pips": -13.542,
+     "win_rate": 0.667
+    }
+   }
+  },
+  "grid_reversion@M15": {
+   "trades": 9741,
+   "edge_pips": -0.419,
+   "edge_t": -2.36,
+   "net_pips": -1.486,
+   "win_rate": 0.783,
+   "costs_pips": {
+    "spread": 0.324,
+    "slippage": 0.044,
+    "commission": 0.7,
+    "total": 1.067
+   },
+   "avg_win_pips": 7.04,
+   "avg_loss_pips": 32.18,
+   "breakeven_win_rate": 0.82,
+   "edge_abs_move_pips": 13.02,
+   "cost_share_of_move": 0.082,
+   "hold_minutes_median": 57.2,
+   "trades_per_quarter": 335.9,
+   "by_exit_reason": {
+    "eod": {
+     "trades": 20,
+     "edge_pips": -12.13,
+     "edge_t": -3.82,
+     "net_pips": -14.68,
+     "win_rate": 0.15,
+     "share": 0.002
+    },
+    "market": {
+     "trades": 2102,
+     "edge_pips": -31.017,
+     "edge_t": -95.3,
+     "net_pips": -32.286,
+     "win_rate": 0.0,
+     "share": 0.216
+    },
+    "tp": {
+     "trades": 7619,
+     "edge_pips": 8.053,
+     "edge_t": 1987.51,
+     "net_pips": 7.046,
+     "win_rate": 1.0,
+     "share": 0.782
+    }
+   },
+   "by_side": {
+    "long": {
+     "trades": 4875,
+     "edge_pips": -0.71,
+     "edge_t": -2.75,
+     "net_pips": -1.78,
+     "win_rate": 0.78
+    },
+    "short": {
+     "trades": 4866,
+     "edge_pips": -0.127,
+     "edge_t": -0.52,
+     "net_pips": -1.192,
+     "win_rate": 0.785
+    }
+   },
+   "by_session": {
+    "asia 22-07": {
+     "trades": 1830,
+     "edge_pips": -1.1,
+     "edge_t": -2.51,
+     "net_pips": -2.248,
+     "win_rate": 0.776
+    },
+    "london 07-12": {
+     "trades": 3029,
+     "edge_pips": -0.338,
+     "edge_t": -1.06,
+     "net_pips": -1.354,
+     "win_rate": 0.789
+    },
+    "ny 16-22": {
+     "trades": 1884,
+     "edge_pips": 0.675,
+     "edge_t": 1.83,
+     "net_pips": -0.427,
+     "win_rate": 0.796
+    },
+    "overlap 12-16": {
+     "trades": 2998,
+     "edge_pips": -0.773,
+     "edge_t": -2.4,
+     "net_pips": -1.82,
+     "win_rate": 0.772
+    }
+   },
+   "by_year": {
+    "2018": {
+     "trades": 1654,
+     "edge_pips": 0.339,
+     "edge_t": 0.83,
+     "net_pips": -0.86,
+     "win_rate": 0.796
+    },
+    "2019": {
+     "trades": 883,
+     "edge_pips": 0.784,
+     "edge_t": 1.42,
+     "net_pips": -0.203,
+     "win_rate": 0.818
+    },
+    "2020": {
+     "trades": 1702,
+     "edge_pips": -0.077,
+     "edge_t": -0.19,
+     "net_pips": -1.081,
+     "win_rate": 0.784
+    },
+    "2021": {
+     "trades": 1182,
+     "edge_pips": -0.038,
+     "edge_t": -0.08,
+     "net_pips": -1.067,
+     "win_rate": 0.783
+    },
+    "2022": {
+     "trades": 1934,
+     "edge_pips": -1.184,
+     "edge_t": -2.74,
+     "net_pips": -2.319,
+     "win_rate": 0.772
+    },
+    "2023": {
+     "trades": 1386,
+     "edge_pips": -0.829,
+     "edge_t": -1.73,
+     "net_pips": -1.873,
+     "win_rate": 0.773
+    },
+    "2024": {
+     "trades": 1000,
+     "edge_pips": -1.721,
+     "edge_t": -2.87,
+     "net_pips": -2.693,
+     "win_rate": 0.761
+    }
+   },
+   "by_hold": {
+    "<5m": {
+     "trades": 658,
+     "edge_pips": 7.742,
+     "edge_t": 61.39,
+     "net_pips": 6.625,
+     "win_rate": 0.982
+    },
+    "5-30m": {
+     "trades": 2772,
+     "edge_pips": 3.081,
+     "edge_t": 11.77,
+     "net_pips": 2.029,
+     "win_rate": 0.856
+    },
+    "30m-2h": {
+     "trades": 3036,
+     "edge_pips": 0.92,
+     "edge_t": 3.49,
+     "net_pips": -0.117,
+     "win_rate": 0.787
+    },
+    "2-8h": {
+     "trades": 2102,
+     "edge_pips": -3.954,
+     "edge_t": -9.18,
+     "net_pips": -5.032,
+     "win_rate": 0.701
+    },
+    ">8h": {
+     "trades": 1173,
+     "edge_pips": -10.401,
+     "edge_t": -13.9,
+     "net_pips": -11.531,
+     "win_rate": 0.633
+    }
+   }
+  },
+  "grid_reversion@M5": {
+   "trades": 25897,
+   "edge_pips": -0.397,
+   "edge_t": -6.21,
+   "net_pips": -1.452,
+   "win_rate": 0.765,
+   "costs_pips": {
+    "spread": 0.308,
+    "slippage": 0.047,
+    "commission": 0.7,
+    "total": 1.055
+   },
+   "avg_win_pips": 3.77,
+   "avg_loss_pips": 18.48,
+   "breakeven_win_rate": 0.831,
+   "edge_abs_move_pips": 7.69,
+   "cost_share_of_move": 0.137,
+   "hold_minutes_median": 21.3,
+   "trades_per_quarter": 893.0,
+   "by_exit_reason": {
+    "eod": {
+     "trades": 24,
+     "edge_pips": -6.433,
+     "edge_t": -5.59,
+     "net_pips": -8.908,
+     "win_rate": 0.0,
+     "share": 0.001
+    },
+    "market": {
+     "trades": 6055,
+     "edge_pips": -17.278,
+     "edge_t": -150.46,
+     "net_pips": -18.521,
+     "win_rate": 0.0,
+     "share": 0.234
+    },
+    "tp": {
+     "trades": 19818,
+     "edge_pips": 4.768,
+     "edge_t": 2432.7,
+     "net_pips": 3.772,
+     "win_rate": 1.0,
+     "share": 0.765
+    }
+   },
+   "by_side": {
+    "long": {
+     "trades": 13058,
+     "edge_pips": -0.383,
+     "edge_t": -4.22,
+     "net_pips": -1.435,
+     "win_rate": 0.769
+    },
+    "short": {
+     "trades": 12839,
+     "edge_pips": -0.412,
+     "edge_t": -4.56,
+     "net_pips": -1.469,
+     "win_rate": 0.761
+    }
+   },
+   "by_session": {
+    "asia 22-07": {
+     "trades": 4527,
+     "edge_pips": -0.092,
+     "edge_t": -0.59,
+     "net_pips": -1.231,
+     "win_rate": 0.79
+    },
+    "london 07-12": {
+     "trades": 7935,
+     "edge_pips": -0.555,
+     "edge_t": -4.89,
+     "net_pips": -1.576,
+     "win_rate": 0.752
+    },
+    "ny 16-22": {
+     "trades": 5700,
+     "edge_pips": 0.072,
+     "edge_t": 0.56,
+     "net_pips": -0.996,
+     "win_rate": 0.781
+    },
+    "overlap 12-16": {
+     "trades": 7735,
+     "edge_pips": -0.76,
+     "edge_t": -6.23,
+     "net_pips": -1.791,
+     "win_rate": 0.753
+    }
+   },
+   "by_year": {
+    "2018": {
+     "trades": 4526,
+     "edge_pips": -0.148,
+     "edge_t": -1.0,
+     "net_pips": -1.337,
+     "win_rate": 0.765
+    },
+    "2019": {
+     "trades": 2450,
+     "edge_pips": 0.231,
+     "edge_t": 1.15,
+     "net_pips": -0.748,
+     "win_rate": 0.807
+    },
+    "2020": {
+     "trades": 4250,
+     "edge_pips": -0.586,
+     "edge_t": -3.75,
+     "net_pips": -1.598,
+     "win_rate": 0.755
+    },
+    "2021": {
+     "trades": 3240,
+     "edge_pips": -0.179,
+     "edge_t": -1.03,
+     "net_pips": -1.193,
+     "win_rate": 0.773
+    },
+    "2022": {
+     "trades": 5159,
+     "edge_pips": -0.352,
+     "edge_t": -2.41,
+     "net_pips": -1.458,
+     "win_rate": 0.767
+    },
+    "2023": {
+     "trades": 3417,
+     "edge_pips": -1.043,
+     "edge_t": -5.54,
+     "net_pips": -2.076,
+     "win_rate": 0.744
+    },
+    "2024": {
+     "trades": 2855,
+     "edge_pips": -0.604,
+     "edge_t": -3.1,
+     "net_pips": -1.56,
+     "win_rate": 0.76
+    }
+   },
+   "by_hold": {
+    "<5m": {
+     "trades": 4508,
+     "edge_pips": 2.639,
+     "edge_t": 24.77,
+     "net_pips": 1.569,
+     "win_rate": 0.891
+    },
+    "5-30m": {
+     "trades": 10640,
+     "edge_pips": 1.252,
+     "edge_t": 16.43,
+     "net_pips": 0.219,
+     "win_rate": 0.807
+    },
+    "30m-2h": {
+     "trades": 6872,
+     "edge_pips": -1.756,
+     "edge_t": -13.68,
+     "net_pips": -2.811,
+     "win_rate": 0.696
+    },
+    "2-8h": {
+     "trades": 2896,
+     "edge_pips": -5.755,
+     "edge_t": -21.21,
+     "net_pips": -6.825,
+     "win_rate": 0.625
+    },
+    ">8h": {
+     "trades": 981,
+     "edge_pips": -6.901,
+     "edge_t": -13.53,
+     "net_pips": -8.077,
+     "win_rate": 0.63
+    }
+   }
+  },
+  "mean_anchor_reversion": {
+   "trades": 169871,
+   "edge_pips": 0.003,
+   "edge_t": 0.45,
+   "net_pips": -1.349,
+   "win_rate": 0.482,
+   "costs_pips": {
+    "spread": 0.349,
+    "slippage": 0.303,
+    "commission": 0.7,
+    "total": 1.352
+   },
+   "avg_win_pips": 1.38,
+   "avg_loss_pips": 3.89,
+   "breakeven_win_rate": 0.738,
+   "edge_abs_move_pips": 2.51,
+   "cost_share_of_move": 0.539,
+   "hold_minutes_median": 3.6,
+   "trades_per_quarter": 5857.6,
+   "by_exit_reason": {
+    "eod": {
+     "trades": 9,
+     "edge_pips": -0.428,
+     "edge_t": -2.19,
+     "net_pips": -2.144,
+     "win_rate": 0.0,
+     "share": 0.0
+    },
+    "sl": {
+     "trades": 87489,
+     "edge_pips": -2.43,
+     "edge_t": -709.28,
+     "net_pips": -3.91,
+     "win_rate": 0.0,
+     "share": 0.515
+    },
+    "tp": {
+     "trades": 82373,
+     "edge_pips": 2.587,
+     "edge_t": 677.38,
+     "net_pips": 1.37,
+     "win_rate": 0.994,
+     "share": 0.485
+    }
+   },
+   "by_side": {
+    "long": {
+     "trades": 84851,
+     "edge_pips": 0.002,
+     "edge_t": 0.17,
+     "net_pips": -1.349,
+     "win_rate": 0.482
+    },
+    "short": {
+     "trades": 85020,
+     "edge_pips": 0.004,
+     "edge_t": 0.48,
+     "net_pips": -1.35,
+     "win_rate": 0.482
+    }
+   },
+   "by_session": {
+    "asia 22-07": {
+     "trades": 44811,
+     "edge_pips": 0.046,
+     "edge_t": 4.06,
+     "net_pips": -1.4,
+     "win_rate": 0.486
+    },
+    "london 07-12": {
+     "trades": 46042,
+     "edge_pips": -0.022,
+     "edge_t": -1.76,
+     "net_pips": -1.325,
+     "win_rate": 0.481
+    },
+    "ny 16-22": {
+     "trades": 40530,
+     "edge_pips": -0.006,
+     "edge_t": -0.47,
+     "net_pips": -1.363,
+     "win_rate": 0.482
+    },
+    "overlap 12-16": {
+     "trades": 38488,
+     "edge_pips": -0.006,
+     "edge_t": -0.41,
+     "net_pips": -1.305,
+     "win_rate": 0.479
+    }
+   },
+   "by_year": {
+    "2018": {
+     "trades": 25990,
+     "edge_pips": 0.012,
+     "edge_t": 0.72,
+     "net_pips": -1.461,
+     "win_rate": 0.469
+    },
+    "2019": {
+     "trades": 19902,
+     "edge_pips": 0.054,
+     "edge_t": 3.05,
+     "net_pips": -1.241,
+     "win_rate": 0.505
+    },
+    "2020": {
+     "trades": 27120,
+     "edge_pips": 0.005,
+     "edge_t": 0.27,
+     "net_pips": -1.334,
+     "win_rate": 0.479
+    },
+    "2021": {
+     "trades": 23492,
+     "edge_pips": 0.019,
+     "edge_t": 1.16,
+     "net_pips": -1.289,
+     "win_rate": 0.493
+    },
+    "2022": {
+     "trades": 30769,
+     "edge_pips": 0.01,
+     "edge_t": 0.61,
+     "net_pips": -1.416,
+     "win_rate": 0.472
+    },
+    "2023": {
+     "trades": 21710,
+     "edge_pips": -0.053,
+     "edge_t": -2.85,
+     "net_pips": -1.383,
+     "win_rate": 0.477
+    },
+    "2024": {
+     "trades": 20888,
+     "edge_pips": -0.03,
+     "edge_t": -1.76,
+     "net_pips": -1.269,
+     "win_rate": 0.488
+    }
+   },
+   "by_hold": {
+    "<5m": {
+     "trades": 103125,
+     "edge_pips": -0.107,
+     "edge_t": -13.17,
+     "net_pips": -1.461,
+     "win_rate": 0.466
+    },
+    "5-30m": {
+     "trades": 60376,
+     "edge_pips": 0.176,
+     "edge_t": 15.46,
+     "net_pips": -1.162,
+     "win_rate": 0.507
+    },
+    "30m-2h": {
+     "trades": 6018,
+     "edge_pips": 0.195,
+     "edge_t": 5.26,
+     "net_pips": -1.22,
+     "win_rate": 0.516
+    },
+    "2-8h": {
+     "trades": 211,
+     "edge_pips": -0.517,
+     "edge_t": -1.63,
+     "net_pips": -1.964,
+     "win_rate": 0.507
+    },
+    ">8h": {
+     "trades": 99,
+     "edge_pips": -1.376,
+     "edge_t": -0.87,
+     "net_pips": -5.052,
+     "win_rate": 0.455
+    }
+   }
+  },
+  "mean_anchor_reversion@H1": {
+   "trades": 2911,
+   "edge_pips": -0.018,
+   "edge_t": -0.05,
+   "net_pips": -1.356,
+   "win_rate": 0.526,
+   "costs_pips": {
+    "spread": 0.343,
+    "slippage": 0.295,
+    "commission": 0.7,
+    "total": 1.338
+   },
+   "avg_win_pips": 17.71,
+   "avg_loss_pips": 22.53,
+   "breakeven_win_rate": 0.56,
+   "edge_abs_move_pips": 19.94,
+   "cost_share_of_move": 0.067,
+   "hold_minutes_median": 178.8,
+   "trades_per_quarter": 100.4,
+   "by_exit_reason": {
+    "eod": {
+     "trades": 12,
+     "edge_pips": -0.046,
+     "edge_t": -0.02,
+     "net_pips": -2.908,
+     "win_rate": 0.417,
+     "share": 0.004
+    },
+    "sl": {
+     "trades": 1372,
+     "edge_pips": -21.14,
+     "edge_t": -124.95,
+     "net_pips": -22.602,
+     "win_rate": 0.0,
+     "share": 0.471
+    },
+    "tp": {
+     "trades": 1527,
+     "edge_pips": 18.96,
+     "edge_t": 98.78,
+     "net_pips": 17.746,
+     "win_rate": 1.0,
+     "share": 0.525
+    }
+   },
+   "by_side": {
+    "long": {
+     "trades": 1478,
+     "edge_pips": -0.018,
+     "edge_t": -0.03,
+     "net_pips": -1.354,
+     "win_rate": 0.526
+    },
+    "short": {
+     "trades": 1433,
+     "edge_pips": -0.019,
+     "edge_t": -0.03,
+     "net_pips": -1.358,
+     "win_rate": 0.527
+    }
+   },
+   "by_session": {
+    "asia 22-07": {
+     "trades": 456,
+     "edge_pips": -0.592,
+     "edge_t": -0.64,
+     "net_pips": -2.032,
+     "win_rate": 0.504
+    },
+    "london 07-12": {
+     "trades": 826,
+     "edge_pips": 0.025,
+     "edge_t": 0.04,
+     "net_pips": -1.294,
+     "win_rate": 0.523
+    },
+    "ny 16-22": {
+     "trades": 780,
+     "edge_pips": 0.037,
+     "edge_t": 0.05,
+     "net_pips": -1.296,
+     "win_rate": 0.532
+    },
+    "overlap 12-16": {
+     "trades": 849,
+     "edge_pips": 0.198,
+     "edge_t": 0.26,
+     "net_pips": -1.108,
+     "win_rate": 0.536
+    }
+   },
+   "by_year": {
+    "2018": {
+     "trades": 439,
+     "edge_pips": -0.028,
+     "edge_t": -0.03,
+     "net_pips": -1.496,
+     "win_rate": 0.524
+    },
+    "2019": {
+     "trades": 341,
+     "edge_pips": -0.551,
+     "edge_t": -0.52,
+     "net_pips": -1.848,
+     "win_rate": 0.54
+    },
+    "2020": {
+     "trades": 465,
+     "edge_pips": -1.017,
+     "edge_t": -0.98,
+     "net_pips": -2.331,
+     "win_rate": 0.49
+    },
+    "2021": {
+     "trades": 396,
+     "edge_pips": -0.893,
+     "edge_t": -0.9,
+     "net_pips": -2.191,
+     "win_rate": 0.505
+    },
+    "2022": {
+     "trades": 506,
+     "edge_pips": 1.847,
+     "edge_t": 1.83,
+     "net_pips": 0.488,
+     "win_rate": 0.555
+    },
+    "2023": {
+     "trades": 374,
+     "edge_pips": -1.049,
+     "edge_t": -0.98,
+     "net_pips": -2.434,
+     "win_rate": 0.505
+    },
+    "2024": {
+     "trades": 390,
+     "edge_pips": 1.107,
+     "edge_t": 1.1,
+     "net_pips": -0.116,
+     "win_rate": 0.564
+    }
+   },
+   "by_hold": {
+    "<5m": {
+     "trades": 18,
+     "edge_pips": 2.989,
+     "edge_t": 0.67,
+     "net_pips": 1.539,
+     "win_rate": 0.611
+    },
+    "5-30m": {
+     "trades": 219,
+     "edge_pips": 2.507,
+     "edge_t": 2.01,
+     "net_pips": 1.198,
+     "win_rate": 0.616
+    },
+    "30m-2h": {
+     "trades": 839,
+     "edge_pips": -0.048,
+     "edge_t": -0.07,
+     "net_pips": -1.364,
+     "win_rate": 0.529
+    },
+    "2-8h": {
+     "trades": 1105,
+     "edge_pips": -0.356,
+     "edge_t": -0.56,
+     "net_pips": -1.703,
+     "win_rate": 0.515
+    },
+    ">8h": {
+     "trades": 727,
+     "edge_pips": -0.305,
+     "edge_t": -0.36,
+     "net_pips": -1.656,
+     "win_rate": 0.513
+    }
+   }
+  },
+  "mean_anchor_reversion@M15": {
+   "trades": 11565,
+   "edge_pips": 0.096,
+   "edge_t": 0.98,
+   "net_pips": -1.246,
+   "win_rate": 0.531,
+   "costs_pips": {
+    "spread": 0.348,
+    "slippage": 0.294,
+    "commission": 0.7,
+    "total": 1.342
+   },
+   "avg_win_pips": 8.15,
+   "avg_loss_pips": 11.88,
+   "breakeven_win_rate": 0.593,
+   "edge_abs_move_pips": 9.86,
+   "cost_share_of_move": 0.136,
+   "hold_minutes_median": 47.2,
+   "trades_per_quarter": 398.8,
+   "by_exit_reason": {
+    "eod": {
+     "trades": 15,
+     "edge_pips": 1.54,
+     "edge_t": 1.46,
+     "net_pips": -0.44,
+     "win_rate": 0.4,
+     "share": 0.001
+    },
+    "sl": {
+     "trades": 5415,
+     "edge_pips": -10.42,
+     "edge_t": -218.19,
+     "net_pips": -11.893,
+     "win_rate": 0.0,
+     "share": 0.468
+    },
+    "tp": {
+     "trades": 6135,
+     "edge_pips": 9.375,
+     "edge_t": 197.03,
+     "net_pips": 8.149,
+     "win_rate": 1.0,
+     "share": 0.53
+    }
+   },
+   "by_side": {
+    "long": {
+     "trades": 5761,
+     "edge_pips": 0.101,
+     "edge_t": 0.72,
+     "net_pips": -1.239,
+     "win_rate": 0.533
+    },
+    "short": {
+     "trades": 5804,
+     "edge_pips": 0.091,
+     "edge_t": 0.67,
+     "net_pips": -1.253,
+     "win_rate": 0.529
+    }
+   },
+   "by_session": {
+    "asia 22-07": {
+     "trades": 2852,
+     "edge_pips": 0.349,
+     "edge_t": 2.04,
+     "net_pips": -1.038,
+     "win_rate": 0.549
+    },
+    "london 07-12": {
+     "trades": 3551,
+     "edge_pips": -0.129,
+     "edge_t": -0.73,
+     "net_pips": -1.432,
+     "win_rate": 0.528
+    },
+    "ny 16-22": {
+     "trades": 2420,
+     "edge_pips": 0.304,
+     "edge_t": 1.37,
+     "net_pips": -1.088,
+     "win_rate": 0.529
+    },
+    "overlap 12-16": {
+     "trades": 2742,
+     "edge_pips": -0.058,
+     "edge_t": -0.26,
+     "net_pips": -1.362,
+     "win_rate": 0.518
+    }
+   },
+   "by_year": {
+    "2018": {
+     "trades": 1714,
+     "edge_pips": 0.005,
+     "edge_t": 0.02,
+     "net_pips": -1.463,
+     "win_rate": 0.522
+    },
+    "2019": {
+     "trades": 1295,
+     "edge_pips": 0.433,
+     "edge_t": 1.62,
+     "net_pips": -0.844,
+     "win_rate": 0.56
+    },
+    "2020": {
+     "trades": 1843,
+     "edge_pips": -0.001,
+     "edge_t": -0.0,
+     "net_pips": -1.339,
+     "win_rate": 0.521
+    },
+    "2021": {
+     "trades": 1632,
+     "edge_pips": 0.479,
+     "edge_t": 1.98,
+     "net_pips": -0.809,
+     "win_rate": 0.553
+    },
+    "2022": {
+     "trades": 2138,
+     "edge_pips": 0.162,
+     "edge_t": 0.64,
+     "net_pips": -1.248,
+     "win_rate": 0.529
+    },
+    "2023": {
+     "trades": 1527,
+     "edge_pips": -0.132,
+     "edge_t": -0.5,
+     "net_pips": -1.45,
+     "win_rate": 0.521
+    },
+    "2024": {
+     "trades": 1416,
+     "edge_pips": -0.269,
+     "edge_t": -1.04,
+     "net_pips": -1.51,
+     "win_rate": 0.519
+    }
+   },
+   "by_hold": {
+    "<5m": {
+     "trades": 561,
+     "edge_pips": -0.83,
+     "edge_t": -2.13,
+     "net_pips": -2.254,
+     "win_rate": 0.492
+    },
+    "5-30m": {
+     "trades": 3593,
+     "edge_pips": 0.176,
+     "edge_t": 1.05,
+     "net_pips": -1.142,
+     "win_rate": 0.547
+    },
+    "30m-2h": {
+     "trades": 4651,
+     "edge_pips": -0.02,
+     "edge_t": -0.13,
+     "net_pips": -1.352,
+     "win_rate": 0.523
+    },
+    "2-8h": {
+     "trades": 2291,
+     "edge_pips": 0.251,
+     "edge_t": 1.13,
+     "net_pips": -1.087,
+     "win_rate": 0.531
+    },
+    ">8h": {
+     "trades": 466,
+     "edge_pips": 0.992,
+     "edge_t": 1.67,
+     "net_pips": -0.544,
+     "win_rate": 0.539
+    }
+   }
+  },
+  "mean_anchor_reversion@M5": {
+   "trades": 33944,
+   "edge_pips": 0.057,
+   "edge_t": 1.73,
+   "net_pips": -1.288,
+   "win_rate": 0.52,
+   "costs_pips": {
+    "spread": 0.35,
+    "slippage": 0.296,
+    "commission": 0.7,
+    "total": 1.345
+   },
+   "avg_win_pips": 4.28,
+   "avg_loss_pips": 7.32,
+   "breakeven_win_rate": 0.631,
+   "edge_abs_move_pips": 5.67,
+   "cost_share_of_move": 0.237,
+   "hold_minutes_median": 17.3,
+   "trades_per_quarter": 1170.5,
+   "by_exit_reason": {
+    "eod": {
+     "trades": 14,
+     "edge_pips": -0.579,
+     "edge_t": -1.08,
+     "net_pips": -2.686,
+     "win_rate": 0.143,
+     "share": 0.0
+    },
+    "sl": {
+     "trades": 16276,
+     "edge_pips": -5.849,
+     "edge_t": -371.63,
+     "net_pips": -7.326,
+     "win_rate": 0.0,
+     "share": 0.479
+    },
+    "tp": {
+     "trades": 17654,
+     "edge_pips": 5.503,
+     "edge_t": 322.03,
+     "net_pips": 4.279,
+     "win_rate": 1.0,
+     "share": 0.52
+    }
+   },
+   "by_side": {
+    "long": {
+     "trades": 16913,
+     "edge_pips": 0.056,
+     "edge_t": 1.21,
+     "net_pips": -1.287,
+     "win_rate": 0.519
+    },
+    "short": {
+     "trades": 17031,
+     "edge_pips": 0.058,
+     "edge_t": 1.24,
+     "net_pips": -1.29,
+     "win_rate": 0.521
+    }
+   },
+   "by_session": {
+    "asia 22-07": {
+     "trades": 8907,
+     "edge_pips": 0.133,
+     "edge_t": 2.38,
+     "net_pips": -1.267,
+     "win_rate": 0.532
+    },
+    "london 07-12": {
+     "trades": 9581,
+     "edge_pips": 0.034,
+     "edge_t": 0.55,
+     "net_pips": -1.26,
+     "win_rate": 0.518
+    },
+    "ny 16-22": {
+     "trades": 7569,
+     "edge_pips": 0.159,
+     "edge_t": 2.27,
+     "net_pips": -1.234,
+     "win_rate": 0.519
+    },
+    "overlap 12-16": {
+     "trades": 7887,
+     "edge_pips": -0.099,
+     "edge_t": -1.3,
+     "net_pips": -1.399,
+     "win_rate": 0.51
+    }
+   },
+   "by_year": {
+    "2018": {
+     "trades": 5074,
+     "edge_pips": 0.047,
+     "edge_t": 0.54,
+     "net_pips": -1.409,
+     "win_rate": 0.515
+    },
+    "2019": {
+     "trades": 3951,
+     "edge_pips": 0.248,
+     "edge_t": 2.8,
+     "net_pips": -1.035,
+     "win_rate": 0.553
+    },
+    "2020": {
+     "trades": 5470,
+     "edge_pips": 0.215,
+     "edge_t": 2.53,
+     "net_pips": -1.114,
+     "win_rate": 0.53
+    },
+    "2021": {
+     "trades": 4654,
+     "edge_pips": 0.071,
+     "edge_t": 0.85,
+     "net_pips": -1.233,
+     "win_rate": 0.521
+    },
+    "2022": {
+     "trades": 6180,
+     "edge_pips": -0.034,
+     "edge_t": -0.4,
+     "net_pips": -1.458,
+     "win_rate": 0.503
+    },
+    "2023": {
+     "trades": 4471,
+     "edge_pips": 0.001,
+     "edge_t": 0.01,
+     "net_pips": -1.324,
+     "win_rate": 0.516
+    },
+    "2024": {
+     "trades": 4144,
+     "edge_pips": -0.142,
+     "edge_t": -1.63,
+     "net_pips": -1.383,
+     "win_rate": 0.51
+    }
+   },
+   "by_hold": {
+    "<5m": {
+     "trades": 5607,
+     "edge_pips": -0.39,
+     "edge_t": -5.28,
+     "net_pips": -1.748,
+     "win_rate": 0.499
+    },
+    "5-30m": {
+     "trades": 17189,
+     "edge_pips": 0.063,
+     "edge_t": 1.36,
+     "net_pips": -1.264,
+     "win_rate": 0.524
+    },
+    "30m-2h": {
+     "trades": 9210,
+     "edge_pips": 0.258,
+     "edge_t": 3.94,
+     "net_pips": -1.086,
+     "win_rate": 0.526
+    },
+    "2-8h": {
+     "trades": 1703,
+     "edge_pips": 0.289,
+     "edge_t": 1.84,
+     "net_pips": -1.073,
+     "win_rate": 0.521
+    },
+    ">8h": {
+     "trades": 226,
+     "edge_pips": 0.771,
+     "edge_t": 1.46,
+     "net_pips": -1.607,
+     "win_rate": 0.549
+    }
+   }
+  }
+ }
+}
