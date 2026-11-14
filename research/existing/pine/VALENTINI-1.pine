@@ -1,6 +1,11 @@
 //@version=6
 // ============================================================================
-// VALENTINI-1 · Trend model (Chart Fanatics masterclass) · Pine v1 · GRADE: PROXY
+// VALENTINI-1 · Trend model (Chart Fanatics masterclass) · Pine v2 · GRADE: PROXY
+// v2 fixes (from v1 trade list, 108 trades): (1) entry at NEXT bar open, v1 filled at the signal bar's close
+//   and let the emulator stop/target out on that same bar (76 fake same-bar exits); (2) min stop 10 pts
+//   (his examples: $160-650/contract = 8-32 pts), v1 used 2 pts -> oversized positions + margin calls;
+//   (3) contract cap + margin check; (4) backup exit if price closes beyond the stop; (5) aggression average
+//   from NY-session bars only; (6) entry label shows LVN / delta / stop / target.
 // Rule sheet: research/existing/rulesheets/VALENTINI-1_TREND.md  (row ids in comments)
 //
 // Chart: NQ1! (or MNQ1!), 1-minute (E7). Needs TradingView Premium (request.footprint).
@@ -27,11 +32,11 @@
 //  S2 "previous day"          -> previous RTH session 09:30-16:00 NY (input)
 // NOT implemented: S3 compression-area profile, X6 discretionary early exit, X7 adding.
 // ============================================================================
-strategy("VALENTINI-1 · Trend model (PROXY)", overlay = true, process_orders_on_close = true,
+strategy("VALENTINI-1 · Trend model v2 (PROXY)", overlay = true, process_orders_on_close = false,
      default_qty_type = strategy.fixed, default_qty_value = 1, initial_capital = 100000,
      currency = currency.USD, commission_type = strategy.commission.cash_per_contract,
      commission_value = 2.5, slippage = 1, margin_long = 5, margin_short = 5,
-     max_bars_back = 500, max_boxes_count = 200)
+     max_bars_back = 500, max_boxes_count = 200, max_labels_count = 500)
 
 // ---------------- inputs ----------------
 string TZ = "America/New_York"
@@ -48,13 +53,15 @@ deltaMult    = input.float(2.0, "Aggression: bar delta >= x * avg |delta| (E1 pr
 deltaLen     = input.int(20, "Avg |delta| length", minval = 2, group = "Trigger")
 needImb      = input.bool(true, "Aggression: require imbalance row in LVN zone (E1 proxy)", group = "Trigger")
 stopOffTicks = input.int(2, "Stop beyond aggression row, ticks (E5)", minval = 0, group = "Trigger")
-minStopTicks = input.int(8, "Min stop, ticks", minval = 1, group = "Trigger")
+minStopTicks = input.int(40, "Min stop, ticks (40 = 10 pts NQ)", minval = 1, group = "Trigger")
 maxStopPts   = input.float(40.0, "Max stop, points (else skip)", group = "Trigger")
 minRR        = input.float(2.5, "Min R:R to target (X4)", group = "Exit")
 fallbackRR   = input.float(5.0, "Target R when no level in direction (X2 proxy)", group = "Exit")
 useBE        = input.bool(true, "Breakeven on additional breakout (X5)", group = "Exit")
 riskPct      = input.float(0.25, "Risk % per trade (R1)", group = "Risk")
 minOne       = input.bool(true, "Trade 1 contract if sizing gives < 1", group = "Risk")
+maxQty       = input.int(2, "Max contracts per trade", minval = 1, group = "Risk")
+marginPct    = input.float(5.0, "Margin % per contract (must match Properties)", group = "Risk")
 dailyCap     = input.float(2.0, "Max daily loss % (R2)", group = "Risk")
 maxLosses    = input.int(3, "Max losing trades per day (R4)", minval = 1, group = "Risk")
 showDash     = input.bool(true, "Show dashboard", group = "Display")
@@ -140,7 +147,10 @@ bool newRef  = inRef and not inRef[1]
 footprint fp = request.footprint(rowTicks)
 bool hasFp = not na(fp)
 float fpDelta = hasFp ? fp.delta() : na
-float avgAbsDelta = ta.sma(math.abs(nz(fpDelta)), deltaLen)
+var float avgAbsDelta = na     // average |delta| of NY-session bars only (v2)
+if hasFp and not na(time(timeframe.period, refSess, TZ))
+    float ad = math.abs(fpDelta)
+    avgAbsDelta := na(avgAbsDelta) ? ad : avgAbsDelta + (ad - avgAbsDelta) * 2.0 / (deltaLen + 1)
 var int fpBars = 0
 var int allBars = 0
 allBars += 1
@@ -349,11 +359,14 @@ if trig
     float dist = math.abs(close - stopPx)
     float q = math.floor(riskPct / 100.0 * strategy.equity / (dist * syminfo.pointvalue))
     q := q < 1 ? (minOne ? 1 : 0) : q
+    float qMargin = math.floor(0.8 * strategy.equity / (close * syminfo.pointvalue * marginPct / 100.0))
+    q := math.min(q, maxQty, qMargin)
     if q > 0
         tgtPx := f_target(dir, close, dist)
         stp := stopPx
         entryExt := legExt
         beDone := false
+        label.new(bar_index, dir == 1 ? low : high, (dir == 1 ? "V1 L" : "V1 S") + "\nLVN " + str.tostring(lvnLo, format.mintick) + "\ndelta " + str.tostring(fpDelta, "#") + " (avg " + str.tostring(avgAbsDelta, "#") + ")\nstop " + str.tostring(stp, format.mintick) + "\ntgt " + str.tostring(tgtPx, format.mintick), style = dir == 1 ? label.style_label_up : label.style_label_down, color = color.new(dir == 1 ? color.teal : color.maroon, 10), textcolor = color.white, size = size.tiny)
         if dir == 1
             strategy.entry("L", strategy.long, qty = q, comment = "V1 long")
             strategy.exit("XL", "L", stop = stp, limit = tgtPx)
@@ -370,11 +383,15 @@ if strategy.position_size > 0
         stp := math.max(stp, strategy.position_avg_price + syminfo.mintick)
         beDone := true
     strategy.exit("XL", "L", stop = stp, limit = tgtPx)
+    if close < stp
+        strategy.close("L", comment = "backup stop")
 if strategy.position_size < 0
     if useBE and not beDone and low < entryExt
         stp := math.min(stp, strategy.position_avg_price - syminfo.mintick)
         beDone := true
     strategy.exit("XS", "S", stop = stp, limit = tgtPx)
+    if close > stp
+        strategy.close("S", comment = "backup stop")
 
 // T4: flat by the close
 if inFlat and strategy.position_size != 0
@@ -402,7 +419,7 @@ if showDash and barstate.islast
     float al = strategy.losstrades > 0 ? strategy.grossloss / strategy.losstrades : na
     float np = strategy.netprofit
     color pc = np >= 0 ? color.lime : color.red
-    f_row(0, "VALENTINI-1 trend", "grade: PROXY", color.yellow)
+    f_row(0, "VALENTINI-1 trend v2", "grade: PROXY", color.yellow)
     f_row(1, "Net P&L", str.tostring(np, "#,##0") + " $  (" + str.tostring(100 * np / strategy.initial_capital, "0.00") + "%)", pc)
     f_row(2, "Closed trades", str.tostring(ct), color.white)
     f_row(3, "Win rate", na(wr) ? "-" : str.tostring(wr, "0.0") + "%", color.white)
