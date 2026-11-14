@@ -67,3 +67,9 @@ Status: STATED / INTERPRETED / MISSING / CONFLICT (see `../FIDELITY.md`).
 1. B1: what is "the first hours of the session" profile in practice: from 09:30 NY, or including pre-market? (masterclass ⏳)
 2. A3: allow entries before 09:30+30 min if absorption is strong, or stick to the 30-min rule?
 3. D3: breakeven "within 1 minute": implement as "move to breakeven after +N ticks", or "exit if not in profit within N minutes"?
+
+## Masterclass check (2026-11-14)
+- Risk-free mechanism (open question 3): "when you see that you get an additional breakout, immediately stop to breakeven"
+  (CF 17:38-20:01); CVD-based early breakeven (CF 26:19); "full body candle accepting the high" (CF 2:54:21). Still discretionary.
+- 30-min rule context (open question 2): "direction for the day [clear] from 15 to 30 minutes inside the opening" (CF 1:23:34).
+- Daily cap 2%, 0.25% per trade (CF 2:09:19, 2:23:06) confirm F-rows.

@@ -42,6 +42,9 @@ unverified claims. Both are tested; the bucket is context, not a verdict.
 - Range bars (e.g. 40-range on NQ ≈ 3-8 pip range bars on EURUSD) instead of time bars.
 
 ## Data notes
+- **TradingView Premium (Kian has it):** `request.footprint()` = per bar, per price row: buy/sell volume, delta, POC, VAH/VAL,
+  imbalance flags. It does **not** give individual trade sizes, so Valentini's "30+ contract bubbles" are not available
+  in Pine. Those need trade-level data (Databento NQ trades).
 - **Order flow:** VALENTINI-1/2/3/6 depend on executed volume, big-trade prints, delta, CVD and volume profile.
   Spot FX and CFD quotes have none of that (Fabio says so himself for EURUSD). A faithful test needs **NQ futures
   trade data with aggressor side** (e.g. CME tick/trades data from a vendor). Without it we test proxies and
@@ -52,10 +55,11 @@ unverified claims. Both are tested; the bucket is context, not a verdict.
 
 | Name | Transcript | Rule sheet | Approved | Code | Grade |
 |---|---|---|---|---|---|
-| VALENTINI-1, 2 | masterclass needed | – | – | – | – |
+| VALENTINI-1 (trend) | CF ✓ | `rulesheets/VALENTINI-1_TREND.md` draft | awaiting Kian | – | best possible: Proxy (big-trade trigger needs trade data; mgmt discretionary) |
+| VALENTINI-2 (mean rev.) | CF ✓ | `rulesheets/VALENTINI-2_MEANREV.md` draft | awaiting Kian | – | best possible: Proxy |
 | VALENTINI-6 (NASDAQ Effort) | IQC ✓ | `rulesheets/VALENTINI-6_EFFORT.md` | – | **not copyable 1:1** (proprietary Effort layer); sub-model "Order Track" needs candle TF + footprint | – |
-| VALENTINI-3 (AAA) | WoR ✓ (masterclass ⏳) | `rulesheets/VALENTINI-3_AAA.md` draft | awaiting Kian | – | – |
-| VALENTINI-4 (momentum) | WoR ✓ (masterclass ⏳) | `rulesheets/VALENTINI-4_MOMENTUM.md` draft | awaiting Kian | old Pine = DRAFT, not usable | – |
+| VALENTINI-3 (AAA) | WoR ✓ CF ✓ | `rulesheets/VALENTINI-3_AAA.md` draft | awaiting Kian | – | – |
+| VALENTINI-4 (momentum) | WoR ✓ CF ✓ | `rulesheets/VALENTINI-4_MOMENTUM.md` draft | awaiting Kian | old Pine = DRAFT, not usable | – |
 | VALENTINI-5 (power hour / Model B) | WoR ✓ | `rulesheets/VALENTINI-5_POWERHOUR.md`: entry rules MISSING | – | – | – |
 | DATATRADER-1 | needed (recap is detailed) | draft from recap | – | Pine v1 (4 INTERPRETED items, see rule sheet) | pending |
 | GOH-1 | needed | – | – | – | – |

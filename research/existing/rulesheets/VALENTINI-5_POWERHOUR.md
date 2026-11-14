@@ -14,3 +14,6 @@ Source: `sources/valentini_words_of_rizdom_TRANSCRIPT.md`. Masterclass rows to v
 ## Status
 Not codable yet: P5 (the actual entry rules of Model B) is missing. Needs the masterclass transcript.
 P1-P4 already give a **filter** usable by other models: "after a first-hour expansion, no trend entries until 13:30 NY".
+
+## Masterclass check (2026-11-14)
+The masterclass does **not** describe Power Hour / Model B entries. P5 stays **MISSING**. Not codable.

@@ -27,3 +27,15 @@ which got rule M3 backwards and lacked M1/M2. Masterclass rows to verify: ⏳.
 ## Open questions for Kian
 1. M6: entry by **buy stop** (WoR) or by **1-min body close** above (masterclass)? Proposal: test both as variants.
 2. M10: what counts as "auction failed" for you when you watch it: no new high within ~3-5 minutes, or a close back inside the range?
+
+## Masterclass check (2026-11-14, `sources/valentini_chart_fanatics_TRANSCRIPT.md`)
+- **M6 CONFLICT is context-dependent in his own live trades, not one rule:**
+  - first squeeze break, protected by big orders: "This execution can be on buy stop" (2:11:31)
+  - re-entry when already extended: "So the next setup, buy stop? No, I want a full candle close... so risky" (2:40:08);
+    "the trade is valid as soon as we close with a 1-minute candle, full body candle above" (2:40:08, 2:52:42, 3:11:31)
+  → still two variants; when he picks which is discretionary.
+- **M10 answered in part:** "every time it approaches the high and gets back, our probability that we will get a stop loss
+  gets higher... the setup is getting weaker... I will [move to breakeven]" (2:56:20); took the $255 loss there.
+- **M11 verified:** "every time that you reject... the setup gets weaker and weaker, so every time I get more demanding" (3:23:19).
+- Stop: below the big buyers / the box, re-calculated at the close ("I need to adapt my stop loss", 2:52:42). Needs big-trade data.
+- Risk-free: "when we get a full body candle up, we can get risk-free" (2:54:21).
