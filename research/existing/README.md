@@ -52,8 +52,10 @@ unverified claims. Both are tested; the bucket is context, not a verdict.
 
 | Name | Transcript | Rule sheet | Approved | Code | Grade |
 |---|---|---|---|---|---|
-| VALENTINI-1..6 | needed | – | – | – | – |
-| VALENTINI-4 | needed | – | – | Pine **DRAFT** (audit: 1 wrong rule, context + order flow missing) | not usable |
+| VALENTINI-1, 2, 6 | masterclass + IQCapital needed | – | – | – | – |
+| VALENTINI-3 (AAA) | WoR ✓ (masterclass ⏳) | `rulesheets/VALENTINI-3_AAA.md` draft | awaiting Kian | – | – |
+| VALENTINI-4 (momentum) | WoR ✓ (masterclass ⏳) | `rulesheets/VALENTINI-4_MOMENTUM.md` draft | awaiting Kian | old Pine = DRAFT, not usable | – |
+| VALENTINI-5 (power hour / Model B) | WoR ✓ | `rulesheets/VALENTINI-5_POWERHOUR.md`: entry rules MISSING | – | – | – |
 | DATATRADER-1 | needed (recap is detailed) | draft from recap | – | Pine v1 (4 INTERPRETED items, see rule sheet) | pending |
 | GOH-1 | needed | – | – | – | – |
 | MAMBAFX-1 | needed | – | – | – | – |
