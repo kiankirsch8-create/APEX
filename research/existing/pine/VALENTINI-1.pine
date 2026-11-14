@@ -25,7 +25,7 @@
 //                                Proxy: bar delta >= x * average |delta| AND an imbalance row inside the LVN zone.
 //  L1 impulse start           -> lowest low (highest high) of the last N bars at the breakout
 //  L1 LVN                     -> lowest-volume row of the leg profile, ignoring the outer 20% of the leg
-//  E4 entry timing            -> at the close of the aggression bar
+//  E4 entry timing            -> at the open of the bar after the aggression bar (v2)
 //  X2 trail when no POC       -> fixed 5R target instead (trail rule not stated)
 //  X5 breakeven               -> when price makes a new high beyond the leg's high ("additional breakout")
 //  T3 15-30 min after open    -> entry window 09:45-13:30 NY
