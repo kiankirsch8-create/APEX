@@ -1,0 +1,137 @@
+//@version=6
+// VALENTINI-4 · Compression squeeze breakout  (APEX research, Track 2 · reputable bucket)
+// Source recaps: research/existing/sources/valentini_*  (live trades #1-#3 in the Chart Fanatics
+// masterclass, "Model 2 momentum squeeze" in the Words of Rizdom session)
+//
+// Rules as he trades them, every vague term pinned to one definition:
+//  1. Market/session: NQ, 1-minute chart, New York cash session. He never trades the first
+//     minutes after the open (whipsaw), so the window starts 09:45 NY. Flat by 15:55 NY.
+//  2. Compression ("the box"): the high/low of the last N bars, only valid when its height is
+//     small versus recent volatility (<= K x ATR), and the side being broken has been tested
+//     and rejected at least M times ("each rejection, then the trapped side gives way").
+//  3. Trigger: a FULL 1-minute candle body CLOSES outside the box (wicks through don't count;
+//     he skipped four fake-out wicks live because of exactly this rule). Enter at that close.
+//  4. Stop: tight, behind the breakout candle (his stops sit just behind the aggressive prints),
+//     skipped if wider than a max risk.  Move to breakeven ("risk zero") once +1R is reached.
+//  5. Target: fixed R multiple (his minimum is 2.5R, typical 3-5R). 100% exit, no runners.
+//  6. Discipline: stop for the day after 3 consecutive losses; max trades per day.
+//
+// What is NOT in here (needs order flow): his "big bubble" confirmation and CVD divergence exit.
+// Settings -> Properties: order size 1, your NQ commission per contract per side, slippage 1 tick.
+
+strategy("VALENTINI-4 · Compression squeeze breakout", overlay = true,
+     process_orders_on_close = true,
+     default_qty_type = strategy.fixed, default_qty_value = 1,
+     initial_capital = 100000, currency = currency.USD,
+     commission_type = strategy.commission.cash_per_contract, commission_value = 0,
+     slippage = 1, max_bars_back = 500,
+     margin_long = 5, margin_short = 5)
+
+// ── Inputs ────────────────────────────────────────────────────────────────
+TZ           = "America/New_York"
+tradeSess    = input.session("0945-1555", "Trading window (NY time)")
+boxLen       = input.int(20, "Box: lookback (bars)", minval = 5)
+boxMaxAtr    = input.float(2.0, "Box: max height (x ATR)", minval = 0.5, step = 0.25)
+atrLen       = input.int(60, "ATR length (bars)", minval = 5)
+minTests     = input.int(2, "Box: min rejected tests of the broken side", minval = 0)
+tolTicks     = input.int(4, "Box: test tolerance (ticks)", minval = 0)
+rr           = input.float(3.0, "Target (R)", minval = 1.0, step = 0.25)
+beAtR        = input.float(1.0, "Move stop to breakeven at (R, 0 = off)", minval = 0, step = 0.25)
+maxRiskPts   = input.float(40, "Max risk per trade (points)", minval = 1)
+bufTicks     = input.int(2, "Stop buffer behind breakout candle (ticks)", minval = 0)
+maxLossRow   = input.int(3, "Stop for the day after N losses in a row", minval = 1)
+maxTradesDay = input.int(6, "Max trades per day", minval = 1)
+allowLong    = input.bool(true, "Allow longs")
+allowShort   = input.bool(true, "Allow shorts")
+
+// ── Clock and day reset ───────────────────────────────────────────────────
+inSess = not na(time(timeframe.period, tradeSess, TZ))
+nyDate = year(time, TZ) * 10000 + month(time, TZ) * 100 + dayofmonth(time, TZ)
+newDay = nyDate != nyDate[1]
+
+// ── Box from the PREVIOUS N bars (the breakout bar itself is not part of the box) ──
+atr    = ta.atr(atrLen)
+boxHi  = ta.highest(high, boxLen)[1]
+boxLo  = ta.lowest(low, boxLen)[1]
+height = boxHi - boxLo
+tight  = height <= boxMaxAtr * atr[1]
+tol    = tolTicks * syminfo.mintick
+
+testsUp = 0
+testsDn = 0
+for i = 1 to boxLen
+    if high[i] >= boxHi - tol and close[i] < boxHi
+        testsUp += 1
+    if low[i] <= boxLo + tol and close[i] > boxLo
+        testsDn += 1
+
+// ── Day state ─────────────────────────────────────────────────────────────
+var int   lossRow   = 0
+var int   tradesDay = 0
+var int   lastClosed = 0
+var float eP  = na
+var float rk  = na
+var float tp  = na
+var int   dir = 0
+var bool  beDone = false
+
+if newDay
+    lossRow   := 0
+    tradesDay := 0
+
+if strategy.closedtrades > lastClosed
+    lossRow := strategy.closedtrades.profit(strategy.closedtrades - 1) < 0 ? lossRow + 1 : 0
+    lastClosed := strategy.closedtrades
+    dir := 0
+
+flat     = strategy.position_size == 0
+canTrade = inSess and flat and lossRow < maxLossRow and tradesDay < maxTradesDay and tight
+buf      = bufTicks * syminfo.mintick
+
+longSig  = allowLong  and canTrade and testsUp >= minTests and close > boxHi and close > open
+shortSig = allowShort and canTrade and testsDn >= minTests and close < boxLo and close < open
+
+if longSig
+    stopPx = low - buf
+    risk   = close - stopPx
+    if risk > 0 and risk <= maxRiskPts
+        eP := close
+        rk := risk
+        tp := close + rr * risk
+        dir := 1
+        beDone := false
+        strategy.entry("Long", strategy.long)
+        strategy.exit("Long exit", "Long", stop = stopPx, limit = tp)
+        tradesDay += 1
+else if shortSig
+    stopPx = high + buf
+    risk   = stopPx - close
+    if risk > 0 and risk <= maxRiskPts
+        eP := close
+        rk := risk
+        tp := close - rr * risk
+        dir := -1
+        beDone := false
+        strategy.entry("Short", strategy.short)
+        strategy.exit("Short exit", "Short", stop = stopPx, limit = tp)
+        tradesDay += 1
+
+// ── Breakeven ("risk zero") once +beAtR R is reached ──────────────────────
+if beAtR > 0 and not beDone and not flat
+    if dir == 1 and high >= eP + beAtR * rk
+        strategy.exit("Long exit", "Long", stop = eP, limit = tp)
+        beDone := true
+    else if dir == -1 and low <= eP - beAtR * rk
+        strategy.exit("Short exit", "Short", stop = eP, limit = tp)
+        beDone := true
+
+if not inSess and not flat
+    strategy.close_all("End of NY session")
+
+// ── Drawing ───────────────────────────────────────────────────────────────
+showBox = inSess and tight
+plot(showBox ? boxHi : na, "Box high", color = color.new(color.teal, 0), linewidth = 2, style = plot.style_linebr)
+plot(showBox ? boxLo : na, "Box low",  color = color.new(color.maroon, 0), linewidth = 2, style = plot.style_linebr)
+plotshape(longSig,  "Breakout up",   shape.triangleup,   location.belowbar, color.new(color.green, 0), size = size.tiny)
+plotshape(shortSig, "Breakout down", shape.triangledown, location.abovebar, color.new(color.red, 0),   size = size.tiny)
+bgcolor(inSess ? na : color.new(color.gray, 92), title = "Outside trading window")
