@@ -85,6 +85,8 @@ a failed attempt (overfit) and goes to the Analyst.
    If the rebase conflicts on `ledger.jsonl`, keep both sides' lines (it is append-only), re-render, continue.
 
 ## Hard rules
+- **Existing (Track 2) strategies are copied 1:1 or not at all** (`existing/FIDELITY.md` §0). Never implement one
+  without an approved rule sheet; if information is missing, write it down as a request and move on.
 - Never delete or rewrite ledger lines, results, scans or past reports. Never touch 2022+ data.
 - No parameter-only tweaks: a revision changes something the post-mortem constraint justifies.
 - Conclusions use entry-time features only (not hold time, not exit reason).

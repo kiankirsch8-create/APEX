@@ -4,6 +4,13 @@
 nothing and we wrongly bury a working idea. Every Track 2 strategy goes through these steps, in order.
 No step may be skipped, by Claude or by any agent.
 
+## 0. Hard rule: no copy without enough information
+An existing strategy is copied **1:1 or not at all**. Before writing any code, check that every rule
+(context, location, trigger, stop, management, exit, risk) is known from the trader's own words.
+If something is unknown, proprietary or only in a source we don't have yet: **stop, say exactly what is
+missing, and ask for the source.** Never fill gaps with a plausible guess and call it his strategy.
+This applies to Claude and to every agent. (Lesson: VALENTINI-4 draft, 2026-11-14.)
+
 ## 1. Primary source
 - Work from **the trader's own words**: video transcript (YouTube → "…more" → Show transcript),
   his own written material, or his chart walkthroughs. Gemini recaps are an **index** to find the right

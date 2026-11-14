@@ -52,7 +52,8 @@ unverified claims. Both are tested; the bucket is context, not a verdict.
 
 | Name | Transcript | Rule sheet | Approved | Code | Grade |
 |---|---|---|---|---|---|
-| VALENTINI-1, 2, 6 | masterclass + IQCapital needed | – | – | – | – |
+| VALENTINI-1, 2 | masterclass needed | – | – | – | – |
+| VALENTINI-6 (NASDAQ Effort) | IQC ✓ | `rulesheets/VALENTINI-6_EFFORT.md` | – | **not copyable 1:1** (proprietary Effort layer); sub-model "Order Track" needs candle TF + footprint | – |
 | VALENTINI-3 (AAA) | WoR ✓ (masterclass ⏳) | `rulesheets/VALENTINI-3_AAA.md` draft | awaiting Kian | – | – |
 | VALENTINI-4 (momentum) | WoR ✓ (masterclass ⏳) | `rulesheets/VALENTINI-4_MOMENTUM.md` draft | awaiting Kian | old Pine = DRAFT, not usable | – |
 | VALENTINI-5 (power hour / Model B) | WoR ✓ | `rulesheets/VALENTINI-5_POWERHOUR.md`: entry rules MISSING | – | – | – |
