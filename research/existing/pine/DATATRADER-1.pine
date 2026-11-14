@@ -1,0 +1,129 @@
+//@version=6
+// DATATRADER-1 · First 4H New York range fakeout  (APEX research, Track 2 · influencer bucket)
+// Source recap: research/existing/sources/datatrader_4h_ny_range_recap.md
+//
+// Rules (as published, every vague term pinned to one definition):
+//  1. Reference range = high/low of 00:00-04:00 New York time (the first 4H candle of the NY day).
+//     Only valid once that window has fully closed.
+//  2. Breakout = a chart bar (use 5m) CLOSES outside the range. Wicks only don't count.
+//  3. Re-entry = a later bar closes back inside the range  ->  fade it at that bar's close.
+//     Short after a close above the high, long after a close below the low.
+//  4. Stop = the most extreme price of the breakout excursion (+ optional buffer).
+//     Wide-breakout exception (the video's "too wide" rule): if that stop is more than
+//     K x ATR away, use the highest high / lowest low of the last N bars instead.
+//  5. Target = 2R.  Same NY day only. Several setups per day allowed, one position at a time.
+//
+// Costs: set them under Settings -> Properties. Defaults model Capital.com EURUSD
+// (about 0.7 pip spread = 0.000035 per unit per side, plus 2 ticks = 0.2 pip slippage).
+// For other symbols, change commission / slippage there.
+
+strategy("DATATRADER-1 · 4H NY range fakeout", overlay = true,
+     process_orders_on_close = true,
+     default_qty_type = strategy.fixed, default_qty_value = 10000,
+     initial_capital = 10000, currency = currency.USD,
+     commission_type = strategy.commission.cash_per_contract, commission_value = 0.000035,
+     slippage = 2, max_bars_back = 500)
+
+// ── Inputs ────────────────────────────────────────────────────────────────
+TZ          = "America/New_York"
+rangeSess   = input.session("0000-0400", "Reference range (NY time)")
+tradeSess   = input.session("0400-2355", "Trading window (NY time)")
+rr          = input.float(2.0, "Reward : risk", minval = 0.5, step = 0.25)
+atrLen      = input.int(14, "ATR length", minval = 1)
+capK        = input.float(2.5, "Wide-stop cap: max stop distance (x ATR)", minval = 0.5, step = 0.25)
+capN        = input.int(6, "Wide-stop cap: fallback lookback (bars)", minval = 1)
+bufTicks    = input.int(0, "Stop buffer (ticks)", minval = 0)
+maxPerSide  = input.int(99, "Max entries per boundary per day (99 = unlimited)", minval = 1)
+flatEOD     = input.bool(true, "Close open trade at end of trading window")
+showLabels  = input.bool(true, "Show breakout markers")
+
+// ── Clock (New York, DST-aware) ───────────────────────────────────────────
+inRange  = not na(time(timeframe.period, rangeSess, TZ))
+inTrade  = not na(time(timeframe.period, tradeSess, TZ))
+nyDate   = year(time, TZ) * 10000 + month(time, TZ) * 100 + dayofmonth(time, TZ)
+newDay   = nyDate != nyDate[1]
+
+atr = ta.atr(atrLen)
+hh  = ta.highest(high, capN)
+ll  = ta.lowest(low, capN)
+
+// ── State ─────────────────────────────────────────────────────────────────
+var float rHi       = na
+var float rLo       = na
+var bool  rangeDone = false
+var int   state     = 0        // 0 none, 1 closed above high, -1 closed below low
+var float ext       = na       // excursion extreme while outside
+var int   nShort    = 0
+var int   nLong     = 0
+
+if newDay
+    rHi       := na
+    rLo       := na
+    rangeDone := false
+    state     := 0
+    ext       := na
+    nShort    := 0
+    nLong     := 0
+
+if inRange
+    rHi := na(rHi) ? high : math.max(rHi, high)
+    rLo := na(rLo) ? low  : math.min(rLo, low)
+else if not na(rHi) and not rangeDone
+    rangeDone := true          // the 00:00-04:00 candle has fully closed
+
+canTrade = rangeDone and inTrade
+buf      = bufTicks * syminfo.mintick
+flat     = strategy.position_size == 0
+
+if canTrade
+    if state == 0
+        if close > rHi
+            state := 1
+            ext   := high
+            if showLabels
+                label.new(bar_index, high, "▲ out", style = label.style_label_down, color = color.new(color.orange, 30), textcolor = color.white, size = size.tiny)
+        else if close < rLo
+            state := -1
+            ext   := low
+            if showLabels
+                label.new(bar_index, low, "▼ out", style = label.style_label_up, color = color.new(color.orange, 30), textcolor = color.white, size = size.tiny)
+    else if state == 1
+        ext := math.max(ext, high)
+        if close < rLo                       // fell straight through the whole range: new breakout below
+            state := -1
+            ext   := low
+        else if close < rHi                  // closed back inside -> SHORT
+            stopPx = ext + buf
+            if stopPx - close > capK * atr
+                stopPx := hh + buf
+            if flat and nShort < maxPerSide and stopPx > close
+                tp = close - rr * (stopPx - close)
+                strategy.entry("Short", strategy.short)
+                strategy.exit("Short exit", "Short", stop = stopPx, limit = tp)
+                nShort += 1
+            state := 0
+            ext   := na
+    else if state == -1
+        ext := math.min(ext, low)
+        if close > rHi                       // rallied straight through: new breakout above
+            state := 1
+            ext   := high
+        else if close > rLo                  // closed back inside -> LONG
+            stopPx = ext - buf
+            if close - stopPx > capK * atr
+                stopPx := ll - buf
+            if flat and nLong < maxPerSide and stopPx < close
+                tp = close + rr * (close - stopPx)
+                strategy.entry("Long", strategy.long)
+                strategy.exit("Long exit", "Long", stop = stopPx, limit = tp)
+                nLong += 1
+            state := 0
+            ext   := na
+
+if flatEOD and not inTrade and not flat
+    strategy.close_all("End of NY day")
+
+// ── Drawing ───────────────────────────────────────────────────────────────
+bgcolor(inRange ? color.new(color.blue, 90) : na, title = "Reference window")
+plot(rangeDone ? rHi : na, "Range high", color = color.new(color.teal, 0), linewidth = 2, style = plot.style_linebr)
+plot(rangeDone ? rLo : na, "Range low",  color = color.new(color.maroon, 0), linewidth = 2, style = plot.style_linebr)
