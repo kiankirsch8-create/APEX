@@ -62,10 +62,13 @@ def ideas() -> dict[str, dict]:
                 if e["verdict"] == "pass":
                     idea["status"] = "candidate"
                     idea["best"] = e
-                elif idea["status"] == "proposed":
-                    idea["status"] = "build_fail"
-                    if idea["best"] is None or e["metrics"].get("net_pips", -9) > idea["best"]["metrics"].get("net_pips", -9):
-                        idea["best"] = e
+                else:
+                    if idea["status"] == "proposed":
+                        idea["status"] = "build_fail"
+                    best_failed = idea["best"] is None or idea["best"]["verdict"] != "pass"
+                    if best_failed and (idea["best"] is None or e["metrics"].get("net_pips", -9)
+                                        > idea["best"]["metrics"].get("net_pips", -9)):
+                        idea["best"] = e  # best failing variant, until something passes
         elif e["kind"] == "validate":
             idea["status"] = e["verdict"]
             idea["validation"] = e

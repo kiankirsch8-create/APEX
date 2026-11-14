@@ -86,3 +86,11 @@ def test_confirm_and_stress_gates():
          "by_year": {"2022": {"edge_pips": 1}, "2023": {"edge_pips": -1}, "2024": {"edge_pips": 1}}}
     assert all(gates("confirm", m, 0).values())
     assert gates("stress", {**m, "net_pips": -0.01}, 0) == {"net>0 under stress": False}
+
+
+def test_best_build_tracks_the_best_failing_variant(ledger):
+    L = ledger
+    L.main(["idea", "--title", "t", "--mechanism", "m", "--hypothesis", "h", "--rules", "r"])
+    _eval(L, "R001", "fail", -1.6)
+    _eval(L, "R001", "fail", -1.1)
+    assert L.ideas()["R001"]["best"]["metrics"]["net_pips"] == -1.1

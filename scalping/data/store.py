@@ -11,6 +11,7 @@ The year directory is the partition. Days inside it are the incremental unit.
 
 from __future__ import annotations
 
+import os
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -46,7 +47,10 @@ def bar_day_path(data_dir: Path, symbol: str, day: date) -> Path:
 
 def write_parquet(frame: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".partial")
+    # Per-process temp name: two processes building the same cache file must not
+    # share (and rename away) one ".partial". os.replace is atomic, so the last
+    # writer wins with a complete file either way.
+    tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}.partial")
     frame.to_parquet(tmp, index=False)
     tmp.replace(path)
 
