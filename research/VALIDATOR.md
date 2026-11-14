@@ -42,7 +42,7 @@ python -m research.evaluate --idea Rxxx --strategy <name> --period stress
 
 **Confirm gate:** ≥60 trades · net > 0 · edge t ≥ 2.0 · ≥50% positive quarters ·
 positive edge in ≥2 of 3 years · worst quarter DD ≤ 6%.
-**Stress gate:** net > 0 with commission $5/lot/side and 3-point slippage.
+**Stress gate:** net > 0 with a 1.0-pip spread floor, 3-point slippage and the full 4%/yr funding fee on both sides.
 
 ## 5. Verdict
 

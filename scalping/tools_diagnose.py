@@ -3,7 +3,7 @@
 Reads per-block reports written with ``--trades`` and splits every trade into
 
     edge  = mid-to-mid price move in the trade's direction (pips, before any cost)
-    costs = half spread at entry + half spread at exit + slippage both ways + commission
+    costs = half spread at entry + half spread at exit + slippage both ways + commission + overnight financing
 
 so ``net = edge - costs``. Then slices edge by exit reason, session, side,
 year and holding time, and adds a t-statistic for the edge.
@@ -40,10 +40,10 @@ def load(src: Path) -> pd.DataFrame:
                     rows.append((strat["strategy"], cell["block"], t["side"], t["lots"], t["entry_time"],
                                  t["exit_time"], t["entry_price"], t["exit_price"], t["exit_reason"],
                                  t["spread_entry"], t["spread_exit"], t["slippage_entry"], t["slippage_exit"],
-                                 t["commission"], t["net_pnl"]))
+                                 t["commission"], t["net_pnl"], t.get("financing", 0.0)))
     df = pd.DataFrame(rows, columns=["strategy", "block", "side", "lots", "entry_time", "exit_time", "entry_price",
                                      "exit_price", "exit_reason", "spread_entry", "spread_exit", "slip_entry",
-                                     "slip_exit", "commission", "net_pnl"])
+                                     "slip_exit", "commission", "net_pnl", "financing"])
     df["entry_time"] = pd.to_datetime(df["entry_time"], utc=True, format="ISO8601")
     df["exit_time"] = pd.to_datetime(df["exit_time"], utc=True, format="ISO8601")
     return df
@@ -60,7 +60,8 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
     df["slip_pips"] = (df["slip_entry"] + df["slip_exit"]) / PIP
     # commission is in EUR; one pip on `lots` is 10*lots USD = 10*lots/EURUSD EUR
     df["comm_pips"] = df["commission"] * df["exit_price"] / (10.0 * df["lots"])
-    df["net_pips"] = df["edge_pips"] - df["spread_pips"] - df["slip_pips"] - df["comm_pips"]
+    df["fin_pips"] = df["financing"] * df["exit_price"] / (10.0 * df["lots"])  # overnight funding, EUR -> pips
+    df["net_pips"] = df["edge_pips"] - df["spread_pips"] - df["slip_pips"] - df["comm_pips"] - df["fin_pips"]
     df["side_label"] = np.where(long, "long", "short")
     df["hold_min"] = (df["exit_time"] - df["entry_time"]).dt.total_seconds() / 60
     df["year"] = df["entry_time"].dt.year
@@ -97,13 +98,14 @@ def diagnose(df: pd.DataFrame) -> dict:
                 "spread": round(float(g["spread_pips"].mean()), 3),
                 "slippage": round(float(g["slip_pips"].mean()), 3),
                 "commission": round(float(g["comm_pips"].mean()), 3),
-                "total": round(float((g["spread_pips"] + g["slip_pips"] + g["comm_pips"]).mean()), 3),
+                "financing": round(float(g["fin_pips"].mean()), 3),
+                "total": round(float((g["spread_pips"] + g["slip_pips"] + g["comm_pips"] + g["fin_pips"]).mean()), 3),
             },
             "avg_win_pips": round(avg_w, 2),
             "avg_loss_pips": round(avg_l, 2),
             "breakeven_win_rate": round(avg_l / (avg_w + avg_l), 3) if avg_w + avg_l else None,
             "edge_abs_move_pips": round(float(g["edge_pips"].abs().mean()), 2),
-            "cost_share_of_move": round(float((g["spread_pips"] + g["slip_pips"] + g["comm_pips"]).mean()
+            "cost_share_of_move": round(float((g["spread_pips"] + g["slip_pips"] + g["comm_pips"] + g["fin_pips"]).mean()
                                               / g["edge_pips"].abs().mean()), 3),
             "hold_minutes_median": round(float(g["hold_min"].median()), 1),
             "trades_per_quarter": round(len(g) / g["block"].nunique(), 1),
@@ -125,7 +127,7 @@ def main(src: str, out: str) -> int:
     result = {"meta": {"pair": "EURUSD", "trades": len(df), "blocks": int(df["block"].nunique()),
                        "period": f"{df['entry_time'].min():%Y-%m-%d} to {df['entry_time'].max():%Y-%m-%d}",
                        "pip": PIP, "notes": "edge = mid-to-mid move in trade direction, before all costs; "
-                                            "net = edge - spread - slippage - commission (EUR->pips at the trade exit rate)"},
+                                            "net = edge - spread - slippage - commission - financing (EUR->pips at the trade exit rate)"},
               "strategies": diagnose(df)}
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     Path(out).write_text(json.dumps(result, indent=1) + "\n")

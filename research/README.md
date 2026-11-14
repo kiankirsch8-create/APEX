@@ -22,7 +22,11 @@ any --(researcher)--> closed
   idea raises the bar (edge t +0.3 per prior eval, cap 6), which limits curve fitting by brute force.
 - **A separate validator** keeps the builder from grading its own work, and checks a source hash so a
   candidate can't be edited after it passes.
-- **Gates come from the Section A findings** (`scalping/findings/README.md`): costs are about 1.35 pips per
+- **Costs model the real target account (Capital.com CFD EURUSD):** 0.7-pip spread floor, no commission,
+  0.2-pip slippage on market/stop fills, overnight funding per 22:00 UTC rollover (long 0.0081%/night,
+  short 0.00012%). Stress test: 1.0-pip floor, 3-point slippage, full 4%/yr funding fee both ways.
+  Funding uses Nov 2026 rates for all years, which is an approximation (2020–21 rates were different).
+- **Gates come from the Section A findings** (`scalping/findings/README.md`): costs are about 1.05 pips per
   round trip, so a strategy needs a real per-trade edge well above that, consistent across years.
 
 ## Files

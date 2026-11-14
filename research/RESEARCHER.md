@@ -63,6 +63,12 @@ python -m research.evaluate --idea R004 --strategy r004_x@M15 --period build --n
 - A variant must change something you can justify from the mechanism, not just nudge a number until it passes.
 - Budget: **at most 8 build evaluations per run** in total (each takes about 2–4 minutes).
 
+**Costs (since 2026-11-14): Capital.com profile.** No commission; every tick's spread floored at
+0.7 pip (HistData's raw spread is tighter); 0.2 pip slippage on market/stop fills; overnight funding at
+22:00 UTC: long -0.0081%/night (about 0.8 pip per night per position), short about 0. Round trip intraday is about
+1.05 pips; **holding a long overnight costs about 0.8 pips more per night**. Design holding periods with that in
+mind. Ledger entries before 2026-11-14 12:00 used the old profile ($3.5/lot/side, raw spread).
+
 **Build gate** (all required): ≥200 trades · edge t ≥ 3.0 (+0.3 per prior eval) ·
 net ≥ +0.30 pips/trade · ≥60% positive quarters · worst quarter DD ≤ 6% ·
 positive edge in ≥3 of 4 years.

@@ -28,7 +28,7 @@ from scalping.costs import (
 )
 from scalping.fills import EVENT_WIDTH, get_simulate
 from scalping.instruments import Instrument
-from scalping.market import MarketData
+from scalping.market import MarketData, with_min_spread
 from scalping.strategies.base import (
     BarContext,
     BarWindow,
@@ -64,6 +64,7 @@ class Trade:
     commission: float
     net_pnl: float
     tag: str
+    financing: float = 0.0  # overnight funding paid (account currency, positive = cost)
 
     def as_dict(self) -> dict:
         return {
@@ -83,6 +84,7 @@ class Trade:
             "commission": self.commission,
             "net_pnl": self.net_pnl,
             "tag": self.tag,
+            "financing": self.financing,
         }
 
 
@@ -192,6 +194,8 @@ def run_backtest(
     if len(market) == 0:
         raise ValueError("market has no bars")
     book = fx if fx is not None else FxBook(instrument)
+    if costs.min_spread_points > 0:
+        market = with_min_spread(market, costs.min_spread_points * float(instrument.point))
     engine = _Engine(market, strategy, instrument, costs, book, float(initial_equity), flatten_end)
     return engine.run()
 
@@ -363,6 +367,18 @@ class _Engine:
             tag=tag,
         )
 
+    def _financing(self, meta, when, bid, ask) -> float:
+        """Overnight funding for every 22:00 UTC rollover between entry and exit."""
+        pct = self.costs.financing_long_pct if meta.side == 1 else self.costs.financing_short_pct
+        if pct == 0.0:
+            return 0.0
+        day, roll = 86_400_000_000_000, 22 * 3_600_000_000_000
+        nights = (int(when) - roll) // day - (int(meta.entry_time_ns) - roll) // day
+        if nights <= 0:
+            return 0.0
+        notional = abs(meta.lots) * float(self.instrument.contract_size)
+        return self.fx.to_eur(notional * pct / 100.0 * nights, self.instrument.base, when, bid, ask)
+
     def _close_position(self, slot, price, bid, ask, when, reason, slip) -> None:
         meta = self.pos_meta[slot]
         if meta is None:
@@ -376,8 +392,9 @@ class _Engine:
             bid,
             ask,
         )
-        self.cash += gross - exit_comm
-        net = gross - meta.entry_commission - exit_comm
+        financing = self._financing(meta, when, bid, ask)
+        self.cash += gross - exit_comm - financing
+        net = gross - meta.entry_commission - exit_comm - financing
         self.trades.append(
             Trade(
                 symbol=self.instrument.symbol,
@@ -396,6 +413,7 @@ class _Engine:
                 commission=meta.entry_commission + exit_comm,
                 net_pnl=net,
                 tag=meta.tag,
+                financing=financing,
             )
         )
         self.pos_meta[slot] = None

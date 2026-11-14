@@ -13,7 +13,7 @@ Gates (see research/README.md for the reasoning):
            positive edge in >= 3 of 4 build years; max 6 build evals per idea
   confirm  trades >= 60, net > 0, edge t >= 2.0, >= 50% positive quarters,
            positive edge in >= 2 of 3 years, worst quarter DD <= 6%
-  stress   confirm period with commission 5.0/lot/side and 3-point slippage: net > 0
+  stress   confirm period with 1.0-pip spread floor, 3-point slippage, 4%/yr funding both sides: net > 0
 """
 
 from __future__ import annotations
@@ -144,7 +144,8 @@ def evaluate(names: list[str], period: str, idea: str, note: str, keep_trades: b
              "pos_quarters": round(sum(c["net_return"] > 0 for c in q.values()) / max(len(q), 1), 3),
              "worst_dd": round(max((c["max_drawdown"] for c in q.values()), default=0.0), 4),
              "sum_return": round(sum(c["net_return"] for c in q.values()), 4),
-             "costs_pips": round(float((g["spread_pips"] + g["slip_pips"] + g["comm_pips"]).mean()), 3) if len(g) else 0,
+             "costs_pips": round(float((g["spread_pips"] + g["slip_pips"] + g["comm_pips"] + g["fin_pips"]).mean()), 3) if len(g) else 0,
+             "financing_pips": round(float(g["fin_pips"].mean()), 3) if len(g) else 0,
              "by_year": {str(k): edge_stats(v) for k, v in g.groupby("year")} if len(g) else {},
              "by_session": {k: edge_stats(v) for k, v in g.groupby("session")} if len(g) else {},
              "by_side": {k: edge_stats(v) for k, v in g.groupby("side_label")} if len(g) else {}}

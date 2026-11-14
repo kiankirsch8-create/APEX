@@ -78,3 +78,24 @@ def build_market(ticks: pd.DataFrame, bars: pd.DataFrame) -> MarketData:
         tick_start=np.ascontiguousarray(start[keep].astype(np.int64)),
         tick_end=np.ascontiguousarray(end[keep].astype(np.int64)),
     )
+
+
+def with_min_spread(market: MarketData, floor: float) -> MarketData:
+    """Widen every tick tighter than ``floor`` (price units) symmetrically around its mid.
+
+    Bar OHLC are mids and stay unchanged; bar spreads are floored the same way.
+    Used to model a spread-only broker on top of a tighter raw feed.
+    """
+    from dataclasses import replace
+
+    if floor <= 0:
+        return market
+    spread = market.ask - market.bid
+    widen = np.maximum(floor - spread, 0.0) / 2.0
+    return replace(
+        market,
+        bid=np.ascontiguousarray(market.bid - widen),
+        ask=np.ascontiguousarray(market.ask + widen),
+        spread_close=np.ascontiguousarray(np.maximum(market.spread_close, floor)),
+        spread_mean=np.ascontiguousarray(np.maximum(market.spread_mean, floor)),
+    )

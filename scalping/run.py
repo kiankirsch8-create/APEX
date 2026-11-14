@@ -242,6 +242,9 @@ def _costs_from(cfg: ScalpingConfig, args) -> CostModel:
             args.slippage_points if args.slippage_points is not None else cfg.costs.slippage_points
         ),
         account_currency=cfg.costs.account_currency,
+        min_spread_points=cfg.costs.min_spread_points,
+        financing_long_pct=cfg.costs.financing_long_pct,
+        financing_short_pct=cfg.costs.financing_short_pct,
     )
 
 

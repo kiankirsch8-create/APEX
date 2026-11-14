@@ -39,21 +39,35 @@ class FillKind(str, Enum):
 
 @dataclass(frozen=True)
 class CostModel:
-    """Account-currency commission and market-order slippage.
+    """Account-currency commission, market-order slippage, broker spread floor
+    and overnight financing.
 
-    There is deliberately no spread field. The spread is the tick's ask − bid.
+    The spread is the tick's ask − bid. ``min_spread_points`` (default 0, off)
+    widens any tick whose spread is tighter than the broker's, symmetrically
+    around the mid, so a raw ECN/aggregator feed can model a spread-only CFD
+    broker (Capital.com EURUSD: about 7 points = 0.7 pip, no commission).
+
+    ``financing_long_pct`` / ``financing_short_pct`` are the overnight funding
+    cost per night as a percent of position notional (positive = you pay),
+    charged for every 22:00 UTC rollover a position is held across, weekend
+    nights included (calendar-day accrual, as CFD brokers charge).
     """
 
     commission_per_lot_side: float = 3.5
     commission_currency: str = "USD"
     slippage_points: float = 2.0
     account_currency: str = "EUR"
+    min_spread_points: float = 0.0
+    financing_long_pct: float = 0.0
+    financing_short_pct: float = 0.0
 
     def __post_init__(self) -> None:
         if self.commission_per_lot_side < 0:
             raise ValueError("commission_per_lot_side must be >= 0")
         if self.slippage_points < 0:
             raise ValueError("slippage_points must be >= 0")
+        if self.min_spread_points < 0:
+            raise ValueError("min_spread_points must be >= 0")
         object.__setattr__(self, "commission_currency", self.commission_currency.upper())
         object.__setattr__(self, "account_currency", self.account_currency.upper())
 
@@ -70,6 +84,9 @@ class CostModel:
             "commission_currency": self.commission_currency,
             "slippage_points": self.slippage_points,
             "account_currency": self.account_currency,
+            "min_spread_points": self.min_spread_points,
+            "financing_long_pct": self.financing_long_pct,
+            "financing_short_pct": self.financing_short_pct,
         }
 
 

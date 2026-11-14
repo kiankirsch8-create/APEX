@@ -4,7 +4,7 @@
   ],
   "account_currency": "EUR",
   "initial_equity": 100000.0,
-  "commission_per_lot_side": 5.0,
+  "commission_per_lot_side": 0.0,
   "commission_currency": "USD",
   "slippage_points": 3.0,
   "data_dir": "scalping_data",
@@ -72,5 +72,9 @@
       "start": "2024-10-01",
       "end": "2025-01-01"
     }
-  ]
+  ],
+  "broker_profile": "Capital.com stress: 1.0 pip spread floor, 3-point slippage, full 4%/yr funding fee both sides",
+  "min_spread_points": 10.0,
+  "financing_long_pct": 0.0111,
+  "financing_short_pct": 0.0111
 }

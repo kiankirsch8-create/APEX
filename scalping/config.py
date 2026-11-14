@@ -66,6 +66,9 @@ def load_config(path: str | Path | None = None) -> ScalpingConfig:
         commission_currency=str(raw.get("commission_currency", "USD")).upper(),
         slippage_points=float(raw.get("slippage_points", 2.0)),
         account_currency=str(raw.get("account_currency", "EUR")).upper(),
+        min_spread_points=float(raw.get("min_spread_points", 0.0)),
+        financing_long_pct=float(raw.get("financing_long_pct", 0.0)),
+        financing_short_pct=float(raw.get("financing_short_pct", 0.0)),
     )
     data_dir = Path(raw.get("data_dir", "scalping_data"))
     return ScalpingConfig(
