@@ -6,6 +6,11 @@
 //   (his examples: $160-650/contract = 8-32 pts), v1 used 2 pts -> oversized positions + margin calls;
 //   (3) contract cap + margin check; (4) backup exit if price closes beyond the stop; (5) aggression average
 //   from NY-session bars only; (6) entry label shows LVN / delta / stop / target.
+// v3 fixes (from v2 trade list, 102 trades): (7) stop + target re-anchored to the ACTUAL fill price on the
+//   entry bar (v2 kept the signal-close stop -> 9 trades with the stop on the wrong side); (8) breakeven only
+//   if the bar closes beyond the new stop (v2 moved to BE and the backup closed the same bar at a loss, 24 trades);
+//   (9) if a position ever has no stop, one is set from the fill and a red 'NO STOP' label marks it (9 v2 trades
+//   ran to EOD with no working stop); (10) stop/target lines drawn for every trade.
 // Rule sheet: research/existing/rulesheets/VALENTINI-1_TREND.md  (row ids in comments)
 //
 // Chart: NQ1! (or MNQ1!), 1-minute (E7). Needs TradingView Premium (request.footprint).
@@ -32,7 +37,7 @@
 //  S2 "previous day"          -> previous RTH session 09:30-16:00 NY (input)
 // NOT implemented: S3 compression-area profile, X6 discretionary early exit, X7 adding.
 // ============================================================================
-strategy("VALENTINI-1 · Trend model v2 (PROXY)", overlay = true, process_orders_on_close = false,
+strategy("VALENTINI-1 · Trend model v3 (PROXY)", overlay = true, process_orders_on_close = false,
      default_qty_type = strategy.fixed, default_qty_value = 1, initial_capital = 100000,
      currency = currency.USD, commission_type = strategy.commission.cash_per_contract,
      commission_value = 2.5, slippage = 1, margin_long = 5, margin_short = 5,
@@ -354,6 +359,8 @@ var float tgtPx = na
 var float stp = na
 var float entryExt = na
 var bool beDone = false
+var float sigDist = na
+var bool posInit = false
 
 if trig
     float dist = math.abs(close - stopPx)
@@ -364,6 +371,8 @@ if trig
     if q > 0
         tgtPx := f_target(dir, close, dist)
         stp := stopPx
+        sigDist := dist
+        posInit := false
         entryExt := legExt
         beDone := false
         label.new(bar_index, dir == 1 ? low : high, (dir == 1 ? "V1 L" : "V1 S") + "\nLVN " + str.tostring(lvnLo, format.mintick) + "\ndelta " + str.tostring(fpDelta, "#") + " (avg " + str.tostring(avgAbsDelta, "#") + ")\nstop " + str.tostring(stp, format.mintick) + "\ntgt " + str.tostring(tgtPx, format.mintick), style = dir == 1 ? label.style_label_up : label.style_label_down, color = color.new(dir == 1 ? color.teal : color.maroon, 10), textcolor = color.white, size = size.tiny)
@@ -378,15 +387,29 @@ if trig
         dir := 0
 
 // ---------------- management (X5) ----------------
+// v3: on the first bar in a position, re-anchor stop/target to the real fill price
+if strategy.position_size == 0
+    posInit := false
+else if not posInit
+    float avg0 = strategy.position_avg_price
+    int pd = strategy.position_size > 0 ? 1 : -1
+    bool hadStop = not na(stp)
+    float d0 = na(sigDist) ? minStopTicks * syminfo.mintick : sigDist
+    stp := pd == 1 ? avg0 - d0 : avg0 + d0
+    tgtPx := f_target(pd, avg0, d0)
+    posInit := true
+    if not hadStop
+        label.new(bar_index, high, "NO STOP (fixed)", color = color.red, textcolor = color.white, size = size.tiny)
+
 if strategy.position_size > 0
-    if useBE and not beDone and high > entryExt
+    if useBE and not beDone and high > entryExt and close > strategy.position_avg_price + syminfo.mintick
         stp := math.max(stp, strategy.position_avg_price + syminfo.mintick)
         beDone := true
     strategy.exit("XL", "L", stop = stp, limit = tgtPx)
     if close < stp
         strategy.close("L", comment = "backup stop")
 if strategy.position_size < 0
-    if useBE and not beDone and low < entryExt
+    if useBE and not beDone and low < entryExt and close < strategy.position_avg_price - syminfo.mintick
         stp := math.min(stp, strategy.position_avg_price - syminfo.mintick)
         beDone := true
     strategy.exit("XS", "S", stop = stp, limit = tgtPx)
@@ -419,7 +442,7 @@ if showDash and barstate.islast
     float al = strategy.losstrades > 0 ? strategy.grossloss / strategy.losstrades : na
     float np = strategy.netprofit
     color pc = np >= 0 ? color.lime : color.red
-    f_row(0, "VALENTINI-1 trend v2", "grade: PROXY", color.yellow)
+    f_row(0, "VALENTINI-1 trend v3", "grade: PROXY", color.yellow)
     f_row(1, "Net P&L", str.tostring(np, "#,##0") + " $  (" + str.tostring(100 * np / strategy.initial_capital, "0.00") + "%)", pc)
     f_row(2, "Closed trades", str.tostring(ct), color.white)
     f_row(3, "Win rate", na(wr) ? "-" : str.tostring(wr, "0.0") + "%", color.white)
