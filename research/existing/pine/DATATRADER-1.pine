@@ -13,16 +13,17 @@
 //     K x ATR away, use the highest high / lowest low of the last N bars instead.
 //  5. Target = 2R.  Same NY day only. Several setups per day allowed, one position at a time.
 //
-// Costs: set them under Settings -> Properties. Defaults model Capital.com EURUSD
-// (about 0.7 pip spread = 0.000035 per unit per side, plus 2 ticks = 0.2 pip slippage).
-// For other symbols, change commission / slippage there.
+// Order size and costs: set them per market under Settings -> Properties (defaults are neutral:
+// 1 contract/unit, no commission, 1 tick slippage).
+//   EURUSD (Capital.com): order size 10000, commission 0.000035 per contract (about 0.7 pip spread), slippage 2 ticks
+//   NQ1! futures:         order size 1, commission = your broker's per-contract fee per side, slippage 1 tick
 
 strategy("DATATRADER-1 · 4H NY range fakeout", overlay = true,
      process_orders_on_close = true,
-     default_qty_type = strategy.fixed, default_qty_value = 10000,
-     initial_capital = 10000, currency = currency.USD,
-     commission_type = strategy.commission.cash_per_contract, commission_value = 0.000035,
-     slippage = 2, max_bars_back = 500)
+     default_qty_type = strategy.fixed, default_qty_value = 1,
+     initial_capital = 100000, currency = currency.USD,
+     commission_type = strategy.commission.cash_per_contract, commission_value = 0,
+     slippage = 1, max_bars_back = 500)
 
 // ── Inputs ────────────────────────────────────────────────────────────────
 TZ          = "America/New_York"
