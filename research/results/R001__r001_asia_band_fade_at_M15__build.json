@@ -1,0 +1,214 @@
+{
+ "idea": "R001",
+ "strategy": "r001_asia_band_fade@M15",
+ "period": "build",
+ "verdict": "fail",
+ "checks": {
+  "trades>=200": true,
+  "edge_t>=3.0": false,
+  "net>=+0.30": false,
+  "pos_quarters>=60%": false,
+  "worst_dd<=6%": true,
+  "edge+ in >=3/4 years": false
+ },
+ "metrics": {
+  "trades": 1853,
+  "edge_pips": -0.426,
+  "edge_t": -2.3,
+  "net_pips": -1.631,
+  "win_rate": 0.402,
+  "pos_quarters": 0.0,
+  "worst_dd": 0.0033,
+  "sum_return": -0.026,
+  "costs_pips": 1.205,
+  "by_year": {
+   "2018": {
+    "trades": 503,
+    "edge_pips": -0.334,
+    "edge_t": -0.95,
+    "net_pips": -1.631,
+    "win_rate": 0.396
+   },
+   "2019": {
+    "trades": 338,
+    "edge_pips": -0.286,
+    "edge_t": -0.88,
+    "net_pips": -1.481,
+    "win_rate": 0.42
+   },
+   "2020": {
+    "trades": 528,
+    "edge_pips": -0.475,
+    "edge_t": -1.06,
+    "net_pips": -1.647,
+    "win_rate": 0.417
+   },
+   "2021": {
+    "trades": 484,
+    "edge_pips": -0.567,
+    "edge_t": -2.04,
+    "net_pips": -1.717,
+    "win_rate": 0.38
+   }
+  },
+  "by_session": {
+   "asia 22-07": {
+    "trades": 1853,
+    "edge_pips": -0.426,
+    "edge_t": -2.3,
+    "net_pips": -1.631,
+    "win_rate": 0.402
+   }
+  },
+  "by_side": {
+   "long": {
+    "trades": 871,
+    "edge_pips": 0.086,
+    "edge_t": 0.32,
+    "net_pips": -1.118,
+    "win_rate": 0.421
+   },
+   "short": {
+    "trades": 982,
+    "edge_pips": -0.88,
+    "edge_t": -3.46,
+    "net_pips": -2.085,
+    "win_rate": 0.385
+   }
+  }
+ },
+ "params": {
+  "timeframe_minutes": 15,
+  "period": 20,
+  "num_std": 2.5,
+  "sl_std": 2.0,
+  "min_snap_pips": 5.0,
+  "max_hold_bars": 8,
+  "bar_minutes": 15,
+  "lots": 0.1,
+  "max_spread_points": 20.0
+ },
+ "source_sha": "fa9454915e770a84",
+ "note": "pre-registered rules, first variant",
+ "quarters": {
+  "2018Q1": {
+   "net_return": -0.00063159,
+   "trade_count": 149,
+   "win_rate": 0.44966443,
+   "max_drawdown": 0.00160983,
+   "profit_factor": 0.87966405
+  },
+  "2018Q2": {
+   "net_return": -0.00272399,
+   "trade_count": 143,
+   "win_rate": 0.36363636,
+   "max_drawdown": 0.00295717,
+   "profit_factor": 0.50301934
+  },
+  "2018Q3a": {
+   "net_return": -0.00066129,
+   "trade_count": 53,
+   "win_rate": 0.37735849,
+   "max_drawdown": 0.00092916,
+   "profit_factor": 0.60628836
+  },
+  "2018Q3b": {
+   "net_return": -0.00047536,
+   "trade_count": 43,
+   "win_rate": 0.41860465,
+   "max_drawdown": 0.00065288,
+   "profit_factor": 0.65162554
+  },
+  "2018Q4": {
+   "net_return": -0.00250341,
+   "trade_count": 115,
+   "win_rate": 0.36521739,
+   "max_drawdown": 0.0025737,
+   "profit_factor": 0.43875736
+  },
+  "2019Q1": {
+   "net_return": -0.0013948,
+   "trade_count": 105,
+   "win_rate": 0.40952381,
+   "max_drawdown": 0.00159197,
+   "profit_factor": 0.58606441
+  },
+  "2019Q2": {
+   "net_return": -0.00094183,
+   "trade_count": 85,
+   "win_rate": 0.43529412,
+   "max_drawdown": 0.00117264,
+   "profit_factor": 0.57565008
+  },
+  "2019Q3": {
+   "net_return": -0.00131692,
+   "trade_count": 89,
+   "win_rate": 0.40449438,
+   "max_drawdown": 0.00142734,
+   "profit_factor": 0.55562096
+  },
+  "2019Q4": {
+   "net_return": -0.00079063,
+   "trade_count": 59,
+   "win_rate": 0.44067797,
+   "max_drawdown": 0.00092991,
+   "profit_factor": 0.46088563
+  },
+  "2020Q1": {
+   "net_return": -0.00083479,
+   "trade_count": 89,
+   "win_rate": 0.48314607,
+   "max_drawdown": 0.00130504,
+   "profit_factor": 0.82169522
+  },
+  "2020Q2": {
+   "net_return": -0.00219489,
+   "trade_count": 130,
+   "win_rate": 0.40769231,
+   "max_drawdown": 0.00315999,
+   "profit_factor": 0.58483055
+  },
+  "2020Q3": {
+   "net_return": -0.00265926,
+   "trade_count": 169,
+   "win_rate": 0.3964497,
+   "max_drawdown": 0.00331128,
+   "profit_factor": 0.62209491
+  },
+  "2020Q4": {
+   "net_return": -0.00186589,
+   "trade_count": 140,
+   "win_rate": 0.40714286,
+   "max_drawdown": 0.00202458,
+   "profit_factor": 0.6529247
+  },
+  "2021Q1": {
+   "net_return": -0.00175206,
+   "trade_count": 144,
+   "win_rate": 0.41666667,
+   "max_drawdown": 0.00185624,
+   "profit_factor": 0.62691455
+  },
+  "2021Q2": {
+   "net_return": -0.00233166,
+   "trade_count": 123,
+   "win_rate": 0.31707317,
+   "max_drawdown": 0.00254895,
+   "profit_factor": 0.40729084
+  },
+  "2021Q3": {
+   "net_return": -0.00060889,
+   "trade_count": 93,
+   "win_rate": 0.47311828,
+   "max_drawdown": 0.00117656,
+   "profit_factor": 0.73324029
+  },
+  "2021Q4": {
+   "net_return": -0.0023313,
+   "trade_count": 124,
+   "win_rate": 0.33064516,
+   "max_drawdown": 0.00258841,
+   "profit_factor": 0.40977251
+  }
+ }
+}
