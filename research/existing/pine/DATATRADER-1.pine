@@ -23,7 +23,8 @@ strategy("DATATRADER-1 · 4H NY range fakeout", overlay = true,
      default_qty_type = strategy.fixed, default_qty_value = 1,
      initial_capital = 100000, currency = currency.USD,
      commission_type = strategy.commission.cash_per_contract, commission_value = 0,
-     slippage = 1, max_bars_back = 500)
+     slippage = 1, max_bars_back = 500,
+     margin_long = 5, margin_short = 5)   // futures-style margin; at the v6 default (100%) one NQ contract (~$350k) is rejected
 
 // ── Inputs ────────────────────────────────────────────────────────────────
 TZ          = "America/New_York"
