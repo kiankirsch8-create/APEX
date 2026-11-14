@@ -8,12 +8,15 @@ Strategies are found in the harness registry and in ``research/strategies/*.py``
 Every run is appended to ``research/ledger.jsonl`` automatically, pass or fail.
 
 Gates (see research/README.md for the reasoning):
-  build    trades >= 200, edge t >= 3.0 + 0.3 * prior build evals of this idea,
+  build    needs a passing `research.check` for this exact code, and (for a revision) a post-mortem of
+           the previous failure. trades >= 200, edge t >= 3.0 + 0.3 * prior build evals of this idea,
            net >= +0.30 pips/trade, >= 60% positive quarters, worst quarter DD <= 6%,
-           positive edge in >= 3 of 4 build years; max 6 build evals per idea
+           positive edge in >= 3 of 4 build years. 3 failed builds -> family to the graveyard.
   confirm  trades >= 60, net > 0, edge t >= 2.0, >= 50% positive quarters,
            positive edge in >= 2 of 3 years, worst quarter DD <= 6%
   stress   confirm period with 1.0-pip spread floor, 3-point slippage, 4%/yr funding both sides: net > 0
+  confirm/stress need a passed robustness run (research.robustness) for the same code. Their numbers go to
+  research/holdout/ (gitignored, published on the `holdout` branch); the ledger records pass/fail only.
 """
 
 from __future__ import annotations
@@ -44,7 +47,7 @@ CONFIGS = {
     "confirm": ROOT / "config_confirm.json",
     "stress": ROOT / "config_confirm_stress.json",
 }
-MAX_BUILD_EVALS = 6
+HOLDOUT_DIR = ROOT / "holdout"
 
 
 def source_sha(name: str) -> str:
@@ -102,12 +105,24 @@ def evaluate(names: list[str], period: str, idea: str, note: str, keep_trades: b
         print("Run research/bootstrap.sh with the right role first.", file=sys.stderr)
         return 2
     prior = ledger.build_evals(idea)
-    if period == "build" and prior + len(names) > MAX_BUILD_EVALS:
-        print(f"ERROR: idea {idea} already has {prior} build evaluations; the cap is {MAX_BUILD_EVALS}. "
-              "Close it and write a new idea with a genuinely different mechanism.", file=sys.stderr)
-        return 3
     for n in names:
         get_strategy(n)  # fail fast on typos
+    if period == "build":
+        if len(names) != 1:
+            print("ERROR: one strategy per build evaluation (each is an attempt of the family).", file=sys.stderr)
+            return 3
+        ok, why = ledger.can_build(idea, source_sha(names[0]))
+        if not ok:
+            print(f"ERROR: {why}", file=sys.stderr)
+            return 3
+    else:
+        robust_ok = {e["source_sha"] for e in ledger.entries() if e["kind"] == "eval" and e.get("idea") == idea
+                     and e["period"] == "robust" and e["verdict"] == "pass"}
+        for n in names:
+            if source_sha(n) not in robust_ok:
+                print(f"ERROR: {n} has no passed robustness run for this exact code "
+                      "(python -m research.robustness). Confirm data is not spent before that.", file=sys.stderr)
+                return 3
 
     tmp = REPO / ".research_tmp" / f"{period}_{os.getpid()}"
     tmp.mkdir(parents=True, exist_ok=True)
@@ -156,12 +171,20 @@ def evaluate(names: list[str], period: str, idea: str, note: str, keep_trades: b
                   "metrics": m, "params": params, "source_sha": source_sha(n), "note": note,
                   "quarters": {b: {k: c[k] for k in ("net_return", "trade_count", "win_rate", "max_drawdown",
                                                      "profit_factor")} for b, c in q.items()}}
-        out = ROOT / "results" / f"{idea}__{n.replace('@', '_at_')}__{period}.json"
+        holdout = period != "build"
+        out_dir = HOLDOUT_DIR if holdout else ROOT / "results"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out = out_dir / f"{idea}__{n.replace('@', '_at_')}__{period}.json"
         out.write_text(json.dumps(result, indent=1, default=str) + "\n")
-        ledger.append({"kind": "eval", "idea": idea, "strategy": n, "period": period, "verdict": verdict,
-                       "checks": checks, "params": params, "source_sha": result["source_sha"], "note": note,
-                       "metrics": {k: m[k] for k in ("trades", "edge_pips", "edge_t", "net_pips", "win_rate",
-                                                     "pos_quarters", "worst_dd", "sum_return", "costs_pips")}})
+        entry = {"kind": "eval", "idea": idea, "strategy": n, "period": period, "verdict": verdict,
+                 "params": params, "source_sha": result["source_sha"], "note": note}
+        if holdout:
+            entry["metrics"] = {}          # blind wall: no 2022-2024 numbers on the research branch
+        else:
+            entry["checks"] = checks
+            entry["metrics"] = {k: m[k] for k in ("trades", "edge_pips", "edge_t", "net_pips", "win_rate",
+                                                  "pos_quarters", "worst_dd", "sum_return", "costs_pips")}
+        ledger.append(entry)
         if period == "build":
             prior += 1
         failed = [k for k, ok in checks.items() if not ok]

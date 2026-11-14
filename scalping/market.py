@@ -27,6 +27,16 @@ class MarketData:
     volume: np.ndarray
     tick_start: np.ndarray
     tick_end: np.ndarray
+    # Per-bar features (always filled by build_market; None only for hand-built objects)
+    tick_count: np.ndarray | None = None       # ticks in the minute (arrival rate)
+    spread_high_raw: np.ndarray | None = None  # widest RAW spread in the minute (before any broker floor)
+    upticks: np.ndarray | None = None          # ticks where the mid rose
+    downticks: np.ndarray | None = None        # ticks where the mid fell
+    london_minute: np.ndarray | None = None    # minute of day in Europe/London (DST-aware) at bar open
+    ny_minute: np.ndarray | None = None        # minute of day in America/New_York (DST-aware) at bar open
+    weekday: np.ndarray | None = None          # UTC weekday at bar open, Monday = 0
+    news_next_min: np.ndarray | None = None    # minutes from bar close to the next calendar event (inf if none)
+    news_last_min: np.ndarray | None = None    # minutes from the last calendar event to bar close (inf if none)
 
     def __len__(self) -> int:
         return int(self.bar_time.shape[0])
@@ -77,7 +87,40 @@ def build_market(ticks: pd.DataFrame, bars: pd.DataFrame) -> MarketData:
         volume=np.ascontiguousarray(volume[keep]),
         tick_start=np.ascontiguousarray(start[keep].astype(np.int64)),
         tick_end=np.ascontiguousarray(end[keep].astype(np.int64)),
+        **bar_features(ticks, bars, start[keep], end[keep], bar_time[keep]),
     )
+
+
+def bar_features(ticks: pd.DataFrame, bars: pd.DataFrame, start: np.ndarray, end: np.ndarray,
+                 bar_time: np.ndarray) -> dict:
+    """Tick-derived and clock features per kept bar. See MarketData field comments."""
+    from scalping.data.calendar import news_distances
+
+    bid = ticks["bid"].to_numpy(dtype=np.float64)
+    ask = ticks["ask"].to_numpy(dtype=np.float64)
+    mid = (bid + ask) / 2.0
+    step = np.sign(np.diff(mid, prepend=mid[:1]))
+    up_cs = np.concatenate([[0], np.cumsum(step > 0)])
+    dn_cs = np.concatenate([[0], np.cumsum(step < 0)])
+    spread = ask - bid
+    spread_high = np.maximum.reduceat(spread, start) if len(start) else np.zeros(0)
+    # reduceat runs to the next start; ticks between bars do not exist, so this equals the bar slice
+    stamps = pd.DatetimeIndex(bar_time.astype("datetime64[ns]")).tz_localize("UTC")
+    london = stamps.tz_convert("Europe/London")
+    ny = stamps.tz_convert("America/New_York")
+    close_ns = bar_time.astype("datetime64[ns]").astype(np.int64) + 60_000_000_000
+    nxt, last = news_distances(close_ns)
+    return {
+        "tick_count": np.ascontiguousarray((end - start).astype(np.float64)),
+        "spread_high_raw": np.ascontiguousarray(spread_high.astype(np.float64)),
+        "upticks": np.ascontiguousarray((up_cs[end] - up_cs[start]).astype(np.float64)),
+        "downticks": np.ascontiguousarray((dn_cs[end] - dn_cs[start]).astype(np.float64)),
+        "london_minute": np.ascontiguousarray((london.hour * 60 + london.minute).to_numpy(dtype=np.float64)),
+        "ny_minute": np.ascontiguousarray((ny.hour * 60 + ny.minute).to_numpy(dtype=np.float64)),
+        "weekday": np.ascontiguousarray(stamps.weekday.to_numpy(dtype=np.float64)),
+        "news_next_min": np.ascontiguousarray(nxt),
+        "news_last_min": np.ascontiguousarray(last),
+    }
 
 
 def with_min_spread(market: MarketData, floor: float) -> MarketData:

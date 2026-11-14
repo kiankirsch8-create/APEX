@@ -1,0 +1,284 @@
+date,local_time,tz,event,impact,note
+2018-01-05,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2018-01-12,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2018-01-25,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2018-01-31,14:00,America/New_York,FOMC,high,scheduled statement
+2018-02-02,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2018-02-14,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2018-03-08,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2018-03-09,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2018-03-13,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2018-03-21,14:00,America/New_York,FOMC,high,scheduled statement
+2018-04-06,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2018-04-11,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2018-04-26,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2018-05-02,14:00,America/New_York,FOMC,high,scheduled statement
+2018-05-04,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2018-05-10,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2018-06-01,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2018-06-12,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2018-06-13,14:00,America/New_York,FOMC,high,scheduled statement
+2018-06-14,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2018-07-06,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2018-07-12,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2018-07-26,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2018-08-01,14:00,America/New_York,FOMC,high,scheduled statement
+2018-08-03,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2018-08-10,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2018-09-07,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2018-09-13,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2018-09-13,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2018-09-26,14:00,America/New_York,FOMC,high,scheduled statement
+2018-10-05,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2018-10-11,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2018-10-25,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2018-11-02,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2018-11-08,14:00,America/New_York,FOMC,high,scheduled statement
+2018-11-14,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2018-12-07,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2018-12-12,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2018-12-13,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2018-12-19,14:00,America/New_York,FOMC,high,scheduled statement
+2019-01-04,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2019-01-11,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2019-01-24,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2019-01-30,14:00,America/New_York,FOMC,high,scheduled statement
+2019-02-01,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2019-02-13,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2019-03-07,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2019-03-08,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2019-03-12,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2019-03-20,14:00,America/New_York,FOMC,high,scheduled statement
+2019-04-05,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2019-04-10,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2019-04-10,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2019-05-01,14:00,America/New_York,FOMC,high,scheduled statement
+2019-05-03,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2019-05-10,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2019-06-06,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2019-06-07,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2019-06-12,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2019-06-19,14:00,America/New_York,FOMC,high,scheduled statement
+2019-07-05,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2019-07-11,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2019-07-25,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2019-07-31,14:00,America/New_York,FOMC,high,scheduled statement
+2019-08-02,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2019-08-13,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2019-09-06,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2019-09-12,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2019-09-12,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2019-09-18,14:00,America/New_York,FOMC,high,scheduled statement
+2019-10-04,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2019-10-10,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2019-10-24,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2019-10-30,14:00,America/New_York,FOMC,high,scheduled statement
+2019-11-01,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2019-11-13,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2019-12-06,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2019-12-11,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2019-12-11,14:00,America/New_York,FOMC,high,scheduled statement
+2019-12-12,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2020-01-10,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2020-01-14,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2020-01-23,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2020-01-29,14:00,America/New_York,FOMC,high,scheduled statement
+2020-02-07,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2020-02-13,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2020-03-03,10:00,America/New_York,FOMC,high,unscheduled emergency cut
+2020-03-06,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2020-03-11,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2020-03-12,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2020-03-15,17:00,America/New_York,FOMC,high,unscheduled emergency cut (Sunday)
+2020-03-18,23:30,Europe/Berlin,ECB,high,unscheduled PEPP announcement
+2020-03-23,08:00,America/New_York,FOMC,high,unscheduled QE announcement
+2020-04-03,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2020-04-10,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2020-04-29,14:00,America/New_York,FOMC,high,scheduled statement
+2020-04-30,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2020-05-08,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2020-05-12,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2020-06-04,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2020-06-05,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2020-06-10,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2020-06-10,14:00,America/New_York,FOMC,high,scheduled statement
+2020-07-02,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2020-07-14,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2020-07-16,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2020-07-29,14:00,America/New_York,FOMC,high,scheduled statement
+2020-08-07,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2020-08-12,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2020-09-04,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2020-09-10,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2020-09-11,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2020-09-16,14:00,America/New_York,FOMC,high,scheduled statement
+2020-10-02,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2020-10-13,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2020-10-29,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2020-11-05,14:00,America/New_York,FOMC,high,scheduled statement
+2020-11-06,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2020-11-12,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2020-12-04,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2020-12-10,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2020-12-10,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2020-12-16,14:00,America/New_York,FOMC,high,scheduled statement
+2021-01-08,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2021-01-13,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2021-01-21,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2021-01-27,14:00,America/New_York,FOMC,high,scheduled statement
+2021-02-05,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2021-02-10,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2021-03-05,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2021-03-10,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2021-03-11,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2021-03-17,14:00,America/New_York,FOMC,high,scheduled statement
+2021-04-02,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2021-04-13,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2021-04-22,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2021-04-28,14:00,America/New_York,FOMC,high,scheduled statement
+2021-05-07,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2021-05-12,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2021-06-04,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2021-06-10,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2021-06-10,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2021-06-16,14:00,America/New_York,FOMC,high,scheduled statement
+2021-07-02,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2021-07-13,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2021-07-22,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2021-07-28,14:00,America/New_York,FOMC,high,scheduled statement
+2021-08-06,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2021-08-11,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2021-09-03,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2021-09-09,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2021-09-14,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2021-09-22,14:00,America/New_York,FOMC,high,scheduled statement
+2021-10-08,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2021-10-13,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2021-10-28,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2021-11-03,14:00,America/New_York,FOMC,high,scheduled statement
+2021-11-05,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2021-11-10,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2021-12-03,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2021-12-10,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2021-12-15,14:00,America/New_York,FOMC,high,scheduled statement
+2021-12-16,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2022-01-07,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2022-01-12,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2022-01-26,14:00,America/New_York,FOMC,high,scheduled statement
+2022-02-03,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2022-02-04,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2022-02-10,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2022-03-04,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2022-03-10,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2022-03-10,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2022-03-16,14:00,America/New_York,FOMC,high,scheduled statement
+2022-04-01,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2022-04-12,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2022-04-14,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2022-05-04,14:00,America/New_York,FOMC,high,scheduled statement
+2022-05-06,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2022-05-11,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2022-06-03,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2022-06-09,13:45,Europe/Berlin,ECB,high,monetary policy decision
+2022-06-10,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2022-06-15,14:00,America/New_York,FOMC,high,scheduled statement
+2022-07-08,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2022-07-13,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2022-07-21,14:15,Europe/Berlin,ECB,high,monetary policy decision
+2022-07-27,14:00,America/New_York,FOMC,high,scheduled statement
+2022-08-05,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2022-08-10,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2022-09-02,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2022-09-08,14:15,Europe/Berlin,ECB,high,monetary policy decision
+2022-09-13,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2022-09-21,14:00,America/New_York,FOMC,high,scheduled statement
+2022-10-07,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2022-10-13,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2022-10-27,14:15,Europe/Berlin,ECB,high,monetary policy decision
+2022-11-02,14:00,America/New_York,FOMC,high,scheduled statement
+2022-11-04,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2022-11-10,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2022-12-02,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2022-12-13,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2022-12-14,14:00,America/New_York,FOMC,high,scheduled statement
+2022-12-15,14:15,Europe/Berlin,ECB,high,monetary policy decision
+2023-01-06,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2023-01-12,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2023-02-01,14:00,America/New_York,FOMC,high,scheduled statement
+2023-02-02,14:15,Europe/Berlin,ECB,high,monetary policy decision
+2023-02-03,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2023-02-14,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2023-03-10,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2023-03-14,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2023-03-16,14:15,Europe/Berlin,ECB,high,monetary policy decision
+2023-03-22,14:00,America/New_York,FOMC,high,scheduled statement
+2023-04-07,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2023-04-12,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2023-05-03,14:00,America/New_York,FOMC,high,scheduled statement
+2023-05-04,14:15,Europe/Berlin,ECB,high,monetary policy decision
+2023-05-05,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2023-05-10,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2023-06-02,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2023-06-13,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2023-06-14,14:00,America/New_York,FOMC,high,scheduled statement
+2023-06-15,14:15,Europe/Berlin,ECB,high,monetary policy decision
+2023-07-07,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2023-07-12,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2023-07-26,14:00,America/New_York,FOMC,high,scheduled statement
+2023-07-27,14:15,Europe/Berlin,ECB,high,monetary policy decision
+2023-08-04,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2023-08-10,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2023-09-01,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2023-09-13,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2023-09-14,14:15,Europe/Berlin,ECB,high,monetary policy decision
+2023-09-20,14:00,America/New_York,FOMC,high,scheduled statement
+2023-10-06,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2023-10-12,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2023-10-26,14:15,Europe/Berlin,ECB,high,monetary policy decision
+2023-11-01,14:00,America/New_York,FOMC,high,scheduled statement
+2023-11-03,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2023-11-14,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2023-12-08,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2023-12-12,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2023-12-13,14:00,America/New_York,FOMC,high,scheduled statement
+2023-12-14,14:15,Europe/Berlin,ECB,high,monetary policy decision
+2024-01-05,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2024-01-11,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2024-01-25,14:15,Europe/Berlin,ECB,high,monetary policy decision
+2024-01-31,14:00,America/New_York,FOMC,high,scheduled statement
+2024-02-02,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2024-02-13,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2024-03-07,14:15,Europe/Berlin,ECB,high,monetary policy decision
+2024-03-08,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2024-03-12,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2024-03-20,14:00,America/New_York,FOMC,high,scheduled statement
+2024-04-05,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2024-04-10,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2024-04-11,14:15,Europe/Berlin,ECB,high,monetary policy decision
+2024-05-01,14:00,America/New_York,FOMC,high,scheduled statement
+2024-05-03,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2024-05-15,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2024-06-06,14:15,Europe/Berlin,ECB,high,monetary policy decision
+2024-06-07,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2024-06-12,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2024-06-12,14:00,America/New_York,FOMC,high,scheduled statement
+2024-07-05,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2024-07-11,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2024-07-18,14:15,Europe/Berlin,ECB,high,monetary policy decision
+2024-07-31,14:00,America/New_York,FOMC,high,scheduled statement
+2024-08-02,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2024-08-14,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2024-09-06,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2024-09-11,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2024-09-12,14:15,Europe/Berlin,ECB,high,monetary policy decision
+2024-09-18,14:00,America/New_York,FOMC,high,scheduled statement
+2024-10-04,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2024-10-10,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2024-10-17,14:15,Europe/Berlin,ECB,high,monetary policy decision
+2024-11-01,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2024-11-07,14:00,America/New_York,FOMC,high,scheduled statement
+2024-11-13,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2024-12-06,08:30,America/New_York,US_NFP,high,BLS Employment Situation
+2024-12-11,08:30,America/New_York,US_CPI,high,BLS Consumer Price Index
+2024-12-12,14:15,Europe/Berlin,ECB,high,monetary policy decision
+2024-12-18,14:00,America/New_York,FOMC,high,scheduled statement

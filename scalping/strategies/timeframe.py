@@ -61,6 +61,28 @@ class _HtfBars:
         self.spread_close = market.spread_close[last].astype(np.float64)
         self.volume = np.add.reduceat(market.volume, first).astype(np.float64)
 
+        def agg(name, how):
+            values = getattr(market, name, None)
+            if values is None:
+                return None
+            if how == "sum":
+                return np.add.reduceat(values, first).astype(np.float64)
+            if how == "max":
+                return np.maximum.reduceat(values, first).astype(np.float64)
+            if how == "first":
+                return values[first].astype(np.float64)
+            return values[last].astype(np.float64)  # "last"
+
+        self.tick_count = agg("tick_count", "sum")
+        self.spread_high_raw = agg("spread_high_raw", "max")
+        self.upticks = agg("upticks", "sum")
+        self.downticks = agg("downticks", "sum")
+        self.london_minute = agg("london_minute", "first")   # clock at the bar's open, like M1
+        self.ny_minute = agg("ny_minute", "first")
+        self.weekday = agg("weekday", "first")
+        self.news_next_min = agg("news_next_min", "last")    # measured at the bar's close
+        self.news_last_min = agg("news_last_min", "last")
+
 
 class Resampled(Strategy):
     """Base for generated ``<inner>@M<N>`` strategies. See module docstring."""

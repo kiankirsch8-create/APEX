@@ -106,6 +106,49 @@ class BarWindow:
     def spread_close(self) -> np.ndarray:
         return self._view(self._market.spread_close)
 
+    # Tick and clock features (see MarketData). Empty-safe: absent fields read as NaN.
+    def _feature(self, name: str) -> np.ndarray:
+        values = getattr(self._market, name, None)
+        if values is None:
+            return np.full(self._end, np.nan)
+        return self._view(values)
+
+    @property
+    def tick_count(self) -> np.ndarray:
+        return self._feature("tick_count")
+
+    @property
+    def spread_high_raw(self) -> np.ndarray:
+        return self._feature("spread_high_raw")
+
+    @property
+    def upticks(self) -> np.ndarray:
+        return self._feature("upticks")
+
+    @property
+    def downticks(self) -> np.ndarray:
+        return self._feature("downticks")
+
+    @property
+    def london_minute(self) -> np.ndarray:
+        return self._feature("london_minute")
+
+    @property
+    def ny_minute(self) -> np.ndarray:
+        return self._feature("ny_minute")
+
+    @property
+    def weekday(self) -> np.ndarray:
+        return self._feature("weekday")
+
+    @property
+    def news_next_min(self) -> np.ndarray:
+        return self._feature("news_next_min")
+
+    @property
+    def news_last_min(self) -> np.ndarray:
+        return self._feature("news_last_min")
+
     @property
     def volume(self) -> np.ndarray:
         values = getattr(self._market, "volume", None)
