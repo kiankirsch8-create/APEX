@@ -1,0 +1,690 @@
+//@version=6
+// ============================================================================
+// VALENTINI suite v4 · VALENTINI-1 (trend) + VALENTINI-2 (mean reversion) + VALENTINI-4 (squeeze) · GRADE: PROXY
+// Rule sheets: research/existing/rulesheets/VALENTINI-1_TREND.md, VALENTINI-2_MEANREV.md, VALENTINI-4_MOMENTUM.md
+// Chart: NQ1! 1-minute. Needs TradingView Premium (request.footprint). One position at a time.
+//
+// Kian's decisions (2026-11-14):
+//  V2 "first breakout back inside"  = a 1m close back inside the prev-day value area
+//  V4 entry                         = stop order on the first attempt; after a failed attempt only a full-body 1m close
+//  Extra references per day (V1)    = a new dealing range after every impulse (new confirmed swing -> new leg/LVN)
+//  Re-entries                       = after a win, a same-direction trade may only risk the day's realised profit
+// Shared proxies (see rule sheets): big 30-lot bubble -> bar delta >= x*avg|delta| + imbalance row in the zone;
+//  previous-day value area = previous RTH session 09:30-16:00 NY, built from real footprint volume.
+// v4 vs v3: prev-day levels finalised at 16:00 (so London uses yesterday's RTH), daily reset on the CME day,
+//  separate NY / London delta averages, V1 re-arms on each new swing (no lock until back in value).
+// ============================================================================
+strategy("VALENTINI suite v4 (PROXY)", overlay = true, process_orders_on_close = false, calc_on_order_fills = false,
+     pyramiding = 0, default_qty_type = strategy.fixed, default_qty_value = 1, initial_capital = 100000,
+     currency = currency.USD, commission_type = strategy.commission.cash_per_contract,
+     commission_value = 2.5, slippage = 1, margin_long = 5, margin_short = 5,
+     max_bars_back = 500, max_boxes_count = 300, max_labels_count = 500)
+
+// ---------------- inputs ----------------
+string TZ = "America/New_York"
+useV1        = input.bool(true, "VALENTINI-1 trend model (NY)", group = "Modules")
+useV2        = input.bool(true, "VALENTINI-2 mean reversion (London)", group = "Modules")
+useV4        = input.bool(true, "VALENTINI-4 momentum squeeze (NY)", group = "Modules")
+refSess      = input.session("0930-1600", "Reference balance session NY (S2)", group = "Profile")
+rowTicks     = input.int(4, "Profile row size (ticks)", minval = 1, group = "Profile")
+vaPct        = input.float(70.0, "Value area %", group = "Profile")
+nySess       = input.session("0945-1330", "NY entry window (V1/V4)", group = "Timing")
+ldnSess      = input.session("0300-0910", "London entry window (V2)", group = "Timing")
+v2FlatSess   = input.session("0925-0930", "V2 flatten before NY open", group = "Timing")
+flatSess     = input.session("1555-1600", "Flatten window NY (T4)", group = "Timing")
+skipMonFri   = input.bool(false, "Skip Mondays & Fridays (CF 3:24) - not approved yet", group = "Timing")
+pvLen        = input.int(5, "Swing strength, bars each side (dealing ranges)", minval = 2, group = "Location")
+legLookback  = input.int(30, "First-leg fallback lookback, bars", minval = 5, group = "Location")
+edgePct      = input.float(0.2, "Ignore leg edges for LVN, fraction", minval = 0.0, maxval = 0.45, group = "Location")
+maxLegBars   = input.int(240, "Max leg / box life, bars", minval = 20, group = "Location")
+zoneTolTicks = input.int(4, "LVN zone tolerance, ticks", minval = 0, group = "Location")
+deltaMult    = input.float(2.0, "Aggression: bar delta >= x * avg |delta|", group = "Trigger")
+deltaLen     = input.int(20, "Avg |delta| length", minval = 2, group = "Trigger")
+needImb      = input.bool(true, "Aggression: require imbalance row in zone", group = "Trigger")
+stopOffTicks = input.int(2, "Stop beyond aggression / box, ticks", minval = 0, group = "Trigger")
+minStopTicks = input.int(40, "Min stop, ticks (40 = 10 pts NQ)", minval = 1, group = "Trigger")
+maxStopPts   = input.float(40.0, "Max stop, points (else skip)", group = "Trigger")
+minRR        = input.float(2.5, "Min R:R to target V1/V4 (X4/M8)", group = "Exit")
+fallbackRR   = input.float(5.0, "Target R when no level in direction", group = "Exit")
+v2MinRR      = input.float(1.0, "V2 min R:R to the POC (INTERPRETED)", group = "Exit")
+useBE        = input.bool(true, "Breakeven rules (X5 / M9)", group = "Exit")
+riskPct      = input.float(0.25, "Risk % per trade (R1)", group = "Risk")
+minOne       = input.bool(true, "Trade 1 contract if sizing gives < 1", group = "Risk")
+maxQty       = input.int(2, "Max contracts per trade", minval = 1, group = "Risk")
+marginPct    = input.float(5.0, "Margin % per contract (must match Properties)", group = "Risk")
+dailyCap     = input.float(2.0, "Max daily loss % (R2)", group = "Risk")
+maxLosses    = input.int(3, "Max losing trades per day (R4)", minval = 1, group = "Risk")
+houseMoney   = input.bool(true, "Re-entry after a win risks only the day's profit (R3)", group = "Risk")
+boxLen       = input.int(20, "V4 box length, bars (M4)", minval = 5, group = "V4 squeeze")
+compK        = input.float(0.6, "V4 compression: box range <= x * avg box range (M4)", group = "V4 squeeze")
+fullBody     = input.float(0.5, "V4 full-body candle: body >= x * range (M6)", group = "V4 squeeze")
+showDash     = input.bool(true, "Show dashboard", group = "Display")
+
+float rs = rowTicks * syminfo.mintick
+float tick = syminfo.mintick
+
+// ---------------- storage ----------------
+var array<int>   rbBar = array.new<int>()
+var array<int>   rbKey = array.new<int>()
+var array<float> rbVol = array.new<float>()
+var map<int, float> dayProf = map.new<int, float>()
+var array<float> olderPOC = array.new<float>()
+
+f_va(map<int, float> m, float rsz, float pct) =>
+    float poc = na
+    float vah = na
+    float val = na
+    keys = m.keys()
+    keys.sort()
+    int n = keys.size()
+    if n > 0
+        float tot = 0.0
+        int pi = 0
+        float pv = -1.0
+        for i = 0 to n - 1
+            float v = m.get(keys.get(i))
+            tot += v
+            if v > pv
+                pv := v
+                pi := i
+        int lo = pi
+        int hi = pi
+        float acc = pv
+        while acc < tot * pct / 100.0 and (lo > 0 or hi < n - 1)
+            float vUp = hi < n - 1 ? m.get(keys.get(hi + 1)) : -1.0
+            float vDn = lo > 0 ? m.get(keys.get(lo - 1)) : -1.0
+            if vUp >= vDn
+                hi += 1
+                acc += vUp
+            else
+                lo -= 1
+                acc += vDn
+        poc := (keys.get(pi) + 0.5) * rsz
+        vah := (keys.get(hi) + 1) * rsz
+        val := keys.get(lo) * rsz
+    [poc, vah, val]
+
+f_lvn(int b0, int b1, float lo, float hi) =>
+    float res = na
+    int k0 = math.floor(lo / rs)
+    int k1 = math.floor(hi / rs)
+    int span = k1 - k0 + 1
+    if span >= 5 and rbBar.size() > 0
+        vols = array.new<float>(span, 0.0)
+        for i = 0 to rbBar.size() - 1
+            int b = rbBar.get(i)
+            if b >= b0 and b <= b1
+                int k = rbKey.get(i)
+                if k >= k0 and k <= k1
+                    vols.set(k - k0, vols.get(k - k0) + rbVol.get(i))
+        int a = math.floor(span * edgePct)
+        int z = span - 1 - a
+        if z > a
+            float best = 1e30
+            int bi = -1
+            for j = a to z
+                if vols.get(j) < best
+                    best := vols.get(j)
+                    bi := j
+            if bi >= 0
+                res := (k0 + bi) * rs
+    res
+
+// ---------------- sessions ----------------
+bool inRef   = not na(time(timeframe.period, refSess, TZ))
+bool refEnd  = not inRef and inRef[1]
+bool refStart = inRef and not inRef[1]
+bool inNY    = not na(time(timeframe.period, nySess, TZ))
+bool inLdn   = not na(time(timeframe.period, ldnSess, TZ))
+bool inLdnAvg = not na(time(timeframe.period, "0300-0930", TZ))
+bool inV2Flat = not na(time(timeframe.period, v2FlatSess, TZ))
+bool inFlat  = not na(time(timeframe.period, flatSess, TZ))
+bool newDay  = ta.change(time("D")) != 0
+int dow = dayofweek(time, TZ)
+bool dayOk = not skipMonFri or (dow != dayofweek.monday and dow != dayofweek.friday)
+
+// ---------------- footprint ----------------
+footprint fp = request.footprint(rowTicks)
+bool hasFp = not na(fp)
+float fpDelta = hasFp ? fp.delta() : na
+var float avgNY = na
+var float avgLd = na
+if hasFp
+    float ad = math.abs(fpDelta)
+    if inRef
+        avgNY := na(avgNY) ? ad : avgNY + (ad - avgNY) * 2.0 / (deltaLen + 1)
+    if inLdnAvg
+        avgLd := na(avgLd) ? ad : avgLd + (ad - avgLd) * 2.0 / (deltaLen + 1)
+var int fpBars = 0
+var int allBars = 0
+allBars += 1
+if hasFp
+    fpBars += 1
+
+// ---------------- previous-day balance (finalised at 16:00 NY) ----------------
+var float pPOC = na
+var float pVAH = na
+var float pVAL = na
+var float pHigh = na
+var float pLow = na
+var float dayHi = na
+var float dayLo = na
+var bool profComplete = false
+
+barKeys = array.new<int>()
+barVols = array.new<float>()
+if hasFp
+    for r in fp.rows()
+        barKeys.push(math.floor(((r.up_price() + r.down_price()) / 2) / rs))
+        barVols.push(r.total_volume())
+else if volume > 0
+    int k0 = math.floor(low / rs)
+    int k1 = math.floor(high / rs)
+    int n = math.min(k1 - k0 + 1, 200)
+    for j = 0 to n - 1
+        barKeys.push(k0 + j)
+        barVols.push(volume / n)
+
+if refEnd
+    if profComplete and dayProf.size() > 0
+        [p, h, l] = f_va(dayProf, rs, vaPct)
+        if not na(pPOC)
+            olderPOC.unshift(pPOC)
+            if olderPOC.size() > 10
+                olderPOC.pop()
+        pPOC := p
+        pVAH := h
+        pVAL := l
+        pHigh := dayHi
+        pLow := dayLo
+    profComplete := false
+    dayProf.clear()
+    dayHi := na
+    dayLo := na
+if refStart
+    profComplete := true
+
+if inRef
+    dayHi := na(dayHi) ? high : math.max(dayHi, high)
+    dayLo := na(dayLo) ? low : math.min(dayLo, low)
+
+if barKeys.size() > 0
+    for j = 0 to barKeys.size() - 1
+        int k = barKeys.get(j)
+        float v = barVols.get(j)
+        rbBar.push(bar_index)
+        rbKey.push(k)
+        rbVol.push(v)
+        if inRef
+            dayProf.put(k, nz(dayProf.get(k)) + v)
+if bar_index % 60 == 0 and rbBar.size() > 0
+    int cut = 0
+    int lim = bar_index - maxLegBars - legLookback
+    while cut < rbBar.size() and rbBar.get(cut) < lim
+        cut += 1
+    if cut > 0
+        rbBar := rbBar.slice(cut, rbBar.size()).copy()
+        rbKey := rbKey.slice(cut, rbKey.size()).copy()
+        rbVol := rbVol.slice(cut, rbVol.size()).copy()
+
+// ---------------- daily bookkeeping (R2, R3, R4) ----------------
+var float dayStartEq = strategy.initial_capital
+var float dayStartNet = 0.0
+var int dayLosses = 0
+var int lastWinDir = 0
+var bool v1FirstUsedL = false
+var bool v1FirstUsedS = false
+var int v4Att = 0
+var int v4dir = 0
+if newDay
+    dayStartEq := strategy.equity
+    dayStartNet := strategy.netprofit
+    dayLosses := 0
+    lastWinDir := 0
+    v1FirstUsedL := false
+    v1FirstUsedS := false
+
+if strategy.closedtrades > strategy.closedtrades[1]
+    int ci = strategy.closedtrades - 1
+    float cp = strategy.closedtrades.profit(ci)
+    string cid = strategy.closedtrades.entry_id(ci)
+    if cp < 0
+        dayLosses += 1
+    else
+        lastWinDir := strategy.closedtrades.size(ci) > 0 ? 1 : -1
+    if str.startswith(cid, "V4") and v4dir != 0
+        v4Att += 1
+bool canTrade = dayOk and dayLosses < maxLosses and strategy.equity - dayStartEq > -dailyCap / 100.0 * dayStartEq
+bool flat = strategy.position_size == 0
+
+// ---------------- shared helpers ----------------
+f_trig(int d, float zLo, float zHi, float avgD) =>
+    float edge = na
+    bool touches = low <= zHi and high >= zLo
+    bool dOk = d == 1 ? (fpDelta > 0 and fpDelta >= deltaMult * avgD) : (fpDelta < 0 and fpDelta <= -deltaMult * avgD)
+    if hasFp and touches and dOk
+        for r in fp.rows()
+            float rd = r.down_price()
+            float ru = r.up_price()
+            bool inZone = ru >= zLo and rd <= zHi
+            bool isAgg = d == 1 ? r.has_buy_imbalance() : r.has_sell_imbalance()
+            if inZone and (isAgg or not needImb)
+                if d == 1
+                    edge := na(edge) ? rd : math.min(edge, rd)
+                else
+                    edge := na(edge) ? ru : math.max(edge, ru)
+    edge
+
+f_stop(int d, float level, float entry) =>
+    float s = d == 1 ? level - stopOffTicks * tick : level + stopOffTicks * tick
+    float minD = minStopTicks * tick
+    s := d == 1 ? math.min(s, entry - minD) : math.max(s, entry + minD)
+    math.abs(entry - s) > maxStopPts ? na : s
+
+f_target(int d, float entry, float dist) =>
+    float best = na
+    cands = array.new<float>()
+    cands.push(d == 1 ? pHigh : pLow)
+    cands.push(pPOC)
+    for c0 in olderPOC
+        cands.push(c0)
+    for c in cands
+        if not na(c)
+            float rr = d == 1 ? (c - entry) / dist : (entry - c) / dist
+            if rr >= minRR
+                if na(best) or math.abs(c - entry) < math.abs(best - entry)
+                    best := c
+    na(best) ? (d == 1 ? entry + fallbackRR * dist : entry - fallbackRR * dist) : best
+
+f_qty(float dist, int d, float px) =>
+    float q = math.floor(riskPct / 100.0 * strategy.equity / (dist * syminfo.pointvalue))
+    q := q < 1 ? (minOne ? 1 : 0) : q
+    float qm = math.floor(0.8 * strategy.equity / (px * syminfo.pointvalue * marginPct / 100.0))
+    q := math.min(q, maxQty, qm)
+    if houseMoney and lastWinDir == d and q > 0
+        float dayPnl = strategy.netprofit - dayStartNet
+        if q * dist * syminfo.pointvalue > dayPnl
+            q := math.max(math.floor(dayPnl / (dist * syminfo.pointvalue)), 0)
+    q
+
+// ---------------- swings (dealing ranges) ----------------
+float pl = ta.pivotlow(low, pvLen, pvLen)
+float ph = ta.pivothigh(high, pvLen, pvLen)
+var float lastPL = na
+var int lastPLbar = na
+var float lastPH = na
+var int lastPHbar = na
+if not na(pl)
+    lastPL := pl
+    lastPLbar := bar_index - pvLen
+if not na(ph)
+    lastPH := ph
+    lastPHbar := bar_index - pvLen
+float lowestL = ta.lowest(low, legLookback)
+int lowestOff = ta.lowestbars(low, legLookback)
+float highestH = ta.highest(high, legLookback)
+int highestOff = ta.highestbars(high, legLookback)
+
+// per-trade state shared by all modules
+var float tgtPx = na
+var float stp = na
+var float entryExt = na
+var float sigDist = na
+var bool beDone = false
+var bool posInit = false
+var int curModel = 0
+var float v4Hi = na
+var float v4Lo = na
+var box v4Box = na
+
+// ============================================================================
+// VALENTINI-1 · trend: out of balance vs prev VA, new dealing range per swing, LVN + aggression
+// ============================================================================
+var int v1dir = 0
+var float v1Start = na
+var int v1StartBar = na
+var float v1Ext = na
+var float v1Lvn = na
+var int v1UsedPL = -1
+var int v1UsedPH = -1
+bool v1New = false
+if useV1 and not na(pVAH)
+    if v1dir == 0 and inNY and canTrade
+        if close > pVAH
+            if not na(lastPLbar) and lastPLbar != v1UsedPL and bar_index - lastPLbar <= maxLegBars and lastPL < close
+                v1dir := 1
+                v1Start := lastPL
+                v1StartBar := lastPLbar
+                v1UsedPL := lastPLbar
+            else if not v1FirstUsedL
+                v1dir := 1
+                v1Start := lowestL
+                v1StartBar := bar_index + lowestOff
+                v1FirstUsedL := true
+            if v1dir == 1
+                v1Ext := high
+                v1New := true
+        else if close < pVAL
+            if not na(lastPHbar) and lastPHbar != v1UsedPH and bar_index - lastPHbar <= maxLegBars and lastPH > close
+                v1dir := -1
+                v1Start := lastPH
+                v1StartBar := lastPHbar
+                v1UsedPH := lastPHbar
+            else if not v1FirstUsedS
+                v1dir := -1
+                v1Start := highestH
+                v1StartBar := bar_index + highestOff
+                v1FirstUsedS := true
+            if v1dir == -1
+                v1Ext := low
+                v1New := true
+    else if v1dir == 1
+        if high > v1Ext
+            v1Ext := high
+            v1New := true
+        if low < v1Start or bar_index - v1StartBar > maxLegBars
+            v1dir := 0
+    else if v1dir == -1
+        if low < v1Ext
+            v1Ext := low
+            v1New := true
+        if high > v1Start or bar_index - v1StartBar > maxLegBars
+            v1dir := 0
+if not inNY
+    v1dir := 0
+if v1New and v1dir != 0
+    v1Lvn := f_lvn(v1StartBar, bar_index, v1dir == 1 ? v1Start : v1Ext, v1dir == 1 ? v1Ext : v1Start)
+
+// ============================================================================
+// VALENTINI-2 · mean reversion (London): outside prev VA -> 1m close back inside -> pullback to LVN + aggression -> POC
+// phase: +-1 = outside, +-2 = back inside (armed)
+// ============================================================================
+var int v2dir = 0
+var float v2Swing = na
+var int v2SwingBar = na
+var float v2Ext = na
+var float v2Lvn = na
+bool v2New = false
+if useV2 and not na(pVAL) and inLdn
+    if v2dir == 0 and canTrade
+        if close < pVAL
+            v2dir := 1
+            v2Swing := low
+            v2SwingBar := bar_index
+        else if close > pVAH
+            v2dir := -1
+            v2Swing := high
+            v2SwingBar := bar_index
+    else if v2dir == 1
+        if low < v2Swing
+            v2Swing := low
+            v2SwingBar := bar_index
+        if close > pVAL
+            v2dir := 2
+            v2Ext := high
+            v2New := true
+    else if v2dir == -1
+        if high > v2Swing
+            v2Swing := high
+            v2SwingBar := bar_index
+        if close < pVAH
+            v2dir := -2
+            v2Ext := low
+            v2New := true
+    else if v2dir == 2
+        if high > v2Ext
+            v2Ext := high
+            v2New := true
+        if low < v2Swing
+            v2dir := 0
+    else if v2dir == -2
+        if low < v2Ext
+            v2Ext := low
+            v2New := true
+        if high > v2Swing
+            v2dir := 0
+if not inLdn
+    v2dir := 0
+if v2New and math.abs(v2dir) == 2
+    v2Lvn := f_lvn(v2SwingBar, bar_index, v2dir == 2 ? v2Swing : v2Ext, v2dir == 2 ? v2Ext : v2Swing)
+
+// ============================================================================
+// VALENTINI-4 · squeeze: compression box, trapped side (box delta against price), stop order first, body close after
+// ============================================================================
+float boxHi = ta.highest(high, boxLen)[1]
+float boxLo = ta.lowest(low, boxLen)[1]
+float avgBox = ta.sma(ta.highest(high, boxLen) - ta.lowest(low, boxLen), 390)
+float boxDelta = math.sum(nz(fpDelta), boxLen)[1]
+var int v4Bar = na
+if useV4 and not na(pVAH)
+    if v4dir == 0 and flat and inNY and canTrade and boxHi - boxLo <= compK * avgBox
+        float mid = (boxHi + boxLo) / 2
+        if close > pVAH and boxDelta < 0 and close >= mid and close <= boxHi
+            v4dir := 1
+        else if close < pVAL and boxDelta > 0 and close <= mid and close >= boxLo
+            v4dir := -1
+        if v4dir != 0
+            v4Hi := boxHi
+            v4Lo := boxLo
+            v4Att := 0
+            v4Bar := bar_index
+            v4Box := box.new(bar_index - boxLen, v4Hi, bar_index, v4Lo, border_color = color.new(color.purple, 0), bgcolor = color.new(color.purple, 85))
+    else if v4dir != 0
+        bool dead = (v4dir == 1 and close < v4Lo) or (v4dir == -1 and close > v4Hi) or bar_index - v4Bar > maxLegBars or not inNY or v4Att >= 2
+        if dead
+            v4dir := 0
+            strategy.cancel("V4L")
+            strategy.cancel("V4S")
+        else if not na(v4Box)
+            box.set_right(v4Box, bar_index)
+
+// ============================================================================
+// entries (one position at a time)
+// ============================================================================
+f_label(string txt, int d) =>
+    label.new(bar_index, d == 1 ? low : high, txt, style = d == 1 ? label.style_label_up : label.style_label_down, color = color.new(d == 1 ? color.teal : color.maroon, 10), textcolor = color.white, size = size.tiny)
+
+bool entered = false
+// V1
+if flat and not entered and useV1 and v1dir != 0 and not v1New and inNY and canTrade and not na(v1Lvn)
+    float e1 = f_trig(v1dir, v1Lvn - zoneTolTicks * tick, v1Lvn + rs + zoneTolTicks * tick, avgNY)
+    if not na(e1)
+        float s1 = f_stop(v1dir, e1, close)
+        if not na(s1)
+            float d1 = math.abs(close - s1)
+            float q1 = f_qty(d1, v1dir, close)
+            if q1 > 0
+                strategy.cancel("V4L")
+                strategy.cancel("V4S")
+                sigDist := d1
+                stp := s1
+                tgtPx := f_target(v1dir, close, d1)
+                entryExt := v1Ext
+                beDone := false
+                posInit := false
+                f_label((v1dir == 1 ? "V1 L" : "V1 S") + "\nstop " + str.tostring(stp, format.mintick) + "\ntgt " + str.tostring(tgtPx, format.mintick), v1dir)
+                if v1dir == 1
+                    strategy.entry("V1L", strategy.long, qty = q1, comment = "V1 long")
+                    strategy.exit("XV1L", "V1L", stop = stp, limit = tgtPx)
+                else
+                    strategy.entry("V1S", strategy.short, qty = q1, comment = "V1 short")
+                    strategy.exit("XV1S", "V1S", stop = stp, limit = tgtPx)
+                entered := true
+                v1dir := 0
+// V2
+if flat and not entered and useV2 and math.abs(v2dir) == 2 and not v2New and inLdn and canTrade and not na(v2Lvn)
+    int d2 = v2dir > 0 ? 1 : -1
+    float e2 = f_trig(d2, v2Lvn - zoneTolTicks * tick, v2Lvn + rs + zoneTolTicks * tick, avgLd)
+    if not na(e2)
+        float s2 = f_stop(d2, e2, close)
+        bool pocOk = not na(pPOC) and (d2 == 1 ? pPOC > close : pPOC < close)
+        if not na(s2) and pocOk
+            float dd2 = math.abs(close - s2)
+            float rr2 = math.abs(pPOC - close) / dd2
+            float q2 = f_qty(dd2, d2, close)
+            if q2 > 0 and rr2 >= v2MinRR
+                strategy.cancel("V4L")
+                strategy.cancel("V4S")
+                sigDist := dd2
+                stp := s2
+                tgtPx := pPOC
+                entryExt := v2Ext
+                beDone := false
+                posInit := false
+                f_label((d2 == 1 ? "V2 L" : "V2 S") + "\nstop " + str.tostring(stp, format.mintick) + "\nPOC " + str.tostring(tgtPx, format.mintick), d2)
+                if d2 == 1
+                    strategy.entry("V2L", strategy.long, qty = q2, comment = "V2 long")
+                    strategy.exit("XV2L", "V2L", stop = stp, limit = tgtPx)
+                else
+                    strategy.entry("V2S", strategy.short, qty = q2, comment = "V2 short")
+                    strategy.exit("XV2S", "V2S", stop = stp, limit = tgtPx)
+                entered := true
+                v2dir := 0
+// V4: attempt 1 = stop order at the box edge; later attempts = full-body close beyond the box
+if flat and not entered and useV4 and v4dir != 0 and inNY and canTrade
+    float lvl = v4dir == 1 ? v4Hi + tick : v4Lo - tick
+    bool bodyOk = math.abs(close - open) >= fullBody * (high - low)
+    if v4Att == 0
+        float s4 = f_stop(v4dir, v4dir == 1 ? v4Lo : v4Hi, lvl)
+        if not na(s4)
+            float d4 = math.abs(lvl - s4)
+            float q4 = f_qty(d4, v4dir, lvl)
+            if q4 > 0
+                sigDist := d4
+                stp := s4
+                tgtPx := f_target(v4dir, lvl, d4)
+                entryExt := na
+                beDone := false
+                posInit := false
+                if v4dir == 1
+                    strategy.entry("V4L", strategy.long, qty = q4, stop = lvl, comment = "V4 long (stop)")
+                    strategy.exit("XV4L", "V4L", stop = stp, limit = tgtPx)
+                else
+                    strategy.entry("V4S", strategy.short, qty = q4, stop = lvl, comment = "V4 short (stop)")
+                    strategy.exit("XV4S", "V4S", stop = stp, limit = tgtPx)
+    else
+        bool brk = v4dir == 1 ? (close > v4Hi and close > open and bodyOk) : (close < v4Lo and close < open and bodyOk)
+        if brk
+            float s4b = f_stop(v4dir, v4dir == 1 ? v4Lo : v4Hi, close)
+            if not na(s4b)
+                float d4b = math.abs(close - s4b)
+                float q4b = f_qty(d4b, v4dir, close)
+                if q4b > 0
+                    sigDist := d4b
+                    stp := s4b
+                    tgtPx := f_target(v4dir, close, d4b)
+                    entryExt := na
+                    beDone := false
+                    posInit := false
+                    f_label((v4dir == 1 ? "V4 L" : "V4 S") + " (body close)\nstop " + str.tostring(stp, format.mintick), v4dir)
+                    if v4dir == 1
+                        strategy.entry("V4L", strategy.long, qty = q4b, comment = "V4 long (close)")
+                        strategy.exit("XV4L", "V4L", stop = stp, limit = tgtPx)
+                    else
+                        strategy.entry("V4S", strategy.short, qty = q4b, comment = "V4 short (close)")
+                        strategy.exit("XV4S", "V4S", stop = stp, limit = tgtPx)
+                    entered := true
+
+// ============================================================================
+// management
+// ============================================================================
+if strategy.position_size == 0
+    posInit := false
+    curModel := 0
+else
+    string eid = strategy.opentrades.entry_id(0)
+    int pd = strategy.position_size > 0 ? 1 : -1
+    float avg0 = strategy.position_avg_price
+    if not posInit
+        curModel := str.startswith(eid, "V1") ? 1 : str.startswith(eid, "V2") ? 2 : 4
+        float d0 = na(sigDist) ? minStopTicks * tick : sigDist
+        stp := pd == 1 ? avg0 - d0 : avg0 + d0
+        if curModel == 2
+            bool pocBeyond = not na(pPOC) and (pd == 1 ? pPOC > avg0 : pPOC < avg0)
+            tgtPx := pocBeyond ? pPOC : (pd == 1 ? avg0 + d0 : avg0 - d0)
+        else
+            tgtPx := f_target(pd, avg0, d0)
+        if curModel != 4
+            strategy.cancel("V4L")
+            strategy.cancel("V4S")
+        posInit := true
+    // breakeven: V1/V2 = additional breakout (X5); V4 = +1R close (M9, INTERPRETED)
+    if useBE and not beDone
+        bool beHit = false
+        if curModel == 4
+            beHit := pd == 1 ? close >= avg0 + sigDist : close <= avg0 - sigDist
+        else if not na(entryExt)
+            beHit := pd == 1 ? (high > entryExt and close > avg0 + tick) : (low < entryExt and close < avg0 - tick)
+        if beHit
+            stp := pd == 1 ? math.max(stp, avg0 + tick) : math.min(stp, avg0 - tick)
+            beDone := true
+    string xid = "X" + eid
+    strategy.exit(xid, eid, stop = stp, limit = tgtPx)
+    if (pd == 1 and close < stp) or (pd == -1 and close > stp)
+        strategy.close(eid, comment = "backup stop")
+    // V4 M10: auction failed = close back inside the box
+    if curModel == 4 and not na(v4Hi) and ((pd == 1 and close < v4Hi) or (pd == -1 and close > v4Lo))
+        strategy.close(eid, comment = "V4 auction failed")
+    if curModel == 2 and inV2Flat
+        strategy.close(eid, comment = "V2 flat before NY")
+
+if inFlat and strategy.position_size != 0
+    strategy.close_all(comment = "EOD flat")
+
+// ---------------- plots ----------------
+plot(pVAH, "Prev VAH", color.new(color.teal, 0), 1, plot.style_linebr)
+plot(pVAL, "Prev VAL", color.new(color.teal, 0), 1, plot.style_linebr)
+plot(pPOC, "Prev POC", color.new(color.orange, 0), 2, plot.style_linebr)
+plot(strategy.position_size != 0 ? stp : na, "Stop", color.new(color.red, 0), 1, plot.style_linebr)
+plot(strategy.position_size != 0 ? tgtPx : na, "Target", color.new(color.lime, 0), 1, plot.style_linebr)
+plot(v1dir != 0 ? v1Lvn : na, "V1 LVN", color.new(color.yellow, 0), 2, plot.style_linebr)
+plot(math.abs(v2dir) == 2 ? v2Lvn : na, "V2 LVN", color.new(color.aqua, 0), 2, plot.style_linebr)
+
+// ---------------- dashboard ----------------
+var table dash = table.new(position.top_right, 3, 14, bgcolor = color.new(color.black, 15), border_width = 1)
+f_cell(int c, int r, string t, color col) =>
+    table.cell(dash, c, r, t, text_color = col, text_size = size.small, text_halign = c == 0 ? text.align_left : text.align_right)
+
+if showDash and barstate.islast
+    int ct = strategy.closedtrades
+    float wr = ct > 0 ? 100.0 * strategy.wintrades / ct : na
+    float pf = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na
+    float np = strategy.netprofit
+    array<int> mN = array.new<int>(3, 0)
+    array<float> mP = array.new<float>(3, 0.0)
+    if ct > 0
+        for i = 0 to ct - 1
+            string id = strategy.closedtrades.entry_id(i)
+            int m = str.startswith(id, "V1") ? 0 : str.startswith(id, "V2") ? 1 : 2
+            mN.set(m, mN.get(m) + 1)
+            mP.set(m, mP.get(m) + strategy.closedtrades.profit(i))
+    f_cell(0, 0, "VALENTINI suite v4", color.yellow)
+    f_cell(1, 0, "grade: PROXY", color.yellow)
+    f_cell(2, 0, "", color.white)
+    f_cell(0, 1, "Net P&L", color.silver)
+    f_cell(1, 1, str.tostring(np, "#,##0") + " $", np >= 0 ? color.lime : color.red)
+    f_cell(2, 1, str.tostring(100 * np / strategy.initial_capital, "0.00") + "%", np >= 0 ? color.lime : color.red)
+    f_cell(0, 2, "Trades / win rate", color.silver)
+    f_cell(1, 2, str.tostring(ct), color.white)
+    f_cell(2, 2, na(wr) ? "-" : str.tostring(wr, "0.0") + "%", color.white)
+    f_cell(0, 3, "Profit factor / max DD", color.silver)
+    f_cell(1, 3, na(pf) ? "-" : str.tostring(pf, "0.00"), color.white)
+    f_cell(2, 3, str.tostring(strategy.max_drawdown, "#,##0") + " $", color.orange)
+    f_cell(0, 4, "V1 trend: trades / P&L", color.silver)
+    f_cell(1, 4, str.tostring(mN.get(0)), color.white)
+    f_cell(2, 4, str.tostring(mP.get(0), "#,##0") + " $", mP.get(0) >= 0 ? color.lime : color.red)
+    f_cell(0, 5, "V2 mean rev: trades / P&L", color.silver)
+    f_cell(1, 5, str.tostring(mN.get(1)), color.white)
+    f_cell(2, 5, str.tostring(mP.get(1), "#,##0") + " $", mP.get(1) >= 0 ? color.lime : color.red)
+    f_cell(0, 6, "V4 squeeze: trades / P&L", color.silver)
+    f_cell(1, 6, str.tostring(mN.get(2)), color.white)
+    f_cell(2, 6, str.tostring(mP.get(2), "#,##0") + " $", mP.get(2) >= 0 ? color.lime : color.red)
+    f_cell(0, 7, "Footprint data", color.silver)
+    f_cell(1, 7, str.tostring(100.0 * fpBars / math.max(allBars, 1), "0.0") + "%", fpBars > 0 ? color.white : color.red)
+    f_cell(2, 7, "", color.white)
+    f_cell(0, 8, "Prev POC / VAH / VAL", color.silver)
+    f_cell(1, 8, na(pPOC) ? "building..." : str.tostring(pPOC, format.mintick), color.white)
+    f_cell(2, 8, na(pVAH) ? "" : str.tostring(pVAH, format.mintick) + " / " + str.tostring(pVAL, format.mintick), color.white)
+    f_cell(0, 9, "Chart timeframe", color.silver)
+    f_cell(1, 9, timeframe.period == "1" ? "1m OK" : timeframe.period + " (use 1m!)", timeframe.period == "1" ? color.white : color.red)
+    f_cell(2, 9, "", color.white)

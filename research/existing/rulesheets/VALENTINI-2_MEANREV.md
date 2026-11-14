@@ -45,3 +45,7 @@ trade-level data; E2 needs one pinned definition. Best grade: **Proxy**. No code
 1. E2: what counts as the "first breakout" back inside? Options: (a) a 1m/5m close back inside the value area,
    (b) a break of the last swing high (for longs) while outside value.
 2. T2: month filter (Mar/May/Jun/Aug) as stated, or only the London session?
+
+## Kian's decisions (2026-11-14)
+- E2 "first breakout back inside" = a 1m close back inside the previous-day value area. APPROVED.
+- Built in `pine/VALENTINI-suite.pine` (module V2): London window 03:00-09:10 NY, flat 09:25, target prev POC, min R:R 1.0 (INTERPRETED).

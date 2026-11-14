@@ -39,3 +39,9 @@ which got rule M3 backwards and lacked M1/M2. Masterclass rows to verify: ⏳.
 - **M11 verified:** "every time that you reject... the setup gets weaker and weaker, so every time I get more demanding" (3:23:19).
 - Stop: below the big buyers / the box, re-calculated at the close ("I need to adapt my stop loss", 2:52:42). Needs big-trade data.
 - Risk-free: "when we get a full body candle up, we can get risk-free" (2:54:21).
+
+## Kian's decisions (2026-11-14)
+- M6: stop order on the first attempt; after a failed attempt only a full-body 1m close beyond the box. APPROVED.
+- Built in `pine/VALENTINI-suite.pine` (module V4). INTERPRETED proxies: box = last 20 bars, compression = box range <= 0.6 x avg;
+  trapped side = box delta against the price position (M2/M3); stop = beyond the box (M7); BE at +1R (M9);
+  "auction failed" = close back inside the box (M10); full body = body >= 50% of range.

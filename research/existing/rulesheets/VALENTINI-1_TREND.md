@@ -78,3 +78,8 @@ with trade data; X5/X6 must be pinned to one definition each. Under §0 this nee
 2. E1: accept Databento trade data as the only route to his trigger, or stop VALENTINI-1 here?
 3. X1 vs X3: prior balance POC (summary) vs previous daily high (live)? Proposal: whichever comes first in the trade direction.
 4. Accept a mechanical X5 (breakeven after price clears the entry swing high by one more breakout) as "Proxy"?
+
+## Kian's decisions (2026-11-14)
+- Extra references per day = a new dealing range after every impulse (new confirmed swing -> new leg + LVN). APPROVED (S3 replacement).
+- Re-entries: after a win, a same-direction trade may only risk the day's realised profit (R3). APPROVED.
+- Pine history: v1 (bugs) -> v2 -> v3 (clean, positive but not significant, t<1.5) -> suite v4.
