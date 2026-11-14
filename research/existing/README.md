@@ -55,7 +55,7 @@ unverified claims. Both are tested; the bucket is context, not a verdict.
 
 | Name | Transcript | Rule sheet | Approved | Code | Grade |
 |---|---|---|---|---|---|
-| VALENTINI-1 (trend) | CF ✓ | `rulesheets/VALENTINI-1_TREND.md` draft | awaiting Kian | – | best possible: Proxy (big-trade trigger needs trade data; mgmt discretionary) |
+| VALENTINI-1 (trend) | CF ✓ | `rulesheets/VALENTINI-1_TREND.md` draft | Kian: build Pine now (2026-11-14) | `pine/VALENTINI-1.pine` v1 (footprint profile; E1 proxy) | best possible: Proxy (big-trade trigger needs trade data; mgmt discretionary) |
 | VALENTINI-2 (mean rev.) | CF ✓ | `rulesheets/VALENTINI-2_MEANREV.md` draft | awaiting Kian | – | best possible: Proxy |
 | VALENTINI-6 (NASDAQ Effort) | IQC ✓ | `rulesheets/VALENTINI-6_EFFORT.md` | – | **not copyable 1:1** (proprietary Effort layer); sub-model "Order Track" needs candle TF + footprint | – |
 | VALENTINI-3 (AAA) | WoR ✓ CF ✓ | `rulesheets/VALENTINI-3_AAA.md` draft | awaiting Kian | – | – |
