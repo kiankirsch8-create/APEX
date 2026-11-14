@@ -1,4 +1,9 @@
 //@version=6
+// ⚠ DRAFT, DO NOT USE FOR CONCLUSIONS. Fidelity audit 2026-11-14 found:
+//   - WRONG: requires rejected tests of the broken side; Valentini says "each rejection makes a breakout WEAKER"
+//   - MISSING: failed-auction / out-of-balance context, never inside a "two-sided cage"
+//   - MISSING: order-flow stop (behind aggressive prints), CVD-divergence / round-number exit, fast breakeven + trailing
+//   Rebuild from the transcript-based rule sheet (research/existing/rulesheets/VALENTINI-4.md) once approved.
 // VALENTINI-4 · Compression squeeze breakout  (APEX research, Track 2 · reputable bucket)
 // Source recaps: research/existing/sources/valentini_*  (live trades #1-#3 in the Chart Fanatics
 // masterclass, "Model 2 momentum squeeze" in the Words of Rizdom session)
@@ -19,7 +24,7 @@
 // What is NOT in here (needs order flow): his "big bubble" confirmation and CVD divergence exit.
 // Settings -> Properties: order size 1, your NQ commission per contract per side, slippage 1 tick.
 
-strategy("VALENTINI-4 · Compression squeeze breakout", overlay = true,
+strategy("DRAFT VALENTINI-4 (not faithful)", overlay = true,
      process_orders_on_close = true,
      default_qty_type = strategy.fixed, default_qty_value = 1,
      initial_capital = 100000, currency = currency.USD,

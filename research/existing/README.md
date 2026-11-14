@@ -1,5 +1,8 @@
 # Track 2: existing strategies (tested as published, not refined)
 
+> **Mandatory: `FIDELITY.md`.** Primary source (transcript) → rule sheet (STATED / INTERPRETED / MISSING /
+> CONFLICT, with quotes) → Kian approves → code → fidelity grade on every result. No code before approval.
+
 Strategies taken from traders and creators. Each is turned into an **exact rule spec** (every vague
 term gets one fixed definition, logged under "Definitions chosen"), implemented once, and run through the
 same gates as Track 1 (check → 2018–2021 build → robustness → blind validator → Kian's review). No tuning.
@@ -44,3 +47,13 @@ unverified claims. Both are tested; the bucket is context, not a verdict.
   trade data with aggressor side** (e.g. CME tick/trades data from a vendor). Without it we test proxies and
   label the result "proxy".
 - **Instruments:** NQ / US100 (Capital.com US100 CFD for execution), XAUUSD, EURUSD (we already have it).
+
+## Status (fidelity pipeline)
+
+| Name | Transcript | Rule sheet | Approved | Code | Grade |
+|---|---|---|---|---|---|
+| VALENTINI-1..6 | needed | – | – | – | – |
+| VALENTINI-4 | needed | – | – | Pine **DRAFT** (audit: 1 wrong rule, context + order flow missing) | not usable |
+| DATATRADER-1 | needed (recap is detailed) | draft from recap | – | Pine v1 (4 INTERPRETED items, see rule sheet) | pending |
+| GOH-1 | needed | – | – | – | – |
+| MAMBAFX-1 | needed | – | – | – | – |
