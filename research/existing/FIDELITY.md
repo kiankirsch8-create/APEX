@@ -11,6 +11,15 @@ If something is unknown, proprietary or only in a source we don't have yet: **st
 missing, and ask for the source.** Never fill gaps with a plausible guess and call it his strategy.
 This applies to Claude and to every agent. (Lesson: VALENTINI-4 draft, 2026-11-14.)
 
+## 0b. Hard rule: full audit BEFORE the first line of code
+Before any code is written, go through the **entire** transcript once more, start to finish, and fill the audit table
+(`audits/<NAME>_audit_<date>.md`) with four sections: **A** misread (code would contradict his words),
+**B** forgotten (indicators/rules he uses that are not in the sheet), **C** not copyable with our data,
+**D** correct. Every indicator he mentions anywhere (profile, delta, CVD, big trades, absorption, follow-through,
+session ranges, bias rules, management) must appear in one of the four sections. Code starts only when A and B are
+empty or explicitly accepted by Kian. (Lesson: VALENTINI suite v4 was tested with 4 misreadings and 5 missing tools,
+found only on Kian's second request, 2026-11-15.)
+
 ## 1. Primary source
 - Work from **the trader's own words**: video transcript (YouTube → "…more" → Show transcript),
   his own written material, or his chart walkthroughs. Gemini recaps are an **index** to find the right

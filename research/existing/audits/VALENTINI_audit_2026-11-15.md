@@ -38,3 +38,9 @@ London mean reversion to the POC after a re-entry into value, stops of roughly 8
 ## Verdict
 Four real misreadings (A1-A4) and five forgotten tools (B1-B5), all fixable with TradingView footprint data.
 C1-C3 remain the limit of any coded version: results of a fixed version are still graded **Proxy**.
+
+## Implemented in suite v5 (2026-11-15, Kian: "change what we can now")
+A1 nearest-level target, skip if < 2.5R · A2 V4 failure -> breakeven, exit after 3 failed tests · A3 daily bias from the
+pre-NY range break (latest break wins), V1/V4 with the bias only · A4 full-day previous profile + pre-NY range (18:00-09:30)
+· B1 absorption trigger · B2 follow-through · B3 CVD-supported breakout + CVD early breakeven · B4 strongest-delta level as
+2nd location · B5 developing value area filter. All new definitions are inputs and still INTERPRETED (await Kian's review).
