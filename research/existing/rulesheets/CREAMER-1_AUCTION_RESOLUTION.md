@@ -61,3 +61,6 @@ from our Databento NQ trades (delta, per-candle profile, big trades). Missing: g
 the stacked-imbalance entry (D6), course part 2. Thresholds are MNQ: convert (INTERPRETED) or buy MNQ trades.
 Options: (a) build without gamma as a variant, (b) buy QQQ options open-interest history to compute naive GEX, (c) find a gamma
 provider with downloadable history. Kian decides; no code before.
+
+## First 12.5-month test (2026-11-16)
+See `../audits/PROS_batch_results_2026-11-16.md` (defaults approved by Kian; code `scalping/orderflow/pros.py`).

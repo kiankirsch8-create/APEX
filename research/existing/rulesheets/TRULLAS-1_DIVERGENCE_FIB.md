@@ -35,3 +35,6 @@ runs (stop to break-even fast); never let a winner turn into a loss. STATED, lev
 (MACD/RSI/bar volume). Missing: indicator settings (T1/T2), swing selection (T4), his proprietary "Helite" details (3 registered
 methods, entries partly withheld). An SMA 6/70/200 cross he showed for daily stocks was backtested by a third party: few trades,
 mixed results → not his full method.
+
+## First 12.5-month test (2026-11-16)
+See `../audits/PROS_batch_results_2026-11-16.md` (defaults approved by Kian; code `scalping/orderflow/pros.py`).

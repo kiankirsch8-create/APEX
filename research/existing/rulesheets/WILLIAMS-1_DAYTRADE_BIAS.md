@@ -30,3 +30,6 @@ avg hold 12-15 days; comparative strength within a group (buy strongest, sell we
 Proprietary: valuation, accumulation index, cycle forecast, trend line. → **Not copyable as a whole.**
 Simple seasonals (Copyable): Walmart buy ~2 days before Thanksgiving, sell 3-4 days later; first trading days of November strong;
 13-week earnings cycle; 4-year cycle.
+
+## First 12.5-month test (2026-11-16)
+See `../audits/PROS_batch_results_2026-11-16.md` (defaults approved by Kian; code `scalping/orderflow/pros.py`).
