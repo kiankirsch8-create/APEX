@@ -24,7 +24,7 @@ import numba
 P = dict(BIG_NY=30, BIG_LDN=20, pvLen=5, legLookback=30, edgePct=0.2, maxLegBars=240, zoneTol=4 * TICK, ftPct=0.6,
          absHold=0.5, useAbs=True, useCvdBreak=True, useDevVA=True, stopOff=2 * TICK, minStop=40 * TICK, maxStop=40.0,
          minRR=2.5, fallbackRR=5.0, v2MinRR=1.0, maxLosses=3, houseMoney=True, fullBody=0.5, boxLen=20, compK=0.6,
-         rejMax=3, v4MinTrapped=2, v4stop="box", v4be="live", v3dir="long", v3Win=5, v3MinAbs=2, v3prof="session", v3gate="bias", ivbMin=30, v7RR=1.0, v7Win=5, v7MaxAtt=3, v7mode="breakout", v7long=True, v7filter=True, biasMode="pre", trig="orders", effK=1.5, effN=30, mgmt="base", v1loc="lvn", v8Exp=3, v8Min=3.0, v8RR=1.0, gapMin=120, bars="1m", insideLvl=True, cost=4.50, slip=TICK, models=("V1", "V2", "V4"))
+         rejMax=3, v4MinTrapped=2, v4stop="box", v4be="live", v3dir="long", v3Win=5, v3MinAbs=2, v3prof="session", v3gate="bias", ivbMin=30, v7RR=1.0, v7Win=5, v7MaxAtt=3, v7mode="breakout", v7long=True, v7filter=True, biasMode="pre", trig="orders", effK=1.5, effN=30, mgmt="base", v1loc="lvn", v8Exp=3, v8Min=3.0, v8RR=1.0, gapMin=120, barKind="1m", insideLvl=True, cost=4.50, slip=TICK, models=("V1", "V2", "V4"))
 NY0, NY1, FLAT = 9 * 60 + 45, 13 * 60 + 30, 15 * 60 + 55
 LDN0, LDN1, V2FLAT = 3 * 60, 9 * 60 + 10, 9 * 60 + 25
 
@@ -499,7 +499,7 @@ def run(d, bars, rows, rstart, big, tstart, **over):
                 if p["v7mode"] == "breakout":                       # quant IVB: enter the first breakout once (5E 8:10-9:54)
                     if not v7.get("brkSeen"):
                         v7["brkSeen"] = True; v7["done"] = True
-                        small = p["bars"] == "range" or (not np.isnan(avgR[i]) and rng <= avgR[i])   # range bars: all equal size
+                        small = p["barKind"] == "range" or (not np.isnan(avgR[i]) and rng <= avgR[i])   # range bars: all equal size
                         bigd = not np.isnan(avgAD[i]) and DEL[i] * dd >= p["effK"] * avgAD[i]
                         if (not p["v7filter"]) or (small and bigd):  # B8 "small candle with a lot of delta"
                             s7 = stopfor(dd, L[i] if dd == 1 else H[i], C[i])   # ZERO 9:05: below where buyers got aggressive

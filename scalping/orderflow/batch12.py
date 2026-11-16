@@ -14,8 +14,8 @@ SETS = {  # name: (bars, overrides)
     "B effort triggers":  ("1m", dict(trig="effort")),
     "C profile bias":     ("1m", dict(biasMode="pf")),
     "D his management":   ("1m", dict(mgmt="his")),
-    "E 40-tick range":    ("range", dict(bars="range")),
-    "F all his rules":    ("range", dict(bars="range", trig="effort", biasMode="pf", mgmt="his")),
+    "E 40-tick range":    ("range", dict(barKind="range")),
+    "F all his rules":    ("range", dict(barKind="range", trig="effort", biasMode="pf", mgmt="his")),
 }
 MODELS = {"V1": dict(models=("V1",)), "V1 DeltaPrint": dict(models=("V1",), v1loc="dprint"), "V2": dict(models=("V2",)),
           "V3": dict(models=("V3",)), "V4": dict(models=("V4",)), "V7 IVB": dict(models=("V7",)),
