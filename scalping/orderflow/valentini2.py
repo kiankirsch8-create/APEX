@@ -24,7 +24,7 @@ import numba
 P = dict(BIG_NY=30, BIG_LDN=20, pvLen=5, legLookback=30, edgePct=0.2, maxLegBars=240, zoneTol=4 * TICK, ftPct=0.6,
          absHold=0.5, useAbs=True, useCvdBreak=True, useDevVA=True, stopOff=2 * TICK, minStop=40 * TICK, maxStop=40.0,
          minRR=2.5, fallbackRR=5.0, v2MinRR=1.0, maxLosses=3, houseMoney=True, fullBody=0.5, boxLen=20, compK=0.6,
-         rejMax=3, v4MinTrapped=2, v4stop="box", v4be="live", v3dir="long", v3Win=5, v3MinAbs=2, v3prof="session", v3gate="bias", ivbMin=30, v7RR=1.0, v7Win=5, v7MaxAtt=3, v7mode="breakout", v7long=True, v7filter=True, biasMode="pre", trig="orders", effK=1.5, effN=30, mgmt="base", v1loc="lvn", v8Exp=3, v8Min=3.0, v8RR=1.0, gapMin=120, barKind="1m", insideLvl=True, cost=4.50, slip=TICK, models=("V1", "V2", "V4"))
+         rejMax=3, v4MinTrapped=2, v4stop="box", v4be="live", v3dir="long", v3Win=5, v3MinAbs=2, v3prof="session", v3gate="bias", ivbMin=30, v7RR=1.0, v7Win=5, v7MaxAtt=3, v7mode="breakout", v7long=True, v7filter=True, biasMode="pre", trig="orders", effK=1.5, effN=30, mgmt="base", v1loc="lvn", v8Exp=3, v8Min=3.0, v8RR=1.0, gapMin=120, barKind="1m", g4=False, g4Models=("V1", "V4"), g4Max=2, g4MinR=1.0, g4Frac=1 / 3, g4Swing=5, g4MaxQ=3.0, insideLvl=True, cost=4.50, slip=TICK, models=("V1", "V2", "V4"))
 NY0, NY1, FLAT = 9 * 60 + 45, 13 * 60 + 30, 15 * 60 + 55
 LDN0, LDN1, V2FLAT = 3 * 60, 9 * 60 + 10, 9 * 60 + 25
 
@@ -132,7 +132,7 @@ def run(d, bars, rows, rstart, big, tstart, **over):
     v3 = dict(done=False, att=0, prof={}, cvd=0.0)
     v8 = dict(n=0)
     v7 = dict(hi=np.nan, lo=np.nan, prof={}, dir=0, poc=np.nan, vah=np.nan, val=np.nan, done=False, att=0)  # VALENTINI-7 IVB                     # VALENTINI-3 AAA (rule sheet, Kian 2026-11-16)
-    pos = None; pending = None; stopOrder = None; pendingExit = False; limitOrder = None
+    pos = None; pending = None; stopOrder = None; pendingExit = False; limitOrder = None; pendingAdd = None
     R = dict(prof={}, hi=np.nan, lo=np.nan, close=np.nan, prev=None, prev2=None, pf=0)   # RTH profile framing (N2)
     dayPeak = 0.0
 
@@ -174,12 +174,14 @@ def run(d, bars, rows, rstart, big, tstart, **over):
         return np.nan if abs(entry - s) > p["maxStop"] else s
 
     def close_pos(i, px, why, tsx):
-        nonlocal pos
+        nonlocal pos, pendingAdd
         pnl = (px - pos["fill"]) * pos["d"] * PV - p["cost"]
-        S["dayPnl"] += pnl
+        legp = [lg["q"] * ((px - lg["fill"]) * pos["d"] * PV - p["cost"]) for lg in pos["legs"]]
+        pnl_all = pnl + sum(legp); pendingAdd = None
+        S["dayPnl"] += pnl_all
         nonlocal dayPeak
         dayPeak = max(dayPeak, S["dayPnl"])
-        if pnl < 0: S["dayLosses"] += 1
+        if pnl_all < 0: S["dayLosses"] += 1
         else: S["lastWinDir"] = pos["d"]
         if pos["m"] == "V4" and v4["dir"] != 0: v4["att"] += 1
         if pos["m"] == "V3": v3["att"] += 1
@@ -187,7 +189,11 @@ def run(d, bars, rows, rstart, big, tstart, **over):
         if pos["m"] == "V8": v8["n"] += 1
         out.append(dict(model=pos["m"], session=SES[i], entry_ts=pos["ts"], exit_ts=tsx, d=pos["d"], how=pos["how"],
                         fill=pos["fill"], stop0=pos["stop0"], tgt=pos["tgt"], exit=px, why=why, dist=pos["dist"],
-                        R=(px - pos["fill"]) * pos["d"] / pos["dist"], pnl=pnl, be=pos["be"]))
+                        R=(px - pos["fill"]) * pos["d"] / pos["dist"], pnl=pnl, be=pos["be"], qty=1.0, parent_dist=pos["dist"], leg=0))
+        for j, (lg, lp) in enumerate(zip(pos["legs"], legp), 1):              # G4 add-on legs
+            out.append(dict(model=pos["m"] + "+add", session=SES[i], entry_ts=lg["ts"], exit_ts=tsx, d=pos["d"], how="G4 add",
+                            fill=lg["fill"], stop0=lg["stp"], tgt=pos["tgt"], exit=px, why=why, dist=lg["dist"],
+                            R=(px - lg["fill"]) * pos["d"] / lg["dist"], pnl=lp, be=True, qty=lg["q"], parent_dist=pos["dist"], leg=j))
         pos = None
 
     def open_pos(i, k, fill, sig):
@@ -206,7 +212,7 @@ def run(d, bars, rows, rstart, big, tstart, **over):
             t = target(dd, fill, dist)
             if np.isnan(t): t = sig["tgt"]
         pos = dict(m=sig["m"], d=dd, fill=fill, ts=tsA[k], dist=dist, stp=stp, stop0=stp, tgt=t, how=sig["how"],
-                   ext=sig.get("ext", np.nan), be=False, postExt=np.nan, rej=0, k=k, bar=i)
+                   ext=sig.get("ext", np.nan), be=False, postExt=np.nan, rej=0, k=k, bar=i, legs=[], g4ext=np.nan)
 
     def walk(i, k0):
         if pos is None: return
@@ -261,6 +267,12 @@ def run(d, bars, rows, rstart, big, tstart, **over):
             open_pos(i, k0, pxA[k0] + pending["d"] * p["slip"], pending); stopOrder = None
             walk(i, k0 + 1)
         elif pos is not None:
+            if pendingAdd is not None:                                   # G4: fill the add-on at this bar's first trade
+                fa = pxA[k0] + pos["d"] * p["slip"]; ldist = (fa - pos["stp"]) * pos["d"]
+                if ldist >= 1.0:
+                    q = min(p["g4MaxQ"], pendingAdd / (ldist * PV)); q = np.floor(q * 10) / 10   # MNQ granularity
+                    if q >= 0.1: pos["legs"].append(dict(fill=fa, q=q, dist=ldist, stp=pos["stp"], ts=tsA[k0]))
+                pendingAdd = None
             walk(i, k0)
         elif stopOrder is not None:
             so = stopOrder; dd = so["d"]
@@ -369,7 +381,20 @@ def run(d, bars, rows, rstart, big, tstart, **over):
                 if dirBar and (aggress(i, dd) or any(b.side == dd and b.size >= p["BIG_NY"] for b in bigbar.get(i, []))):
                     ns = L[i] - 2 * TICK if dd == 1 else H[i] + 2 * TICK
                     pos["stp"] = max(pos["stp"], ns) if dd == 1 else min(pos["stp"], ns)
-            if pos["m"] == "V4" and pos["rej"] >= p["rejMax"]:
+            if p["g4"] and pos is not None and pos["m"] in p["g4Models"] and len(pos["legs"]) < p["g4Max"] and mod < NY1 and canTrade:
+                gx = pos["g4ext"]; dirBar = C[i] > O[i] if dd == 1 else C[i] < O[i]
+                accept = not np.isnan(gx) and dirBar and ((C[i] > gx) if dd == 1 else (C[i] < gx)) and \
+                    (aggress(i, dd) or any(b.side == dd and b.size >= p["BIG_NY"] for b in bigbar.get(i, [])))
+                if accept and (C[i] - fill) * dd >= p["g4MinR"] * pos["dist"]:
+                    w0 = max(i - p["g4Swing"] + 1, 0)
+                    lock = (L[w0:i + 1].min() - 2 * TICK) if dd == 1 else (H[w0:i + 1].max() + 2 * TICK)   # last invalidation point
+                    if (lock - fill) * dd > TICK and (lock - pos["stp"]) * dd > 0:
+                        pos["stp"] = lock; pos["be"] = True
+                        locked = (lock - fill) * dd * PV + sum(lg["q"] * (lock - lg["fill"]) * dd * PV for lg in pos["legs"])
+                        if locked > 0: pendingAdd = locked * p["g4Frac"]                 # risk 1/3 of the locked profit
+            if pos is not None:
+                pos["g4ext"] = (H[i] if dd == 1 else L[i]) if np.isnan(pos["g4ext"]) else (max(pos["g4ext"], H[i]) if dd == 1 else min(pos["g4ext"], L[i]))
+            if pos is not None and pos["m"] == "V4" and pos["rej"] >= p["rejMax"]:
                 pendingExit = True
         if pos is not None and (i + 1 == n or SES[i + 1] != SES[i] or (MIN[i + 1] - MIN[i]) > np.timedelta64(p["gapMin"], "m")):
             close_pos(i, C[i] - pos["d"] * p["slip"], "eod", tsA[tstart[i + 1] - 1]); pendingExit = False
@@ -609,10 +634,13 @@ def stats(t, label):
 def account(t, eq0=100_000.0, risk=0.0025, cap=0.02, mnq_cost=1.50):
     """MNQ sizing to `risk` of equity per trade ($2/pt), 2% daily loss cap. Returns (return %, maxDD %)."""
     eq = eq0; peak = eq0; mdd = 0.0; day = None; dstart = eq0
+    t = t.copy()
+    if "qty" not in t: t["qty"] = 1.0; t["parent_dist"] = t["dist"]
     for r in t.sort_values("entry_ts").itertuples():
         if r.session != day: day, dstart = r.session, eq
         if eq - dstart <= -cap * dstart: continue
-        q = int(risk * eq // (r.dist * 2.0))
+        q = int(risk * eq // (r.parent_dist * 2.0))
+        if r.qty != 1.0: q = int(np.floor(q * r.qty))                     # G4 leg: fraction of the parent size
         if q < 1: continue
         eq += q * ((r.exit - r.fill) * r.d * 2.0 - mnq_cost)
         peak = max(peak, eq); mdd = min(mdd, eq / peak - 1)
