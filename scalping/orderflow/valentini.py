@@ -23,7 +23,7 @@ from valentini_v1 import load, build as build1, va, TICK, PV, RS   # same data p
 P = dict(BIG_NY=30, BIG_LDN=20, pvLen=5, legLookback=30, edgePct=0.2, maxLegBars=240, zoneTol=4 * TICK, ftPct=0.6,
          absHold=0.5, useAbs=True, useCvdBreak=True, useDevVA=True, stopOff=2 * TICK, minStop=40 * TICK, maxStop=40.0,
          minRR=2.5, fallbackRR=5.0, v2MinRR=1.0, maxLosses=3, houseMoney=True, fullBody=0.5, boxLen=20, compK=0.6,
-         rejMax=3, v4MinTrapped=2, v4stop="box", v4be="live", insideLvl=True, cost=4.50, slip=TICK, models=("V1", "V2", "V4"))
+         rejMax=3, v4MinTrapped=2, v4stop="box", v4be="live", v3dir="long", v3Win=5, v3MinAbs=2, v3prof="session", v3gate="bias", insideLvl=True, cost=4.50, slip=TICK, models=("V1", "V2", "V4"))
 NY0, NY1, FLAT = 9 * 60 + 45, 13 * 60 + 30, 15 * 60 + 55
 LDN0, LDN1, V2FLAT = 3 * 60, 9 * 60 + 10, 9 * 60 + 25
 
@@ -37,6 +37,10 @@ def build(d):
     osz = np.add.reduceat(sz, gs); m = osz >= min(P["BIG_NY"], P["BIG_LDN"])
     big = pd.DataFrame({"ts": ts[gs[m]], "side": sd[gs[m]], "size": osz[m], "px": px[ge[m] - 1], "bar": bar[gs[m]]})
     return bars, rows, rstart, big, tstart
+
+
+from collections import Counter
+FUN = Counter()
 
 
 def run(d, bars, rows, rstart, big, tstart, **over):
@@ -64,6 +68,7 @@ def run(d, bars, rows, rstart, big, tstart, **over):
     v1 = dict(dir=0, start=np.nan, ext=np.nan, lvn=np.nan, startBar=-1, usedPL=-1, usedPH=-1)
     v2 = dict(dir=0, swing=np.nan, swingBar=-1, ext=np.nan, lvn=np.nan)
     v4 = dict(dir=0, hi=np.nan, lo=np.nan, bar=-1, att=0, trapLvl=np.nan)
+    v3 = dict(done=False, att=0, prof={}, cvd=0.0)                     # VALENTINI-3 AAA (rule sheet, Kian 2026-11-16)
     pos = None; pending = None; stopOrder = None; pendingExit = False
 
     def bigs(i, lo, hi, side=None, minsize=30):
@@ -107,6 +112,7 @@ def run(d, bars, rows, rstart, big, tstart, **over):
         if pnl < 0: S["dayLosses"] += 1
         else: S["lastWinDir"] = pos["d"]
         if pos["m"] == "V4" and v4["dir"] != 0: v4["att"] += 1
+        if pos["m"] == "V3": v3["att"] += 1
         out.append(dict(model=pos["m"], session=SES[i], entry_ts=pos["ts"], exit_ts=tsx, d=pos["d"], how=pos["how"],
                         fill=pos["fill"], stop0=pos["stop0"], tgt=pos["tgt"], exit=px, why=why, dist=pos["dist"],
                         R=(px - pos["fill"]) * pos["d"] / pos["dist"], pnl=pnl, be=pos["be"]))
@@ -116,7 +122,9 @@ def run(d, bars, rows, rstart, big, tstart, **over):
         nonlocal pos
         dd, dist = sig["d"], sig["dist"]
         stp = fill - dd * dist                                         # Pine posInit: re-anchor to the fill
-        if sig["m"] == "V2":
+        if sig["m"] == "V3":                                           # E1: session VAH frozen at signal
+            t = sig["tgt"] if (sig["tgt"] - fill) * dd > 0 else fill + dd * p["minRR"] * dist
+        elif sig["m"] == "V2":
             t = S["pPOC"] if (not np.isnan(S["pPOC"]) and (S["pPOC"] - fill) * dd > 0) else fill + dd * dist
         else:
             t = target(dd, fill, dist)
@@ -145,6 +153,7 @@ def run(d, bars, rows, rstart, big, tstart, **over):
                 S.update(pwHigh=S["wHi"], pwLow=S["wLo"], wHi=np.nan, wLo=np.nan)
             S.update(dayFull=True, dayProf={}, onProf={}, dHi=np.nan, dLo=np.nan, onHigh=np.nan, onLow=np.nan, onPOC=np.nan,
                      dayBias=0, cvd=0.0, dayStart=i, dayLosses=0, lastWinDir=0, dayPnl=0.0, firstUsedL=False, firstUsedS=False)
+            v3.update(done=False, att=0, prof={}, cvd=0.0)
         mod = MOD[i]
         inON = mod >= 18 * 60 or mod < 9 * 60 + 30
         inNY = NY0 <= mod < NY1
@@ -182,6 +191,9 @@ def run(d, bars, rows, rstart, big, tstart, **over):
         if not inON and i > 0 and not newDay and (MOD[i - 1] >= 18 * 60 or MOD[i - 1] < 9 * 60 + 30) and op_:
             S["onPOC"] = va(op_)[0]
         S["cvd"] += DEL[i]; cvdHist[i] = S["cvd"]
+        if 9 * 60 + 30 <= mod < 16 * 60:                               # V3 B1 NY-session profile + A7 NY CVD
+            v3["cvd"] += DEL[i]
+            for kk, vv in zip(rk[s0:e0], rv[s0:e0]): v3["prof"][kk] = v3["prof"].get(kk, 0) + vv
         if afterOpen and not inON and not np.isnan(S["onHigh"]):
             if C[i] > S["onHigh"]: S["dayBias"] = 1
             elif C[i] < S["onLow"]: S["dayBias"] = -1
@@ -221,12 +233,19 @@ def run(d, bars, rows, rstart, big, tstart, **over):
                 elif pos["m"] == "V4":                                   # A8 live rule: a LATER candle accepting the high
                     acc = not np.isnan(prevExt) and bodyOk and dirBar and ((C[i] > prevExt) if dd == 1 else (C[i] < prevExt))
                     hit = fav and (acc or pos["rej"] >= 1)
+                elif pos["m"] == "V3":                                   # D3 risk-free at the first close in profit
+                    hit = fav
                 elif pos["m"] == "V1":                                   # K1 live rule
                     hit = fav and bodyOk and dirBar and ((C[i] > pos["ext"]) if dd == 1 else (C[i] < pos["ext"]))
                 else:                                                    # V2 "additional breakout"
                     hit = fav and ((H[i] > pos["ext"]) if dd == 1 else (L[i] < pos["ext"]))
                 if hit:
                     pos["stp"] = max(pos["stp"], fill + TICK) if dd == 1 else min(pos["stp"], fill - TICK); pos["be"] = True
+            elif pos["m"] == "V3":                                       # D4 trail behind each new wave in direction
+                dirBar = C[i] > O[i] if dd == 1 else C[i] < O[i]
+                if dirBar and any(b.side == dd and b.size >= p["BIG_NY"] for b in bigbar.get(i, [])):
+                    ns = L[i] - 2 * TICK if dd == 1 else H[i] + 2 * TICK
+                    pos["stp"] = max(pos["stp"], ns) if dd == 1 else min(pos["stp"], ns)
             if pos["m"] == "V4" and pos["rej"] >= p["rejMax"]:
                 pendingExit = True
         if pos is not None and (i + 1 == n or SES[i + 1] != SES[i] or (MIN[i + 1] - MIN[i]) > np.timedelta64(60, "m")):
@@ -343,7 +362,45 @@ def run(d, bars, rows, rstart, big, tstart, **over):
                     sig = None
                 else:
                     pending = sig
-            if pending is None and "V4" in M and v4["dir"] != 0 and inNY:
+            if "V3" in M and 10 * 60 <= mod < NY1: FUN["1 in 10:00-13:30, flat"] += 1
+            if pending is None and "V3" in M and not v3["done"] and v3["att"] < 2 and 10 * 60 <= mod < NY1 and v3["prof"]:
+                dd = bias if p["v3gate"] == "bias" else int(np.sign(v3["cvd"]))   # A4: bias break, or NY CVD direction
+                if dd != 0 and (p["v3dir"] == "both" or dd == 1): FUN["2 day bias ok"] += 1
+                if dd != 0 and (p["v3dir"] == "both" or dd == 1) and v3["cvd"] * dd > 0: FUN["3 NY CVD ok"] += 1
+                if dd != 0 and (p["v3dir"] == "both" or dd == 1) and v3["cvd"] * dd > 0:      # A4/A5 day + A7 CVD
+                    if p["v3prof"] == "expansion":                         # B2: profile of the expansion move A->now
+                        o0 = S["dayStart"] + int(np.argmax((MOD[S["dayStart"]:i + 1] >= 9 * 60 + 30)))
+                        a = o0 + (int(np.argmin(L[o0:i + 1])) if dd == 1 else int(np.argmax(H[o0:i + 1])))
+                        kk, vv = rk[rstart[a]:rstart[i + 1]], rv[rstart[a]:rstart[i + 1]]
+                        u, inv = np.unique(kk, return_inverse=True); vol = np.bincount(inv, weights=vv)
+                        _, vah, val = va(dict(zip(u.tolist(), vol.tolist())))
+                    else:                                                  # B1: NY session profile from 09:30
+                        _, vah, val = va(v3["prof"])
+                    zlo, zhi = (val - p["zoneTol"], val + RS + p["zoneTol"]) if dd == 1 else (vah - RS - p["zoneTol"], vah + p["zoneTol"])
+                    w0 = max(i - p["v3Win"] + 1, S["dayStart"])
+                    if (C[i] < zlo) if dd == 1 else (C[i] > zhi):
+                        v3["done"] = True                                                     # C1/B5 level breached
+                    else:
+                        FUN["4 not breached"] += 1
+                        if (L[i] <= zhi) if dd == 1 else (H[i] >= zlo): FUN["4b bar touches zone"] += 1
+                        nabs = sum(1 for j in range(w0, i + 1) for b in bigbar.get(j, [])
+                                   if b.side == -dd and b.size >= p["BIG_NY"] and zlo <= b.px <= zhi)  # C2
+                        held = (C[w0:i + 1].min() >= zlo) if dd == 1 else (C[w0:i + 1].max() <= zhi)
+                        if nabs >= 1: FUN["5a >=1 absorbed order"] += 1
+                        if nabs >= p["v3MinAbs"]: FUN["5b >=2 absorbed orders"] += 1
+                        if nabs >= p["v3MinAbs"] and held:
+                            FUN["6 held"] += 1
+                            lvl = H[i] + TICK if dd == 1 else L[i] - TICK                        # C4 buy stop
+                            prot = L[w0:i + 1].min() if dd == 1 else H[w0:i + 1].max()          # D1
+                            s3 = stopfor(dd, prot, lvl); tgt3 = vah if dd == 1 else val
+                            if not np.isnan(s3):
+                                FUN["7 stop <= 40 pts"] += 1
+                                dist = abs(lvl - s3)
+                                if (tgt3 - lvl) * dd / dist >= p["minRR"]: FUN["8 RR >= 2.5"] += 1
+                                if (tgt3 - lvl) * dd / dist >= p["minRR"] and not (
+                                        p["houseMoney"] and S["lastWinDir"] == dd and dist * PV > S["dayPnl"]):
+                                    stopOrder = dict(m="V3", d=dd, lvl=lvl, dist=dist, tgt=tgt3, how="absorb@VAL" if dd == 1 else "absorb@VAH")
+            if pending is None and stopOrder is None and "V4" in M and v4["dir"] != 0 and inNY:
                 dd = v4["dir"]; lvl = v4["hi"] + TICK if dd == 1 else v4["lo"] - TICK
                 prot = (v4["lo"] if dd == 1 else v4["hi"]) if p["v4stop"] == "box" else v4["trapLvl"]
                 hm = lambda dist: p["houseMoney"] and S["lastWinDir"] == dd and dist * PV > S["dayPnl"]
@@ -393,13 +450,19 @@ if __name__ == "__main__":
                      ("V4 alone (box stop)", dict(models=("V4",), v4stop="box")),
                      ("V4 alone (big-order stop)", dict(models=("V4",), v4stop="big")),
                      ("V4 alone (Pine BE)", dict(models=("V4",), v4stop="box", v4be="pine")),
-                     ("ALL (V4 box stop)", dict(v4stop="box")), ("ALL (V4 big-order stop)", dict(v4stop="big"))]:
+                     ("ALL (V4 box stop)", dict(v4stop="box")), ("ALL (V4 big-order stop)", dict(v4stop="big")),
+                     ("V3 alone (long only)", dict(models=("V3",))),
+                     ("V3 alone (long + short)", dict(models=("V3",), v3dir="both")),
+                     ("V3 B2 expansion (long)", dict(models=("V3",), v3prof="expansion")),
+                     ("V3 B2 expansion (long+short)", dict(models=("V3",), v3prof="expansion", v3dir="both")),
+                     ("ALL4 V1 V2 V3 V4", dict(models=("V1", "V2", "V3", "V4"))),
+                     ("ALL4 with V3 B2 long+short", dict(models=("V1", "V2", "V3", "V4"), v3prof="expansion", v3dir="both"))]:
         t = run(d, *parts, **kw); res[name] = t
         r, mdd = account(t) if not t.empty else (0, 0)
         print(stats(t, name), f"| $100k@0.25%: {r:+.1f}% (DD {mdd:.1f}%)")
         tag = name.replace(" ", "_").replace("(", "").replace(")", "")
         t.to_csv(f"scalping_data/val_{tag}_{months[0]}_{months[-1]}.csv", index=False)
-    for name in ["ALL (V4 box stop)", "ALL (V4 big-order stop)"]:
+    for name in ["ALL4 with V3 B2 long+short"]:
         t = res[name]
-        for m in ["V1", "V2", "V4"]:
+        for m in ["V1", "V2", "V3", "V4"]:
             print("   ", stats(t[t.model == m], f"{name} -> {m}"))

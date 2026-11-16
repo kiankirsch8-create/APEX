@@ -73,3 +73,40 @@ Status: STATED / INTERPRETED / MISSING / CONFLICT (see `../FIDELITY.md`).
   (CF 17:38-20:01); CVD-based early breakeven (CF 26:19); "full body candle accepting the high" (CF 2:54:21). Still discretionary.
 - 30-min rule context (open question 2): "direction for the day [clear] from 15 to 30 minutes inside the opening" (CF 1:23:34).
 - Daily cap 2%, 0.25% per trade (CF 2:09:19, 2:23:06) confirm F-rows.
+
+## Kian's decision (2026-11-16): build and test as Proxy without A6
+Defaults chosen for the open/unclear rows (all INTERPRETED, to be tweaked after the test):
+| Row | Default in the port | Why |
+|---|---|---|
+| A2/A3 | entries only 10:00-13:30 NY (strict 30-min rule); no early exception | his stated rule; exception is discretionary |
+| A4/A5 momentum day | day bias from the break of the pre-NY range (same as V1/V4); long day = AAA long | his "long day / short day" rule (CF 1:43:50) |
+| A6 | not used | MISSING (macro read / 0DTE options) |
+| A7 | NY-session CVD (from 09:30) must be in the trade direction at entry | "CVD not so defined... don't engage" |
+| B1 | profile = NY session from 09:30 to now (developing); VAL/VAH/POC from it | "profile distribution of the first hours of the session" |
+| B3 | location = VAL ± 1 pt (4 ticks) + one profile row | same zone width as V1/V2 |
+| B4/B5 | second area (accumulation POC) NOT built; a 1m close below the VAL zone ends AAA for the day | C1 "breached the level... cancel"; B4 anchor too vague |
+| C2 | absorption = >= 2 big sell orders (>= 30 lots) inside the VAL zone in the last 5 bars, no 1m close below the zone | "big trades... hitting a wall"; count same as V4 (A7) |
+| C3 | delta check not used | how he uses it is not stated |
+| C4 | buy stop 1 tick above the high of the absorption bar; single entry (no scaling) | "build buy stop... covered below this low" |
+| D1 | stop 2 ticks below the lowest low of the 5-bar absorption window (min-stop floor 10 pts, max 40) | "cover ourselves below here" |
+| D3 | breakeven at the first 1m close beyond entry + 1 tick | "in 1 minute the position is risk-free" |
+| D4 | after breakeven: each 1m candle that closes in direction AND contains a big order in direction moves the stop to 2 ticks beyond that candle's low | "trail our stop... as soon as we see buyers getting in" |
+| D5, E2, F2, F4 | not built (discretionary / threshold unknown) | |
+| E1 | target = session VAH at signal time; trade only if >= 2.5R ("1 to 2.5 is the minimum", CF 55:27) | |
+| F1/F3 | shared with the suite: 3 losses/day, house money | |
+| Direction | main = long only (only the long is described); variant = mirrored short at VAH | |
+Fidelity grade of any result: **Proxy**.
+
+## First test (Jun-Aug 2025, Databento trades), 2026-11-16
+V3 almost never fires: 0-2 trades in 3 months under every reading tested.
+| Reading | Long only | Long + short |
+|---|---|---|
+| B1 session profile, day = pre-NY range break | 0 | 1 (BE) |
+| B2 expansion-move profile, day = pre-NY range break | 0 | 0 |
+| B1 session profile, day = NY CVD direction | 0 | 1 (BE) |
+| B2 expansion-move profile, day = NY CVD direction | 0 | 2 (1 stop, 1 BE) |
+Funnel (B1, bias day, long): 3,020 candles with day + CVD ok -> 14 touch the VAL zone -> 2 with one absorbed big sell -> 0 with two.
+Cause: on a momentum day the developing value area rises with price, so a pullback to VAL while the day is already
+confirmed long is rare. His momentum-day call comes from A6 (pre-trade thesis, MISSING); B4 (second area) is not built.
+Note: B2 is the anchor he gives for momentum trades (WoR 1:37:54); choosing B1 as the default was our misread, B2 tested now.
+Status: not testable as defined. Do not loosen rules until Kian decides (see chat 2026-11-16).
