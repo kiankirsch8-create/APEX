@@ -92,3 +92,14 @@ a failed attempt (overfit) and goes to the Analyst.
 - Conclusions use entry-time features only (not hold time, not exit reason).
 - If the Agent tool is unavailable, run the roles yourself in order, but write each role's output to a
   file first (`research/runs/<date>-<HHMM>-<role>.md`) before reading results as the next role.
+
+
+## Validation rules from Valentini (CH interview, 2026-11-16 review), adopted by Kian
+- V-a Compare triggers in isolation at a fixed 1:1 before building the full model.
+- V-b Edge contribution: add one component at a time; keep it only if signal quality improves.
+- V-c A real edge is a plateau of parameters, not a peak (300% works, 301% fails = overfit).
+- V-d PF 1.4-1.6 over thousands of trades is excellent; PF 4+ sustained = suspect; always net of costs and slippage.
+- V-e Rolling-quarter monitor (~200 trades): if a quarter turns down against the previous one, switch the model off.
+- V-f >= 3 years in-sample + 3 months out-of-sample (~300 trades) before live use (scalping data: as much as we can buy).
+- V-g A model that works on NQ is not assumed to work on ES or other markets.
+- V-h Run several decorrelated models; accept regime drawdowns, cap them with the daily budget.
