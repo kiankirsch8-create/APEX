@@ -1,0 +1,11 @@
+# Larry Williams short clips pasted by Kian in chat (2026-11-16), verbatim excerpts
+- Walmart seasonal: "buy Walmart about two days before Thanksgiving sell three or four days later year after year in the last 36 years Walmart has always rallied at that time"; most retail stocks rally from Black Friday.
+- Tools of Trading (66L1M2Lc0Oc): few indicators, each a different job: trend (50-day MA or eyeball), overbought/oversold (Williams %R), professional accumulation (OBV / POI / Williams A/D), seasonal chart.
+- Buy Signal: best time to buy stocks is when the news is horrible.
+- Dirty Secrets of Day Trading I: intraday volatility is U-shaped; best trend/breakout trades right after the open and shortly before the close.
+- Dirty Secrets II: day traders can't make money every day; large moves follow a run of small-range days; wait for them.
+- Dirty Secrets III: trend is the basis of all profits; large-range days close at their high or low → hold to the close, don't dance in and out.
+- Gold I/II: gold rallies with inflation, not recessions; rallies when COT commercials are heavy buyers, falls when they are heavy sellers.
+- Cycles: 4-year low cycle, decennial pattern; Cycles II: 13-week (earnings) cycle in stocks.
+- How to tell the trend: price above/below 50-day MA.
+- Do you have the right stuff: handle stress, think before reacting.
