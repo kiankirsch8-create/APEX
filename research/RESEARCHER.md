@@ -25,6 +25,8 @@ commit it, and stop. Do not work around missing data.
 1. `scalping/findings/README.md`: why the five reference strategies failed, the traps, the ranked hypotheses.
 2. `research/LEDGER.md`: every idea so far and its status. Don't repeat a closed idea under a new name.
 3. The last 3 files in `research/runs/`: what previous runs tried and planned next.
+4. `research/PRO_KNOWLEDGE.md`: principles, filters and validation habits from top traders. Use them to shape
+   mechanisms and filters, cite the `PK-` ID in the ledger, and treat every item as a hypothesis to test.
 
 ## 3. Pick ideas (1–3 per run)
 
