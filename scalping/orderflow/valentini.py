@@ -23,7 +23,7 @@ from valentini_v1 import load, build as build1, va, TICK, PV, RS   # same data p
 P = dict(BIG_NY=30, BIG_LDN=20, pvLen=5, legLookback=30, edgePct=0.2, maxLegBars=240, zoneTol=4 * TICK, ftPct=0.6,
          absHold=0.5, useAbs=True, useCvdBreak=True, useDevVA=True, stopOff=2 * TICK, minStop=40 * TICK, maxStop=40.0,
          minRR=2.5, fallbackRR=5.0, v2MinRR=1.0, maxLosses=3, houseMoney=True, fullBody=0.5, boxLen=20, compK=0.6,
-         rejMax=3, v4MinTrapped=2, v4stop="box", v4be="live", v3dir="long", v3Win=5, v3MinAbs=2, v3prof="session", v3gate="bias", insideLvl=True, cost=4.50, slip=TICK, models=("V1", "V2", "V4"))
+         rejMax=3, v4MinTrapped=2, v4stop="box", v4be="live", v3dir="long", v3Win=5, v3MinAbs=2, v3prof="session", v3gate="bias", ivbMin=30, v7RR=2.5, v7Win=5, v7MaxAtt=3, biasMode="pre", insideLvl=True, cost=4.50, slip=TICK, models=("V1", "V2", "V4"))
 NY0, NY1, FLAT = 9 * 60 + 45, 13 * 60 + 30, 15 * 60 + 55
 LDN0, LDN1, V2FLAT = 3 * 60, 9 * 60 + 10, 9 * 60 + 25
 
@@ -68,7 +68,8 @@ def run(d, bars, rows, rstart, big, tstart, **over):
     v1 = dict(dir=0, start=np.nan, ext=np.nan, lvn=np.nan, startBar=-1, usedPL=-1, usedPH=-1)
     v2 = dict(dir=0, swing=np.nan, swingBar=-1, ext=np.nan, lvn=np.nan)
     v4 = dict(dir=0, hi=np.nan, lo=np.nan, bar=-1, att=0, trapLvl=np.nan)
-    v3 = dict(done=False, att=0, prof={}, cvd=0.0)                     # VALENTINI-3 AAA (rule sheet, Kian 2026-11-16)
+    v3 = dict(done=False, att=0, prof={}, cvd=0.0)
+    v7 = dict(hi=np.nan, lo=np.nan, prof={}, dir=0, poc=np.nan, vah=np.nan, val=np.nan, done=False, att=0)  # VALENTINI-7 IVB                     # VALENTINI-3 AAA (rule sheet, Kian 2026-11-16)
     pos = None; pending = None; stopOrder = None; pendingExit = False
 
     def bigs(i, lo, hi, side=None, minsize=30):
@@ -113,6 +114,7 @@ def run(d, bars, rows, rstart, big, tstart, **over):
         else: S["lastWinDir"] = pos["d"]
         if pos["m"] == "V4" and v4["dir"] != 0: v4["att"] += 1
         if pos["m"] == "V3": v3["att"] += 1
+        if pos["m"] == "V7": v7["att"] += 1
         out.append(dict(model=pos["m"], session=SES[i], entry_ts=pos["ts"], exit_ts=tsx, d=pos["d"], how=pos["how"],
                         fill=pos["fill"], stop0=pos["stop0"], tgt=pos["tgt"], exit=px, why=why, dist=pos["dist"],
                         R=(px - pos["fill"]) * pos["d"] / pos["dist"], pnl=pnl, be=pos["be"]))
@@ -122,7 +124,9 @@ def run(d, bars, rows, rstart, big, tstart, **over):
         nonlocal pos
         dd, dist = sig["d"], sig["dist"]
         stp = fill - dd * dist                                         # Pine posInit: re-anchor to the fill
-        if sig["m"] == "V3":                                           # E1: session VAH frozen at signal
+        if sig["m"] == "V7":                                           # X2 fixed R target from the fill
+            t = fill + dd * p["v7RR"] * dist
+        elif sig["m"] == "V3":                                         # E1: session VAH frozen at signal
             t = sig["tgt"] if (sig["tgt"] - fill) * dd > 0 else fill + dd * p["minRR"] * dist
         elif sig["m"] == "V2":
             t = S["pPOC"] if (not np.isnan(S["pPOC"]) and (S["pPOC"] - fill) * dd > 0) else fill + dd * dist
@@ -154,6 +158,7 @@ def run(d, bars, rows, rstart, big, tstart, **over):
             S.update(dayFull=True, dayProf={}, onProf={}, dHi=np.nan, dLo=np.nan, onHigh=np.nan, onLow=np.nan, onPOC=np.nan,
                      dayBias=0, cvd=0.0, dayStart=i, dayLosses=0, lastWinDir=0, dayPnl=0.0, firstUsedL=False, firstUsedS=False)
             v3.update(done=False, att=0, prof={}, cvd=0.0)
+            v7.update(hi=np.nan, lo=np.nan, prof={}, dir=0, poc=np.nan, vah=np.nan, val=np.nan, done=False, att=0)
         mod = MOD[i]
         inON = mod >= 18 * 60 or mod < 9 * 60 + 30
         inNY = NY0 <= mod < NY1
@@ -197,7 +202,17 @@ def run(d, bars, rows, rstart, big, tstart, **over):
         if afterOpen and not inON and not np.isnan(S["onHigh"]):
             if C[i] > S["onHigh"]: S["dayBias"] = 1
             elif C[i] < S["onLow"]: S["dayBias"] = -1
-        bias = S["dayBias"]
+        # IVB range (R1) and first breakout (R3), tracked for V7 and for the IVB-bias variants
+        ivbEnd = 9 * 60 + 30 + p["ivbMin"]
+        if 9 * 60 + 30 <= mod < ivbEnd:
+            v7["hi"] = H[i] if np.isnan(v7["hi"]) else max(v7["hi"], H[i]); v7["lo"] = L[i] if np.isnan(v7["lo"]) else min(v7["lo"], L[i])
+            for kk, vv in zip(rk[s0:e0], rv[s0:e0]): v7["prof"][kk] = v7["prof"].get(kk, 0) + vv
+        elif ivbEnd <= mod < 16 * 60 and not np.isnan(v7["hi"]):
+            if np.isnan(v7["poc"]) and v7["prof"]: v7["poc"], v7["vah"], v7["val"] = va(v7["prof"])
+            if v7["dir"] == 0:
+                if C[i] > v7["hi"]: v7["dir"] = 1
+                elif C[i] < v7["lo"]: v7["dir"] = -1
+        bias = S["dayBias"] if p["biasMode"] == "pre" else v7["dir"]
         canTrade = S["dayLosses"] < p["maxLosses"]
         c = i - pv
         if c - pv >= 0:
@@ -363,8 +378,31 @@ def run(d, bars, rows, rstart, big, tstart, **over):
                 else:
                     pending = sig
             if "V3" in M and 10 * 60 <= mod < NY1: FUN["1 in 10:00-13:30, flat"] += 1
+            if pending is None and "V7" in M and v7["dir"] != 0 and not v7["done"] and v7["att"] < p["v7MaxAtt"] \
+                    and ivbEnd <= mod < NY1 and not np.isnan(v7["poc"]):
+                dd = v7["dir"]
+                zlo, zhi = (v7["poc"] - p["zoneTol"], v7["vah"] + p["zoneTol"]) if dd == 1 else (v7["val"] - p["zoneTol"], v7["poc"] + p["zoneTol"])
+                if (C[i] < v7["val"]) if dd == 1 else (C[i] > v7["vah"]):
+                    v7["done"] = True                                                         # L3 invalidation
+                elif rng > 0 and L[i] <= zhi and H[i] >= zlo:
+                    w0 = max(i - p["v7Win"] + 1, S["dayStart"]); edge = np.nan; how = ""
+                    agg = bigs(i, zlo, zhi, dd, p["BIG_NY"])
+                    ft = (C[i] > O[i] and C[i] - L[i] >= p["ftPct"] * rng) if dd == 1 else (C[i] < O[i] and H[i] - C[i] >= p["ftPct"] * rng)
+                    nabs = sum(1 for j in range(w0, i + 1) for b in bigbar.get(j, [])
+                               if b.side == -dd and b.size >= p["BIG_NY"] and zlo <= b.px <= zhi)
+                    held = (C[w0:i + 1].min() >= zlo) if dd == 1 else (C[w0:i + 1].max() <= zhi)
+                    if nabs >= 2 and held and ((C[i] > O[i]) if dd == 1 else (C[i] < O[i])):     # T1 absorption
+                        edge = L[w0:i + 1].min() if dd == 1 else H[w0:i + 1].max(); how = "absorb@IVB"
+                    elif agg and ft:                                                          # T3 aggression
+                        edge = min(b.px for b in agg) if dd == 1 else max(b.px for b in agg); how = "agg@IVB"
+                    if not np.isnan(edge):
+                        s7 = stopfor(dd, edge, C[i])
+                        if not np.isnan(s7):
+                            dist = abs(C[i] - s7)
+                            if not (p["houseMoney"] and S["lastWinDir"] == dd and dist * PV > S["dayPnl"]):
+                                pending = dict(m="V7", d=dd, dist=dist, tgt=C[i] + dd * p["v7RR"] * dist, how=how)
             if pending is None and "V3" in M and not v3["done"] and v3["att"] < 2 and 10 * 60 <= mod < NY1 and v3["prof"]:
-                dd = bias if p["v3gate"] == "bias" else int(np.sign(v3["cvd"]))   # A4: bias break, or NY CVD direction
+                dd = {"bias": bias, "ivb": v7["dir"]}.get(p["v3gate"], int(np.sign(v3["cvd"])))   # A4 variants
                 if dd != 0 and (p["v3dir"] == "both" or dd == 1): FUN["2 day bias ok"] += 1
                 if dd != 0 and (p["v3dir"] == "both" or dd == 1) and v3["cvd"] * dd > 0: FUN["3 NY CVD ok"] += 1
                 if dd != 0 and (p["v3dir"] == "both" or dd == 1) and v3["cvd"] * dd > 0:      # A4/A5 day + A7 CVD
@@ -446,23 +484,21 @@ if __name__ == "__main__":
     months = sys.argv[1].split(",") if len(sys.argv) > 1 else ["2025-06", "2025-07", "2025-08"]
     d = load(months); parts = build(d)
     res = {}
+    ALL5 = ("V1", "V2", "V3", "V4", "V7")
     for name, kw in [("V1 alone", dict(models=("V1",))), ("V2 alone", dict(models=("V2",))),
-                     ("V4 alone (box stop)", dict(models=("V4",), v4stop="box")),
-                     ("V4 alone (big-order stop)", dict(models=("V4",), v4stop="big")),
-                     ("V4 alone (Pine BE)", dict(models=("V4",), v4stop="box", v4be="pine")),
-                     ("ALL (V4 box stop)", dict(v4stop="box")), ("ALL (V4 big-order stop)", dict(v4stop="big")),
-                     ("V3 alone (long only)", dict(models=("V3",))),
-                     ("V3 alone (long + short)", dict(models=("V3",), v3dir="both")),
-                     ("V3 B2 expansion (long)", dict(models=("V3",), v3prof="expansion")),
-                     ("V3 B2 expansion (long+short)", dict(models=("V3",), v3prof="expansion", v3dir="both")),
-                     ("ALL4 V1 V2 V3 V4", dict(models=("V1", "V2", "V3", "V4"))),
-                     ("ALL4 with V3 B2 long+short", dict(models=("V1", "V2", "V3", "V4"), v3prof="expansion", v3dir="both"))]:
+                     ("V4 alone (box stop)", dict(models=("V4",))),
+                     ("V7 IVB alone (30m, 2.5R)", dict(models=("V7",))),
+                     ("V7 IVB alone (30m, 3R)", dict(models=("V7",), v7RR=3.0)),
+                     ("V7 IVB alone (15m, 2.5R)", dict(models=("V7",), ivbMin=15)),
+                     ("V3 alone, IVB day bias", dict(models=("V3",), v3gate="ivb", v3dir="both")),
+                     ("ALL (V1 V2 V3 V4 V7)", dict(models=ALL5)),
+                     ("ALL, IVB bias for V1/V4/V3", dict(models=ALL5, biasMode="ivb", v3gate="ivb"))]:
         t = run(d, *parts, **kw); res[name] = t
         r, mdd = account(t) if not t.empty else (0, 0)
         print(stats(t, name), f"| $100k@0.25%: {r:+.1f}% (DD {mdd:.1f}%)")
-        tag = name.replace(" ", "_").replace("(", "").replace(")", "")
+        tag = "".join(ch if ch.isalnum() else "_" for ch in name)
         t.to_csv(f"scalping_data/val_{tag}_{months[0]}_{months[-1]}.csv", index=False)
-    for name in ["ALL4 with V3 B2 long+short"]:
+    for name in ["ALL (V1 V2 V3 V4 V7)", "ALL, IVB bias for V1/V4/V3"]:
         t = res[name]
-        for m in ["V1", "V2", "V3", "V4"]:
+        for m in ["V1", "V2", "V3", "V4", "V7"]:
             print("   ", stats(t[t.model == m], f"{name} -> {m}"))

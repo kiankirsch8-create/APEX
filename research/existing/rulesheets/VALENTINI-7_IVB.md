@@ -48,3 +48,23 @@ Candidate for the missing momentum-day rule of VALENTINI-3 (A4/A6) and as a bias
 3. L4: stop = 2 ticks beyond the absorption low (as V3/V4), or beyond the VAL (his invalidation)?
 4. X2: fixed target 2.5R or 3R?
 5. Use the IVB breakout as the day bias for V3 (AAA), and as a variant for V1/V4?
+
+## Kian 2026-11-16 ("good, let's continue"): build with the proposed defaults, all changeable
+R1 30 min (variant 15) · R3 1m close beyond the range, first break only · L1 profile of the range bars · L2 long zone POC..VAH
+(short VAL..POC) ± 1 pt · L3 1m close beyond the opposite VA edge ends IVB for the day · T1 absorption (>= 2 big orders of the
+other side in the zone within 5 bars, closes hold) or T3 aggression (big order in direction in the zone + follow-through close)
+· entry next bar after the signal close · L4 stop 2 ticks beyond the absorption low / the aggression order (floor 10 pts,
+max 40) · X2 fixed target 2.5R (variant 3R) · no breakeven (not stated) · T4 up to 3 entries per day · 10:00-13:30 NY, flat 15:55.
+IVB bias as day bias for V3 / V1 / V4 = VARIANTS only (Q5 not approved yet).
+Audit (§0b): transcript read in full; A/B/C/D are the rows above (X1 protection level = C, proprietary).
+
+## First test (Jun-Aug 2025, Databento trades), 2026-11-16
+| Variant | Trades | Win | Avg R | Net / NQ | $100k@0.25% |
+|---|---|---|---|---|---|
+| 30 min, 2.5R | 79 | 25% | -0.13 | -$5,310 | -3.4% |
+| 30 min, 3R | 78 | 22% | -0.14 | -$5,061 | -3.7% |
+| 15 min, 2.5R | 73 | 16% | -0.47 | -$5,838 | -9.0% |
+Breakdown (30 min, 2.5R): absorption trigger 47 trades -0.27R, aggression trigger 32 trades +0.08R; longs +0.15R, shorts -0.45R;
+56% of stops at the 10-pt floor; 21 stops within 2 minutes. In the combined suite V7 takes the single position slot and cuts V4
+from 15 to 8 trades: suite with V7 -$1,288 vs +$4,158 without. IVB as day bias for V1/V3/V4: no improvement.
+Grade: Proxy (protection-level target missing, my absorption definition INTERPRETED).
