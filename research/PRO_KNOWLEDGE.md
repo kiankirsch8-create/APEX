@@ -122,5 +122,23 @@ Last update: 2026-11-16 (7 traders). Add new items at the end of each section; n
 | PK-C6 | Index vs active: flows keep moving to index funds; liquidity for active traders is lower | COH `cohen_fuhrman_investing_art` | Expect thinner books outside peak hours; model slippage accordingly |
 
 ---------------------------------------------------------------------------------------------------------------------
+## 8. Ross Cameron additions (small caps, but most transfer) (PK-X)
+| ID | Principle | Who / source | How an agent can use it |
+|---|---|---|---|
+| PK-X1 | **Let your own statistics define the strategy**: he reads his edge from his trade analytics (by price range, relative volume, time of day, move size) and only trades where the data shows profit | CAM `cameron_scalping_class_zapp` | Every model gets a breakdown report by context bucket; drop buckets that lose (with enough trades), then re-validate out of sample |
+| PK-X2 | You capture at best **half of a move** (spread, late exit) → only take trades whose expected move is ≥ 2× the target | CAM `cameron_scalping_class_zapp` | Entry filter: expected range (ATR/realised move) ≥ 2 × target + costs |
+| PK-X3 | High accuracy with avg win ≈ avg loss (68.5%, 1:1) is a valid profile; the danger for scalpers is an **inverted win/loss ratio** from slow loss-cutting | CAM | Monitor avg loss / avg win; alert when it drifts above ~1.2 |
+| PK-X4 | Pullback quality: ≤ 2 red candles, red volume lighter than the green before it, retrace ≤ 50% (best in the top 25%) | CAM `cameron_micro_pullback_candles` | Generic pullback-quality score usable on NQ continuation entries |
+| PK-X5 | Price "respects" **round numbers** (half/whole dollars in stocks): orders cluster there, price stair-steps between them | CAM `cameron_micro_pullback_candles`; VAL round-number exits | Round-number features on NQ (100/50-pt levels) for targets and breakout entries |
+| PK-X6 | **Multi-timeframe alignment** (10s, 1m, 5m all agree) before adding | CAM `cameron_micro_pullback_candles` | Alignment filter for adds/pyramiding |
+| PK-X7 | **Front side vs back side**: trade only while above the 20 EMA with MACD open; after the cross, stop and wait | CAM `cameron_scalping_class_zapp` | Simple trend-state switch for any momentum model |
+| PK-X8 | **Intermittent reinforcement**: a broken-rule trade that wins is the worst outcome, because it trains bad behaviour; rely on long-run data, not single outcomes | CAM `cameron_scalping_class_zapp` | Validator: never keep a rule change because of a few recent wins; require the sample rules (PK-V4) |
+| PK-X9 | **Lean in on what's working, abandon what isn't** (same day, same instrument) | CAM `cameron_scalping_class_zapp` | Test an intraday "model heat" rule: size up a model after early wins in the session, stop it after early losses |
+| PK-X10 | Start small, size up only after a cushion (first trade capped until the day is up) | CAM `cameron_dip_and_rip_recap`, `cameron_2017_midday_recap` | Intraday risk ramp; compare with flat risk |
+| PK-X11 | Market "temperature" gauge: number of circuit-breaker halts / gappers today | CAM `cameron_dip_and_rip_recap` | Breadth-of-momentum regime feature (stock engine; for NQ: count of large-range bars) |
+| PK-X12 | HFT algos read headlines for keywords and pull bids/offers in spikes, which creates slippage and amplifies moves | CAM `cameron_scalping_class_zapp`, `cameron_micro_pullback_candles` | Model extra slippage on breakout/stop entries; expect overshoots on news |
+
+---------------------------------------------------------------------------------------------------------------------
 ## Change log
 - 2026-11-16: created from VAL, NIL, CAM, CRE, WIL, TRU sources + COH (5 transcripts added today).
+- 2026-11-16: section 8 from three more Cameron transcripts.

@@ -79,3 +79,29 @@ the FTC said most customers lost money. His own P&L is shown via broker statemen
 - **News:** proxy = gap ≥10% + RVOL ≥5× (he says high RVOL ≈ news) — INTERPRETED; or a paid historical news feed (exact).
 - **Execution later:** US stock broker with pre-market + hotkeys; check the US pattern-day-trader rule (<$25k margin accounts)
   for Kian's account type before demo/live.
+
+## v1.1 update (2026-11-16): three more sources
+| Code | File | Value |
+|---|---|---|
+| R7 | `cameron_scalping_class_zapp_TRANSCRIPT.md` | full scalping class: 5 steps, stats, stop, exit, hotkeys |
+| R8 | `cameron_dip_and_rip_recap_TRANSCRIPT.md` | "dip and rip" setup, first-trade size cap, halts as market gauge |
+| R9 | `cameron_micro_pullback_candles_TRANSCRIPT.md` | micro pullback anatomy: retrace limit, red-candle count, volume |
+
+| # | Rule | Source | Status |
+|---|---|---|---|
+| S2b | RVOL ≥ 5× vs **14-day** average (R7); continuation names may sit below 5× because recent volume inflates the average | R7 | STATED → lookback conflict with R6 (50-day) stays; test both |
+| S4b | Price $1-20 (R7, R9); best $2-20; risk rises with price (biggest wins *and* losses above $20) | R7 | STATED |
+| S9 | **Move potential ≥ 30c** (ideally ≥ 50c): he captures at best half a move, so no trade if the stock can't move 2× the target | R7 | STATED (new filter) |
+| E1b | Pullback shape: ≤ 2 red candles (3-4 = not the pattern); red candle not bigger than the prior candles; red-candle volume **lighter** than the prior green; retrace never > 50% of the leg (ideally stays in the top 25%) | R9 | STATED (new, mechanical) |
+| E1c | Entry trigger: first candle making a new high, or earlier on green prints on the tape | R7, R9 | STATED; tape part DISCRETIONARY → bar version only |
+| E11 | **Dip and rip**: on a fresh squeeze, buy the first quick dip and sell into the first rip near the next half/whole dollar | R8 | STATED; "dip" depth INTERPRETED (same as micro pullback) |
+| E12 | Multi-timeframe alignment: 10s, 1m and 5m all look good; skip adds when the 1m shows a doji against a good 10s | R9 | STATED; needs 10s bars (we can build them from trades) |
+| X1b | Stop: **arbitrary 10-15c**, not the pullback low ("that's too far"), so average losers stay ≤ ~15-18c (R7); pullback low in R6/R9 | R7, R9 | CONFLICT persists → both variants (R7 = newest class) |
+| X3b | First target 15-20c (≈2:1); exit when green candles shrink, topping tail/doji, big seller on Level 2 | R7 | STATED (L2 part discretionary) |
+| X7 | Don't trade a stock whose spread is too wide to keep a ~15c stop (he quit ZAPP for that) | R7 | STATED |
+| D5 | First trade capped (5,000 shares) until the day is up > $1,000; then size up | R8 | STATED (= D1 "bell curve") |
+| D6 | Walk away after the daily goal / when the stock stops working ("lean in on what works, abandon what doesn't") | R7, R8 | STATED |
+| D7 | Market gauge: number of circuit-breaker halts in the day (few = weak small-cap tape) | R8 | STATED (context, not a rule) |
+| D4b | Stats update: accuracy 68.5% over 9 years, avg win ~$1,400 / avg loss ~$1,500, avg win ~14c, avg loss ~18c | R7 | STATED (benchmark) |
+Verdict unchanged: **Copyable** on rules, **not testable on NQ**; needs US small-cap data (see options above). The free PDF he
+links ("micro pullback strategy") may settle X1/X1b; it's free in the video description (likely email sign-up).
