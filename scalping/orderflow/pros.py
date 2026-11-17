@@ -360,6 +360,7 @@ def williams(b1, X, study="closeopen", stopK=0.5, blastPct=20, bracketK=0.25):
         elif study == "blastoff":
             if not r.ocpct <= blastPct: continue
             up, dn = r.o + bracketK * r.atr, r.o - bracketK * r.atr
+            up, dn = np.ceil(up / TICK) * TICK, np.floor(dn / TICK) * TICK   # resting stop orders sit on the tick grid
             k = i0; t = None
             while k < len(X.O) and X.SES[k] == s and X.MOD[k] < flat:
                 if X.H[k] >= up: t = X.trade(k, 1, up, dn, None, flat); kind = "blastoff long"; break

@@ -137,6 +137,9 @@ class Engine:
             elif s.pending and not self.halted:
                 self._work_pending(s, ts, price)
 
+    def _mark_used(self, s, o, ts):
+        s.used = [u for u in s.used if ts - u[3] < 600 * NS] + [(o["kind"], o["d"], o.get("lvl"), ts)]
+
     def _work_pending(self, s, ts, price):
         keep = []
         for o in s.pending:
@@ -144,19 +147,21 @@ class Engine:
             if isinstance(o.get("expire_ns"), (int, np.integer)) and ts >= o["expire_ns"]: continue
             if o.get("expire_ns") == "bar" and self._bar_over(s, o, ts, price): continue
             d = o["d"]
-            s.used = [u for u in s.used if ts - u[3] < 600 * NS] + [(o["kind"], d, o.get("lvl"), ts)]
             if o["kind"] == "market":
+                self._mark_used(s, o, ts)
                 self._open(s, d, price + d * TICK, price - d * o["dist"], np.nan, o["dist"], None, o["flat_mod"], "market (next bar)")
                 return
             cb = o.get("cancel_beyond")
             if o["kind"] == "limit":
                 if (price <= cb) if d == 1 else (price >= cb): continue
                 if (price <= o["lvl"] - TICK) if d == 1 else (price >= o["lvl"] + TICK):
+                    self._mark_used(s, o, ts)
                     self._open(s, d, o["lvl"], o["stop"], o["tgt"], o["dist"], None, o["flat_mod"], "limit"); return
             else:
                 if (price >= o["lvl"]) if d == 1 else (price <= o["lvl"]):
                     fill = price + d * TICK                                   # same slip rule as the backtests
                     stop = o["stop"] if s.cfg["family"] != "valentini" else fill - d * o["dist"]
+                    self._mark_used(s, o, ts)
                     self._open(s, d, fill, stop, o["tgt"], abs(fill - stop), None, o["flat_mod"], "stop entry")
                     return
                 if cb is not None and ((price < cb) if d == 1 else (price > cb)): continue

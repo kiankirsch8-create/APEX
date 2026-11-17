@@ -130,6 +130,7 @@ def pros_view(family, kw, b1, b5, prof, partial_ok):
     elif family == "williams": t = P.williams(b1, X, **kw)
     else: raise ValueError(family)
     cut = ny_to_ns(b1.t.iloc[-1]) + 60_000_000_000         # start of the first minute NOT in the bars
-    v = _std_pros(t, cut)
+    # partial view (Williams): the unfinished minute is already in the bars, so its orders are live from that minute's start
+    v = _std_pros(t, cut if not partial_ok else ny_to_ns(b1.t.iloc[-1]))
     v["cut_ns"] = cut if not partial_ok else None          # trades after cut_ns are invisible to this view
     return v
