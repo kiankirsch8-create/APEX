@@ -23,8 +23,12 @@ def ny_to_ns(t):
 
 
 # ------------------------------------------------------------------------------------------------ Valentini
-def valentini_view(d, kw):
-    pr = V.build(d, bars_kind=kw.get("barKind", "1m"))
+def valentini_view(d, kw, cache=None):
+    bk = kw.get("barKind", "1m")
+    if cache is not None and bk in cache: pr = cache[bk]           # several variants share one build per cycle
+    else:
+        pr = V.build(d, bars_kind=bk)
+        if cache is not None: cache[bk] = pr
     bars, rows, rstart, big, tstart = pr
     n = len(bars) - 1                                    # drop the unfinished last bar
     if n < 50: return dict(closed=[], open=None, pending=[])

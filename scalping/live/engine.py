@@ -197,14 +197,14 @@ class Engine:
         now = self.clock()
         names = [n for n, s in self.S.items() if force or self.due(s, now)]
         if not names: return
-        vframe = None; bars = None
+        vframe = None; bars = None; vbuild = {}
         if any(self.S[n].cfg["family"] == "valentini" for n in names): self.vbar_closed = False
         for n in names:
             s = self.S[n]; fam = s.cfg["family"]
             try:
                 if fam == "valentini":
                     if vframe is None: vframe = self.tape.frame(CF.VALENTINI_SESSIONS)
-                    view = ST.valentini_view(vframe, s.cfg["kw"])
+                    view = ST.valentini_view(vframe, s.cfg["kw"], vbuild)
                 else:
                     if bars is None: bars = self.cache.bars(self.tape, CF.WARMUP_SESSIONS)
                     view = ST.pros_view(fam, s.cfg["kw"], *bars, partial_ok=(fam == "williams"))

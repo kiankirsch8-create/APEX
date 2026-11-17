@@ -64,17 +64,38 @@ class Tape:
 
     # -------------------------------------------------------------- views
     def frame(self, n_sessions):
-        """Newest n sessions (including the live one) as a V.load-style frame (categorical session, sorted)."""
-        parts = [self.done[s] for s in sorted(self.done)]
+        """Newest n sessions (including the live one) as a V.load-style frame (categorical session, sorted).
+        Completed sessions are prepared once and cached; only the live buffer is rebuilt each call."""
+        live = None
         if self.buf:
-            g = pd.DataFrame(self.buf, columns=self.COLS[:-1]); g["session"] = self.cur
-            if self.cur in self.done: parts[-1] = pd.concat([parts[-1], g], ignore_index=True)
-            else: parts.append(g)
-        if not parts: return pd.DataFrame(columns=self.COLS)
-        d = pd.concat(parts[-n_sessions:], ignore_index=True)
-        d["session"] = d.session.astype(str).astype("category")
-        d["size"] = d["size"].astype(np.int32); d["side"] = d.side.astype(np.int8)
-        return d.sort_values(["ts", "seq"], kind="stable").reset_index(drop=True)
+            live = pd.DataFrame(self.buf, columns=self.COLS[:-1])
+            if self.cur in self.done:
+                live = pd.concat([self.done[self.cur][self.COLS[:-1]], live], ignore_index=True)
+        done = [s for s in sorted(self.done) if not (live is not None and s == self.cur)]
+        want = done[-(n_sessions - (1 if live is not None else 0)):] if n_sessions > (1 if live is not None else 0) else []
+        names = want + ([self.cur] if live is not None else [])
+        if not names: return pd.DataFrame(columns=self.COLS)
+        key = tuple(want)
+        if getattr(self, "_fkey", None) != key:
+            if want:
+                h = pd.concat([self.done[s] for s in want], ignore_index=True)
+                h["session"] = h.session.astype(str)
+                h["size"] = h["size"].astype(np.int32); h["side"] = h.side.astype(np.int8)
+                h = h.sort_values(["ts", "seq"], kind="stable").reset_index(drop=True)
+            else:
+                h = pd.DataFrame(columns=self.COLS)
+            self._fkey, self._fhist = key, h
+        h = self._fhist
+        cats = pd.CategoricalDtype(names)
+        if live is not None:
+            live = live.sort_values(["ts", "seq"], kind="stable")
+            live["session"] = self.cur
+            live["size"] = live["size"].astype(np.int32); live["side"] = live.side.astype(np.int8)
+            d = pd.concat([h, live], ignore_index=True)
+        else:
+            d = h.copy()
+        d["session"] = d.session.astype(cats)
+        return d
 
     def last_price(self):
         if self.buf: return self.buf[-1][2]
