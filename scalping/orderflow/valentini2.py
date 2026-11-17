@@ -618,6 +618,19 @@ def run(d, bars, rows, rstart, big, tstart, **over):
                     if dist <= p["maxStop"] and not (p["houseMoney"] and S["lastWinDir"] == dd and dist * PV > S["dayPnl"]):
                         limitOrder = dict(m="V8", d=dd, lvl=lvl, stp=stp, dist=dist, tgt=lvl + dd * p["v8RR"] * dist,
                                           how="value migration", exp=i + p["v8Exp"])
+    if isinstance(p.get("live_state"), dict):                         # live engine hook: state at the end of the tape
+        ls = p["live_state"]
+        ls["pos"] = None if pos is None else dict(model=pos["m"], d=pos["d"], fill=pos["fill"], entry_ts=int(pos["ts"]),
+            stop=pos["stp"], tgt=pos["tgt"], dist=pos["dist"], be=pos["be"],
+            legs=[dict(fill=lg["fill"], q=lg["q"], ts=int(lg["ts"])) for lg in pos["legs"]])
+        # orders the NEXT bar would work (set at the last bar's close): the engine works them on live ticks
+        ls["pending"] = None if pending is None else dict(model=pending["m"], d=pending["d"], dist=pending["dist"])
+        ls["stopOrder"] = None if stopOrder is None else dict(model=stopOrder["m"], d=stopOrder["d"], lvl=stopOrder["lvl"],
+            dist=stopOrder["dist"], tgt=stopOrder["tgt"])
+        ls["limitOrder"] = None if limitOrder is None else dict(model=limitOrder["m"], d=limitOrder["d"], lvl=limitOrder["lvl"],
+            stp=limitOrder["stp"], dist=limitOrder["dist"], tgt=limitOrder["tgt"])
+        ls["pendingAdd"] = pendingAdd
+        ls["pendingExit"] = bool(pendingExit)
     return pd.DataFrame(out)
 
 

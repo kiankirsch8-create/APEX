@@ -26,7 +26,8 @@ def load(kind):
 
 # ------------------------------------------------------------------------------------------------ execution
 class Exec:
-    def __init__(self, b1, cost=4.50):
+    def __init__(self, b1, cost=4.50, live=False):
+        self.live = live
         self.O, self.H, self.L, self.C = b1.o.values, b1.h.values, b1.l.values, b1.c.values
         self.MOD, self.SES, self.T = b1["mod"].values, b1.session.values, b1.t.values
         self.cost = cost
@@ -59,7 +60,15 @@ class Exec:
             if cut is not None and cut(k, ke):
                 return self._out(i0, ke, k, d, fill, stop, C[k] - d * TICK, "cut")
             k += 1
-        if fill is None: return None
+        if fill is None:
+            if self.live and k >= n and kind == "stop" and (k - i0) < valid:   # live: order still resting at tape end
+                return dict(session=SES[n - 1], entry_t=None, exit_t=None, d=d, fill=np.nan, stop=stop, exit=np.nan, tgt=tgt,
+                            entry=entry, dist=abs(entry - stop), pnl=np.nan, R=np.nan, why="pending", kx=n - 1,
+                            valid_left=valid - (k - i0), flat_mod=flat_mod)
+            return None
+        if k >= n and self.live:                                   # live engine: tape ended with the position open
+            return dict(session=SES[ke], entry_t=self.T[ke], exit_t=None, d=d, fill=fill, stop=stop, exit=np.nan, tgt=tgt,
+                        dist=abs(fill - stop), pnl=np.nan, R=np.nan, why="open", kx=n - 1, flat_mod=flat_mod)
         k = min(k, n - 1)
         px = (O[k] if (SES[k] == ses and k < n) else C[k - 1]) - d * TICK
         return self._out(i0, ke, k, d, fill, stop, px, "flat")
@@ -329,6 +338,10 @@ def williams(b1, X, study="closeopen", stopK=0.5, blastPct=20, bracketK=0.25):
             if not r.pc < r.pc2: continue                          # down close yesterday
             kind = "down close + higher open" if r.o > r.pc else "down close + lower open"
             t = X.trade(i0, 1, None, r.o - stopK * r.atr, None, flat, kind="market")
+        elif study == "closeopen_dh":                              # D4 best case only: down close + HIGHER open
+            if not (r.pc < r.pc2 and r.o > r.pc): continue
+            kind = "down close + higher open"
+            t = X.trade(i0, 1, None, r.o - stopK * r.atr, None, flat, kind="market")
         elif study == "closeopen_up":
             if not r.pc > r.pc2: continue
             kind = "up close + higher open" if r.o > r.pc else "up close + lower open"
@@ -345,6 +358,12 @@ def williams(b1, X, study="closeopen", stopK=0.5, blastPct=20, bracketK=0.25):
                 if X.H[k] >= up: t = X.trade(k, 1, up, dn, None, flat); kind = "blastoff long"; break
                 if X.L[k] <= dn: t = X.trade(k, -1, dn, up, None, flat); kind = "blastoff short"; break
                 k += 1
+            if t is None and X.live and k >= len(X.O):
+                for dd_, lv, st in ((1, up, dn), (-1, dn, up)):
+                    out.append(dict(session=s, entry_t=None, exit_t=None, d=dd_, fill=np.nan, stop=st, exit=np.nan, tgt=None,
+                                    entry=lv, dist=abs(lv - st), pnl=np.nan, R=np.nan, why="pending", kx=len(X.O) - 1,
+                                    valid_left=10**6, flat_mod=flat, oco="blastoff", model="WILLIAMS-1", kind="blastoff bracket", conf=1))
+                continue
         elif study == "expansion":
             k = np.flatnonzero((X.SES == s) & (X.MOD == 12 * 60))
             if len(k) == 0: continue

@@ -1,0 +1,6 @@
+databento>=0.60
+ib_async>=1.0
+pandas>=2.1
+numpy>=1.26
+numba>=0.59
+pyarrow>=14
