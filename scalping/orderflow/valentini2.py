@@ -396,7 +396,7 @@ def run(d, bars, rows, rstart, big, tstart, **over):
                 pos["g4ext"] = (H[i] if dd == 1 else L[i]) if np.isnan(pos["g4ext"]) else (max(pos["g4ext"], H[i]) if dd == 1 else min(pos["g4ext"], L[i]))
             if pos is not None and pos["m"] == "V4" and pos["rej"] >= p["rejMax"]:
                 pendingExit = True
-        if pos is not None and (i + 1 == n or SES[i + 1] != SES[i] or (MIN[i + 1] - MIN[i]) > np.timedelta64(p["gapMin"], "m")):
+        if pos is not None and ((i + 1 == n and not isinstance(p.get("live_state"), dict)) or (i + 1 < n and SES[i + 1] != SES[i]) or (i + 1 < n and (MIN[i + 1] - MIN[i]) > np.timedelta64(p["gapMin"], "m"))):
             close_pos(i, C[i] - pos["d"] * p["slip"], "eod", tsA[tstart[i + 1] - 1]); pendingExit = False
 
         # ================= V1 leg state (Pine 448-501) =================

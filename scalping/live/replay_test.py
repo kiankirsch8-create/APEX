@@ -16,7 +16,8 @@ from . import strategies as ST
 logging.basicConfig(level=logging.WARNING, format="%(message)s")
 
 
-def run(days, store="scalping_data/live_replay"):
+def run(days, store=None):
+    store = store or f"scalping_data/live_replay_{os.environ.get('REPLAY_ONLY', 'all')}"
     os.makedirs(store, exist_ok=True)
     for f in os.listdir(store) if os.path.exists(store) else []:
         pass
@@ -36,7 +37,9 @@ def run(days, store="scalping_data/live_replay"):
     br = SimBroker(tape)
     for f in os.listdir(os.path.join(store, "journal")) if os.path.exists(os.path.join(store, "journal")) else []:
         os.remove(os.path.join(store, "journal", f))
-    eng = Engine(tape, br, store=store, clock=lambda: clock["t"])
+    only = os.environ.get("REPLAY_ONLY")
+    strats = {k: v for k, v in CF.STRATEGIES.items() if not only or (v["family"] == "valentini") == (only == "valentini")}
+    eng = Engine(tape, br, store=store, strategies=strats, clock=lambda: clock["t"])
     t0 = time.time(); n = 0; last_m = None
     test = hist[hist.session.isin(days)].sort_values(["ts", "seq"], kind="stable")
     for r in test[["ts", "seq", "price", "size", "side"]].itertuples(index=False):
@@ -55,7 +58,7 @@ def run(days, store="scalping_data/live_replay"):
     d = tape.frame(CF.WARMUP_SESSIONS + len(days))
     expected = []
     b1, b5, prof = ST.BarCache().bars(tape, CF.WARMUP_SESSIONS + len(days))
-    for name, cfg in CF.STRATEGIES.items():
+    for name, cfg in strats.items():
         if cfg["family"] == "valentini":
             dv = d[d.session.astype(str).isin(sorted(d.session.astype(str).unique())[-(CF.VALENTINI_SESSIONS + len(days) - 1):])].reset_index(drop=True)
             dv["session"] = dv.session.astype(str).astype("category")
