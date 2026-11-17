@@ -48,10 +48,13 @@ def run(days, store=None):
     test = hist[hist.session.isin(days)].sort_values(["ts", "seq"], kind="stable")
     if until:
         test = test[test.ts < pd.Timestamp(f"{days[-1]} {until}").tz_localize("America/New_York").value]
+    t_from = os.environ.get("REPLAY_FROM")                       # NY HH:MM on the first day: before it only build the tape
+    t_from = pd.Timestamp(f"{days[0]} {t_from}").tz_localize("America/New_York").value if t_from else 0
     debug = os.environ.get("REPLAY_DEBUG")                       # print each strategy view between two NY times "HH:MM-HH:MM"
     for r in test[["ts", "seq", "price", "size", "side"]].itertuples(index=False):
         clock["t"] = int(r.ts)
         tape.add(int(r.ts), int(r.seq), float(r.price), int(r.size), int(r.side))
+        if r.ts < t_from: continue
         eng.on_tick(int(r.ts), float(r.price))
         n += 1
         m = int(r.ts) // 60_000_000_000
