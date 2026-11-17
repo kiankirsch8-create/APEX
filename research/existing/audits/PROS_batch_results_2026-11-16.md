@@ -67,3 +67,17 @@ size below 1 MNQ and are skipped; read Williams from 0.5% up. Periods: Jun-Dec 2
 2. WILLIAMS blastoff and close-open: needs more history (e.g. 2018-2024 NQ daily/1m) to reach a useful sample; these are
    daily patterns, 1 trade/day at most.
 3. CREAMER: decide whether to buy gamma history or drop the reversal model as "not testable as stated".
+
+## Tick replay of TRULLAS-1 fast swings / 61.8% (2026-11-17) — `scalping/orderflow/replay_trullas.py`
+The same signals are replayed on the real trade tape: fill = first trade through the level, the stop fills at the trade that
+hits it, the target needs a trade through by 1 tick, and one position at a time.
+
+| Slippage per side | Fills | Win | Avg R | t | Jun-Dec 25 | Jan-Mar 26 | Apr-Jun 26 |
+|---|---|---|---|---|---|---|---|
+| 0 ticks | 125 | 49% | +0.087 | 0.83 | +0.07 | +0.02 | +0.18 |
+| 1 tick | 125 | 49% | +0.030 | 0.29 | +0.01 | -0.02 | +0.12 |
+| 2 ticks | 125 | 49% | -0.022 | -0.22 | -0.05 | -0.06 | +0.07 |
+
+**Verdict: the +0.30R bar result was mostly a 1-minute-bar artefact.** On real ticks the edge is ~0 after realistic
+slippage. The bar model hid how often the tight stop (median 9 pts) is hit inside the minute, and it skipped some fills.
+TRULLAS-1 stays in the library as "no edge found as interpreted"; it's still worth a forward demo only as a curiosity.
