@@ -81,3 +81,10 @@ hits it, the target needs a trade through by 1 tick, and one position at a time.
 **Verdict: the +0.30R bar result was mostly a 1-minute-bar artefact.** On real ticks the edge is ~0 after realistic
 slippage. The bar model hid how often the tight stop (median 9 pts) is hit inside the minute, and it skipped some fills.
 TRULLAS-1 stays in the library as "no edge found as interpreted"; it's still worth a forward demo only as a curiosity.
+
+
+## Live engine parity (2026-11-17)
+The demo engine (`scalping/live/`) replays raw ticks and re-runs the unchanged backtest functions. On 2026-05-11/13/18 every
+strategy's live trades equal the backtest trades (entry second, fill, exit). Bugs found and fixed on the way: orders created
+on the last closed bar were dropped in live mode (Trullas, Creamer); re-issue guard marked every order; Williams partial-view
+orders started a minute late; blastoff brackets were off the tick grid (backtest prices change by < 1 tick).

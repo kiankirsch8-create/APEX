@@ -41,7 +41,22 @@ Combined daily loss cap 3%. A broker-side disaster stop on the net position prot
   slippage in points, so the demo measures exactly where live differs from the backtest.
 - Logs: `scalping_data/live/logs/`. The live tape is saved per session in `scalping_data/live/tape/` (future research data).
 
+## Parity check (engine vs backtest on the same ticks, SimBroker)
+Run `python -m scalping.live.replay_test YYYY-MM-DD` (filters: REPLAY_ONLY=valentini|other, REPLAY_NAMES, REPLAY_FROM/UNTIL HH:MM).
+Verified 2026-11-17, all exact (same second, same fill, same exit):
+| Strategy | Day | Result |
+|---|---|---|
+| VALENTINI-1 +G4 | 2026-05-18 | 2 shorts 10:45:53 / 10:50:56, both stops, prices equal |
+| TRULLAS-1 fast + defaults | 2026-05-18 | 09:13:01 entry 29374.25, both targets |
+| WILLIAMS-1 down close + higher open | 2026-05-18 | 09:30 open, stop 29147.875 |
+| WILLIAMS-1 blastoff | 2026-05-11 | 09:31:46 stop entry 29385.00 |
+| CREAMER-1 continuation | 2026-05-13 | 11:00:01 entry 29322.50, stop 29296.25 |
+VALENTINI-4 had its two trades (13:12, 13:14) outside the replayed windows; same code path as VALENTINI-1.
+
 ## Known limits (v1)
+- Valentini recomputes its full model (12 sessions) on every range-bar close: ~3 s per cycle. Decisions are taken on the
+  first tick after the bar, as in the backtest, but a busy open can delay a cycle by a few seconds. The journal's slippage
+  column measures it.
 - IBKR nets positions per account, so the engine tracks strategies virtually and sends net orders. Two strategies in
   opposite directions show as a smaller net position at IB.
 - Entries chased after a restart only within 3 minutes of the model's entry; older ones are skipped and logged.
