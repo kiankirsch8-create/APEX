@@ -39,18 +39,35 @@ def run(days, store=None):
         os.remove(os.path.join(store, "journal", f))
     only = os.environ.get("REPLAY_ONLY")
     strats = {k: v for k, v in CF.STRATEGIES.items() if not only or (v["family"] == "valentini") == (only == "valentini")}
+    names = os.environ.get("REPLAY_NAMES")                      # optional substring filter, e.g. "defaults"
+    if names: strats = {k: v for k, v in strats.items() if any(x in k for x in names.split(","))}
+    if os.environ.get("REPLAY_RECOMPUTE"): CF.RECOMPUTE_SEC = int(os.environ["REPLAY_RECOMPUTE"])
+    until = os.environ.get("REPLAY_UNTIL")                       # NY time HH:MM on the last day, to stop early
     eng = Engine(tape, br, store=store, strategies=strats, clock=lambda: clock["t"])
     t0 = time.time(); n = 0; last_m = None
     test = hist[hist.session.isin(days)].sort_values(["ts", "seq"], kind="stable")
+    if until:
+        test = test[test.ts < pd.Timestamp(f"{days[-1]} {until}").tz_localize("America/New_York").value]
+    debug = os.environ.get("REPLAY_DEBUG")                       # print each strategy view between two NY times "HH:MM-HH:MM"
     for r in test[["ts", "seq", "price", "size", "side"]].itertuples(index=False):
         clock["t"] = int(r.ts)
         tape.add(int(r.ts), int(r.seq), float(r.price), int(r.size), int(r.side))
         eng.on_tick(int(r.ts), float(r.price))
         n += 1
         m = int(r.ts) // 60_000_000_000
-        if n % 50 == 0 or m != last_m or eng.vbar_closed: eng.cycle()
+        if n % 50 == 0 or m != last_m or eng.vbar_closed:
+            before = dict(eng.last_cycle)
+            eng.cycle()
+            if debug:
+                a, b = debug.split("-"); tny = pd.Timestamp(int(r.ts), tz="UTC").tz_convert("America/New_York").strftime("%H:%M:%S")
+                if a <= tny[:5] < b:
+                    for k, s_ in eng.S.items():
+                        if eng.last_cycle.get(k) != before.get(k):
+                            v = s_.last_view or {}
+                            print(tny, k, "open", v.get("open"), "pend", v.get("pending"), "pos", s_.pos, "spend", s_.pending, flush=True)
         last_m = m
     tape.roll("END")
+    if until: print("(stopped early at", until, ")")
     print(f"replayed {n} trades in {time.time()-t0:.0f}s", flush=True)
     J = pd.concat([pd.read_csv(os.path.join(store, "journal", f)) for f in sorted(os.listdir(os.path.join(store, "journal")))],
                   ignore_index=True) if os.listdir(os.path.join(store, "journal")) else pd.DataFrame()

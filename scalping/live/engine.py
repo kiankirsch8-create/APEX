@@ -32,6 +32,7 @@ class Strat:
         self.handled = set()       # model entry ids already traded (never re-enter the same model trade)
         self.last_view = None
         self.rng = None            # range-bar tracker for "bar" expiry: [hi, lo]
+        self.used = []             # (kind, d, lvl, fill_ns) of resting orders the engine filled, so a stale view can't re-issue them
         self.recent_close = None   # (opened_ns, d) of the last position closed, to match the model's late view of it
 
 
@@ -143,6 +144,7 @@ class Engine:
             if isinstance(o.get("expire_ns"), (int, np.integer)) and ts >= o["expire_ns"]: continue
             if o.get("expire_ns") == "bar" and self._bar_over(s, o, ts, price): continue
             d = o["d"]
+            s.used = [u for u in s.used if ts - u[3] < 600 * NS] + [(o["kind"], d, o.get("lvl"), ts)]
             if o["kind"] == "market":
                 self._open(s, d, price + d * TICK, price - d * o["dist"], np.nan, o["dist"], None, o["flat_mod"], "market (next bar)")
                 return
@@ -224,7 +226,14 @@ class Engine:
                 s.handled.add(mo["entry_ns"])                         # too old to chase: skip it, log once
                 self._j(dict(strategy=s.name, action="skip", d=mo["d"], model_px=mo["fill"], why="stale model entry"))
             if s.pos is None:
-                s.pending = [o for o in v.get("pending", [])]
+                cut = v.get("cut_ns")
+                def stale(o):                                        # the model hasn't seen the fill of this exact order yet
+                    for k_, d_, l_, f_ in s.used:
+                        same = k_ == o["kind"] and d_ == o["d"] and (k_ == "market" or abs((l_ or 0) - (o.get("lvl") or 0)) < 1e-6)
+                        if same and ((cut is not None and cut <= f_) or (cut is None and now - f_ < 60 * NS) or o["from_ns"] <= f_):
+                            return True
+                    return False
+                s.pending = [o for o in v.get("pending", []) if not stale(o)]
                 self._catch_up(s, now)
             return
         p = s.pos

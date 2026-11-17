@@ -37,7 +37,14 @@ class Exec:
         cancel(i) -> True cancels an unfilled order; cut(i, k_entry) -> True exits at the bar close (management rule).
         Returns dict or None (never filled)."""
         O, H, L, C, MOD, SES = self.O, self.H, self.L, self.C, self.MOD, self.SES
-        n = len(O); ses = SES[i0]; fill = None; k = i0
+        n = len(O)
+        if i0 >= n:                                                # order created on the last closed bar
+            if not self.live or kind != "stop" or MOD[n - 1] + 1 >= flat_mod: return None
+            if (C[n - 1] >= entry) if d == 1 else (C[n - 1] <= entry): return None   # already passed = missed
+            return dict(session=SES[n - 1], entry_t=None, exit_t=None, d=d, fill=np.nan, stop=stop, exit=np.nan, tgt=tgt,
+                        entry=entry, dist=abs(entry - stop), pnl=np.nan, R=np.nan, why="pending", kx=n - 1,
+                        valid_left=valid, flat_mod=flat_mod)
+        ses = SES[i0]; fill = None; k = i0
         if kind == "stop" and i0 > 0 and ((C[i0 - 1] >= entry) if d == 1 else (C[i0 - 1] <= entry)):
             return None                                            # level already passed when the order could be placed = missed
         while k < n and SES[k] == ses and MOD[k] < flat_mod:
@@ -161,7 +168,7 @@ def trullas1(b1, X, tgt_fib=0.382, tf="1m", trend=True, kinds=("regular", "hidde
             tgt = x2 + d * tgt_fib * rng - d * TICK
             if (tgt - ent) * d <= 0: continue
             k0 = idx1[j]
-            if k0 >= len(b1): continue
+            if k0 >= len(b1) and not X.live: continue
             r = X.trade(k0, d, ent, stp, tgt, flat, valid=30,
                         cancel=lambda k, d=d, x2=x2, tgt=tgt: (X.L[k] <= x2 - TICK) if d == 1 else (X.H[k] >= x2 + TICK))
             if r is None: continue
@@ -305,7 +312,7 @@ def creamer(b1, b5, prof5, X, mode="reversal", w0=9 * 60 + 30, w1=11 * 60, flat=
             if dist > 40 or dist < 2: continue
             tgt = ent + d * 2 * dist
             k0 = idx1[n]
-            if k0 >= len(X.O): continue
+            if k0 >= len(X.O) and not X.live: continue
             r = X.trade(k0, d, ent, stp, tgt, flat, valid=10)
             if r is None: continue
             r.update(model="CREAMER-1", kind="continuation", conf=1); out.append(r); busy = r["kx"]; losses += int(r["pnl"] < 0)
