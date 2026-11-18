@@ -249,7 +249,9 @@ import portfolio_construction as _pc  # noqa: E402
 # Group E / PR13 — funded compounds at 0.20–0.30% risk fraction. The full
 # guardrail stack stays shadow-first (``apply_live_guardrails=False``) until
 # forward evidence lands; never go live with bare compounding (no guardrails).
-PROFILE = "ftmo"  # "private" | "funded" | "ftmo"
+# Env-switchable: APEX_V76_PRIVATE_PROFILE=ftmo_challenge for challenge run.
+# Default stays ``ftmo`` so undeployed VPS boxes are unchanged.
+PROFILE = os.environ.get("APEX_V76_PRIVATE_PROFILE", "ftmo").strip().lower() or "ftmo"
 FUNDED_COMPOUND_RISK_MIN = 0.002  # 0.20%
 FUNDED_COMPOUND_RISK_MAX = 0.003  # 0.30%
 # FTMO $10k challenge static / daily hard loss limits (USD).
@@ -272,6 +274,7 @@ PROFILES: dict[str, dict[str, Any]] = {
         "account_loss_limit_usd": None,
         "daily_loss_limit_usd": None,
         "apply_live_guardrails": True,  # no-op via None/0/empty levers above
+        "equity_flatten_dd_pct": None,
     },
     "funded": {
         "cold_start_min_trades": 5,
@@ -290,6 +293,7 @@ PROFILES: dict[str, dict[str, Any]] = {
         "daily_loss_limit_usd": None,
         # Change B — full stack does not drive live sizing until evidence reviewed.
         "apply_live_guardrails": False,
+        "equity_flatten_dd_pct": None,
     },
     # Validated chrono used ACCOUNT_TYPE=private + RISK_BY_CONFIDENCE on current
     # capital (not funded 0.2%/trade, not 40-day warmup). Guardrails ON for FTMO.
@@ -310,8 +314,30 @@ PROFILES: dict[str, dict[str, Any]] = {
         "account_loss_limit_usd": FTMO_ACCOUNT_LOSS_LIMIT_USD,  # $1,000 static
         "daily_loss_limit_usd": FTMO_DAILY_LOSS_LIMIT_USD,  # $500 daily
         "apply_live_guardrails": True,
+        # Optional funded backstop (~9.0) left None until chosen.
+        "equity_flatten_dd_pct": None,
+    },
+    # Conservative 2-step challenge: lower DD levers + hard equity flatten.
+    "ftmo_challenge": {
+        "cold_start_min_trades": 0,
+        "cold_start_multiplier": 1.0,
+        "per_trade_loss_cap_pct": 1.2,  # tighter single-trade ceiling
+        "daily_loss_stop_pct": 2.5,  # halt NEW entries at -2.5% day
+        "dd_ladder": [(4.0, 0.5), (6.0, 0.25)],  # de-risk earlier than native ftmo
+        "dry_run_after_losing_days": None,
+        "warmup_days": 0,
+        "warmup_multiplier": 1.0,
+        "compounding_enabled": False,
+        "compound_risk_fraction": None,
+        "hard_risk_ceiling_pct": 1.2,
+        "account_loss_limit_usd": FTMO_ACCOUNT_LOSS_LIMIT_USD,  # $1,000 static (10%)
+        "daily_loss_limit_usd": FTMO_DAILY_LOSS_LIMIT_USD,  # $500 daily (5%)
+        "apply_live_guardrails": True,
+        "equity_flatten_dd_pct": 8.0,  # HARD flatten-all at -8% equity DD
     },
 }
+if PROFILE not in PROFILES:
+    PROFILE = "ftmo"
 CFG: dict[str, Any] = PROFILES[PROFILE]
 
 # Demo safety rails (FTMO challenge envelope). Halt new entries if breached.
@@ -1628,6 +1654,81 @@ def set_daily_loss_circuit_halt(
     if persist:
         save_v76_state(st)
     return until
+
+
+def _ftmo_start_balance(st: dict[str, Any], ai: Any = None) -> float:
+    """Starting balance to anchor FTMO drawdown against (NOT peak equity)."""
+    for k in ("ftmo_start_balance", "starting_balance", "start_balance"):
+        v = st.get(k)
+        if v:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                pass
+    env = os.environ.get("APEX_FTMO_START_BALANCE")
+    if env:
+        try:
+            return float(env)
+        except ValueError:
+            pass
+    lim = CFG.get("account_loss_limit_usd")  # e.g. $1,000 == 10% of $10k
+    if lim:
+        try:
+            return float(lim) / (FTMO_DEMO_MAX_TOTAL_DD_PCT / 100.0)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        return float(getattr(ai, "balance", 0) or 0)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def _equity_flatten_check(mt5: Any, st: dict[str, Any], scan_d: date | None = None) -> bool:
+    """HARD backstop: if equity drawdown from the starting balance reaches
+    CFG['equity_flatten_dd_pct'], MARKET-CLOSE every open APEX position and halt
+    for the rest of the day. Unlike the entry-gate guardrails, this closes
+    existing positions. Returns True when a flatten fired this cycle.
+    """
+    pct = CFG.get("equity_flatten_dd_pct")
+    if not pct or float(pct) <= 0:
+        return False
+    try:
+        ai = mt5.account_info()
+        if ai is None:
+            return False
+        equity = float(getattr(ai, "equity", 0) or 0)
+    except Exception:  # noqa: BLE001
+        return False
+    if equity <= 0:
+        return False
+    start_bal = _ftmo_start_balance(st, ai)
+    if start_bal <= 0:
+        return False
+    dd_pct = (start_bal - equity) / start_bal * 100.0
+    if dd_pct < float(pct):
+        return False
+    positions = open_v76_positions(mt5) or []
+    closed = 0
+    for p in positions:
+        try:
+            if at.close_position_at_market(mt5, p):
+                closed += 1
+        except Exception as e:  # noqa: BLE001
+            live_log("error", f"[FLATTEN] close failed ticket={getattr(p, 'ticket', '?')} err={e}")
+    live_log(
+        "warning",
+        "[FLATTEN] equity backstop tripped — closed all APEX positions",
+        equity=round(equity, 2),
+        start_balance=round(start_bal, 2),
+        dd_pct=round(dd_pct, 2),
+        threshold_pct=float(pct),
+        positions=len(positions),
+        closed=closed,
+    )
+    if scan_d is None:
+        scan_d = datetime.now(timezone.utc).date()
+    set_daily_loss_circuit_halt(st, scan_d, persist=True)  # don't reopen today
+    return True
 
 
 def _daily_loss_stop_tripped(
@@ -4061,6 +4162,12 @@ def main_loop_v76() -> None:
                     adopted_positions = True
                 else:
                     live_log("warning", "[ADOPT] MT5 not ready — will retry")
+
+            # HARD equity flatten (challenge profile): close all APEX positions on deep DD.
+            if mt5 is not None and _equity_flatten_check(mt5, st):
+                save_v76_state(st)
+                time.sleep(60)
+                continue
 
             now = datetime.now(timezone.utc)
             ran = False
