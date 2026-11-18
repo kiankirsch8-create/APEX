@@ -26,13 +26,13 @@ It refuses to run on a live (non-paper) account.
 ## What it trades (risk tiers: fidelity + evidence, max 1.5% — see config.py)
 | Strategy | Risk/trade | Why this tier |
 |---|---|---|
-| VALENTINI-1 (all his rules) + G4 | 0.50% | Partial copy, best tested portfolio (tick-level) |
-| VALENTINI-4 (range bars) + G4 | 0.50% | same |
-| WILLIAMS-1 down close + higher open | 0.50% | Partial, +0.27R, small sample |
-| WILLIAMS-1 blastoff | 0.50% | Partial, +0.18R, small sample |
-| TRULLAS-1 fast swings 61.8% | 0.25% | Partial, edge ~0 on the tick replay |
+| VALENTINI-1 (all his rules) + G4 | 0.25% | Partial; flat on the added months Dec 24 - May 25 (-0.01R) |
+| VALENTINI-4 (range bars) + G4 | 0.50% | Partial; held on Dec 24 - May 25 (+0.11R, PF 1.23 with G4) |
+| WILLIAMS-1 down close + higher open | 0.25% | Partial; -0.28R on Dec 24 - May 25 (26 trades) |
+| WILLIAMS-1 blastoff | 0.50% | Partial; +0.22R on Dec 24 - May 25, +0.18R over 70 trades |
+| TRULLAS-1 fast swings 61.8% | 0.25% | Partial; tick replay -0.11R on Dec 24 - May 25, ~0 overall |
 | TRULLAS-1 defaults 38.2% | 0.25% | Partial, weak |
-| CREAMER-1 continuation | 0.25% | Partial, inconclusive |
+| CREAMER-1 continuation | 0.25% | Partial; -0.27R on Dec 24 - May 25, ~0 overall |
 
 Combined daily loss cap 3%. A broker-side disaster stop on the net position protects against an engine crash.
 

@@ -24,13 +24,13 @@ def risk_for(fidelity, evidence):
 # name: family, params, fidelity, evidence (update evidence as demo/backtest data arrives; agents will own this later)
 STRATEGIES = {
     "VALENTINI-1 (all his rules) +G4": dict(family="valentini", kw=dict(models=("V1",), g4=True, barKind="range", trig="effort",
-                                         biasMode="pf", mgmt="his"), bars="range", fidelity=2, evidence=2),
+                                         biasMode="pf", mgmt="his"), bars="range", fidelity=2, evidence=1),   # failed Dec24-May25 (2026-11-18)
     "VALENTINI-4 (range) +G4":         dict(family="valentini", kw=dict(models=("V4",), g4=True, barKind="range"), bars="range",
                                          fidelity=2, evidence=2),
     "TRULLAS-1 fast swings 61.8%":     dict(family="trullas1", kw=dict(piv_k=1, tgt_fib=0.618), fidelity=2, evidence=1),
     "TRULLAS-1 defaults 38.2%":        dict(family="trullas1", kw=dict(), fidelity=2, evidence=1),
     "CREAMER-1 continuation":          dict(family="creamer", kw=dict(mode="continuation"), fidelity=2, evidence=1),
-    "WILLIAMS-1 down close + higher open": dict(family="williams", kw=dict(study="closeopen_dh"), fidelity=2, evidence=2),
+    "WILLIAMS-1 down close + higher open": dict(family="williams", kw=dict(study="closeopen_dh"), fidelity=2, evidence=1),  # failed Dec24-May25
     "WILLIAMS-1 blastoff":             dict(family="williams", kw=dict(study="blastoff"), fidelity=2, evidence=2),
 }
 # NY-time windows (minutes) in which a strategy can open positions; open positions are always managed

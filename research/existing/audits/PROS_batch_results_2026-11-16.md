@@ -88,3 +88,21 @@ The demo engine (`scalping/live/`) replays raw ticks and re-runs the unchanged b
 strategy's live trades equal the backtest trades (entry second, fill, exit). Bugs found and fixed on the way: orders created
 on the last closed bar were dropped in live mode (Trullas, Creamer); re-issue guard marked every order; Williams partial-view
 orders started a minute late; blastoff brackets were off the tick grid (backtest prices change by < 1 tick).
+
+
+## Added months Dec 2024 - May 2025 (out-of-sample, 2026-11-18)
+Same code, no changes. OLD = Jun 2025 - Jun 2026, NEW = Dec 2024 - May 2025 (bar backtest unless noted).
+| Strategy | OLD | NEW | Verdict |
+|---|---|---|---|
+| VALENTINI-4 range | 120 pos, +0.12R, PF 1.38 | 70 pos, +0.15R, PF 1.73 | holds |
+| VALENTINI-4 range + G4 | 112 pos, +0.17R, PF 1.99 | 56 pos, +0.11R, PF 1.23 | holds, weaker |
+| VALENTINI-1 all rules (+G4) | 88 pos, +0.36R, PF 1.50 | 67 pos, -0.01R, PF 0.96 | fails |
+| WILLIAMS-1 blastoff | 49, +0.16R, PF 1.20 | 21, +0.22R, PF 1.58 | holds (all: 70, +0.18R, t 1.5) |
+| WILLIAMS-1 down close + higher open | 58, +0.27R | 26, -0.28R | fails |
+| TRULLAS-1 fast 61.8% TICK replay, 1-tick slip | 125, +0.03R | 49, -0.11R | no edge |
+| TRULLAS-1 defaults 38.2% | 45, +0.12R | 12, +0.08R | nothing |
+| CREAMER-1 continuation | 57, +0.10R | 24, -0.27R | fails (all ~0) |
+| TRULLAS-2 sweep 50% (not on demo) | 77, -0.07R | 32, +0.57R | inconsistent (all +0.12R, t 0.8) |
+| WILLIAMS-1 expansion (not on demo) | 43, +0.07R | 12, +0.61R | small sample |
+Controls: buy every open NEW ~0R (PF 1.02), up close NEW -0.06R.
+Demo risk updated by the agreed rule: VALENTINI-1 and WILLIAMS down close -> evidence 1 (0.25%).
