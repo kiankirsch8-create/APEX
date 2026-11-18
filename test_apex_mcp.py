@@ -394,3 +394,65 @@ def test_real_mcp_payload_shapes(monkeypatch) -> None:
     assert info.trade_contract_size == 100000.0
     assert info.filling_mode == 3  # IOC|FOK → bits 1|2
     assert mcp._TICK_VALUE_CACHE.get("EURUSDm") == 1.0
+
+
+def test_account_info_computes_margin_level_when_omitted(monkeypatch) -> None:
+    """Live MCP omits margin_level → compute equity/margin*100 so guard won't false-trip."""
+
+    def fake_call_tool(name: str, args: dict[str, Any] | None = None) -> Any:
+        assert name == "get_trading_account_info"
+        return {
+            "account": {
+                "balance": 10000.0,
+                "equity": 9990.54,
+                "margin": 465.29,
+                "margin_free": 9534.3,
+                "currency": "USD",
+                "login": 511443540,
+                # margin_level intentionally absent
+            }
+        }
+
+    monkeypatch.setattr(mcp, "call_tool", fake_call_tool)
+    ai = mcp.account_info()
+    assert ai is not None
+    expected = (9990.54 / 465.29) * 100.0
+    assert ai.margin_level == expected
+    assert ai.margin_level > 400.0  # above live guard floor
+    assert abs(ai.margin_level - 2147.0) < 1.0
+
+
+def test_account_info_passthrough_real_margin_level(monkeypatch) -> None:
+    def fake_call_tool(name: str, args: dict[str, Any] | None = None) -> Any:
+        return {
+            "account": {
+                "equity": 10000.0,
+                "margin": 500.0,
+                "margin_level": 1500.0,
+                "balance": 10000.0,
+                "login": 1,
+            }
+        }
+
+    monkeypatch.setattr(mcp, "call_tool", fake_call_tool)
+    ai = mcp.account_info()
+    assert ai is not None
+    assert ai.margin_level == 1500.0  # not overwritten by equity/margin
+
+
+def test_account_info_flat_book_margin_level_zero(monkeypatch) -> None:
+    def fake_call_tool(name: str, args: dict[str, Any] | None = None) -> Any:
+        return {
+            "account": {
+                "equity": 10000.0,
+                "margin": 0.0,
+                "balance": 10000.0,
+                "login": 1,
+            }
+        }
+
+    monkeypatch.setattr(mcp, "call_tool", fake_call_tool)
+    ai = mcp.account_info()
+    assert ai is not None
+    assert ai.margin_level == 0.0
+    assert ai.margin == 0.0

@@ -368,12 +368,20 @@ def account_info() -> SimpleNamespace | None:
         # Avoid treating nested account dict as login when unwrapping failed partially
         if isinstance(login_raw, dict):
             login_raw = _pick(login_raw, "login", default=0)
+        _eq = float(_pick(d, "equity", default=0) or 0)
+        _mg = float(_pick(d, "margin", default=0) or 0)
+        _ml = float(_pick(d, "margin_level", "marginLevel", default=0) or 0)
+        # MCP account_info omits margin_level (returns 0). MT5 defines it as
+        # equity/margin*100; compute it when margin is in use so the live
+        # margin guard doesn't false-trip (margin_level=0 < 400%).
+        if _ml <= 0.0 and _mg > 0.0:
+            _ml = (_eq / _mg) * 100.0
         return _ns(
             balance=float(_pick(d, "balance", default=0) or 0),
-            equity=float(_pick(d, "equity", default=0) or 0),
-            margin=float(_pick(d, "margin", default=0) or 0),
+            equity=_eq,
+            margin=_mg,
             margin_free=float(_pick(d, "margin_free", "free_margin", "marginFree", default=0) or 0),
-            margin_level=float(_pick(d, "margin_level", "marginLevel", default=0) or 0),
+            margin_level=_ml,
             currency=str(_pick(d, "currency", default="") or ""),
             login=int(login_raw or 0),
             server=str(_pick(d, "server", default="") or ""),
