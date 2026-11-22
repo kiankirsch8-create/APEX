@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Momentum Scanner</title>
+<style>
+:root{--bg:#0b0f17;--panel:#121826;--line:#1f2838;--text:#e6ebf2;--mute:#8592a6;--hit:#16c47f;--miss:#3a4456;--warn:#f5b942;--hot:#0f2a1f;--accent:#4c8dff}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif}
+header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:2}
+h1{font-size:16px;margin:0;letter-spacing:.02em}
+.meta{color:var(--mute);font-size:12px;display:flex;gap:14px;flex-wrap:wrap;align-items:center}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;background:var(--miss)}
+.ok .dot{background:var(--hit)} .bad .dot{background:#ff5d5d}
+button{background:var(--accent);color:#fff;border:0;border-radius:6px;padding:6px 10px;font-size:12px;cursor:pointer}
+button.on{background:#2b3446}
+.legend{padding:8px 16px;color:var(--mute);font-size:12px;border-bottom:1px solid var(--line)}
+.wrap{overflow-x:auto;padding:0 8px 24px}
+table{width:100%;border-collapse:collapse;min-width:860px}
+th,td{padding:8px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}
+th{color:var(--mute);font-weight:500;font-size:12px;background:var(--bg)}
+td.l,th.l{text-align:left}
+tr.all5{background:var(--hot)}
+tr.all5 td.sym{color:var(--hit)}
+td.sym{font-weight:700;font-size:15px}
+.pill{display:inline-block;width:22px;height:18px;line-height:18px;border-radius:4px;margin-left:3px;font-size:10px;text-align:center;background:var(--miss);color:#c9d1dd}
+.pill.y{background:var(--hit);color:#04150d}
+.pill.n2{background:var(--warn);color:#2a1d00}
+td.news{max-width:420px;overflow:hidden;text-overflow:ellipsis;text-align:left;color:#cfd6e2}
+.src{color:var(--mute);font-size:11px;margin-right:6px}
+.up{color:var(--hit)} .mute{color:var(--mute)}
+.empty{padding:40px 16px;color:var(--mute);text-align:center}
+</style>
+</head>
+<body>
+<header>
+  <h1>Momentum Scanner <span class="mute" style="font-weight:400">· 5 pillars</span></h1>
+  <div class="meta">
+    <span id="status"><span class="dot"></span>connecting…</span>
+    <span id="clock"></span>
+    <span id="count"></span>
+    <button id="snd" title="Browsers need one click before they may play sounds">Enable sound</button>
+  </div>
+</header>
+<div class="legend">Pillars: <b>RV</b> relative volume ≥5× · <b>%</b> up ≥10% · <b>N</b> news in last 24 h · <b>$</b> price $1–20 · <b>F</b> float &lt;10M (amber = 10–20M). Green rows meet all 5; a chime plays when a new one appears.</div>
+<div class="wrap">
+<table>
+  <thead><tr>
+    <th class="l">Symbol</th><th>Price</th><th>Change</th><th>RVol</th><th>Volume×day</th><th>Float</th><th class="l">Pillars</th><th class="l">Latest news</th><th>Seen</th>
+  </tr></thead>
+  <tbody id="rows"></tbody>
+</table>
+<div id="empty" class="empty" hidden>No candidates yet. Scanners fill up from the 4:00 New York pre-market.</div>
+</div>
+<script>
+const fmtM = v => v==null ? "–" : v>=1e9 ? (v/1e9).toFixed(1)+"B" : v>=1e6 ? (v/1e6).toFixed(1)+"M" : v>=1e3 ? (v/1e3).toFixed(0)+"K" : v.toFixed(0);
+const fx = (v,d=2) => v==null ? "–" : v.toFixed(d);
+let sound=false, ctx=null, known=new Set(), first=true;
+document.getElementById("snd").onclick = e => {
+  sound=!sound; e.target.textContent = sound ? "Sound on" : "Enable sound"; e.target.classList.toggle("on", sound);
+  if (sound && !ctx) ctx = new (window.AudioContext||window.webkitAudioContext)();
+};
+function chime(){
+  if(!sound||!ctx) return;
+  [880,1320].forEach((f,i)=>{const o=ctx.createOscillator(),g=ctx.createGain();o.frequency.value=f;o.connect(g);g.connect(ctx.destination);
+    const t=ctx.currentTime+i*0.12;g.gain.setValueAtTime(0.0001,t);g.gain.exponentialRampToValueAtTime(0.25,t+0.02);g.gain.exponentialRampToValueAtTime(0.0001,t+0.25);o.start(t);o.stop(t+0.3);});
+}
+function clock(){
+  const now=new Date();
+  const ny=now.toLocaleTimeString("en-GB",{timeZone:"America/New_York",hour:"2-digit",minute:"2-digit",second:"2-digit"});
+  const lu=now.toLocaleTimeString("en-GB",{timeZone:"Europe/Luxembourg",hour:"2-digit",minute:"2-digit"});
+  document.getElementById("clock").textContent=`New York ${ny} · Luxembourg ${lu}`;
+}
+setInterval(clock,1000); clock();
+function pills(r){
+  const k=r.checks, f=k.float?"y":(r.near_float?"n2":"");
+  return `<span class="pill ${k.rvol?"y":""}">RV</span><span class="pill ${k.change?"y":""}">%</span><span class="pill ${k.news?"y":""}">N</span><span class="pill ${k.price?"y":""}">$</span><span class="pill ${f}">F</span>`;
+}
+async function tick(){
+  try{
+    const s = await (await fetch("state.json",{cache:"no-store"})).json();
+    const st=document.getElementById("status");
+    st.className = s.status==="live"||s.status==="demo" ? "ok" : "bad";
+    st.innerHTML = `<span class="dot"></span>${s.status}${s.updated?" · "+new Date(s.updated).toLocaleTimeString("en-GB"):""}`;
+    const rows=s.rows||[]; let fresh=false;
+    document.getElementById("count").textContent = `${rows.filter(r=>r.all5).length} full · ${rows.length} watched`;
+    document.getElementById("empty").hidden = rows.length>0;
+    document.getElementById("rows").innerHTML = rows.map(r=>{
+      if(r.all5 && !known.has(r.symbol)){ known.add(r.symbol); if(!first) fresh=true; }
+      const n=(r.news&&r.news[0]); const seen=r.first_seen?new Date(r.first_seen).toLocaleTimeString("en-GB",{timeZone:"America/New_York",hour:"2-digit",minute:"2-digit"}):"–";
+      return `<tr class="${r.all5?"all5":""}">
+        <td class="l sym">${r.symbol}</td><td>${fx(r.last)}</td>
+        <td class="${(r.change_pct||0)>0?"up":""}">${r.change_pct==null?"–":(r.change_pct>0?"+":"")+r.change_pct.toFixed(1)+"%"}</td>
+        <td>${r.rvol_tod==null?"–":r.rvol_tod.toFixed(1)+"×"}</td><td class="mute">${r.rvol_day==null?"–":r.rvol_day.toFixed(1)+"×"}</td>
+        <td>${fmtM(r.float_shares)}</td><td class="l">${pills(r)}</td>
+        <td class="news" title="${n?n.title.replace(/"/g,"&quot;"):""}">${n?`<span class="src">${n.source}</span>${n.title}`:"<span class='mute'>–</span>"}</td>
+        <td class="mute">${seen}</td></tr>`;}).join("");
+    if(fresh) chime(); first=false;
+  }catch(e){ const st=document.getElementById("status"); st.className="bad"; st.innerHTML='<span class="dot"></span>scanner not reachable'; }
+}
+setInterval(tick,2000); tick();
+</script>
+</body>
+</html>
