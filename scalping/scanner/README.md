@@ -26,4 +26,9 @@ Without IBKR: `python -m scalping.scanner.run --demo` shows the dashboard with s
 - News lag: time between a press release and its label in the scanner.
 - Relative volume vs another source (e.g. the Dash trial or TradingView's RVOL) on the same stock.
 
+## Replay a past morning (works on weekends)
+`python3 -m scalping.scanner.replay 2024-08-21 VRAX GOVX BPTH GDC MNPR APDN` (add `--speed 120`, `--start 07:00`).
+Uses IBKR historical 1-minute bars incl. pre-market, previous daily bars and IB news. IBKR has no historical scanner,
+so you name the tickers. Float is today's value. Delisted tickers are skipped.
+
 Tests: `python -m pytest scalping/scanner/test_scanner.py -q`

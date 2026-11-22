@@ -56,7 +56,7 @@ td.news{max-width:420px;overflow:hidden;text-overflow:ellipsis;text-align:left;c
 <script>
 const fmtM = v => v==null ? "–" : v>=1e9 ? (v/1e9).toFixed(1)+"B" : v>=1e6 ? (v/1e6).toFixed(1)+"M" : v>=1e3 ? (v/1e3).toFixed(0)+"K" : v.toFixed(0);
 const fx = (v,d=2) => v==null ? "–" : v.toFixed(d);
-let sound=false, ctx=null, known=new Set(), first=true;
+let sound=false, ctx=null, known=new Set(), first=true, simTime=null;
 document.getElementById("snd").onclick = e => {
   sound=!sound; e.target.textContent = sound ? "Sound on" : "Enable sound"; e.target.classList.toggle("on", sound);
   if (sound && !ctx) ctx = new (window.AudioContext||window.webkitAudioContext)();
@@ -67,6 +67,7 @@ function chime(){
     const t=ctx.currentTime+i*0.12;g.gain.setValueAtTime(0.0001,t);g.gain.exponentialRampToValueAtTime(0.25,t+0.02);g.gain.exponentialRampToValueAtTime(0.0001,t+0.25);o.start(t);o.stop(t+0.3);});
 }
 function clock(){
+  if(simTime){ document.getElementById("clock").textContent="Replay · "+new Date(simTime).toLocaleString("en-GB",{timeZone:"America/New_York",day:"2-digit",month:"short",year:"numeric",hour:"2-digit",minute:"2-digit"})+" New York"; return; }
   const now=new Date();
   const ny=now.toLocaleTimeString("en-GB",{timeZone:"America/New_York",hour:"2-digit",minute:"2-digit",second:"2-digit"});
   const lu=now.toLocaleTimeString("en-GB",{timeZone:"Europe/Luxembourg",hour:"2-digit",minute:"2-digit"});
@@ -80,8 +81,9 @@ function pills(r){
 async function tick(){
   try{
     const s = await (await fetch("state.json",{cache:"no-store"})).json();
+    simTime = s.sim_time || null; clock();
     const st=document.getElementById("status");
-    st.className = s.status==="live"||s.status==="demo" ? "ok" : "bad";
+    st.className = /^(live|demo|replay)/.test(s.status||"") ? "ok" : "bad";
     st.innerHTML = `<span class="dot"></span>${s.status}${s.updated?" · "+new Date(s.updated).toLocaleTimeString("en-GB"):""}`;
     const rows=s.rows||[]; let fresh=false;
     document.getElementById("count").textContent = `${rows.filter(r=>r.all5).length} full · ${rows.length} watched`;
