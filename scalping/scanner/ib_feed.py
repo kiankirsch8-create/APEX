@@ -22,7 +22,9 @@ class IBFeed:
 
     def connect(self):
         self.ib.connect(C.IB_HOST, C.IB_PORT, clientId=C.IB_CLIENT_ID, readonly=True)
-        self.ib.reqMarketDataType(1)                      # live (needs the US stock data subscription)
+        # 2 = "frozen": live while the market is open, last recorded values when it's closed (evenings, weekends),
+        # so the dashboard still shows the last session's movers outside market hours
+        self.ib.reqMarketDataType(2)
         try:
             self.providers = "+".join(p.code for p in self.ib.reqNewsProviders())
             log.info("IB news providers: %s", self.providers or "(none)")

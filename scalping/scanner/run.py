@@ -36,7 +36,8 @@ def live():
             q = feed.quote(s)
             heads = sorted(news.recent(s, now) + feed.headlines(s), key=lambda n: n["time"], reverse=True)
             rows.append(score(Candidate(symbol=s, float_shares=floats.get(s), news=heads, first_seen=seen[s], **q), now))
-        server.STATE.update(rows=rank(rows), updated=now.isoformat(), status="live")
+        server.STATE.update(rows=rank(rows), updated=now.isoformat(),
+                            status="live" if rows else "live · no movers from IB yet (market closed?)")
 
 
 def demo():
