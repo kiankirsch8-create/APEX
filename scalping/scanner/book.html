@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Order Flow</title>
+<style>
+:root{--bg:#05080d;--panel:#0d131d;--line:#1b2433;--text:#e6ebf2;--mute:#7f8ba0;--buy:#19d27e;--sell:#ff4d5e;--accent:#4c8dff}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--text);font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif;display:flex;flex-direction:column}
+header{display:flex;flex-wrap:wrap;gap:10px 16px;align-items:center;padding:8px 12px;background:var(--panel);border-bottom:1px solid var(--line)}
+header input{background:#060a10;border:1px solid var(--line);color:var(--text);border-radius:6px;padding:5px 8px;width:96px;font-weight:700;text-transform:uppercase}
+header button{background:var(--accent);color:#fff;border:0;border-radius:6px;padding:5px 10px;cursor:pointer;font-size:12px}
+header button.ghost{background:#1c2636}
+.k{color:var(--mute);font-size:11px;margin-right:4px}
+.v{font-variant-numeric:tabular-nums;font-weight:600}
+#note{color:#f5b942;font-size:12px}
+#status .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#555;margin-right:6px}
+#status.ok .dot{background:var(--buy)}
+main{flex:1;display:flex;min-height:0}
+#heat{flex:1;min-width:0;display:block}
+#side{width:250px;display:block;border-left:1px solid var(--line)}
+@media (max-width:640px){#side{width:150px}}
+.legend{padding:4px 12px;color:var(--mute);font-size:11px;border-top:1px solid var(--line);background:var(--panel)}
+</style>
+</head>
+<body>
+<header>
+  <form id="f"><input id="sym" placeholder="Symbol" aria-label="Symbol"> <button>Show</button></form>
+  <span id="status"><span class="dot"></span><span id="st">connecting…</span></span>
+  <span><span class="k">Last</span><span class="v" id="last">–</span></span>
+  <span><span class="k">Bid</span><span class="v" id="bb" style="color:var(--buy)">–</span></span>
+  <span><span class="k">Ask</span><span class="v" id="ba" style="color:var(--sell)">–</span></span>
+  <span><span class="k">Spread</span><span class="v" id="spr">–</span></span>
+  <span><span class="k">Zoom</span><button class="ghost" id="zin">+</button> <button class="ghost" id="zout">−</button> <button class="ghost" id="tin">time +</button> <button class="ghost" id="tout">time −</button></span>
+  <span id="note"></span>
+</header>
+<main><canvas id="heat"></canvas><canvas id="side"></canvas></main>
+<div class="legend">Heatmap: resting limit orders over time (blue = little → yellow/red/white = large). Bubbles: executed volume (green = buyers lifting the ask, red = sellers hitting the bid). Lines: best bid (green) / best ask (red). Right: price · current order book (COB) · traded volume profile (CVP). Scroll on the chart to zoom price.</div>
+<script>
+const heat=document.getElementById("heat"), side=document.getElementById("side"), H=heat.getContext("2d"), S=side.getContext("2d");
+let cols=[], trades=[], lastId=0, tick=0.01, tickPx=12, pxPerSec=5, center=null, norm=1000, volNorm=500, sym=null, dpr=window.devicePixelRatio||1;
+const cvp=new Map();   // price -> [buy, sell]
+const STOPS=[[0,[2,6,14]],[.06,[8,30,80]],[.16,[0,80,180]],[.3,[0,160,215]],[.45,[0,210,150]],[.6,[190,230,0]],[.75,[255,180,0]],[.88,[255,70,30]],[1,[255,255,255]]];
+function cmap(x){x=Math.max(0,Math.min(1,x));for(let i=1;i<STOPS.length;i++){if(x<=STOPS[i][0]){const[a,ca]=STOPS[i-1],[b,cb]=STOPS[i],f=(x-a)/(b-a);return`rgb(${ca.map((c,j)=>Math.round(c+(cb[j]-c)*f)).join(",")})`;}}return"#fff";}
+function fit(c){const r=c.getBoundingClientRect();c.width=Math.max(1,r.width*dpr);c.height=Math.max(1,r.height*dpr);}
+function resize(){fit(heat);fit(side);}
+window.addEventListener("resize",resize);resize();
+const pk=p=>Math.round(p/tick);                       // price -> integer tick index
+const fmt=p=>p==null?"–":p.toFixed(tick<0.01?4:tick<1?2:2);
+function yOf(p){const h=heat.height/dpr;return h/2-(pk(p)-pk(center))*tickPx;}
+
+async function sub(s){sym=s.toUpperCase();document.getElementById("sym").value=sym;cols=[];trades=[];cvp.clear();center=null;
+  try{await fetch("subscribe?sym="+encodeURIComponent(sym));}catch(e){} history.replaceState(null,"","?sym="+sym);}
+document.getElementById("f").onsubmit=e=>{e.preventDefault();const v=document.getElementById("sym").value.trim();if(v)sub(v);};
+document.getElementById("zin").onclick=()=>tickPx=Math.min(40,tickPx*1.3);
+document.getElementById("zout").onclick=()=>tickPx=Math.max(3,tickPx/1.3);
+document.getElementById("tin").onclick=()=>pxPerSec=Math.min(60,pxPerSec*1.5);
+document.getElementById("tout").onclick=()=>pxPerSec=Math.max(0.5,pxPerSec/1.5);
+heat.addEventListener("wheel",e=>{e.preventDefault();tickPx=Math.max(3,Math.min(40,tickPx*(e.deltaY<0?1.12:1/1.12)));},{passive:false});
+
+function guessTick(c){const ps=[...c.bids,...c.asks].map(x=>x[0]).sort((a,b)=>a-b);let m=Infinity;for(let i=1;i<ps.length;i++){const d=ps[i]-ps[i-1];if(d>1e-9&&d<m)m=d;}
+  if(m===Infinity)return tick; for(const t of [0.0001,0.001,0.005,0.01,0.05,0.1,0.25,0.5,1,5]) if(m<=t*1.01) return t; return m;}
+
+async function poll(){
+  try{
+    const s=await (await fetch("state?since="+lastId,{cache:"no-store"})).json();
+    if(s.sym && s.sym!==sym && !sym){sym=s.sym;document.getElementById("sym").value=sym;}
+    if(s.sym && sym && s.sym!==sym) { /* server still switching */ }
+    const st=document.getElementById("status"); st.className=(s.status==="live"||s.status==="demo")?"ok":""; document.getElementById("st").textContent=(s.sym||"")+" · "+s.status;
+    document.getElementById("note").textContent=s.depth_note||"";
+    const now=Date.now()/1000, c={t:now,bids:s.bids||[],asks:s.asks||[],bb:s.bb,ba:s.ba};
+    if(c.bids.length||c.asks.length) tick=guessTick(c);
+    cols.push(c); if(cols.length>8000) cols.splice(0,cols.length-8000);
+    for(const t of s.trades||[]){trades.push(t);lastId=Math.max(lastId,t.id);const k=pk(t.p),e=cvp.get(k)||[0,0];e[t.side<0?1:0]+=t.s;cvp.set(k,e);}
+    if(trades.length>30000) trades.splice(0,trades.length-30000);
+    const mid=(c.bb!=null&&c.ba!=null)?(c.bb+c.ba)/2:(s.last!=null?s.last:null);
+    if(mid!=null){const vis=(heat.height/dpr)/tickPx; if(center==null||Math.abs(pk(mid)-pk(center))>vis*0.3) center=mid;}
+    document.getElementById("last").textContent=fmt(s.last); document.getElementById("bb").textContent=fmt(c.bb); document.getElementById("ba").textContent=fmt(c.ba);
+    document.getElementById("spr").textContent=(c.bb!=null&&c.ba!=null)?fmt(c.ba-c.bb):"–";
+  }catch(e){document.getElementById("status").className="";document.getElementById("st").textContent="order-flow server not reachable";}
+  setTimeout(poll,150);
+}
+
+function updateNorms(){
+  const sz=[];for(let i=Math.max(0,cols.length-300);i<cols.length;i+=3){for(const x of cols[i].bids)sz.push(x[1]);for(const x of cols[i].asks)sz.push(x[1]);}
+  if(sz.length>20){sz.sort((a,b)=>a-b);norm=sz[Math.floor(sz.length*0.97)]||norm;}
+  const vb=bins().map(b=>b.buy+b.sell).sort((a,b)=>a-b); if(vb.length>10) volNorm=vb[Math.floor(vb.length*0.9)]||volNorm;
+}
+setInterval(updateNorms,2000);
+
+function bins(){
+  const w=heat.width/dpr, now=Date.now()/1000, t0=now-w/pxPerSec, m=new Map(), bw=Math.max(0.25,4/pxPerSec);
+  for(let i=trades.length-1;i>=0;i--){const t=trades[i];if(t.t<t0)break;const key=Math.floor(t.t/bw)+"|"+pk(t.p);let b=m.get(key);
+    if(!b){b={t:Math.floor(t.t/bw)*bw+bw/2,p:t.p,buy:0,sell:0};m.set(key,b);} if(t.side<0)b.sell+=t.s; else b.buy+=t.s;}
+  return [...m.values()];
+}
+
+function draw(){
+  const w=heat.width/dpr,h=heat.height/dpr; H.setTransform(dpr,0,0,dpr,0,0); H.fillStyle="#02050a"; H.fillRect(0,0,w,h);
+  if(center!=null && cols.length){
+    const now=Date.now()/1000, xOf=t=>w-(now-t)*pxPerSec; let lastX=-1;
+    for(let i=cols.length-1;i>=0;i--){const c=cols[i];const x=Math.floor(xOf(c.t));if(x<-2)break;if(x===lastX)continue;
+      const x2=i<cols.length-1?Math.ceil(xOf(cols[i+1].t)):w, cw=Math.max(1,(lastX<0?x2:lastX)-x); lastX=x;
+      for(const lv of [c.bids,c.asks]) for(const [p,s] of lv){const y=yOf(p);if(y<-tickPx||y>h+tickPx)continue;H.fillStyle=cmap(Math.sqrt(s/norm));H.fillRect(x,y-tickPx/2,cw,Math.max(1,tickPx));}}
+    // volume bubbles
+    for(const b of bins()){const x=xOf(b.t),y=yOf(b.p),v=b.buy+b.sell;if(x<0)continue;const r=Math.min(38,2+Math.sqrt(v/Math.max(1,volNorm))*9);
+      const buyShare=b.buy/v; H.beginPath();H.arc(x,y,r,0,Math.PI*2);
+      H.fillStyle=buyShare>=0.5?`rgba(25,210,126,${0.35+0.4*buyShare})`:`rgba(255,77,94,${0.35+0.4*(1-buyShare)})`;H.fill();
+      H.lineWidth=1;H.strokeStyle=buyShare>=0.5?"#7dffb9":"#ffb0b8";H.stroke();}
+    // best bid / ask lines
+    for(const [key,color] of [["bb","#19d27e"],["ba","#ff4d5e"]]){H.beginPath();H.strokeStyle=color;H.lineWidth=1.5;let started=false,py=null;
+      for(let i=0;i<cols.length;i++){const c=cols[i],v=c[key];if(v==null)continue;const x=xOf(c.t);if(x<0)continue;const y=yOf(v);
+        if(!started){H.moveTo(x,y);started=true;}else{H.lineTo(x,py);H.lineTo(x,y);} py=y;}
+      if(started){H.lineTo(w,py);H.stroke();}}
+  } else { H.fillStyle="#7f8ba0"; H.font="14px -apple-system,sans-serif"; H.textAlign="center"; H.fillText("waiting for data…",w/2,h/2); }
+  drawSide(); requestAnimationFrame(draw);
+}
+
+function drawSide(){
+  const w=side.width/dpr,h=side.height/dpr; S.setTransform(dpr,0,0,dpr,0,0); S.fillStyle="#070b12"; S.fillRect(0,0,w,h);
+  const c=cols[cols.length-1]; if(!c||center==null) return;
+  const axisW=Math.min(64,w*0.3), cobW=(w-axisW)*0.6, cvpW=w-axisW-cobW;
+  let mx=1; for(const lv of [c.bids,c.asks]) for(const [p,s] of lv){const y=yOf(p); if(y>0&&y<h) mx=Math.max(mx,s);}
+  let mv=1; for(const [k,[b,s]] of cvp){mv=Math.max(mv,b+s);}
+  const bh=Math.max(1,tickPx-1);
+  for(const [lv,col] of [[c.bids,"#19d27e"],[c.asks,"#ff4d5e"]]) for(const [p,s] of lv){const y=yOf(p);if(y<-tickPx||y>h+tickPx)continue;
+    S.fillStyle=col; S.globalAlpha=0.85; S.fillRect(axisW,y-bh/2,Math.max(1,cobW*(s/mx)),bh); S.globalAlpha=1;
+    if(tickPx>=11){S.fillStyle="#e6ebf2";S.font="10px -apple-system,sans-serif";S.fillText(s>=1e3?(s/1e3).toFixed(1)+"k":Math.round(s),axisW+3,y+3.5);}}
+  for(const [k,[b,s]] of cvp){const p=k*tick,y=yOf(p);if(y<-tickPx||y>h+tickPx)continue;const x0=axisW+cobW, lb=cvpW*(b/mv), ls=cvpW*(s/mv);
+    S.fillStyle="#19d27e";S.fillRect(x0,y-bh/2,lb,bh);S.fillStyle="#ff4d5e";S.fillRect(x0+lb,y-bh/2,ls,bh);}
+  // price axis: label every n ticks
+  const every=Math.max(1,Math.ceil(16/tickPx)); S.font="10px -apple-system,sans-serif";
+  const top=pk(center)+Math.ceil(h/2/tickPx), bot=pk(center)-Math.ceil(h/2/tickPx);
+  for(let k=bot;k<=top;k++){if(k%every)continue;const p=k*tick,y=yOf(p);S.fillStyle=(c.bb!=null&&Math.abs(p-c.bb)<tick/2)?"#19d27e":(c.ba!=null&&Math.abs(p-c.ba)<tick/2)?"#ff4d5e":"#9aa6ba";S.fillText(fmt(p),4,y+3.5);}
+  S.fillStyle="#070b12"; S.fillRect(0,0,w,16); S.fillStyle="#7f8ba0"; S.font="10px -apple-system,sans-serif";
+  S.fillText("PRICE",4,12); S.fillText("COB",axisW+4,12); S.fillText("CVP",axisW+cobW+4,12);
+  S.strokeStyle="#1b2433"; S.beginPath(); S.moveTo(axisW-.5,0); S.lineTo(axisW-.5,h); S.moveTo(axisW+cobW-.5,0); S.lineTo(axisW+cobW-.5,h); S.stroke();
+}
+
+const q=new URLSearchParams(location.search).get("sym"); if(q) sub(q);
+poll(); requestAnimationFrame(draw);
+</script>
+</body>
+</html>

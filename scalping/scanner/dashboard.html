@@ -23,7 +23,7 @@ th{color:var(--mute);font-weight:500;font-size:12px;background:var(--bg)}
 td.l,th.l{text-align:left}
 tr.all5{background:var(--hot)}
 tr.all5 td.sym{color:var(--hit)}
-td.sym{font-weight:700;font-size:15px}
+td.sym{font-weight:700;font-size:15px;cursor:pointer;text-decoration:underline dotted #3a4456;text-underline-offset:4px}
 .pill{display:inline-block;width:22px;height:18px;line-height:18px;border-radius:4px;margin-left:3px;font-size:10px;text-align:center;background:var(--miss);color:#c9d1dd}
 .pill.y{background:var(--hit);color:#04150d}
 .pill.n2{background:var(--warn);color:#2a1d00}
@@ -43,7 +43,7 @@ td.news{max-width:420px;overflow:hidden;text-overflow:ellipsis;text-align:left;c
     <button id="snd" title="Browsers need one click before they may play sounds">Enable sound</button>
   </div>
 </header>
-<div class="legend">Pillars: <b>RV</b> relative volume ≥5× · <b>%</b> up ≥10% · <b>N</b> news in last 24 h · <b>$</b> price $1–20 · <b>F</b> float &lt;10M (amber = 10–20M). Green rows meet all 5; a chime plays when a new one appears.</div>
+<div class="legend">Pillars: <b>RV</b> relative volume ≥5× · <b>%</b> up ≥10% · <b>N</b> news in last 24 h · <b>$</b> price $1–20 · <b>F</b> float &lt;10M (amber = 10–20M). Green rows meet all 5; a chime plays when a new one appears. Click a ticker to open its order flow (start <code>python3 -m scalping.scanner.book</code>).</div>
 <div class="wrap">
 <table>
   <thead><tr>
@@ -92,7 +92,7 @@ async function tick(){
       if(r.all5 && !known.has(r.symbol)){ known.add(r.symbol); if(!first) fresh=true; }
       const n=(r.news&&r.news[0]); const seen=r.first_seen?new Date(r.first_seen).toLocaleTimeString("en-GB",{timeZone:"America/New_York",hour:"2-digit",minute:"2-digit"}):"–";
       return `<tr class="${r.all5?"all5":""}">
-        <td class="l sym">${r.symbol}</td><td>${fx(r.last)}</td>
+        <td class="l sym" title="Open order flow" onclick="window.open('http://127.0.0.1:8766/?sym=${r.symbol}','orderflow')">${r.symbol}</td><td>${fx(r.last)}</td>
         <td class="${(r.change_pct||0)>0?"up":""}">${r.change_pct==null?"–":(r.change_pct>0?"+":"")+r.change_pct.toFixed(1)+"%"}</td>
         <td>${r.rvol_tod==null?"–":r.rvol_tod.toFixed(1)+"×"}</td><td class="mute">${r.rvol_day==null?"–":r.rvol_day.toFixed(1)+"×"}</td>
         <td>${fmtM(r.float_shares)}</td><td class="l">${pills(r)}</td>

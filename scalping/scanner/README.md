@@ -31,4 +31,10 @@ Without IBKR: `python -m scalping.scanner.run --demo` shows the dashboard with s
 Uses IBKR historical 1-minute bars incl. pre-market, previous daily bars and IB news. IBKR has no historical scanner,
 so you name the tickers. Float is today's value. Delisted tickers are skipped.
 
+## Order-flow window (Bookmap-style)
+`python3 -m scalping.scanner.book GDC` (or `NQ`, or `--demo`) → http://127.0.0.1:8766 . Clicking a ticker in the scanner
+switches it. Shows liquidity heatmap, volume bubbles, best bid/ask, current order book (COB) and volume profile (CVP).
+Depth = the Level 2 feeds subscribed at IBKR, merged (free IEX only = thin; Nasdaq TotalView = full for Nasdaq stocks).
+Bubbles and bid/ask use Level 1 data and are complete already.
+
 Tests: `python -m pytest scalping/scanner/test_scanner.py -q`
